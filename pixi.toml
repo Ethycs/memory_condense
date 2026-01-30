@@ -1,0 +1,25 @@
+[workspace]
+channels = ["conda-forge"]
+name = "memory_condense"
+platforms = ["win-64", "linux-64"]
+preview = ["pixi-build"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+numpy = ">=1.26"
+
+[pypi-dependencies]
+pydantic = ">=2.0,<3"
+FlagEmbedding = ">=1.2"
+hnswlib = ">=0.8"
+pysbd = ">=0.3"
+litellm = ">=1.40"
+tiktoken = ">=0.7"
+memory_condense = { path = ".", editable = true }
+
+[feature.dev.pypi-dependencies]
+pytest = ">=8.0"
+
+[environments]
+default = { features = [], solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }

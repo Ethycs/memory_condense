@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# pixi
+.pixi/
+
+# Runtime data
+data/
+demo_data/
+*.db
+
+# hnswlib index files
+*.bin
+
+# Model cache
+.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env

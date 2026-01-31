@@ -27,7 +27,6 @@ class MemoryCondenser:
         self,
         data_dir: str | Path = "./data",
         model_name: str = "BAAI/bge-m3",
-        use_fp16: bool = True,
         chunker_min_tokens: int = 120,
         chunker_max_tokens: int = 250,
         device: str | None = None,
@@ -43,7 +42,6 @@ class MemoryCondenser:
         )
         self._embedder = EmbeddingService(
             model_name=model_name,
-            use_fp16=use_fp16,
             device=device,
         )
         self._retriever = SimilarityRetriever(
@@ -67,10 +65,12 @@ class MemoryCondenser:
 
         return turn, chunks
 
-    def search(self, query: str, k: int = 10) -> list[RetrievalResult]:
+    def search(
+        self, query: str, k: int = 10, ef_search: int = 50
+    ) -> list[RetrievalResult]:
         """Search for chunks similar to the query."""
         query_embedding = self._embedder.embed_query(query)
-        return self._retriever.query(query_embedding, k=k)
+        return self._retriever.query(query_embedding, k=k, ef_search=ef_search)
 
     @property
     def transcript(self) -> TranscriptStore:

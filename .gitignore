@@ -27,5 +27,9 @@ demo_data/
 .DS_Store
 Thumbs.db
 
+# Eval cache and results
+eval_cache/
+eval_results/
+
 # Environment
 .env

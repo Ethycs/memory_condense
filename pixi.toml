@@ -4,20 +4,25 @@ name = "memory_condense"
 platforms = ["win-64", "linux-64"]
 preview = ["pixi-build"]
 
+[activation.env]
+KMP_DUPLICATE_LIB_OK = "TRUE"
+
 [dependencies]
 python = ">=3.11,<3.13"
 numpy = ">=1.26"
-
-[pypi-dependencies]
+pytorch = ">=2.0"
 pydantic = ">=2.0,<3"
-FlagEmbedding = ">=1.2"
+sentence-transformers = ">=3.0"
 hnswlib = ">=0.8"
 pysbd = ">=0.3"
 litellm = ">=1.40"
 tiktoken = ">=0.7"
+python-dotenv = ">=1.0"
+
+[pypi-dependencies]
 memory_condense = { path = ".", editable = true }
 
-[feature.dev.pypi-dependencies]
+[feature.dev.dependencies]
 pytest = ">=8.0"
 
 [environments]

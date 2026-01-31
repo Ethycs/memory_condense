@@ -14,7 +14,7 @@ from memory_condense.schemas import Chunk
 @pytest.fixture(scope="module")
 def embedder():
     """Shared embedder instance (model loads once per test session)."""
-    return EmbeddingService(model_name="BAAI/bge-m3", use_fp16=True)
+    return EmbeddingService(model_name="BAAI/bge-m3")
 
 
 @pytest.mark.slow
@@ -36,19 +36,6 @@ def test_embed_chunks(embedder):
     for c in result:
         assert c.embedding is not None
         assert len(c.embedding) == 1024
-        assert c.lexical_weights is None
-
-
-@pytest.mark.slow
-def test_embed_chunks_with_sparse(embedder):
-    chunks = [
-        Chunk(turn_id="t1", text="Hello world", start_char=0, end_char=11, token_count=2),
-    ]
-    result = embedder.embed_chunks(chunks, return_sparse=True)
-    assert len(result) == 1
-    assert result[0].embedding is not None
-    # lexical_weights may or may not be populated depending on model version
-    # but the call should not error
 
 
 @pytest.mark.slow

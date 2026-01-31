@@ -9,11 +9,12 @@ description = "Long-term memory condensation system for LLM conversations"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.0,<3",
-    "FlagEmbedding>=1.2",
+    "sentence-transformers>=3.0",
     "hnswlib>=0.8",
     "pysbd>=0.3",
     "litellm>=1.40",
     "tiktoken>=0.7",
+    "python-dotenv>=1.0",
 ]
 
 [tool.hatch.build.targets.wheel]

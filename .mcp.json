@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "memory_condense": {
+      "type": "stdio",
+      "command": "pixi",
+      "args": ["run", "python", "-m", "memory_condense.mcp_server"]
+    }
+  }
+}

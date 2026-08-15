@@ -21,6 +21,11 @@ python-dotenv = ">=1.0"
 
 [pypi-dependencies]
 memory_condense = { path = ".", editable = true }
+# MCP server so the memory system is callable from Claude Code / Desktop.
+mcp = ">=1.2"
+
+[tasks]
+mcp = "python -m memory_condense.mcp_server"
 
 [feature.dev.dependencies]
 pytest = ">=8.0"

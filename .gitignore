@@ -33,3 +33,6 @@ eval_results/
 
 # Environment
 .env
+
+# MCP server per-project memory store
+.memory_condense/

@@ -32,7 +32,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 docs/
 ├── 00 - Theory/           Why retrieval-weighted context should work; the eval's formal claim
 ├── 01 - Design/           The original architecture plan + eval design rationale
-├── 02 - Implementation/   Setup, environment gotchas, how to run all four eval modes
+├── 02 - Implementation/   Setup, the four eval modes, and MCP/Claude Code integration
 ├── 03 - Architecture/     The as-built system map (what actually exists)
 ├── 04 - Reference/        External landscape (SimpleMem, Mem0, MemDelta…) + vocabulary
 ├── 05 - Standards/        Normative data contracts (SQLite v2, embedding, memory provenance, formats)
@@ -63,6 +63,7 @@ docs/
 - "What does the system do?" → `03 - Architecture/00 - System Overview.md`.
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
+- "How do I actually *use* it day to day?" → `02 - Implementation/02 - MCP Integration.md` — the memory system is exposed to Claude Code as an MCP server.
 - "Is this competitive?" → **unanswerable today.** `04 - Reference/00 - Competitive Landscape 2026.md` plus `08 - Analysis/` give the context, but zero common-benchmark runs exist. The harness is built; the numbers are not.
 
 ## The one distinction this tree tries hardest to keep

@@ -41,7 +41,8 @@ docs/
 ├── 06 - Roadmaps/         Gap analysis: designed vs. built vs. measured, tiered next steps
 ├── 07 - Status Reports/   Dated snapshots (session handoffs)
 ├── 08 - Analysis/         Measured results — the ablation numbers, and one retraction
-└── 09 - Archived/         Superseded material (append-only)
+├── 09 - Archived/         Superseded material (append-only)
+└── 10 - Research Log/     Dated experiment entries with data/ artifacts; baselines of record
 ```
 
 ## Governance
@@ -66,7 +67,7 @@ docs/
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
 - "How do I actually *use* it day to day?" → `02 - Implementation/02 - MCP Integration.md` — the memory system is exposed to Claude Code as an MCP server.
-- "Is this competitive?" → **unanswerable today.** `04 - Reference/00 - Competitive Landscape 2026.md` plus `08 - Analysis/` give the context, but zero common-benchmark runs exist. The harness is built; the numbers are not.
+- "Is this competitive?" → **on common benchmarks, still unanswerable** (`04 - Reference/00` + `08 - Analysis/`; zero common-benchmark runs exist). **In-regime, a baseline of record now exists**: `10 - Research Log/00` — B0, 92.3% recall at 0.5% of transcript tokens on this project's own build session, with its caveats stated.
 
 ## The one distinction this tree tries hardest to keep
 

@@ -49,7 +49,7 @@ Per-turn context is bounded by a constant, so session cost is O(N). There is **n
 
 The deployed use case is **agentic coding** (Claude Code sessions: ~500 tokens/turn, tool output dominating chunk volume, crossover ≈ 25 turns). LoCoMo (31 tok/turn, crossover ≈ 400 turns, 33–47% containment ceiling) is nearly the worst-case regime for this design and is valid **only for retriever-vs-retriever comparisons**, never for verdicts on whether the system earns its place.
 
-- **State**: **In progress** (2026-08-16): this project's own build session is being converted into a probe benchmark. No in-regime number exists yet.
+- **State**: **Met — baseline of record exists.** B0 (2026-08-16): hybrid k=10, 92.3% recall at 1,533 tokens over the 305k-token build session, 25× past crossover, 99% cumulative token reduction. Declared the baseline by the operator. See [`10 - Research Log/00`](../10%20-%20Research%20Log/00%20-%202026-08-16%20-%20Baseline%20B0,%20the%20first%20in-regime%20number.md), caveats included (self-authored needle probe, n=39, upper estimate).
 
 ---
 

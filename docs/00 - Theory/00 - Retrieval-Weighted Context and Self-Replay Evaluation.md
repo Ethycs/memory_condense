@@ -25,7 +25,12 @@ The design (see `01 - Design`) separates two orthogonal quantities per memory un
 score = wR·relevance + wI·importance + wP·pin_boost + wE·energy − wS·superseded_penalty
 ```
 
-**As-built note**: the current implementation realizes only the first term with `wR = 1` and all other weights 0 — score is raw cosine (`retrieval.py:167`). The rest of the equation is design intent, not code.
+**As-built note** (corrected 2026-08-15): the original note here said the implementation realizes "only the first term with $w_R = 1$ and all other weights 0 — score is raw cosine." That conflated two different paths and has been false since `0d86038`:
+
+- **Chunk retrieval** (`retrieval.py`) is raw cosine, with no other term. The note was accurate about this path.
+- **Memory-item ranking** (`ranking.rank_score`) implements the full equation: $w_R = 1.0$, $w_I = 0.3$, $w_P = 0.5$, $w_E = 0.2$, $w_S = 1.0$.
+
+**On $energy$**: the quantity is $e \cdot 0.5^{\Delta/h}$, where $\Delta$ is measured in **conversation turns**, not seconds. The distinction is load-bearing rather than a unit convention — under a wall-clock coordinate an ingest completes in minutes, so $\Delta \approx 0$, the factor is ~1.0 for every item, and $w_E \cdot energy$ contributes a constant that discriminates nothing. Turns are what make the term a discriminator: an item the conversation keeps recalling has its access turn pushed forward by `touch`, while one it has moved past falls behind. See `06 - Roadmaps/01`.
 
 ## 2. The core hypothesis
 

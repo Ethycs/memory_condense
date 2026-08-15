@@ -4,6 +4,7 @@
 **Date:** 2026-08-14
 **Supersedes:** the earlier 2026-08-14 revision, which listed Phases 1–4 as unbuilt and the Decision Point as blocking Tier 2
 **Applies to:** `main` (merge `f3edc91`) — committed and merged, **still not measured**
+**Partly superseded (2026-08-15):** by [`01 - Delivering the Specified System.md`](01%20-%20Delivering%20the%20Specified%20System.md). Decay was specified in wall-clock seconds when the design intent is per-turn, so the energy term contributed a constant and **every memory-arm number taken before that fix is void** — including any verdict on Phase 4, whose gate ("evidence COLD items are worth keeping") was never answerable because COLD was unreachable by construction. The ✅ rows below for decay/tiering/ranking describe code that exists and is wired, on the wrong coordinate. Dense and span numbers are unaffected.
 
 ## Current status
 

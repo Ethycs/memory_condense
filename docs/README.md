@@ -20,7 +20,8 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `03 - Architecture/00 - System Overview.md` | ✅ | Diagram and every subsystem rewritten; "there is no condensation yet" was false |
 | `04 - Reference/01 - Vocabulary.md` | ✅ | Lifecycle + retrieval terms moved out of *(planned)*; BM25/hybrid/α/`term_count`/`UsageStats`/F1/provenance added |
 | `05 - Standards/00 - MC-STD-DATA-v0.md` | ✅ | Schema v2 + migration path; new normative clauses 8–10 (provenance, no destruction, migrate-in-place). Still **DRAFT** |
-| `06 - Roadmaps/00 - Gap Analysis and Roadmap.md` | ✅ | Status table and tiers rewritten; Decision Point now *unblocked* but still *open* |
+| `06 - Roadmaps/00 - Gap Analysis and Roadmap.md` | ✅ | Status table and tiers rewritten; Decision Point now *unblocked* but still *open*. **Partly superseded 2026-08-15** — see below |
+| `06 - Roadmaps/01 - Delivering the Specified System.md` | **new** | Decay was specified in wall-clock seconds; the design intent is per-turn. The energy term therefore contributed a constant, and **every memory-arm number is void** — including the Phase 4 verdict. Carries the git evidence that the spec was wrong from commit one, and the five-stage delivery sequence |
 | `00 - Theory/00 …` | — | Not touched; stable by policy (corrections only) |
 | `04 - Reference/00 - Competitive Landscape 2026.md` | — | Not touched this pass |
 | `08 - Analysis/00 - Retrieval Ablation…` | ✅ | Sweep corrected to 54 configs; a position-bin analysis was added and then **retracted the same day** — it does not replicate on the second run pair, and every bin-to-bin difference is inside noise. The aggregate ablation result stands |
@@ -60,7 +61,7 @@ docs/
 
 ## Where to start
 
-- Resuming cold? → `07 - Status Reports/2026-08-15_retrieval-measurement-session.md` — the newest handoff, and the one that explains why every pre-2026-08-15 retrieval number came from a single corpus shape.
+- Resuming cold? → **`06 - Roadmaps/01 - Delivering the Specified System.md` first** — it explains why every memory-arm number on record is void and what order the remaining work has to happen in. Then `07 - Status Reports/2026-08-15_retrieval-measurement-session.md` for the retrieval half, which still stands.
 - "What does the system do?" → `03 - Architecture/00 - System Overview.md`.
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
@@ -76,9 +77,11 @@ docs/
 **Verification block**: run
 
 ```powershell
-git log --oneline -1                     # expect f77781b on main
-git status --short                       # expect a clean tree
-pixi run -e dev pytest -q -m "not slow"  # expect 523 passed, 13 deselected
+git log --oneline -1                     # expect 03105c4 on main
+git status --short                       # NOT clean — the decay re-coordination is in flight
+pixi run -e dev pytest -q -m "not slow"  # 523 at 03105c4; red mid-change, by design
 ```
+
+> **In flight as of 2026-08-15**: `schemas.py` and `decay.py` have been re-coordinated onto turns; schema v4 and the `now_turn` threading have not landed yet, so the working tree does not run. `06 - Roadmaps/01` §3 Stage 1 is the checklist.
 
 If all three hold, this tree is accurate as far as it goes — which is to say it accurately describes something whose *external* competitiveness has never been measured. Retrieval itself now has numbers: see `07 - Status Reports/2026-08-15`. The next thing worth doing is not another feature; it is `--answer-recall` against the long-form corpus, which is free and needs no API key.

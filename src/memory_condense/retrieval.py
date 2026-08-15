@@ -12,6 +12,11 @@ from memory_condense.db import Database
 from memory_condense.lexical import LexicalIndex
 from memory_condense.schemas import Chunk, RetrievalResult, Turn
 
+#: `meta` key holding the next free hnswlib label. Labels are shared state
+#: across every process open on a store, so they are allocated through the
+#: database rather than from a per-process counter.
+_LABEL_KEY = "next_hnsw_label"
+
 
 class SimilarityRetriever:
     """Chunk retrieval over hnswlib (dense) and BM25 (lexical).
@@ -41,7 +46,6 @@ class SimilarityRetriever:
         # label <-> chunk_id mapping
         self._label_to_chunk_id: dict[int, str] = {}
         self._chunk_id_to_label: dict[str, int] = {}
-        self._next_label = 0
         #: Labels marked deleted in this process; hnswlib still counts them.
         self._deleted_labels: set[int] = set()
 
@@ -74,16 +78,92 @@ class SimilarityRetriever:
         for chunk_id, label in cur.fetchall():
             self._label_to_chunk_id[label] = chunk_id
             self._chunk_id_to_label[chunk_id] = label
-            if label >= self._next_label:
-                self._next_label = label + 1
 
-    def _assign_label(self, chunk_id: str) -> int:
-        """Assign a new integer label for a chunk."""
-        label = self._next_label
-        self._next_label += 1
+    def _allocate_labels(self, count: int) -> list[int]:
+        """Reserve `count` labels that no other process can also hand out.
+
+        hnswlib labels are persisted in ``chunks.hnsw_label``, which is UNIQUE,
+        so they are shared state across every process open on the store. A
+        per-process counter (the previous approach) gave two concurrent
+        sessions the same labels and crashed the second writer with an
+        IntegrityError on its first ingest.
+
+        The counter therefore lives in ``meta`` and is bumped inside the
+        implicit write transaction, which holds SQLite's write lock until the
+        commit below. The ``MAX(...)`` guard also repairs stores written
+        before this counter existed, where the counter would otherwise start
+        behind the labels already on disk.
+        """
+        if count <= 0:
+            return []
+
+        conn = self._db.connection
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) "
+            "SELECT ?, CAST(COALESCE(MAX(hnsw_label), -1) + 1 AS TEXT) FROM chunks",
+            (_LABEL_KEY,),
+        )
+        conn.execute(
+            "UPDATE meta SET value = CAST("
+            "  MAX(CAST(value AS INTEGER),"
+            "      (SELECT COALESCE(MAX(hnsw_label), -1) + 1 FROM chunks)) + ?"
+            " AS TEXT) WHERE key = ?",
+            (count, _LABEL_KEY),
+        )
+        end = int(
+            conn.execute(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?", (_LABEL_KEY,)
+            ).fetchone()[0]
+        )
+        conn.commit()
+
+        start = end - count
+        return list(range(start, end))
+
+    def _register(self, chunk_id: str, label: int) -> None:
         self._label_to_chunk_id[label] = chunk_id
         self._chunk_id_to_label[chunk_id] = label
-        return label
+
+    def _sync_from_db(self) -> int:
+        """Adopt chunks another process indexed since we last looked.
+
+        Each process keeps its own in-memory hnswlib graph, so without this a
+        second session's writes stay invisible until restart. SQLite is the
+        source of truth (MC-STD-DATA clause 1), so we reconcile against it.
+        Returns the number of vectors adopted.
+        """
+        if self._index is None:
+            return 0
+
+        on_disk = self._db.execute(
+            "SELECT COUNT(*) FROM chunks "
+            "WHERE hnsw_label IS NOT NULL AND embedding IS NOT NULL"
+        ).fetchone()[0]
+        if on_disk <= len(self._chunk_id_to_label):
+            return 0
+
+        rows = self._db.execute(
+            "SELECT chunk_id, hnsw_label, embedding FROM chunks "
+            "WHERE hnsw_label IS NOT NULL AND embedding IS NOT NULL"
+        ).fetchall()
+
+        labels: list[int] = []
+        vectors: list[np.ndarray] = []
+        for chunk_id, label, blob in rows:
+            if chunk_id in self._chunk_id_to_label or label in self._deleted_labels:
+                continue
+            self._register(chunk_id, int(label))
+            labels.append(int(label))
+            vectors.append(np.frombuffer(blob, dtype=np.float32))
+
+        if not labels:
+            return 0
+
+        needed = self._index.get_current_count() + len(labels)
+        if needed > self._index.get_max_elements():
+            self._index.resize_index(max(needed * 2, self._max_elements))
+        self._index.add_items(np.stack(vectors), np.array(labels, dtype=np.int64))
+        return len(labels)
 
     def add_chunks(self, chunks: list[Chunk]) -> None:
         """Add embedded chunks to the ANN index and persist to SQLite.
@@ -116,8 +196,10 @@ class SimilarityRetriever:
         vectors: list[np.ndarray] = []
         indexed: list[Chunk] = []
 
-        for chunk in new_chunks:
-            label = self._assign_label(chunk.chunk_id)
+        allocated = self._allocate_labels(len(new_chunks))
+
+        for chunk, label in zip(new_chunks, allocated):
+            self._register(chunk.chunk_id, label)
             labels.append(label)
             vectors.append(np.array(chunk.embedding, dtype=np.float32))
 
@@ -177,6 +259,7 @@ class SimilarityRetriever:
         ef_search: int,
     ) -> list[tuple[str, float]]:
         """``(chunk_id, cosine_similarity)`` for the k nearest neighbours."""
+        self._sync_from_db()
         live = self._live_count()
         if live == 0 or k <= 0:
             return []
@@ -350,28 +433,30 @@ class SimilarityRetriever:
         self._label_to_chunk_id.clear()
         self._chunk_id_to_label.clear()
         self._deleted_labels.clear()
-        self._next_label = 0
 
         if not rows:
             return
+
+        # Rows that never got a label (or lost it) need fresh ones, allocated
+        # through the database like any other write.
+        unlabelled = [r[0] for r in rows if r[2] is None]
+        fresh = iter(self._allocate_labels(len(unlabelled)))
 
         labels: list[int] = []
         vectors: list[np.ndarray] = []
 
         for chunk_id, emb_blob, hnsw_label in rows:
-            vec = np.frombuffer(emb_blob, dtype=np.float32)
-            label = hnsw_label if hnsw_label is not None else self._assign_label(chunk_id)
-
-            if hnsw_label is not None:
-                self._label_to_chunk_id[label] = chunk_id
-                self._chunk_id_to_label[chunk_id] = label
-                if label >= self._next_label:
-                    self._next_label = label + 1
-            else:
-                self._assign_label(chunk_id)
-
+            label = int(hnsw_label) if hnsw_label is not None else next(fresh)
+            if hnsw_label is None:
+                self._db.execute(
+                    "UPDATE chunks SET hnsw_label = ? WHERE chunk_id = ?",
+                    (label, chunk_id),
+                )
+            self._register(chunk_id, label)
             labels.append(label)
-            vectors.append(vec)
+            vectors.append(np.frombuffer(emb_blob, dtype=np.float32))
+
+        self._db.commit()
 
         data = np.stack(vectors)
         self._index.add_items(data, np.array(labels, dtype=np.int64))

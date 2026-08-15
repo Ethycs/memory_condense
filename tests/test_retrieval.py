@@ -315,3 +315,113 @@ def test_delete_unknown_chunk_returns_false(retriever):
 
 def _vector_query(components: dict[int, float]) -> np.ndarray:
     return np.array(_vector(components), dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent sessions. Two Claude Code windows on one project open two
+# retrievers on the same store; before labels were allocated through the
+# database this crashed the second writer with
+# "UNIQUE constraint failed: chunks.hnsw_label" on its first ingest.
+# ---------------------------------------------------------------------------
+
+
+def _seed(retriever, db, prefix, n, dim=8):
+    """Add n chunks through `retriever`, returning their ids."""
+    from memory_condense.schemas import Chunk, Turn
+
+    ids = []
+    for i in range(n):
+        turn = Turn(role="user", text=f"{prefix} turn {i}")
+        db.execute(
+            "INSERT OR IGNORE INTO turns (turn_id, role, text, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (turn.turn_id, turn.role, turn.text, turn.created_at.isoformat()),
+        )
+        db.commit()
+        vec = [0.0] * dim
+        vec[i % dim] = 1.0
+        chunk = Chunk(
+            turn_id=turn.turn_id,
+            text=f"{prefix} chunk {i}",
+            start_char=0,
+            end_char=10,
+            token_count=3,
+            embedding=vec,
+        )
+        retriever.add_chunks([chunk])
+        ids.append(chunk.chunk_id)
+    return ids
+
+
+def test_two_retrievers_on_one_store_do_not_collide(tmp_path):
+    """The regression: the second writer used to raise IntegrityError."""
+    from memory_condense.db import Database
+    from memory_condense.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "shared.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    a = SimilarityRetriever(db=db_a, dim=8, index_path=tmp_path / "a.bin")
+    b = SimilarityRetriever(db=db_b, dim=8, index_path=tmp_path / "b.bin")
+
+    _seed(a, db_a, "alpha", 3)
+    _seed(b, db_b, "beta", 3)  # used to raise here
+
+    labels = [
+        r[0]
+        for r in db_a.execute(
+            "SELECT hnsw_label FROM chunks WHERE hnsw_label IS NOT NULL"
+        ).fetchall()
+    ]
+    assert len(labels) == 6
+    assert len(set(labels)) == 6, "labels must be globally unique across processes"
+
+    db_a.close()
+    db_b.close()
+
+
+def test_a_session_adopts_another_sessions_writes(tmp_path):
+    """SQLite is the source of truth, so a live session must reconcile to it."""
+    from memory_condense.db import Database
+    from memory_condense.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "shared.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    a = SimilarityRetriever(db=db_a, dim=8, index_path=tmp_path / "a.bin")
+    b = SimilarityRetriever(db=db_b, dim=8, index_path=tmp_path / "b.bin")
+
+    _seed(a, db_a, "alpha", 2)
+    _seed(b, db_b, "beta", 2)
+
+    probe = _vector_query({0: 1.0})
+    # Each retriever should see all four vectors, not just its own two.
+    assert len(a.query(probe, k=10)) == 4
+    assert len(b.query(probe, k=10)) == 4
+
+    db_a.close()
+    db_b.close()
+
+
+def test_label_counter_repairs_a_store_written_before_it_existed(tmp_path):
+    """Older stores have labels but no counter row; allocation must not reuse them."""
+    from memory_condense.db import Database
+    from memory_condense.retrieval import SimilarityRetriever
+
+    db = Database(tmp_path / "legacy.db")
+    retriever = SimilarityRetriever(db=db, dim=8, index_path=tmp_path / "i.bin")
+    _seed(retriever, db, "old", 3)
+
+    # Simulate a pre-fix store: drop the counter, keep the labels.
+    db.execute("DELETE FROM meta WHERE key = 'next_hnsw_label'")
+    db.commit()
+
+    fresh = SimilarityRetriever(db=db, dim=8, index_path=tmp_path / "i2.bin")
+    _seed(fresh, db, "new", 2)
+
+    labels = [
+        r[0]
+        for r in db.execute(
+            "SELECT hnsw_label FROM chunks WHERE hnsw_label IS NOT NULL"
+        ).fetchall()
+    ]
+    assert len(set(labels)) == len(labels) == 5
+    db.close()

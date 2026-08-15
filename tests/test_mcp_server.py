@@ -165,6 +165,110 @@ class TestStatsPinForget:
         assert server._condense().memory.get(item.mem_id) is not None
 
 
+class TestProvenanceSourcing:
+    """`remember` must prefer a real transcript turn over a self-quoting one."""
+
+    FACT = "We decided to ship the beta on Friday."
+
+    def test_witnessed_when_the_text_was_actually_said(self, server):
+        server._condense().ingest("user", f"{self.FACT} No exceptions.")
+        before = server._condense().transcript.count()
+
+        out = server.remember(self.FACT)
+
+        assert "witnessed in the transcript" in out
+        # No new turn: the memory cites what the user really said.
+        assert server._condense().transcript.count() == before
+
+    def test_asserted_when_nothing_in_the_transcript_says_it(self, server):
+        out = server.remember("The user works in Pacific time.", "Entity")
+
+        assert "asserted" in out
+        assert server._condense().transcript.count() == 1
+
+    def test_the_cited_turn_really_contains_the_quote(self, server):
+        server._condense().ingest("user", f"{self.FACT} No exceptions.")
+        server.remember(self.FACT)
+
+        item = server._condense().memory.list_items()[0]
+        assert item.provenance, "memory stored with no provenance"
+        source = item.provenance[0]
+        assert server._condense().validator.quote_matches(source.turn_id, source.quote)
+        # The cited turn is the user's own, not one manufactured for the memory.
+        assert "No exceptions." in server._condense().transcript.get_turn(
+            source.turn_id
+        ).text
+
+    def test_wildcards_in_a_fact_do_not_match_unrelated_turns(self, server):
+        """A LIKE lookup that forgets to escape would call this witnessed."""
+        server._condense().ingest("user", "Coverage is above ninety percent.")
+
+        out = server.remember("Coverage is 100% _guaranteed_.")
+
+        assert "asserted" in out
+
+
+class TestSupersede:
+    def test_links_the_replacement_to_what_it_replaced(self, server):
+        server.remember("The beta ships on Friday.", "Decision")
+        old = server._condense().memory.list_items()[0]
+
+        out = server.supersede(old.mem_id[:8], "The beta ships on Monday.")
+
+        assert "Superseded" in out
+        rows = {i.mem_id: i for i in server._condense().memory.list_items(status=None)}
+        assert rows[old.mem_id].status.value == "superseded"
+        new = next(i for i in rows.values() if i.supersedes == old.mem_id)
+        assert new.content == "The beta ships on Monday."
+        assert new.status.value == "active"
+
+    def test_replacement_inherits_the_old_type_by_default(self, server):
+        server.remember("Tabs, not spaces.", "Preference")
+        old = server._condense().memory.list_items()[0]
+
+        server.supersede(old.mem_id[:8], "Spaces, not tabs.")
+
+        new = next(
+            i
+            for i in server._condense().memory.list_items()
+            if i.supersedes == old.mem_id
+        )
+        assert new.type.value == "Preference"
+
+    def test_explicit_type_overrides_it(self, server):
+        server.remember("Tabs, not spaces.", "Preference")
+        old = server._condense().memory.list_items()[0]
+
+        server.supersede(old.mem_id[:8], "Spaces are mandatory.", "Constraint")
+
+        new = next(
+            i
+            for i in server._condense().memory.list_items()
+            if i.supersedes == old.mem_id
+        )
+        assert new.type.value == "Constraint"
+
+    def test_superseded_items_stop_being_recalled(self, server):
+        server.remember("The beta ships on Friday.", "Decision")
+        old = server._condense().memory.list_items()[0]
+        server.supersede(old.mem_id[:8], "The beta ships on Monday.")
+
+        out = server.recall("when does the beta ship")
+
+        assert "Monday" in out
+        assert "Friday" not in out
+
+    def test_unknown_id_is_reported_not_raised(self, server):
+        assert "No memory matches" in server.supersede("deadbeef", "Anything.")
+
+    def test_empty_content_stores_nothing(self, server):
+        server.remember("The beta ships on Friday.", "Decision")
+        old = server._condense().memory.list_items()[0]
+
+        assert "Nothing superseded" in server.supersede(old.mem_id[:8], "   ")
+        assert server._condense().memory.count() == 1
+
+
 class TestToolRegistration:
     """`list_tools` is async; driven with asyncio.run to avoid a plugin dependency."""
 
@@ -180,6 +284,7 @@ class TestToolRegistration:
             "ingest",
             "memory_stats",
             "pin_memory",
+            "supersede",
             "forget",
         }
 

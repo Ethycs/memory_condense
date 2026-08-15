@@ -40,6 +40,7 @@ from memory_condense.schemas import (
     PinOp,
     PinState,
     Provenance,
+    SupersedeOp,
     DeleteOp,
 )
 
@@ -103,6 +104,41 @@ def _find(mem_id: str) -> MemoryItem | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _source_turn(text: str) -> tuple[str, bool]:
+    """Resolve the turn a memory should cite. Returns ``(turn_id, is_witnessed)``.
+
+    Prefer a turn that already contains the text verbatim — that is genuine
+    provenance, traceable back to something actually said. Only when no such
+    turn exists do we record the text as its own source turn, which makes the
+    memory *asserted* rather than witnessed. Both are traceable; only the first
+    is evidence, and the two are reported differently so the distinction is
+    visible instead of hidden behind a validator that cannot fail.
+    """
+    existing = _condense().transcript.find_containing(text)
+    if existing is not None:
+        return existing.turn_id, True
+    return _condense().transcript.append("user", text).turn_id, False
+
+
+#: How a stored memory's provenance is reported back to the caller.
+_SOURCING = {True: "witnessed in the transcript", False: "asserted"}
+
+
+def _build_create(text: str, type: str, details: str) -> tuple[CreateOp, bool]:
+    """A provenance-carrying CreateOp for ``text``, and whether it was witnessed."""
+    turn_id, witnessed = _source_turn(text)
+    return (
+        CreateOp(
+            type=_resolve_type(type),
+            content=text,
+            details=details.strip() or None,
+            provenance=[Provenance(turn_id=turn_id, quote=text)],
+            importance=0.8,
+        ),
+        witnessed,
+    )
+
+
 def _describe(item: MemoryItem) -> str:
     pin = " PINNED" if item.is_pinned else ""
     return (
@@ -126,9 +162,15 @@ def remember(
     """Store a durable fact in long-term memory.
 
     Call this when the user states something worth carrying across sessions:
-    a decision made, a stated preference, a hard constraint, a correction to
-    something established earlier, or a definition specific to this project.
-    Do not call it for transient conversational detail.
+    a decision made, a stated preference, a hard constraint, or a definition
+    specific to this project. Do not call it for transient conversational
+    detail. If the fact revises one already stored, call `supersede` instead so
+    the link between the old and new versions survives.
+
+    Provenance is recorded either way. When the text appears verbatim in an
+    already-ingested turn the memory cites that turn — genuine evidence. When
+    it does not, the text is recorded as its own source and the memory is
+    reported as *asserted*: traceable to you, but not to anything the user said.
 
     Args:
         content: The fact, in one or two lines, phrased so it stands alone
@@ -146,14 +188,7 @@ def remember(
         return "Nothing stored: content was empty."
 
     condenser = _condense()
-    turn = condenser.transcript.append("user", text)
-    op = CreateOp(
-        type=_resolve_type(type),
-        content=text,
-        details=details.strip() or None,
-        provenance=[Provenance(turn_id=turn.turn_id, quote=text)],
-        importance=0.8,
-    )
+    op, witnessed = _build_create(text, type, details)
 
     report = condenser.validator.validate(MemoryOps(create=[op]))
     if not report.ok:
@@ -163,8 +198,11 @@ def remember(
     item = condenser.memory.create(op)
     if pin:
         condenser.memory.pin(PinOp(mem_id=item.mem_id, pin=PinState.USER))
-    logger.info("stored memory %s", item.mem_id)
-    return f"Remembered {_describe(condenser.memory.get(item.mem_id) or item)}"
+    logger.info("stored memory %s (witnessed=%s)", item.mem_id, witnessed)
+    return (
+        f"Remembered ({_SOURCING[witnessed]}) "
+        f"{_describe(condenser.memory.get(item.mem_id) or item)}"
+    )
 
 
 @mcp.tool()
@@ -315,13 +353,64 @@ def pin_memory(mem_id: str, pinned: bool = True) -> str:
 
 
 @mcp.tool()
-def forget(mem_id: str) -> str:
-    """Retire a memory that is wrong or no longer applies.
+def supersede(mem_id: str, content: str, type: str = "", details: str = "") -> str:
+    """Replace a memory whose content has changed, preserving the history.
 
-    This is a soft delete — the row and its provenance survive so the audit
-    trail stays intact, but the memory stops being retrieved. To *replace* a
-    fact rather than drop it, call `remember` with the corrected version and
-    then `forget` the old one.
+    This is the right tool whenever a fact is *revised* — the plan changed, the
+    user corrected an earlier statement, a constraint was relaxed. The old item
+    is marked superseded rather than deleted, and the new item points back at
+    it, so the chain of what was believed when stays walkable.
+
+    Do not emulate this with `remember` followed by `forget`: that produces two
+    unrelated rows and loses the link between them.
+
+    Args:
+        mem_id: Full or short (8-character) id of the memory being replaced.
+        content: The corrected fact, phrased to stand alone.
+        type: Memory type for the replacement. Defaults to the old item's type.
+        details: Optional short elaboration.
+
+    Returns:
+        A confirmation naming both the retired and the replacing memory.
+    """
+    text = content.strip()
+    if not text:
+        return "Nothing superseded: content was empty."
+
+    old = _find(mem_id)
+    if old is None:
+        return f"No memory matches id {mem_id!r} (or the prefix is ambiguous)."
+
+    condenser = _condense()
+    op, witnessed = _build_create(text, type or old.type.value, details)
+    sup = SupersedeOp(mem_id=old.mem_id, replacement=op)
+
+    report = condenser.validator.validate(MemoryOps(supersede=[sup]))
+    if not report.ok:
+        reasons = "; ".join(f"{e.reason}: {e.detail}" for e in report.rejected)
+        return f"Rejected by the provenance validator ({reasons})."
+
+    new = condenser.memory.supersede(sup)
+    if new is None:
+        return f"Could not supersede {mem_id!r}."
+    logger.info("superseded %s with %s", old.mem_id, new.mem_id)
+    return (
+        f"Superseded [{old.mem_id[:8]}] {old.content}\n"
+        f"  with ({_SOURCING[witnessed]}) {_describe(new)}"
+    )
+
+
+@mcp.tool()
+def forget(mem_id: str) -> str:
+    """Retire a memory that should no longer exist at all.
+
+    Use this only when the fact was never true, is no longer wanted on the
+    record, or the user asks you to drop it. If the fact merely *changed*, call
+    `supersede` instead — it keeps the link between the old and new versions,
+    which `forget` destroys.
+
+    This is a soft delete: the row and its provenance survive so the audit
+    trail stays intact, but the memory stops being retrieved.
 
     Args:
         mem_id: Full or short (8-character) memory id.

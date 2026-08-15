@@ -9,7 +9,7 @@ The memory system is exposed to Claude Code — and any other MCP client — as 
 
 | Half | Mechanism | What it does | Cost |
 | --- | --- | --- | --- |
-| **Active** | MCP server ([`mcp_server.py`](../../src/memory_condense/mcp_server.py)) | Seven tools the model calls when it decides memory is relevant. Full semantic + keyword retrieval. | One model load per server process (lazy) |
+| **Active** | MCP server ([`mcp_server.py`](../../src/memory_condense/mcp_server.py)) | Eight tools the model calls when it decides memory is relevant. Full semantic + keyword retrieval. | One model load per server process (lazy) |
 | **Passive** *(opt-in)* | `UserPromptSubmit` hook ([`memory_context_hook.py`](../../examples/claude_hooks/memory_context_hook.py)) | Prepends pinned and still-hot facts to every prompt. | Single-digit ms; **no embedding model at all** |
 
 The split is forced by how each runs. The MCP server is one long-lived process, so it can afford to hold bge-m3 in memory. A hook is a **fresh process on every prompt**, so semantic search there would reload a 2.3 GB model per turn. The hook therefore ranks by pin state and decayed energy only — pure SQLite. Query-specific recall is the `recall` tool's job, not the hook's.
@@ -26,9 +26,18 @@ Registered under the server name `memory_condense`, so the model sees them as `m
 | `ingest(text, role)` | Chunk, embed, index, and auto-extract facts from a block of text |
 | `memory_stats()` | Store location, turn count, active/pinned counts, heat distribution |
 | `pin_memory(mem_id, pinned)` | Exempt a fact from decay. Accepts the 8-character short id |
+| `supersede(mem_id, content, type, details)` | Replace a revised fact, keeping the old row and the link back to it |
 | `forget(mem_id)` | Soft delete — the row and its provenance survive so the audit trail stays walkable |
 
-**Provenance still applies through MCP.** `remember` writes the content as a transcript turn and cites it, so the item passes the same validator as everything else. A fact with no traceable source cannot enter the store by any path — see clause 8 of `05 - Standards/00`.
+### Witnessed vs. asserted provenance
+
+Every path into the store goes through the same validator, but on the MCP path **that guarantee is weaker than it looks, and the tools say so out loud.**
+
+`remember` first looks for an existing turn containing the content verbatim. If one exists, the memory cites *that* turn — real evidence, traceable to something the user actually said — and the reply is tagged `witnessed in the transcript`. If none exists, the content is recorded as its own source turn and the reply is tagged `asserted`.
+
+An asserted memory satisfies clause 8 (it has a turn and an exact quote) but proves nothing: the model wrote both the claim and the source. Calling that "provenance-enforced" would be circular. The distinction is surfaced in the tool output rather than hidden, so a reader can tell which memories rest on evidence. **Auto-extraction is the path where the validator can genuinely fail** — there the extractor quotes turns it did not write, and a paraphrase is rejected.
+
+`supersede` is a first-class tool because `remember` + `forget` is *not* equivalent: it produces two unrelated rows and destroys the `supersedes` link the audit trail depends on. The `forget` docstring points at `supersede` for revisions so the model does not learn the lossy workflow.
 
 ## 2. Registration
 
@@ -100,7 +109,25 @@ Not enabled by default — it injects context into every prompt, so turning it o
 
 It emits `hookSpecificOutput.additionalContext` with up to six facts, pinned first. It **fails open**: any error exits 0 with no output, so a missing or corrupt store can never block a prompt.
 
-There is deliberately **no auto-capture hook**. Recording every prompt would grow the store without discrimination and is a privacy decision that should be made explicitly, not inherited from a default. If you want it, a `Stop` hook calling `ingest` is the shape — but consider whether `remember` on the facts that matter is better than ingesting everything.
+## 6. Why there is no auto-capture hook (and what would actually be needed)
+
+There is no hook that records the conversation automatically. The reason is **not** that "deciding what is worth keeping is unsolved" — that framing appeared in an earlier revision of this file and was wrong. Selection is the architecture's central claim and it is built:
+
+| Concern auto-capture raises | Where the architecture already answers it |
+| --- | --- |
+| The store fills with junk | `importance` seeds energy; unused items decay to COLD (`decay.py`) |
+| Junk survives by being re-read | Reheating happens **only in `recall`** — an item reheats when a query actually matched it |
+| Important facts get buried | Pins are exempt from decay; `w_P` boosts them in the rerank scalar |
+| Context cost grows with the store | `ContextPacker` enforces a hard token budget per section, independent of store size |
+| A wrong fact persists | `supersede` replaces it and keeps the chain; `forget` retires it |
+
+So "ingest broadly and let decay sort it out" is the design working as intended, not a shortcut.
+
+What is genuinely missing is narrower: **nothing in the repo binds `LLMExtractor` to a provider.** `MemoryCondenser` defaults to `RuleBasedExtractor`, and `grep -rn "LLMExtractor" src/` finds it only in its own module. Auto-capture today would therefore run regex cue-matching over real prose and mint a Constraint from every sentence containing "must". `LLMExtractor` is written, tested, and takes an injected `complete(system, user) -> str`, so the gap is a binding and a default — not a design question.
+
+The remaining blocker after that is consent, which is a user decision rather than an engineering one: recording every turn of every session is not something to inherit from a default.
+
+If you want it now, a `Stop` hook calling `ingest` is the shape. Prefer `remember` on the facts that matter until LLM extraction is wired.
 
 ---
 
@@ -108,7 +135,7 @@ There is deliberately **no auto-capture hook**. Recording every prompt would gro
 
 ```powershell
 claude mcp list                              # expect memory_condense listed and connected
-pixi run -e dev pytest tests/test_mcp_server.py -q   # expect 28 passed
+pixi run -e dev pytest tests/test_mcp_server.py -q   # expect 38 passed
 ```
 
 Then, in a Claude Code session, ask it to store and retrieve a fact — the round trip through `remember` → `recall` is the real check. If `claude mcp list` shows the server as failed, run `pixi run python -m memory_condense.mcp_server` directly: it should start, log to stderr, and wait on stdin rather than exiting.

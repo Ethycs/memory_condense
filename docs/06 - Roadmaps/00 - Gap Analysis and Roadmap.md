@@ -3,7 +3,7 @@
 **Status:** Living Document
 **Date:** 2026-08-14
 **Supersedes:** the earlier 2026-08-14 revision, which listed Phases 1–4 as unbuilt and the Decision Point as blocking Tier 2
-**Applies to:** commit `cd9f423` + the **UNCOMMITTED** memory-layer working tree
+**Applies to:** branch `feat/memory-layer` (`80262ea`, `abdcc9b`, `24c7323` on top of `cd9f423`) — committed, not merged, not measured
 
 ## Current status
 
@@ -46,10 +46,10 @@ Deciding requires exactly two runs: a `--k 10` dense baseline and a memory/hybri
 
 | Gap | Depends on | Blocks | Status |
 | --- | --- | --- | --- |
-| ~~Commit `num_retries=5` on judge/responder~~ | — | — | ✅ in the tree (still UNCOMMITTED, with everything else) |
+| ~~Commit `num_retries=5` on judge/responder~~ | — | — | ✅ committed in `abdcc9b` |
 | ~~Token + latency instrumentation~~ | — | — | ✅ done |
 | ~~Decouple judge from responder~~ | — | — | ✅ done |
-| **Commit the working tree** | — | *every* claim below being reproducible by anyone else | 🔲 **do this first** |
+| ~~Commit the working tree~~ | — | — | ✅ done — 3 commits on `feat/memory-layer`. 🔲 **not merged to `main`** |
 | Run the first benchmark: `--benchmark-file longmemeval_oracle.json --max-samples 10` | commit; LongMemEval data downloaded | Decision Point | 🔲 |
 | Run the `scores_by_position` analysis against the 2026-01-31 pair (`--compare`) | — | hypothesis H2 becoming a figure instead of a claim | 🔲 |
 | Re-run the 2026-01-31 ablation pair with the fixed models | commit | all four archived numbers were produced by a now-retired responder+judge | 🔲 |
@@ -91,7 +91,7 @@ Deciding requires exactly two runs: a `--k 10` dense baseline and a memory/hybri
 **Verification block**: run
 
 ```powershell
-git status --short                                     # expect ~40 modified/untracked paths — nothing committed yet
+git log --oneline main..HEAD                           # expect 3 commits on feat/memory-layer
 pixi run -e dev pytest -q -m "not slow"                # expect 366 passed, 13 deselected
 ls eval_results                                        # expect exactly the four 2026-01-31 files
 ```

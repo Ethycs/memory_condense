@@ -6,7 +6,7 @@
 **Applies to:** `src/memory_condense/` and `eval_results/` JSON
 **Depends on:** • `03 - Architecture/00 - System Overview.md` (as-built map)
 
-> **UNCOMMITTED**: the schema this standard describes (`schema_version` 2) exists only in the working tree as of 2026-08-14. A reader on `cd9f423` will find version 1.
+> **Branch-only**: the schema this standard describes (`schema_version` 2) landed in `80262ea` on `feat/memory-layer`. A reader on `main` will still find version 1.
 
 ## 0. Scope
 

@@ -3,7 +3,7 @@
 **Status**: CURRENT
 **Date**: 2026-08-14
 **Supersedes**: the earlier 2026-08-14 "dense-retrieval-only / no condensation yet" version of this document, which described the tree at commit `cd9f423`
-**Applies to**: commit `cd9f423` **plus a large UNCOMMITTED working tree** — 14 modified + 9 new source files, 7 modified + 11 new test files (`git status --short` is the authority)
+**Applies to**: branch `feat/memory-layer` — `80262ea` (memory layer), `abdcc9b` (eval harness), `24c7323` (docs), on top of `cd9f423`. Committed, **not merged to `main`**.
 
 ## Executive summary
 
@@ -164,7 +164,7 @@ memory_condense is now the full local memory manager the design called for: tran
 ```powershell
 pixi run -e dev pytest -q -m "not slow"        # expect 366 passed, 13 deselected
 pixi run python -c "from memory_condense.db import Database; import tempfile, pathlib; d=Database(pathlib.Path(tempfile.mkdtemp())/'v.db'); print('schema_version', d.schema_version)"
-git status --short                              # expect the whole memory layer still UNCOMMITTED
+git log --oneline main..HEAD                    # expect 3 commits, unmerged
 ```
 
 Expect `schema_version 2`. Then decide: commit the memory layer as one change, or split the eval-model fix (`eval/schemas.py`, `judge.py`, `responder.py`) into its own commit first since it is the only part that unblocks *running* anything.

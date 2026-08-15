@@ -7,7 +7,7 @@
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
 
-> **UNCOMMITTED — read this first.** The system these docs describe exists in the **working tree only**. Commit `cd9f423` contains Phase 0 (transcript → chunker → bge-m3 → hnswlib) and a self-replay eval harness; everything else — the memory layer, hybrid retrieval, the benchmark harness, the eval-model fix — is modified-or-untracked. `git status --short` is the authority, not any sentence in this tree.
+> **On a branch, not on `main` — read this first.** The system these docs describe lives on **`feat/memory-layer`**, three commits on top of `cd9f423`: `80262ea` (memory layer), `abdcc9b` (eval harness repair + benchmark path), `24c7323` (this tree). `main` still contains only Phase 0 and the pre-repair eval harness. Nothing has been merged, and nothing has been measured. `git log --oneline main..HEAD` is the authority, not any sentence in this tree.
 
 ## Reconciliation state (2026-08-14)
 
@@ -59,7 +59,7 @@ docs/
 
 ## Where to start
 
-- Resuming cold? → newest file in `07 - Status Reports/`, then the UNCOMMITTED warning above.
+- Resuming cold? → newest file in `07 - Status Reports/`, then the branch note above.
 - "What does the system do?" → `03 - Architecture/00 - System Overview.md`.
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
@@ -74,7 +74,8 @@ docs/
 **Verification block**: run
 
 ```powershell
-git status --short                       # expect ~40 modified/untracked paths
+git log --oneline main..HEAD             # expect 3 commits on feat/memory-layer
+git status --short                       # expect a clean tree
 pixi run -e dev pytest -q -m "not slow"  # expect 366 passed, 13 deselected
 ```
 

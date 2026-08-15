@@ -168,7 +168,11 @@ class TestStatsPinForget:
 class TestProvenanceSourcing:
     """`remember` must prefer a real transcript turn over a self-quoting one."""
 
-    FACT = "We decided to ship the beta on Friday."
+    #: Chosen to match none of `extractor.RULES` — it has no "we decided",
+    #: "must", "i prefer" or other cue word. Otherwise `ingest`'s auto-extraction
+    #: creates this memory first and the subsequent `remember` reports a merge
+    #: instead of exercising the witnessed-provenance path this class is about.
+    FACT = "The beta ships on Friday."
 
     def test_witnessed_when_the_text_was_actually_said(self, server):
         server._condense().ingest("user", f"{self.FACT} No exceptions.")
@@ -267,6 +271,37 @@ class TestSupersede:
 
         assert "Nothing superseded" in server.supersede(old.mem_id[:8], "   ")
         assert server._condense().memory.count() == 1
+
+
+class TestDedupThroughMCP:
+    def test_re_remembering_a_known_fact_is_a_no_op(self, server):
+        server.remember("The beta ships on Friday.", "Decision")
+        out = server.remember("The beta ships on Friday.", "Decision")
+
+        assert "Already remembered" in out
+        assert server._condense().memory.count() == 1
+
+    def test_a_repeat_assertion_appends_no_transcript_turn(self, server):
+        server.remember("The beta ships on Friday.", "Decision")
+        before = server._condense().transcript.count()
+
+        server.remember("the beta ships on   FRIDAY.", "Decision")
+
+        assert server._condense().transcript.count() == before
+
+    def test_a_repeat_assertion_can_still_pin(self, server):
+        server.remember("The beta ships on Friday.", "Decision")
+        out = server.remember("The beta ships on Friday.", "Decision", pin=True)
+
+        assert "PINNED" in out
+        assert server._condense().memory.list_items()[0].is_pinned
+
+    def test_the_same_text_under_a_different_type_is_kept_separately(self, server):
+        server.remember("The beta ships on Friday.", "Decision")
+        out = server.remember("The beta ships on Friday.", "Constraint")
+
+        assert "Already remembered" not in out
+        assert server._condense().memory.count() == 2
 
 
 class TestToolRegistration:

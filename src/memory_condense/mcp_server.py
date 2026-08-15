@@ -178,6 +178,9 @@ def remember(
     it does not, the text is recorded as its own source and the memory is
     reported as *asserted*: traceable to you, but not to anything the user said.
 
+    Re-stating a fact already stored is safe and cheap: it merges into the
+    existing memory and refreshes it rather than creating a second copy.
+
     Args:
         content: The fact, in one or two lines, phrased so it stands alone
             without the surrounding conversation.
@@ -194,6 +197,22 @@ def remember(
         return "Nothing stored: content was empty."
 
     condenser = _condense()
+
+    # Checked before anything is written, so re-asserting a known fact does not
+    # append a redundant turn to the append-only transcript on its way to being
+    # merged away.
+    known = condenser.memory.find_by_content(_resolve_type(type), text)
+    if known is not None:
+        refreshed = condenser.memory.touch(known.mem_id) or known
+        if pin and not refreshed.is_pinned:
+            refreshed = (
+                condenser.memory.pin(
+                    PinOp(mem_id=refreshed.mem_id, pin=PinState.USER)
+                )
+                or refreshed
+            )
+        return f"Already remembered {_describe(refreshed)}"
+
     op, witnessed = _build_create(text, type, details)
 
     report = condenser.validator.validate(MemoryOps(create=[op]))
@@ -309,7 +328,9 @@ def ingest(text: str, role: str = "user") -> str:
 
     return (
         f"Ingested {len(body)} chars as a {role} turn: "
-        f"{len(chunks)} searchable chunk(s), {extracted} fact(s) auto-extracted."
+        f"{len(chunks)} searchable chunk(s), {extracted} new fact(s) extracted "
+        f"(exact duplicates merge into the existing memory rather than adding "
+        f"a row)."
     )
 
 

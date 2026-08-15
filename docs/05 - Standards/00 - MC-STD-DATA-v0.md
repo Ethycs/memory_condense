@@ -6,7 +6,7 @@
 **Applies to:** `src/memory_condense/` and `eval_results/` JSON
 **Depends on:** • `03 - Architecture/00 - System Overview.md` (as-built map)
 
-> **On `main`**: the schema this standard describes (`schema_version` 2) landed in `80262ea` and merged in `f3edc91`. Stores created before that migrate in place on open — see clause 10.
+> **On `main`**: `schema_version` 3. v2 landed in `80262ea` and merged in `f3edc91`; v3 adds `memory_items.content_hash` for exact-duplicate detection. Stores at any earlier version migrate in place on open — see clause 10.
 
 ## 0. Scope
 
@@ -26,10 +26,13 @@ Does NOT cover: prompt formats (implementation detail), rank weights or `alpha` 
 8. **Every memory item MUST carry at least one provenance entry**, and every provenance `quote` MUST appear verbatim in the referenced turn's text, compared after whitespace normalization only (runs of whitespace collapsed to one space, ends stripped). No case folding, no punctuation stripping, no fuzzy matching. An op that cannot satisfy this MUST be rejected, not stored. *(Enforced by `validator.Validator`; the sole exception is `UpdateOp`, which MAY carry an empty provenance list because it amends an item that already has provenance — any entry it **does** carry is checked in full.)*
 9. **Memory rows MUST NOT be destroyed.** `delete` MUST set `status = 'deleted'`; a correction MUST be expressed as a supersede — a new row whose `supersedes` names the old one, with the old row set to `status = 'superseded'`. Hard `DELETE` on `memory_items` is forbidden: the audit trail from a memory back to the transcript that justifies it MUST stay walkable. Removing a chunk from the indexes (`retrieval.delete_chunk`) MUST likewise keep the `chunks` row so provenance cannot dangle.
 10. **A database file MUST be migrated in place, never recreated.** A file at any `schema_version` < `CURRENT_SCHEMA_VERSION` MUST be upgraded by applying each intervening migration in order; a fresh file is created directly at the current version. Migrations MUST be additive (new tables/columns) so that clause 3 holds across upgrades. Every version bump MUST ship its migration in `db._MIGRATIONS` in the same change.
+11. **Active memory items MUST be unique on content identity.** Identity is `(type, content)` after collapsing whitespace runs and case folding — `schemas.content_key`, stored as `memory_items.content_hash`. A create whose identity matches an existing **active** item MUST merge into that item — adding its provenance and refreshing its energy — rather than inserting a second row. Two consequences are deliberate: identity is scoped to `active`, so forgetting a fact and stating it again recreates it; and the type is part of the key, so the same sentence recorded as a `Constraint` and as a `Decision` remains two claims. **Near-duplicate collapsing by embedding similarity is forbidden** — "the beta ships on Friday" and "the beta ships on Monday" are highly similar and contradictory, and merging them would destroy the distinction clause 9 exists to preserve. Semantic conflict is expressed by supersede, never by dedup.
+
+    Note the normalization here differs from clause 8's on purpose. Clause 8 decides whether a quote is genuine *evidence*, where a change of case changes the evidence, so it MUST NOT case-fold. This clause decides whether two memories are the *same memory*. The two MUST NOT be unified.
 
 ## 2. Core concept
 
-One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 2) holds everything durable: the transcript, the chunks, the BM25 inverted index, and the memory items with their provenance. Two derived caches sit beside it — the hnswlib index file (`hnsw_index.bin`, cosine, `M=16`, `ef_construction=200`, `max_elements=100 000`, rebuildable via `rebuild_index()`) and the `chunk_terms` postings (rebuildable via `LexicalIndex.rebuild()`).
+One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 3) holds everything durable: the transcript, the chunks, the BM25 inverted index, and the memory items with their provenance. Two derived caches sit beside it — the hnswlib index file (`hnsw_index.bin`, cosine, `M=16`, `ef_construction=200`, `max_elements=100 000`, rebuildable via `rebuild_index()`) and the `chunk_terms` postings (rebuildable via `LexicalIndex.rebuild()`).
 
 ## 3. Storage schema (v2)
 
@@ -38,7 +41,7 @@ One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 2) holds everythin
 | `turns` | `turn_id` PK, `role` CHECK ∈ {user, assistant, system}, `text`, `created_at` | append-only |
 | `chunks` | `chunk_id` PK, `turn_id` FK, `text`, `start_char`, `end_char`, `token_count`, `embedding` BLOB (dim×4 bytes f32), `lexical_weights` TEXT (JSON term→tf, **now populated**), `hnsw_label` INTEGER UNIQUE, `term_count` INTEGER | `hnsw_label` is the sole chunk↔dense-index mapping; `term_count` is the BM25 document length (NULL ⇒ not lexically indexed) |
 | `chunk_terms` | `term`, `chunk_id` FK, `tf`, PK `(term, chunk_id)` | BM25 inverted index; postings are replaced wholesale per chunk, never appended to |
-| `memory_items` | `mem_id` PK, `type`, `content`, `details`, `status` CHECK ∈ {active, superseded, deleted}, `supersedes`, `pin` CHECK ∈ {user_pinned, system_pinned, none}, `energy` REAL, `half_life_s` REAL (default 604800), `importance` REAL, `created_at`, `last_access_at`, `embedding` BLOB | see clause 9 — status transitions only, no deletes |
+| `memory_items` | `mem_id` PK, `type`, `content`, `details`, `status` CHECK ∈ {active, superseded, deleted}, `supersedes`, `pin` CHECK ∈ {user_pinned, system_pinned, none}, `energy` REAL, `half_life_s` REAL (default 604800), `importance` REAL, `created_at`, `last_access_at`, `embedding` BLOB, `content_hash` (v3, indexed, **not** UNIQUE) | see clause 9 — status transitions only, no deletes |
 | `memory_provenance` | `mem_id` FK ON DELETE CASCADE, `turn_id`, `chunk_id` (nullable), `quote`, UNIQUE `(mem_id, turn_id, quote)` | see clause 8 — at least one row per item |
 | `meta` | `key` PK, `value` | holds `schema_version` |
 
@@ -46,10 +49,15 @@ One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 2) holds everythin
 
 | From | To | Applied changes |
 | --- | --- | --- |
-| (no file / no `meta` table) | 2 | full schema created directly at v2 |
+| (no file / no `meta` table) | 3 | full schema created directly at v3 |
 | 1 | 2 | `ALTER TABLE chunks ADD COLUMN term_count`; create `chunk_terms`, `memory_items`, `memory_provenance` and their indexes; `UPDATE meta SET value = '2'` |
+| 2 | 3 | `ALTER TABLE memory_items ADD COLUMN content_hash`; `idx_memory_content_hash`; **post-migration backfill** of `content_hash` for existing rows; `UPDATE meta SET value = '3'` |
 
 `Database.schema_version` reports the on-disk version (`0` when unreadable). Migrations run inside `Database.__init__`, so opening a v1 file upgrades it — no separate migration command exists, and none should be added without also making the upgrade opt-in.
+
+Some migrations need work SQL cannot express — the v3 backfill hashes content, and stock SQLite has neither `sha256` nor a way to collapse internal whitespace runs. Those live in `db._POST_MIGRATIONS`, keyed by target version and run immediately after that version's SQL.
+
+**`content_hash` is indexed but deliberately not UNIQUE.** Stores written before v3 almost certainly already contain duplicates — that is the bug the column exists to stop — and `CREATE UNIQUE INDEX` would raise inside `Database.__init__`, making an existing store permanently unopenable. Uniqueness is enforced in `MemoryStore.create`; `MemoryStore.dedupe_existing()` cleans a legacy store on request (never from a migration: opening a database must not silently rewrite it). Promoting the constraint into the schema is a later version, after that cleanup has run.
 
 ### 3.2 Value contracts
 
@@ -113,4 +121,6 @@ pixi run -e dev pytest -q -m "not slow" tests/test_db.py tests/test_memory_store
 pixi run python -c "import sqlite3, tempfile, pathlib; from memory_condense.db import Database; p=pathlib.Path(tempfile.mkdtemp())/'v.db'; d=Database(p); print(d.schema_version); print(sorted(r[0] for r in d.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")))"
 ```
 
-Expect `2` and the table list `['chunk_terms', 'chunks', 'memory_items', 'memory_provenance', 'meta', 'turns']`. If a table is missing, the migration in `db._MIGRATIONS[2]` and `_SCHEMA_SQL` have drifted apart — fix that before writing any data.
+Expect `3` and the table list `['chunk_terms', 'chunks', 'memory_items', 'memory_provenance', 'meta', 'turns']`.
+
+Drift between `_SCHEMA_SQL` and `_MIGRATIONS` is no longer something to catch by hand: `tests/test_db.py::TestSchemaParity` builds a fresh database and a migrated one from both v1 and v2, then asserts they converge on the same tables, columns, and indexes. It compares shape rather than DDL text, because `ALTER TABLE ADD COLUMN` and `CREATE TABLE` render the same logical column differently and a text comparison would fail on every additive migration until everyone learned to ignore it.

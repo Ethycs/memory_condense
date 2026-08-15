@@ -2,8 +2,22 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Callable
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
+
+#: DDL introduced by v3, written once and reused by both the fresh-database
+#: path and the migration path.
+#:
+#: ``_SCHEMA_SQL`` and ``_MIGRATIONS`` are otherwise two hand-maintained copies
+#: of the same schema, and the standard's own verification block warns that
+#: they drift. Anything shareable should be shared. The ``content_hash``
+#: *column* cannot be — a fresh database declares it inside CREATE TABLE while
+#: an existing one needs ALTER TABLE — so `test_db.py` asserts the two paths
+#: converge on the same columns and indexes instead of the same DDL text.
+_V3_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_memory_content_hash ON memory_items(content_hash);
+"""
 
 #: Full schema for a freshly created database (already at CURRENT_SCHEMA_VERSION).
 _SCHEMA_SQL = """
@@ -56,7 +70,8 @@ CREATE TABLE IF NOT EXISTS memory_items (
     importance     REAL NOT NULL DEFAULT 0.5,
     created_at     TEXT NOT NULL,
     last_access_at TEXT NOT NULL,
-    embedding      BLOB
+    embedding      BLOB,
+    content_hash   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_status ON memory_items(status);
@@ -77,9 +92,14 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-
-INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2');
 """
+
+_SCHEMA_SQL = (
+    _SCHEMA_SQL
+    + _V3_INDEXES
+    + f"\nINSERT OR REPLACE INTO meta (key, value)"
+    f" VALUES ('schema_version', '{CURRENT_SCHEMA_VERSION}');\n"
+)
 
 #: Statements that upgrade a database *into* the keyed version.
 _MIGRATIONS: dict[int, str] = {
@@ -127,7 +147,47 @@ CREATE TABLE IF NOT EXISTS memory_provenance (
 CREATE INDEX IF NOT EXISTS idx_provenance_mem ON memory_provenance(mem_id);
 
 UPDATE meta SET value = '2' WHERE key = 'schema_version';
+""",
+    3: """
+ALTER TABLE memory_items ADD COLUMN content_hash TEXT;
 """
+    + _V3_INDEXES
+    + """
+UPDATE meta SET value = '3' WHERE key = 'schema_version';
+""",
+}
+
+
+def _backfill_content_hash(conn: sqlite3.Connection) -> None:
+    """Populate ``content_hash`` for rows that predate v3.
+
+    Python rather than SQL because stock SQLite has neither ``sha256`` nor a
+    way to collapse internal whitespace runs.
+    """
+    from memory_condense.schemas import content_key
+
+    rows = conn.execute(
+        "SELECT mem_id, type, content FROM memory_items WHERE content_hash IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    conn.executemany(
+        "UPDATE memory_items SET content_hash = ? WHERE mem_id = ?",
+        [(content_key(mem_type, content), mem_id) for mem_id, mem_type, content in rows],
+    )
+
+
+#: Work that must run *after* the SQL for a version, when SQL alone cannot
+#: express it. Keyed by target version, same as :data:`_MIGRATIONS`.
+#:
+#: Deliberately no UNIQUE index on ``content_hash``: stores written before v3
+#: almost certainly already contain duplicates — that is the bug this column
+#: exists to stop — and ``CREATE UNIQUE INDEX`` would raise inside
+#: ``Database.__init__``, making an existing store permanently unopenable.
+#: Uniqueness is enforced in ``MemoryStore.create``; promoting it to a database
+#: constraint is a later version, after ``dedupe_existing()`` has been run.
+_POST_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    3: _backfill_content_hash,
 }
 
 
@@ -161,6 +221,9 @@ class Database:
                 sql = _MIGRATIONS.get(target)
                 if sql is not None:
                     self._conn.executescript(sql)
+                post = _POST_MIGRATIONS.get(target)
+                if post is not None:
+                    post(self._conn)
 
         self._conn.commit()
 

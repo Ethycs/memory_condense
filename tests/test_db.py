@@ -6,8 +6,13 @@ import pytest
 
 from memory_condense.db import CURRENT_SCHEMA_VERSION, Database
 
-# The v1 schema exactly as it shipped, used to build a legacy database
-# and prove the migration path works on real pre-existing files.
+# The v1 schema exactly as it shipped in cd9f423, used to build a legacy
+# database and prove the migration path works on real pre-existing files.
+#
+# The two indexes matter: this fixture used to omit them, which was harmless
+# while nothing compared schemas but would make the fresh-vs-migrated parity
+# test below report drift that does not exist. Verify against
+# `git show cd9f423:src/memory_condense/db.py` before editing.
 _V1_SCHEMA = """
 CREATE TABLE turns (
     turn_id    TEXT PRIMARY KEY,
@@ -15,6 +20,7 @@ CREATE TABLE turns (
     text       TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE INDEX idx_turns_created ON turns(created_at);
 CREATE TABLE chunks (
     chunk_id        TEXT PRIMARY KEY,
     turn_id         TEXT NOT NULL REFERENCES turns(turn_id),
@@ -26,6 +32,7 @@ CREATE TABLE chunks (
     lexical_weights TEXT,
     hnsw_label      INTEGER UNIQUE
 );
+CREATE INDEX idx_chunks_turn ON chunks(turn_id);
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -118,6 +125,66 @@ class TestMigrationFromV1:
         # A second open must not re-run the ALTER TABLE (which would error).
         with Database(v1_db_path) as db:
             assert db.schema_version == CURRENT_SCHEMA_VERSION
+
+    def test_content_hash_column_added(self, v1_db_path):
+        with Database(v1_db_path) as db:
+            assert "content_hash" in _column_names(db, "memory_items")
+
+
+class TestSchemaParity:
+    """`_SCHEMA_SQL` and `_MIGRATIONS` are two hand-maintained copies of one
+    schema. The standard's own verification block warns that they drift. These
+    tests make drift a test failure rather than a support ticket.
+
+    Compares columns and indexes rather than raw `sqlite_master.sql` text:
+    `ALTER TABLE ADD COLUMN` and `CREATE TABLE` produce different DDL text for
+    the same logical column, so a text comparison would fail on every additive
+    migration and teach everyone to ignore it.
+    """
+
+    @staticmethod
+    def _shape(db: Database) -> dict:
+        tables = sorted(_table_names(db))
+        return {
+            "tables": tables,
+            "columns": {t: sorted(_column_names(db, t)) for t in tables},
+            "indexes": sorted(
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ),
+        }
+
+    def _migrated(self, tmp_path, schema_sql: str, name: str) -> dict:
+        path = tmp_path / name
+        conn = sqlite3.connect(str(path))
+        conn.executescript(schema_sql)
+        conn.commit()
+        conn.close()
+        with Database(path) as db:
+            assert db.schema_version == CURRENT_SCHEMA_VERSION
+            return self._shape(db)
+
+    def test_fresh_matches_migrated_from_v1(self, tmp_path):
+        with Database(tmp_path / "fresh.db") as db:
+            fresh = self._shape(db)
+        assert fresh == self._migrated(tmp_path, _V1_SCHEMA, "from_v1.db")
+
+    def test_fresh_matches_migrated_from_v2(self, tmp_path):
+        """v2 is what a store written before this change actually looks like."""
+        from memory_condense.db import _MIGRATIONS
+
+        v2_sql = _V1_SCHEMA.replace(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '1');", ""
+        ) + _MIGRATIONS[2].replace(
+            "UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '2');",
+        )
+        with Database(tmp_path / "fresh2.db") as db:
+            fresh = self._shape(db)
+        assert fresh == self._migrated(tmp_path, v2_sql, "from_v2.db")
 
 
 class TestConstraints:

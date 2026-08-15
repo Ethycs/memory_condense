@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -88,6 +90,28 @@ WARM_THRESHOLD = 0.25
 
 #: Default half-life for memory energy decay: 7 days.
 DEFAULT_HALF_LIFE_S = 7 * 24 * 3600.0
+
+_CONTENT_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def content_key(mem_type: "MemoryType | str", content: str) -> str:
+    """Stable identity for a memory's *content*, for exact-duplicate detection.
+
+    Whitespace runs collapse and case is folded, so re-ingesting the same
+    sentence with different wrapping or capitalisation is recognised as the
+    same fact rather than creating a second row.
+
+    Deliberately **not** the same normalisation as ``validator._normalize``,
+    which must not casefold: that one decides whether a quote is genuine
+    evidence, where a change of case is a change to the evidence. This one
+    decides whether two memories are the same memory. Do not "unify" them.
+
+    The type is part of the key — the same sentence recorded as a
+    ``Constraint`` and as a ``Decision`` is two different claims.
+    """
+    value = mem_type.value if isinstance(mem_type, MemoryType) else str(mem_type)
+    normalized = _CONTENT_WHITESPACE_RE.sub(" ", content).strip().casefold()
+    return hashlib.sha256(f"{value}\x1f{normalized}".encode("utf-8")).hexdigest()
 
 
 class Provenance(BaseModel):

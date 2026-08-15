@@ -377,6 +377,7 @@ def test_apply_runs_ops_in_order(store, turn):
 
     assert summary == {
         "created": 1,
+        "duplicate": 0,
         "updated": 1,
         "superseded": 1,
         "deleted": 1,
@@ -604,3 +605,134 @@ def test_retrieve_honours_k(store, turn):
 
 def test_retrieve_on_empty_store(store):
     assert store.retrieve(np.asarray([1.0, 0.0]), k=5) == []
+
+
+# ----------------------------------------------------------------------
+# Duplicate detection
+# ----------------------------------------------------------------------
+
+
+class TestDedup:
+    def test_creating_the_same_fact_twice_merges(self, store, turn):
+        first = store.create(make_create(turn.turn_id, content="ship on Friday"))
+        again = store.create(make_create(turn.turn_id, content="ship on Friday"))
+
+        assert store.count() == 1
+        assert again.mem_id == first.mem_id
+
+    def test_whitespace_and_case_variants_collapse(self, store, turn):
+        store.create(make_create(turn.turn_id, content="Ship on Friday"))
+        store.create(make_create(turn.turn_id, content="ship   on\n  FRIDAY"))
+        assert store.count() == 1
+
+    def test_the_same_text_under_a_different_type_is_a_different_memory(
+        self, store, turn
+    ):
+        store.create(
+            make_create(turn.turn_id, content="ship on Friday", type=MemoryType.DECISION)
+        )
+        store.create(
+            make_create(
+                turn.turn_id, content="ship on Friday", type=MemoryType.CONSTRAINT
+            )
+        )
+        assert store.count() == 2
+
+    def test_merging_adds_provenance_without_duplicating_it(self, store, db):
+        transcript = TranscriptStore(db)
+        t1 = transcript.append("user", "I prefer dark mode. It is easier.")
+        t2 = transcript.append("user", "I prefer dark mode. Still true.")
+
+        store.create(make_create(t1.turn_id, content="dark mode"))
+        merged = store.create(make_create(t2.turn_id, content="dark mode"))
+
+        assert {p.turn_id for p in merged.provenance} == {t1.turn_id, t2.turn_id}
+        # Re-asserting the identical citation must not add a third row.
+        again = store.create(make_create(t2.turn_id, content="dark mode"))
+        assert len(again.provenance) == 2
+
+    def test_re_asserting_a_fact_reheats_it(self, store, turn):
+        item = store.create(make_create(turn.turn_id, content="ship on Friday"))
+        # Past the refractory window opened by creation itself.
+        store._db.execute(
+            "UPDATE memory_items SET last_access_at = ? WHERE mem_id = ?",
+            (
+                (item.last_access_at - timedelta(days=3)).isoformat(),
+                item.mem_id,
+            ),
+        )
+        store._db.commit()
+        before = store.get(item.mem_id)
+
+        after = store.create(make_create(turn.turn_id, content="ship on Friday"))
+        assert after.last_access_at > before.last_access_at
+
+    def test_forgetting_then_remembering_recreates(self, store, turn):
+        first = store.create(make_create(turn.turn_id, content="ship on Friday"))
+        store.delete(DeleteOp(mem_id=first.mem_id))
+
+        second = store.create(make_create(turn.turn_id, content="ship on Friday"))
+        assert second.mem_id != first.mem_id
+        assert store.count(status=MemoryStatus.ACTIVE) == 1
+
+    def test_supersede_with_identical_content_still_replaces(self, store, turn):
+        """The reason the old row is retired before the replacement is made.
+
+        In the other order the replacement would find its own still-active
+        predecessor as a duplicate and merge into it — no chain, no new row.
+        """
+        old = store.create(make_create(turn.turn_id, content="same text"))
+        new = store.supersede(
+            SupersedeOp(
+                mem_id=old.mem_id,
+                replacement=make_create(turn.turn_id, content="same text"),
+            )
+        )
+
+        assert new is not None
+        assert new.mem_id != old.mem_id
+        assert new.supersedes == old.mem_id
+        assert store.get(old.mem_id).status is MemoryStatus.SUPERSEDED
+
+    def test_apply_reports_duplicates(self, store, turn):
+        ops = MemoryOps(
+            create=[
+                make_create(turn.turn_id, content="a fact"),
+                make_create(turn.turn_id, content="a fact"),
+            ]
+        )
+        summary = store.apply(ops)
+        assert summary["created"] == 1
+        assert summary["duplicate"] == 1
+
+    def test_dedupe_existing_collapses_legacy_duplicates(self, store, turn):
+        a = store.create(make_create(turn.turn_id, content="legacy"))
+        b = store.create(make_create(turn.turn_id, content="legacy"), dedupe=False)
+        c = store.create(make_create(turn.turn_id, content="legacy"), dedupe=False)
+        assert store.count(status=MemoryStatus.ACTIVE) == 3
+
+        retired = store.dedupe_existing()
+
+        assert retired == 2
+        active = store.list_items(status=MemoryStatus.ACTIVE)
+        assert len(active) == 1
+        survivor = active[0].mem_id
+        assert survivor in {a.mem_id, b.mem_id, c.mem_id}
+        # Nothing destroyed; the losers point at the survivor.
+        for item in store.list_items(status=MemoryStatus.SUPERSEDED):
+            assert item.supersedes == survivor
+
+    def test_dedupe_existing_is_a_no_op_on_a_clean_store(self, store, turn):
+        store.create(make_create(turn.turn_id, content="one"))
+        store.create(make_create(turn.turn_id, content="two"))
+        assert store.dedupe_existing() == 0
+
+    def test_updating_content_moves_the_identity(self, store, turn):
+        item = store.create(make_create(turn.turn_id, content="before"))
+        store.update(UpdateOp(mem_id=item.mem_id, content="after"))
+
+        # The new text now dedupes; the old text no longer does.
+        store.create(make_create(turn.turn_id, content="after"))
+        assert store.count(status=MemoryStatus.ACTIVE) == 1
+        store.create(make_create(turn.turn_id, content="before"))
+        assert store.count(status=MemoryStatus.ACTIVE) == 2

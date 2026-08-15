@@ -39,6 +39,7 @@ from memory_condense.schemas import (
     SupersedeOp,
     UpdateOp,
     ValidationReport,
+    content_key,
 )
 
 _ITEM_COLUMNS = (
@@ -76,12 +77,35 @@ class MemoryStore:
         embedding: Any = None,
         half_life_s: float = DEFAULT_HALF_LIFE_S,
         supersedes: str | None = None,
+        dedupe: bool = True,
     ) -> MemoryItem:
         """Insert a new item plus its provenance rows.
 
         Starting energy comes from ``decay.seed_energy(op.importance)`` —
         important items enter HOT, everything else WARM.
+
+        **Exact duplicates are merged, not inserted.** If an active item
+        already exists with the same ``(type, content)`` under
+        ``schemas.content_key`` normalisation, its provenance gains the new
+        citations, it is ``touch``ed — re-asserting a fact is a genuine
+        salience signal — and the existing item is returned. Without this,
+        re-ingesting the same text grows the store without bound, and every
+        duplicate is then scanned by every :meth:`retrieve`.
+
+        Only *exact* duplicates. Near-duplicate detection by embedding
+        similarity is deliberately not done: "the beta ships on Friday" and
+        "the beta ships on Monday" are highly similar and mean opposite
+        things, and collapsing them would destroy the distinction
+        :meth:`supersede` exists to record. Semantic conflict already has a
+        mechanism, and it is not dedup.
         """
+        if dedupe:
+            existing = self.find_by_content(op.type, op.content)
+            if existing is not None:
+                self._insert_provenance(existing.mem_id, op.provenance)
+                self._db.commit()
+                return self.touch(existing.mem_id) or existing
+
         vector = self._resolve_embedding(op.content, embedding)
         item = MemoryItem(
             type=op.type,
@@ -98,6 +122,23 @@ class MemoryStore:
         )
         self._insert(item)
         return item
+
+    def find_by_content(
+        self, mem_type: MemoryType, content: str
+    ) -> MemoryItem | None:
+        """The active item with this exact content, if one exists.
+
+        Scoped to ``status = 'active'`` on purpose: forgetting a fact and then
+        remembering it again should recreate it, not silently resurrect the
+        retired row.
+        """
+        cur = self._db.execute(
+            f"SELECT {_ITEM_COLUMNS} FROM memory_items "
+            "WHERE content_hash = ? AND status = ? LIMIT 1",
+            (content_key(mem_type, content), MemoryStatus.ACTIVE.value),
+        )
+        row = cur.fetchone()
+        return self._row_to_item(row) if row is not None else None
 
     def get(self, mem_id: str) -> MemoryItem | None:
         cur = self._db.execute(
@@ -160,27 +201,39 @@ class MemoryStore:
                 embedding_blob = _to_blob(new_vector)
 
         self._db.execute(
-            "UPDATE memory_items SET content = ?, details = ?, embedding = ? "
-            "WHERE mem_id = ?",
-            (content, details, embedding_blob, op.mem_id),
+            "UPDATE memory_items SET content = ?, details = ?, embedding = ?, "
+            "content_hash = ? WHERE mem_id = ?",
+            (
+                content,
+                details,
+                embedding_blob,
+                # Must move with the content, or an amended item keeps the old
+                # identity and stops deduplicating against its own new text.
+                content_key(item.type, content),
+                op.mem_id,
+            ),
         )
         self._insert_provenance(op.mem_id, op.provenance)
         self._db.commit()
         return self.get(op.mem_id)
 
     def supersede(self, op: SupersedeOp) -> MemoryItem | None:
-        """Create the replacement and mark the old item ``superseded``.
+        """Mark the old item ``superseded`` and create its replacement.
 
         The old row is never removed: ``replacement.supersedes`` points back at
         it so the correction chain stays walkable.
+
+        The old row is retired **first**, deliberately. In the other order a
+        replacement with identical content (a details-only correction) would
+        find its own still-active predecessor as an exact duplicate, merge into
+        it, and return the old row — no replacement, no chain.
         """
         old = self.get(op.mem_id)
         if old is None:
             return None
 
-        replacement = self.create(op.replacement, supersedes=op.mem_id)
         self._set_status(op.mem_id, MemoryStatus.SUPERSEDED)
-        return replacement
+        return self.create(op.replacement, supersedes=op.mem_id)
 
     def delete(self, op: DeleteOp) -> bool:
         """Soft-delete: status becomes ``deleted``, the row survives."""
@@ -215,6 +268,7 @@ class MemoryStore:
 
         summary = {
             "created": 0,
+            "duplicate": 0,
             "updated": 0,
             "superseded": 0,
             "deleted": 0,
@@ -223,8 +277,15 @@ class MemoryStore:
         }
 
         for create_op in ops.create:
+            before = self.count()
             self.create(create_op)
-            summary["created"] += 1
+            # A create that added no row was merged into an existing item.
+            # Counted rather than hidden: silent merging looks like extraction
+            # producing less than it did.
+            if self.count() > before:
+                summary["created"] += 1
+            else:
+                summary["duplicate"] += 1
 
         for update_op in ops.update:
             if self.update(update_op) is not None:
@@ -432,8 +493,9 @@ class MemoryStore:
         self._db.execute(
             "INSERT INTO memory_items "
             "(mem_id, type, content, details, status, supersedes, pin, energy, "
-            "half_life_s, importance, created_at, last_access_at, embedding) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "half_life_s, importance, created_at, last_access_at, embedding, "
+            "content_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 item.mem_id,
                 item.type.value,
@@ -448,6 +510,7 @@ class MemoryStore:
                 item.created_at.isoformat(),
                 item.last_access_at.isoformat(),
                 _to_blob(item.embedding),
+                content_key(item.type, item.content),
             ),
         )
         self._insert_provenance(item.mem_id, item.provenance)
@@ -464,6 +527,43 @@ class MemoryStore:
             "(mem_id, turn_id, chunk_id, quote) VALUES (?, ?, ?, ?)",
             rows,
         )
+
+    def dedupe_existing(self) -> int:
+        """Collapse pre-existing exact duplicates. Returns how many were retired.
+
+        Opt-in maintenance for stores written before duplicate detection
+        existed. Deliberately **not** run from the migration: it changes data,
+        and opening a database should not silently rewrite it.
+
+        Nothing is destroyed — losers become ``superseded`` with ``supersedes``
+        pointing at the survivor, so clause 9 holds and the chain stays
+        walkable. The newest row survives, on the grounds that it carries the
+        most recent provenance.
+        """
+        rows = self._db.execute(
+            "SELECT content_hash FROM memory_items "
+            "WHERE status = ? AND content_hash IS NOT NULL "
+            "GROUP BY content_hash HAVING COUNT(*) > 1",
+            (MemoryStatus.ACTIVE.value,),
+        ).fetchall()
+
+        retired = 0
+        for (digest,) in rows:
+            dupes = self._db.execute(
+                "SELECT mem_id FROM memory_items "
+                "WHERE content_hash = ? AND status = ? ORDER BY created_at DESC",
+                (digest, MemoryStatus.ACTIVE.value),
+            ).fetchall()
+            survivor = dupes[0][0]
+            for (loser,) in dupes[1:]:
+                self._db.execute(
+                    "UPDATE memory_items SET status = ?, supersedes = ? "
+                    "WHERE mem_id = ?",
+                    (MemoryStatus.SUPERSEDED.value, survivor, loser),
+                )
+                retired += 1
+        self._db.commit()
+        return retired
 
     def _set_status(self, mem_id: str, status: MemoryStatus) -> None:
         self._db.execute(

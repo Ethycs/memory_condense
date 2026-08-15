@@ -13,14 +13,16 @@ Everything marked ✅ below is **built and unit-tested but not committed**. `git
 | --- | --- |
 | TranscriptStore / Chunker / bge-m3 / ANN index / similarity demo | ✅ Complete |
 | ~~Hybrid sparse retrieval (lexical weights)~~ | ✅ Complete — BM25 (`lexical.py`) + `hybrid_query(alpha=0.65)`; `chunks.lexical_weights` and `chunk_terms` are populated by `add_chunks` |
-| ~~Rerank formula (importance/recency/pins)~~ | ✅ Complete — `ranking.py`, one implementation shared by memory + chunk paths |
+| ~~Rerank formula (importance/energy/pins)~~ | ✅ Complete — `ranking.py`. The fourth term was `recency`, computed from a **second copy** of the decay kernel that had drifted from `decay.py` and, because `touch` restamps `last_access_at`, evaluated to a constant 1.0 for every item ever recalled. Collapsed to one kernel; the term is now decayed energy |
 | ~~ContextPacker (token budgets)~~ | ✅ Complete — `context_packer.py`, 4500/900/800, ≤3 expansions × ≤250 tok, drops counted |
 | ~~MemoryItem / MemoryOps / Validator / provenance~~ | ✅ Complete — `schemas.py`, `memory_store.py`, `validator.py`, `extractor.py` |
-| ~~Decay / HOT-WARM-COLD tiering~~ | ✅ Complete — `decay.py`, lazy exponential decay, reheat on access, pins exempt |
+| ~~Decay / HOT-WARM-COLD tiering~~ | ✅ Complete **and now wired** — `decay.py` was built in isolation and consumed only by display code; nothing filtered, evicted, or ranked by it. Decayed energy is now the scalar's fourth term, reheat saturates with a refractory window, and the design's HOT cap is enforced at tier derivation |
 | ~~Token + latency instrumentation in eval~~ | ✅ Complete — `UsageStats` through `TurnResult` → `ConversationResult` → `EvalRunResult` |
 | ~~Judge decoupled from responder~~ | ✅ Complete — judge `anthropic/claude-sonnet-5`, responder `anthropic/claude-haiku-4-5` |
 | ~~Benchmark loader (LongMemEval / LoCoMo)~~ | ✅ Complete — `loader.load_benchmark` + `eval/benchmark.py` QA-probe harness |
-| ~~`scores_by_position` analysis code~~ | ✅ Complete — `eval/analysis.py`; 🔲 **never run against real data** |
+| ~~`scores_by_position` analysis code~~ | ✅ Complete — `eval/analysis.py`. Run 2026-08-14 and the result was **retracted**: the position-bin story does not replicate across run pairs, and every bin-to-bin difference is inside noise. See `08 - Analysis/00` |
+| ~~The memory layer is reachable from the eval at all~~ | ✅ Complete — `--mode memory` routes the responder through `build_context`. Until this landed, `ContextPacker`, `MemoryStore.retrieve`, `rank_score` and `decay` were exercised by **no run**, so the Decision Point was unanswerable in principle |
+| ~~Answer-reachability measurement~~ | ✅ Complete — `--answer-recall`, free and keyless. Caught the LoCoMo loader discarding the session timestamps that its largest question category asks about, before any money was spent |
 | ~~Hardcoded `dim = 1024`~~ | ✅ Fixed — `embedding.py` reads the true dimension from the loaded model |
 | Eval harness (self-replay + judge + ablation) | ✅ ~95% — instrumented and model-fixed; sweep still never run |
 | **Benchmark numbers on LongMemEval / LoCoMo** | 🔲 **Open — harness exists, has never been run. No competitiveness claim is possible yet.** |

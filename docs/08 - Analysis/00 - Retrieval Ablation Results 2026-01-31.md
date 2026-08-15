@@ -52,16 +52,36 @@ Two candidate explanations, neither yet tested:
 
 Explanation 1 is the more likely and the more deflating: it would mean the depth-vs-gain story is partly an artifact of where the baseline happens to struggle. **Do not cite H2 as confirmed without re-running this on more than one conversation** — n≈27 per bin from a single transcript is not enough to separate these.
 
+### RETRACTION (2026-08-14, later the same day): the bin table does not replicate
+
+Pair B had never been binned. It is free, so it was. Result:
+
+| Position bin | Baseline | k=10 | Δ | n |
+| --- | --- | --- | --- | --- |
+| 1 (earliest 20%) | 3.78 | 3.94 | +0.17 | 18 |
+| 2 | 4.47 | 4.53 | **+0.06** | 17 |
+| 3 (middle) | 4.12 | 4.29 | +0.18 | 17 |
+| 4 | 4.12 | 4.53 | **+0.41** | 17 |
+| 5 (latest 20%) | 4.12 | 4.38 | +0.25 | 16 |
+
+**Neither the H2 story nor its counter-explanation survives.** Pair A peaks in the middle with the final fifth *smallest*; pair B peaks in the **fourth** fifth with the final fifth **second-largest**. And explanation 1 fails on pair B too: its weakest bin (+0.06) has the *highest* baseline (4.47), while three bins tied at baseline 4.12 span +0.18 to +0.41 — identical baselines, deltas differing by 2×.
+
+The arithmetic that should have been done before publishing the first table: per-turn scores are integers on 1–5 with SD ≈ 0.9, so at n ≈ 17–28 per bin the standard error of a bin mean is ≈ 0.2. **Every bin-to-bin difference in both tables is inside noise.** The aggregate deltas are not — SE ≈ 0.08 at n=137 and ≈ 0.10 at n=85, making +0.30 and +0.21 a 2–4 SE effect.
+
+So: **the aggregate ablation result stands; the position-bin decomposition is withdrawn.** Item 1 under "Next measurements" called this table "the most useful thing in this document." It was the least — a five-way split of a sample that only supports one number. H2 remains untested, in either direction.
+
+*Reproduce:* `pixi run python -m memory_condense.eval --compare eval_results/eval_120-250_k0_ef50_20260131_031126.json eval_results/eval_120-250_k10_ef50_20260131_024030.json` — offline, no API key.
+
 ## Interpretation
 
-1. **H2 is directionally supported across conversations but not within them**: the gain scales with total conversation length (0 at 27 turns, +0.25 at 146, +0.30 at 283), yet within the 283-turn conversation it does *not* rise with position — see the bin table above.
+1. **H2 is weakly supported across conversations and untested within them**: the gain scales with total conversation length (0 at 27 turns, +0.25 at 146, +0.30 at 283) — three points, so suggestive at best. The within-conversation claim is withdrawn; see the retraction above. Three conversations cannot establish a trend either, and two of the three points come from the same run pair.
 2. **Baseline inflation**: even k=0 scores 3.74–4.12 because the judge rewards generic-but-plausible responses and both judge and responder are Haiku while ground truth is a stronger Claude. Absolute values are not comparable across models; **only within-pair deltas are load-bearing.**
 3. **What we cannot claim from this data**: any external competitiveness (no common benchmark), any efficiency numbers (no token/latency instrumentation), any parameter optimality (sweep never run).
 
 ## Next measurements (in value order)
 
-1. ~~Score-vs-position curve from the already-captured `scores_by_position`.~~ **Done 2026-08-14** — see the bin table above. It did not confirm what it was expected to confirm, which makes it the most useful thing in this document.
+1. ~~Score-vs-position curve from the already-captured `scores_by_position`.~~ ~~**Done 2026-08-14** — the most useful thing in this document.~~ **Retracted the same day**: it does not replicate on pair B, and every bin-to-bin difference is inside noise. See the retraction above.
 2. **Re-run pair A** with the fixed harness. This is now both possible and necessary: the models these numbers were produced with were retired on 2026-02-19, and the judge is no longer the same model as the responder, so every absolute score above is from a configuration that can no longer be reproduced. Treat the table as historical.
-3. **Repeat the bin analysis across several conversations** to separate "retrieval helps most where the baseline is weakest" from "retrieval helps most mid-conversation". One transcript cannot distinguish them.
+3. **Test H2 with a design that can actually detect it** — enough scored turns that a per-bin SE is well under the effect you are looking for. At SD ≈ 0.9 and a hypothesised per-bin Δ of 0.1, that is n ≈ 300+ *per bin*, i.e. thousands of scored turns, not one 283-turn transcript. The cheaper route is the benchmark path (`02 - Implementation/01`), where LoCoMo yields ~200 graded questions per haystack ingest.
 4. **Dense vs hybrid** on the same corpus (`--hybrid`) — BM25 blending is wired but its effect is unmeasured.
 5. The **54-config sweep** (3 min × 3 max × 3 k × 2 ef; no combinations are skipped since 180 < 200) — replaces guessed defaults (120–250, k=10, ef 50) with measured ones.

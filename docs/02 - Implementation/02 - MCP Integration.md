@@ -111,23 +111,25 @@ It emits `hookSpecificOutput.additionalContext` with up to six facts, pinned fir
 
 ## 6. Why there is no auto-capture hook (and what would actually be needed)
 
-There is no hook that records the conversation automatically. The reason is **not** that "deciding what is worth keeping is unsolved" — that framing appeared in an earlier revision of this file and was wrong. Selection is the architecture's central claim and it is built:
+There is no hook that records the conversation automatically. An earlier revision of this file said the reason was that "deciding what is worth keeping is unsolved", then corrected that to say selection was fully built. **Both were wrong**, and `08 - Analysis/01` measured why.
 
-| Concern auto-capture raises | Where the architecture already answers it |
-| --- | --- |
-| The store fills with junk | `importance` seeds energy; unused items decay to COLD (`decay.py`) |
-| Junk survives by being re-read | Reheating happens **only in `recall`** — an item reheats when a query actually matched it |
-| Important facts get buried | Pins are exempt from decay; `w_P` boosts them in the rerank scalar |
-| Context cost grows with the store | `ContextPacker` enforces a hard token budget per section, independent of store size |
-| A wrong fact persists | `supersede` replaces it and keeps the chain; `forget` retires it |
+Selection is *designed* — and the design is sound — but two of its four mechanisms are not connected to anything:
 
-So "ingest broadly and let decay sort it out" is the design working as intended, not a shortcut.
+| Concern auto-capture raises | Designed answer | As built |
+| --- | --- | --- |
+| The store fills with junk | `importance` seeds energy; unused items decay to COLD | ⚠️ **Decorative.** `ranking.rank_score` has no energy or heat term. Energy is read only for display in `memory_stats` and the hook. Nothing filters COLD; nothing evicts |
+| Junk survives by being re-read | Reheating fires only when a query actually matched | ⚠️ Reheating works, but since energy does not affect ranking it changes nothing about what is returned. `touch` also restamps `last_access_at`, so the `recency` term ≡ 1.0 for everything ever recalled — the term discriminates nothing |
+| Important facts get buried | Pins are exempt from decay; `w_P` boosts them | ✅ Built and wired |
+| Context cost grows with the store | `ContextPacker` enforces a hard per-section budget | ✅ Built — and it is the *binding* constraint: 70.6% of items are dropped by the 900-token header before decay is ever consulted |
+| A wrong fact persists | `supersede` keeps the chain; `forget` retires it | ✅ Built and wired |
 
-What is genuinely missing is narrower: **nothing in the repo binds `LLMExtractor` to a provider.** `MemoryCondenser` defaults to `RuleBasedExtractor`, and `grep -rn "LLMExtractor" src/` finds it only in its own module. Auto-capture today would therefore run regex cue-matching over real prose and mint a Constraint from every sentence containing "must". `LLMExtractor` is written, tested, and takes an injected `complete(system, user) -> str`, so the gap is a binding and a default — not a design question.
+So "ingest broadly and let decay sort it out" describes `decay.py` accurately and retrieval inaccurately. Until the wire-up lands, ingesting broadly means keeping everything at equal standing forever.
 
-The remaining blocker after that is consent, which is a user decision rather than an engineering one: recording every turn of every session is not something to inherit from a default.
+The extraction half is measured too: the default `RuleBasedExtractor` produces **65% `Constraint` and 93% assistant-sourced** items on a 4,554-turn corpus, because its `must|never|always|cannot` pattern fires on ordinary technical modality. `Decision` and `Preference` together account for 8 items out of 4,463. `LLMExtractor` exists and is tested but has no provider binding.
 
-If you want it now, a `Stop` hook calling `ingest` is the shape. Prefer `remember` on the facts that matter until LLM extraction is wired.
+Consent remains genuinely a user decision: recording every turn of every session should not be inherited from a default.
+
+If you want it now, a `Stop` hook calling `ingest` is the shape. Prefer `remember` on the facts that matter.
 
 ---
 

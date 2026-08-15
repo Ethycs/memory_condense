@@ -68,10 +68,20 @@ Deciding requires exactly two runs: a `--k 10` dense baseline and a memory/hybri
 
 | Gap | Depends on | Blocks | Status |
 | --- | --- | --- | --- |
-| Cold-tier era summaries (design Phase 4: cluster summaries + centroid index) | evidence that COLD items are worth keeping at all | — | 🔲 gated |
-| `LLMExtractor` in the default path (currently `RuleBasedExtractor`) | evidence that rule-based extraction is the bottleneck | — | 🔲 gated |
+| Cold-tier era summaries (design Phase 4: cluster summaries + centroid index) | ~~evidence that COLD items are worth keeping at all~~ → **wiring decay into ranking first** (see below) | — | 🔲 gated, **gate was unsatisfiable** |
+| `LLMExtractor` in the default path (currently `RuleBasedExtractor`) | ~~evidence that rule-based extraction is the bottleneck~~ — **that evidence now exists** (`08 - Analysis/01`) | — | 🔲 **ungated**; still opt-in by default for cost reasons |
 | MC-STD-MEMOPS: freeze the `MemoryOps` wire contract | an external consumer existing | — | 🔲 gated |
 | Second ANN index for memory items | memory item counts reaching thousands (brute-force cosine is deliberate below that) | — | 🔲 gated, probably never |
+
+### Why the Phase 4 gate could not be satisfied (2026-08-14)
+
+The gate read *"evidence that COLD items are worth keeping at all."* `08 - Analysis/01` went to collect it and found the evidence cannot be produced: with a 7-day half-life, seeds of 0.5/0.8, and `retrieve` reheating everything it returns, an item needs 7–11.75 days of *no access* to reach COLD, while an eval run lasts minutes. The facade also drops the `now` parameter `MemoryStore` accepts, and the loader discards the timestamps both benchmarks ship — so no clock can be injected either.
+
+Worse, the gate assumed the wrong bottleneck. **70.6% of memory items never reach the prompt at all**, dropped by a flat 900-token header ceiling that never consults energy. Items are lost while still HOT.
+
+And the mechanism the gate is about does not currently influence retrieval: **`ranking.rank_score` has no energy or heat term.** Energy is read only for display. So "COLD" is, today, a label with no consequences.
+
+**Revised dependency:** Phase 4 is gated on wiring decay into ranking and enforcing the design's HOT cap — the work that gives `COLD` consequences — and then on the memory-vs-dense benchmark run. Until `build_context` is on a measured path at all (`runner.py` and `benchmark.py` both bypass it), no run can evaluate the layer Phase 4 would sit on top of.
 
 ## Known rough edges (tracked, not blocking)
 

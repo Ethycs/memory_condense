@@ -23,7 +23,8 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `06 - Roadmaps/00 - Gap Analysis and Roadmap.md` | ✅ | Status table and tiers rewritten; Decision Point now *unblocked* but still *open* |
 | `00 - Theory/00 …` | — | Not touched; stable by policy (corrections only) |
 | `04 - Reference/00 - Competitive Landscape 2026.md` | — | Not touched this pass |
-| `08 - Analysis/00 - Retrieval Ablation…` | ✅ | Sweep corrected to 54 configs; **new position-bin analysis added** — the gain peaks mid-conversation and is *smallest* in the final fifth, which qualifies hypothesis H2 |
+| `08 - Analysis/00 - Retrieval Ablation…` | ✅ | Sweep corrected to 54 configs; a position-bin analysis was added and then **retracted the same day** — it does not replicate on the second run pair, and every bin-to-bin difference is inside noise. The aggregate ablation result stands |
+| `08 - Analysis/01 - Extraction and Decay Audit` | **new** | 70.6% of memory items never reach the prompt; COLD is unreachable by construction; the default extractor is 65% spurious `Constraint`s. All free, all previously unmeasured |
 | `07 - Status Reports/…` | ✅ | Two dated handoffs; the earlier one's "expect 48 passed" is superseded by **366** in the later one |
 
 ## The tree
@@ -38,7 +39,7 @@ docs/
 ├── 05 - Standards/        Normative data contracts (SQLite v2, embedding, memory provenance, formats)
 ├── 06 - Roadmaps/         Gap analysis: designed vs. built vs. measured, tiered next steps
 ├── 07 - Status Reports/   Dated snapshots (session handoffs)
-├── 08 - Analysis/         Measured results — the retrieval ablation numbers
+├── 08 - Analysis/         Measured results — the ablation numbers, and one retraction
 └── 09 - Archived/         Superseded material (append-only)
 ```
 

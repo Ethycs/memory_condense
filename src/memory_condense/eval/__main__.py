@@ -37,6 +37,7 @@ from memory_condense.eval.benchmark import (
     run_benchmark,
     save_benchmark_report,
 )
+from memory_condense.eval.judge import JUDGE_MAX_TOKENS
 from memory_condense.eval.report import (
     print_run_summary,
     print_sweep_table,
@@ -168,6 +169,20 @@ def config_from_args(args: argparse.Namespace) -> EvalConfig:
     )
 
 
+def _content(response) -> str:
+    """The assistant text, or "" if the provider returned none.
+
+    A refusal, a content filter, or a `max_tokens` stop before any visible text
+    all yield ``content=None``. Reaching ``.strip()`` on that raises
+    ``AttributeError`` deep in a paid run, after every preceding call has
+    already been billed.
+    """
+    try:
+        return (response.choices[0].message.content or "").strip()
+    except (AttributeError, IndexError, TypeError):
+        return ""
+
+
 def _make_answer_fn(model: str):
     """Answer a benchmark question. Short, deterministic answers — F1/EM depend on it."""
     import litellm
@@ -180,23 +195,31 @@ def _make_answer_fn(model: str):
             max_tokens=256,
             num_retries=5,
         )
-        return response.choices[0].message.content.strip()
+        return _content(response)
 
     return answer_fn
 
 
 def _make_judge_fn(model: str):
-    """Semantic-equivalence grading, for answers that F1 scores unfairly."""
+    """Semantic-equivalence grading, for answers that F1 scores unfairly.
+
+    ``max_tokens`` is JUDGE_MAX_TOKENS for the reason spelled out in
+    ``judge.py``: the default judge is Sonnet 5, which runs adaptive thinking,
+    and ``max_tokens`` caps thinking + visible text together. A tight 256 spends
+    the whole budget on thinking and returns an empty verdict — which this path
+    then scored as INCORRECT for every answer. The replay judge got this fix;
+    this one did not, so it is deliberately expressed as the same constant.
+    """
     import litellm
 
     def judge_fn(question: str, gold: str, prediction: str) -> tuple[bool, str]:
         response = litellm.completion(
             model=model,
             messages=build_judge_prompt(question, gold, prediction),
-            max_tokens=256,
+            max_tokens=JUDGE_MAX_TOKENS,
             num_retries=5,
         )
-        text = response.choices[0].message.content.strip()
+        text = _content(response)
         return text.upper().startswith("CORRECT"), text
 
     return judge_fn

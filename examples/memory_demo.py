@@ -90,7 +90,7 @@ def main() -> None:
         for result in mc.recall_memories("what storage are we using?", k=3):
             print(
                 f"  [{result.score:.3f}] rel={result.relevance:.2f} "
-                f"imp={result.importance:.2f} rec={result.recency:.2f}  "
+                f"imp={result.importance:.2f} energy={result.energy:.2f}  "
                 f"{result.item.content}"
             )
 

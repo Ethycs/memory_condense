@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
 import pytest
 
 from memory_condense.ranking import (
@@ -11,33 +9,13 @@ from memory_condense.ranking import (
     min_max_normalize,
     pin_boost,
     rank_score,
-    recency_score,
     top_k,
 )
-from memory_condense.schemas import DEFAULT_HALF_LIFE_S, PinState
+from memory_condense.schemas import PinState
 
-
-def _now() -> datetime:
-    return datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-
-class TestRecencyScore:
-    def test_just_happened_scores_one(self):
-        now = _now()
-        assert recency_score(now, now) == pytest.approx(1.0)
-
-    def test_one_half_life_scores_half(self):
-        now = _now()
-        past = now - timedelta(seconds=DEFAULT_HALF_LIFE_S)
-        assert recency_score(past, now) == pytest.approx(0.5)
-
-    def test_future_timestamp_clamps_to_one(self):
-        now = _now()
-        assert recency_score(now + timedelta(days=1), now) == 1.0
-
-    def test_naive_datetime_handled(self):
-        now = _now()
-        assert recency_score(datetime(2026, 1, 1), now) == pytest.approx(1.0)
+# The decay kernel used to live here as `recency_score`, a second copy of the
+# exponential in decay.py. It now has one home; its tests moved with it to
+# tests/test_decay.py::TestDecayFactor.
 
 
 class TestPinBoost:

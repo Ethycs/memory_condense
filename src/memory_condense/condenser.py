@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -147,10 +148,25 @@ class MemoryCondenser:
         query: str,
         k: int = 10,
         weights: RankWeights = DEFAULT_WEIGHTS,
+        now: datetime | None = None,
+        min_energy: float = 0.0,
+        reheat: bool = True,
     ) -> list[MemoryResult]:
-        """Rank memory items for a query. Retrieved items are reheated."""
+        """Rank memory items for a query. Retrieved items are reheated.
+
+        ``now`` is forwarded rather than dropped: without it there is no way to
+        evaluate decay at all, since every item is minutes old inside a test or
+        an eval run and a tier below WARM takes a week of real time to reach.
+        """
         query_embedding = self._embedder.embed_query(query)
-        return self._memory.retrieve(query_embedding, k=k, weights=weights)
+        return self._memory.retrieve(
+            query_embedding,
+            k=k,
+            weights=weights,
+            now=now,
+            min_energy=min_energy,
+            reheat=reheat,
+        )
 
     # -- context assembly ---------------------------------------------------
 
@@ -209,9 +225,9 @@ class MemoryCondenser:
         """Access the provenance validator directly."""
         return self._validator
 
-    def heat_counts(self) -> dict[str, int]:
+    def heat_counts(self, now: datetime | None = None) -> dict[str, int]:
         """Current HOT/WARM/COLD distribution of active memory items."""
-        return self._memory.heat_counts()
+        return self._memory.heat_counts(now=now)
 
     def close(self) -> None:
         """Persist index and close database."""

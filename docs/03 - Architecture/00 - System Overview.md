@@ -110,7 +110,8 @@ memory_condense is now the full local memory manager the design called for: tran
 
 ### Ranking — `ranking.py`
 - **Domain**: the one place the design's rerank scalar lives. Pure functions.
-- **Structure**: `score = wR·relevance + wI·importance + wP·pin_boost + wT·recency − wS·superseded_penalty`. `RankWeights` defaults: relevance `1.0`, importance `0.3`, pin `0.5`, recency `0.2`, superseded penalty `1.0`. Pin boost: user-pinned `1.0`, system-pinned `0.6`, none `0.0`. Also `recency_score` (half-life decay to `[0,1]`), `blend_hybrid`, `min_max_normalize` (flat input → all-`1.0`, i.e. "no signal"), `top_k`.
+- **Structure**: `score = wR·relevance + wI·importance + wP·pin_boost + wE·energy − wS·superseded_penalty`. `RankWeights` defaults: relevance `1.0`, importance `0.3`, pin `0.5`, energy `0.2`, superseded penalty `1.0`. Pin boost: user-pinned `1.0`, system-pinned `0.6`, none `0.0`. Also `blend_hybrid`, `min_max_normalize` (flat input → all-`1.0`, i.e. "no signal"), `top_k`.
+- **The `wE·energy` term was `wT·recency` until 2026-08-14**, computed here from a second copy of the exponential in `decay.py`. They were never independent — `effective_energy ≡ energy × recency_score` — and had drifted to opposite semantics for a non-positive half-life. Worse, since `touch` restamps `last_access_at` on every retrieve, `recency` was `1.0` for every item ever recalled, so the term discriminated nothing and decay influenced nothing. `ranking` now holds no decay arithmetic at all; `decay.decay_factor` is the one kernel.
 - **Hard constraint**: both the memory store and the hybrid retriever score through this module, so weighting is never forked.
 
 ### Extractor — `extractor.py`

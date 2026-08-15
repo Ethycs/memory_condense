@@ -31,9 +31,11 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from memory_condense.condenser import MemoryCondenser
-from memory_condense.decay import item_energy, item_heat
+from memory_condense import decay as decay_module
+from memory_condense.decay import heat_map, item_energy, item_heat
 from memory_condense.schemas import (
     CreateOp,
+    Heat,
     MemoryItem,
     MemoryOps,
     MemoryType,
@@ -139,10 +141,14 @@ def _build_create(text: str, type: str, details: str) -> tuple[CreateOp, bool]:
     )
 
 
-def _describe(item: MemoryItem) -> str:
+def _describe(item: MemoryItem, heat: Heat | None = None) -> str:
+    """One display line. Pass ``heat`` from a pool-wide :func:`heat_map` so the
+    tier shown matches the tier counted — the HOT cap is pool-relative, so an
+    item tiered on its own can read HOT while the store reports it as WARM."""
     pin = " PINNED" if item.is_pinned else ""
+    tier = heat if heat is not None else item_heat(item)
     return (
-        f"[{item.mem_id[:8]}] [{item.type.value}] {item_heat(item).value} "
+        f"[{item.mem_id[:8]}] [{item.type.value}] {tier.value} "
         f"e={item_energy(item):.2f}{pin}  {item.content}"
     )
 
@@ -226,12 +232,13 @@ def recall(query: str, limit: int = 8) -> str:
             "No memories matched that query."
         )
 
+    tiers = heat_map(_condense().memory.list_items())
     lines = [f"{len(results)} memories for {query!r}:"]
     for r in results:
         lines.append(
-            f"  {_describe(r.item)}\n"
+            f"  {_describe(r.item, tiers.get(r.item.mem_id))}\n"
             f"      score={r.score:.3f} (relevance {r.relevance:.2f}, "
-            f"importance {r.importance:.2f}, recency {r.recency:.2f})"
+            f"importance {r.importance:.2f}, energy {r.energy:.2f})"
         )
     return "\n".join(lines)
 
@@ -317,17 +324,19 @@ def memory_stats() -> str:
     heat = condenser.heat_counts()
     items = condenser.memory.list_items()
     pinned = sum(1 for i in items if i.is_pinned)
+    tiers = heat_map(items)
 
     lines = [
         f"Store: {_data_dir()}",
         f"Turns ingested: {condenser.transcript.count()}",
         f"Active memories: {len(items)} ({pinned} pinned)",
-        f"Heat: HOT {heat.get('HOT', 0)} / WARM {heat.get('WARM', 0)} / COLD {heat.get('COLD', 0)}",
+        f"Heat: HOT {heat.get('HOT', 0)} / WARM {heat.get('WARM', 0)} / COLD {heat.get('COLD', 0)}"
+        f"  (HOT is capped at {decay_module.HOT_CAP} unpinned items)",
     ]
     if items:
         lines.append("Most recent:")
         for item in items[:5]:
-            lines.append(f"  {_describe(item)}")
+            lines.append(f"  {_describe(item, tiers.get(item.mem_id))}")
     return "\n".join(lines)
 
 

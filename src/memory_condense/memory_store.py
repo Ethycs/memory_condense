@@ -260,7 +260,13 @@ class MemoryStore:
         """Access reheating: decay to *now*, add the reheat boost, restamp.
 
         Pinned items keep their stored energy (pins override decay) but their
-        ``last_access_at`` is still refreshed so recency stays honest.
+        ``last_access_at`` is still refreshed so the timestamp stays honest.
+
+        Within :data:`decay.REHEAT_REFRACTORY_S` of the previous access the
+        item is decayed and restamped but **not** boosted: a burst of recalls
+        in one working session is one access, not ten. Restamping is still
+        correct — the access really happened — and the withheld decay over a
+        five-minute window is negligible against a seven-day half-life.
         """
         item = self.get(mem_id)
         if item is None:
@@ -270,7 +276,9 @@ class MemoryStore:
         if item.is_pinned:
             energy = item.energy
         else:
-            energy = decay.reheat(decay.item_energy(item, now=stamp))
+            energy = decay.item_energy(item, now=stamp)
+            if decay.should_reheat(item.last_access_at, now=stamp):
+                energy = decay.reheat(energy)
 
         self._db.execute(
             "UPDATE memory_items SET energy = ?, last_access_at = ? WHERE mem_id = ?",
@@ -279,12 +287,28 @@ class MemoryStore:
         self._db.commit()
         return self.get(mem_id)
 
+    def items_by_heat(
+        self,
+        now: datetime | None = None,
+        status: MemoryStatus | None = MemoryStatus.ACTIVE,
+        hot_cap: int = decay.HOT_CAP,
+    ) -> dict[Heat, list[MemoryItem]]:
+        """Items bucketed by decayed heat, with the HOT cap applied.
+
+        A pure read — nothing is touched, restamped, or reheated. Contrast
+        :meth:`retrieve`, which reheats everything it returns.
+        """
+        items = self.list_items(status=status)
+        tiers = decay.heat_map(items, now=now, hot_cap=hot_cap)
+        buckets: dict[Heat, list[MemoryItem]] = {h: [] for h in Heat}
+        for item in items:
+            buckets[tiers[item.mem_id]].append(item)
+        return buckets
+
     def heat_counts(self, now: datetime | None = None) -> dict[str, int]:
         """How many active items sit in each HOT/WARM/COLD tier right now."""
-        counts = {Heat.HOT.value: 0, Heat.WARM.value: 0, Heat.COLD.value: 0}
-        for item in self.list_items(status=MemoryStatus.ACTIVE):
-            counts[decay.item_heat(item, now=now).value] += 1
-        return counts
+        buckets = self.items_by_heat(now=now)
+        return {heat.value: len(buckets[heat]) for heat in Heat}
 
     # ------------------------------------------------------------------
     # Retrieval
@@ -297,6 +321,8 @@ class MemoryStore:
         weights: RankWeights = DEFAULT_WEIGHTS,
         now: datetime | None = None,
         include_superseded: bool = False,
+        min_energy: float = 0.0,
+        reheat: bool = True,
     ) -> list[MemoryResult]:
         """Rank memory items by the deterministic rerank scalar.
 
@@ -309,11 +335,21 @@ class MemoryStore:
         Cosine is mapped from [-1, 1] into [0, 1] via ``(cos + 1) / 2`` so it
         composes with the other [0, 1] rank components. Items without an
         embedding — or any item when ``query_embedding`` is None — score
-        ``relevance = 0`` and fall back to importance/recency/pin.
+        ``relevance = 0`` and fall back to importance/energy/pin.
 
-        Every returned item is ``touch``ed (access reheating), so the items in
-        the results reflect their post-reheat energy while the scores reflect
-        the state at query time.
+        ``min_energy`` drops items whose decayed energy is below the given
+        floor. It defaults to 0.0 — **off** — deliberately: a rarely-touched
+        Constraint that exactly answers the query is precisely what must not be
+        dropped, which is what ``relevance`` at weight 1.0 is for. The
+        parameter exists so the cost of a COLD cutoff can be *measured* rather
+        than assumed.
+
+        ``reheat=False`` scores without recording an access, for callers that
+        inspect rankings rather than put items in front of a model.
+
+        Every returned item is otherwise ``touch``ed (access reheating), so the
+        items in the results reflect their post-reheat energy while the scores
+        reflect the state at query time.
         """
         if k <= 0:
             return []
@@ -333,16 +369,16 @@ class MemoryStore:
 
         scored: list[tuple[float, MemoryResult]] = []
         for item in items:
+            energy = decay.item_energy(item, now=stamp)
+            if energy < min_energy:
+                continue
             relevance = self._relevance(query_vec, item)
-            recency = ranking.recency_score(
-                item.last_access_at, now=stamp, half_life_s=item.half_life_s
-            )
             superseded = item.status is MemoryStatus.SUPERSEDED
             score = ranking.rank_score(
                 relevance=relevance,
                 importance=item.importance,
                 pin=item.pin,
-                recency=recency,
+                energy=energy,
                 superseded=superseded,
                 weights=weights,
             )
@@ -354,7 +390,15 @@ class MemoryStore:
                         score=score,
                         relevance=relevance,
                         importance=item.importance,
-                        recency=recency,
+                        energy=energy,
+                        # The time factor alone, without the stored amplitude.
+                        # Reporting both is what makes it obvious when energy
+                        # is high only because the item was recently read.
+                        recency=decay.decay_factor(
+                            item.last_access_at,
+                            now=stamp,
+                            half_life_s=item.half_life_s,
+                        ),
                         pin_boost=ranking.pin_boost(item.pin),
                     ),
                 )
@@ -364,9 +408,10 @@ class MemoryStore:
 
         results: list[MemoryResult] = []
         for _, result in best:
-            refreshed = self.touch(result.item.mem_id, now=stamp)
-            if refreshed is not None:
-                result = result.model_copy(update={"item": refreshed})
+            if reheat:
+                refreshed = self.touch(result.item.mem_id, now=stamp)
+                if refreshed is not None:
+                    result = result.model_copy(update={"item": refreshed})
             results.append(result)
         return results
 

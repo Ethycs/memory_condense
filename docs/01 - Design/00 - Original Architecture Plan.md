@@ -93,7 +93,12 @@ All of the above is committed and merged to `main` as of 2026-08-14 (merge `f3ed
 
 Chunk 120–250 tokens · candidate top-100 · memory header ~900 tokens · expansions max 3 × ≤250 tokens · HOT cap ~20 · heat thresholds HOT ≥ 0.75, WARM ≥ 0.25 · pins override decay.
 
-Realized defaults, for reference: `ContextBudget` 4500 / 900 / 800 with ≤3 expansions of ≤250 tokens; `RankWeights` relevance 1.0, importance 0.3, pin 0.5, recency 0.2, superseded penalty 1.0; hybrid `alpha` 0.65 (dense weight) over 100 candidates per side; half-life 7 days; reheat +0.25. **No HOT cap is enforced** — the design's "HOT cap ~20" is not implemented; the header budget caps the header instead.
+Realized defaults, for reference: `ContextBudget` 4500 / 900 / 800 with ≤3 expansions of ≤250 tokens; `RankWeights` relevance 1.0, importance 0.3, pin 0.5, **energy** 0.2, superseded penalty 1.0; hybrid `alpha` 0.65 (dense weight) over 100 candidates per side; half-life 7 days; reheat closes 25% of remaining headroom with a 300 s refractory window. The design's **HOT cap ~20 is now enforced** (`decay.heat_map`) — pool-relative and applied at tier derivation, so heat stays derived-never-stored.
+
+Two departures from the plan's wording, both deliberate and both corrections of as-built behaviour:
+
+- The scalar's fourth term is **energy**, not recency. The plan wrote `wT*recency`; the implementation computed that from a second copy of the decay exponential, which had drifted from `decay.py` and — because `touch` restamps `last_access_at` — evaluated to a constant 1.0 for every item ever recalled. Energy is the same time signal times a stored amplitude that access frequency moves. See `08 - Analysis/01`.
+- Reheat is **multiplicative**, not the plan's flat addition. A flat `+0.25` has a fixed point that clamps at 1.0 for anything touched more often than ~every three days, which reintroduces the constant-term problem one level down.
 
 ---
 

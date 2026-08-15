@@ -21,7 +21,7 @@ Registered under the server name `memory_condense`, so the model sees them as `m
 | Tool | Purpose |
 | --- | --- |
 | `remember(content, type, details, pin)` | Store a durable fact. `type` ∈ Decision, Preference, Constraint, Entity, Definition, Task, Correction |
-| `recall(query, limit)` | Ranked retrieval over stored facts, with the score breakdown (relevance / importance / recency) |
+| `recall(query, limit)` | Ranked retrieval over stored facts, with the score breakdown (relevance / importance / energy) |
 | `search(query, limit, hybrid)` | Search the raw ingested transcript rather than curated facts; `hybrid` blends BM25 with semantic similarity |
 | `ingest(text, role)` | Chunk, embed, index, and auto-extract facts from a block of text |
 | `memory_stats()` | Store location, turn count, active/pinned counts, heat distribution |
@@ -117,13 +117,13 @@ Selection is *designed* — and the design is sound — but two of its four mech
 
 | Concern auto-capture raises | Designed answer | As built |
 | --- | --- | --- |
-| The store fills with junk | `importance` seeds energy; unused items decay to COLD | ⚠️ **Decorative.** `ranking.rank_score` has no energy or heat term. Energy is read only for display in `memory_stats` and the hook. Nothing filters COLD; nothing evicts |
-| Junk survives by being re-read | Reheating fires only when a query actually matched | ⚠️ Reheating works, but since energy does not affect ranking it changes nothing about what is returned. `touch` also restamps `last_access_at`, so the `recency` term ≡ 1.0 for everything ever recalled — the term discriminates nothing |
+| The store fills with junk | `importance` seeds energy; unused items decay to COLD | ✅ **Wired 2026-08-14.** Decayed energy is the scalar's fourth term (`wE = 0.2`), replacing a `recency` term that evaluated to a constant. Nothing is evicted — decay demotes, it does not delete |
+| Junk survives by being re-read | Reheating fires only when a query actually matched | ✅ Wired, and made saturating: each access closes 25% of the *remaining* headroom, with a 300 s refractory window, so energy is a rate estimator rather than a ratchet. Only a pin holds the top of the range |
 | Important facts get buried | Pins are exempt from decay; `w_P` boosts them | ✅ Built and wired |
 | Context cost grows with the store | `ContextPacker` enforces a hard per-section budget | ✅ Built — and it is the *binding* constraint: 70.6% of items are dropped by the 900-token header before decay is ever consulted |
 | A wrong fact persists | `supersede` keeps the chain; `forget` retires it | ✅ Built and wired |
 
-So "ingest broadly and let decay sort it out" describes `decay.py` accurately and retrieval inaccurately. Until the wire-up lands, ingesting broadly means keeping everything at equal standing forever.
+So "ingest broadly and let decay sort it out" now describes retrieval as well as `decay.py` — but note what is still true: **the 900-token header remains the binding constraint**, and it is checked after ranking, not instead of it. Decay changes *which* items win the header; it does not change how many fit.
 
 The extraction half is measured too: the default `RuleBasedExtractor` produces **65% `Constraint` and 93% assistant-sourced** items on a 4,554-turn corpus, because its `must|never|always|cannot` pattern fires on ordinary technical modality. `Decision` and `Preference` together account for 8 items out of 4,463. `LLMExtractor` exists and is tested but has no provider binding.
 

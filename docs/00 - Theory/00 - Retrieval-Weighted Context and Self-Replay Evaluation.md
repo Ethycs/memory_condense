@@ -22,7 +22,7 @@ The design (see `01 - Design`) separates two orthogonal quantities per memory un
 ### 1.2 Canonical ranking equation
 
 ```
-score = wR·relevance + wI·importance + wP·pin_boost + wT·recency − wS·superseded_penalty
+score = wR·relevance + wI·importance + wP·pin_boost + wE·energy − wS·superseded_penalty
 ```
 
 **As-built note**: the current implementation realizes only the first term with `wR = 1` and all other weights 0 — score is raw cosine (`retrieval.py:167`). The rest of the equation is design intent, not code.

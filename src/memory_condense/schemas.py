@@ -254,12 +254,20 @@ class RetrievalResult(BaseModel):
 
 
 class MemoryResult(BaseModel):
-    """A memory item returned from retrieval, with its score breakdown."""
+    """A memory item returned from retrieval, with its score breakdown.
+
+    ``energy`` is the scored term (decayed energy at query time). ``recency``
+    is the decay factor alone, with the stored amplitude divided out — it is
+    **not** scored, and is carried purely as a diagnostic. Reporting both is
+    what makes it visible when an item ranks high only because it was read a
+    moment ago: ``energy ≈ recency`` means the amplitude is near 1.0.
+    """
 
     item: MemoryItem
     score: float
     relevance: float = 0.0
     importance: float = 0.0
+    energy: float = 0.0
     recency: float = 0.0
     pin_boost: float = 0.0
 

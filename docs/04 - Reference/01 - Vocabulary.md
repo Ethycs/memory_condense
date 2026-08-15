@@ -32,7 +32,10 @@ One-line scope: canonical terms as used in this repo's code, docs, and eval resu
 | hybrid retrieval | dense ∪ lexical | `SimilarityRetriever.hybrid_query` — `candidates` pulled from each side, each side min-max normalized, then blended |
 | alpha (`α`) | dense weight | Blend weight in `blend_hybrid(dense, lexical, α) = α·dense + (1−α)·lexical`. Default `0.65`. `α=1.0` reproduces dense ordering; `α=0.0` is pure BM25 |
 | min-max normalize | — | Scaling each side's raw scores into `[0, 1]` before blending. A flat input maps to all-`1.0` ("no signal"), not all-`0.0` |
-| rerank scalar | rank score | `wR·relevance + wI·importance + wP·pin_boost + wT·recency − wS·superseded_penalty` (`ranking.rank_score`); defaults 1.0 / 0.3 / 0.5 / 0.2 / 1.0 |
+| rerank scalar | rank score | `wR·relevance + wI·importance + wP·pin_boost + wE·energy − wS·superseded_penalty` (`ranking.rank_score`); defaults 1.0 / 0.3 / 0.5 / 0.2 / 1.0. `energy` arrives already decayed from `decay.item_energy` — `ranking` holds no decay arithmetic |
+| decay kernel | — | `decay.decay_factor` = `0.5 ** (elapsed / half_life)`. The single implementation; `effective_energy` is this times the stored amplitude. A second copy lived in `ranking.recency_score` until 2026-08-14 |
+| HOT cap | working-set cap | At most `decay.HOT_CAP` (20) *unpinned* items may hold HOT at once. Applied when deriving tiers pool-wide (`decay.heat_map`), never stored; pins neither occupy a slot nor get demoted |
+| refractory window | — | `decay.REHEAT_REFRACTORY_S` (300 s). A second access inside it restamps but does not boost — a burst of recalls is one access |
 | lexical weights | sparse weights | `chunks.lexical_weights` — now **populated** with the chunk's term→frequency map by `add_chunks` (formerly always NULL) |
 | term_count | document length | `chunks.term_count`: number of BM25 tokens in the chunk, the `\|d\|` in the BM25 denominator. NULL ⇒ not lexically indexed |
 | ef_search | ef | hnswlib query-time beam width (default 50) |

@@ -55,8 +55,8 @@ One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 2) holds everythin
 
 | Quantity | Contract |
 | --- | --- |
-| `energy` | `[0, 1]`; decayed lazily on read as `energy × 0.5^(elapsed / half_life_s)`; pinned items exempt |
-| heat tier | derived, never stored: HOT ≥ `0.75`, WARM ≥ `0.25`, else COLD |
+| `energy` | `[0, 1]`; decayed lazily on read as `energy × 0.5^(elapsed / half_life_s)`; pinned items exempt. An access raises it by `0.25 × (1 − energy)` — closing a fraction of the *remaining* headroom, so it approaches 1.0 without reaching it — and a second access within `300 s` restamps without boosting. Implementations MUST compute decay through `decay.decay_factor`; a `half_life_s ≤ 0` MUST mean "does not decay" |
+| heat tier | derived, never stored: HOT ≥ `0.75`, WARM ≥ `0.25`, else COLD — **and** at most `HOT_CAP` (20) *unpinned* items may hold HOT at once, the excess derived down one tier to WARM, lowest energy first. Pins neither occupy a slot nor get demoted. A cap is still derivation; it simply derives from the pool rather than from one row |
 | `importance` | `[0, 1]`; seeds energy at `0.8` when `≥ 0.7`, else `0.5` |
 | memory `embedding` | same dtype/dimension contract as chunk embeddings (clause 4); items without one score `relevance = 0` rather than erroring |
 | BM25 | Okapi with `k1 = 1.5`, `b = 0.75`; scores are **raw** and MUST be normalized before blending with dense scores |

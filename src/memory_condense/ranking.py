@@ -1,20 +1,30 @@
 """The deterministic rerank scalar from the design:
 
     score = wR*relevance + wI*importance + wP*pin_boost
-          + wT*recency - wS*superseded_penalty
+          + wE*energy - wS*superseded_penalty
 
-Pure functions only — no I/O, no model calls. Both the memory store (ranking
-memory items) and the retriever (ranking chunks) score through here so the
-weighting lives in exactly one place.
+Pure functions only — no I/O, no model calls, and deliberately **no decay
+kernel** — ``energy`` arrives already decayed from :mod:`memory_condense.decay`,
+which owns that arithmetic.
+
+The ``wE*energy`` term was ``wT*recency`` until 2026-08-14, computed here from
+a second copy of the exponential in ``decay.py``. Two consequences, both
+measured: the two copies had drifted to opposite semantics for a non-positive
+half-life, and because ``MemoryStore.touch`` restamps ``last_access_at`` on
+every retrieve, ``recency`` was 1.0 for every item ever recalled — a constant,
+discriminating nothing. Decayed energy carries the same time signal *times* a
+stored amplitude that access frequency actually moves.
+
+Note that only memory items carry the full scalar. Chunks are ranked by
+``blend_hybrid`` alone — they have no importance, pin, or energy.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
-from memory_condense.schemas import DEFAULT_HALF_LIFE_S, PinState
+from memory_condense.schemas import PinState
 
 
 @dataclass(frozen=True)
@@ -24,7 +34,7 @@ class RankWeights:
     relevance: float = 1.0
     importance: float = 0.3
     pin: float = 0.5
-    recency: float = 0.2
+    energy: float = 0.2
     superseded_penalty: float = 1.0
 
 
@@ -42,40 +52,25 @@ def pin_boost(pin: PinState) -> float:
     return _PIN_BOOST.get(pin, 0.0)
 
 
-def recency_score(
-    timestamp: datetime,
-    now: datetime | None = None,
-    half_life_s: float = DEFAULT_HALF_LIFE_S,
-) -> float:
-    """1.0 for something that just happened, decaying to 0 with age."""
-    now = now or datetime.now(timezone.utc)
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-
-    elapsed = (now - timestamp).total_seconds()
-    if elapsed <= 0:
-        return 1.0
-    if half_life_s <= 0:
-        return 0.0
-    return 0.5 ** (elapsed / half_life_s)
-
-
 def rank_score(
     relevance: float,
     importance: float = 0.0,
     pin: PinState = PinState.NONE,
-    recency: float = 0.0,
+    energy: float = 0.0,
     superseded: bool = False,
     weights: RankWeights = DEFAULT_WEIGHTS,
 ) -> float:
-    """The rerank scalar. All component inputs are expected in [0, 1]."""
+    """The rerank scalar. All component inputs are expected in [0, 1].
+
+    ``energy`` must already be decayed to the scoring instant — pass
+    ``decay.item_energy(item, now=...)``, not ``item.energy``, which is the
+    stored amplitude and ignores elapsed time.
+    """
     score = (
         weights.relevance * relevance
         + weights.importance * importance
         + weights.pin * pin_boost(pin)
-        + weights.recency * recency
+        + weights.energy * energy
     )
     if superseded:
         score -= weights.superseded_penalty

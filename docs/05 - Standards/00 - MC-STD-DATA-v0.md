@@ -6,7 +6,7 @@
 **Applies to:** `src/memory_condense/` and `eval_results/` JSON
 **Depends on:** • `03 - Architecture/00 - System Overview.md` (as-built map)
 
-> **Branch-only**: the schema this standard describes (`schema_version` 2) landed in `80262ea` on `feat/memory-layer`. A reader on `main` will still find version 1.
+> **On `main`**: the schema this standard describes (`schema_version` 2) landed in `80262ea` and merged in `f3edc91`. Stores created before that migrate in place on open — see clause 10.
 
 ## 0. Scope
 

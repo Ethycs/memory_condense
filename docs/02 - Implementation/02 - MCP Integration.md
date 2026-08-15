@@ -2,7 +2,7 @@
 
 **Status**: CURRENT
 **Date**: 2026-08-14
-**Applies to**: branch `feat/memory-layer`
+**Applies to**: `main` (merged in `f3edc91`)
 **Depends on**: `00 - Setup and Environment.md` (pixi env), `03 - Architecture/00` (what the tools wrap)
 
 The memory system is exposed to Claude Code — and any other MCP client — as a stdio MCP server. The integration has two halves, and they do deliberately different jobs:

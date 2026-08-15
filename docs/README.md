@@ -7,7 +7,7 @@
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
 
-> **On a branch, not on `main` — read this first.** The system these docs describe lives on **`feat/memory-layer`**, three commits on top of `cd9f423`: `80262ea` (memory layer), `abdcc9b` (eval harness repair + benchmark path), `24c7323` (this tree). `main` still contains only Phase 0 and the pre-repair eval harness. Nothing has been merged, and nothing has been measured. `git log --oneline main..HEAD` is the authority, not any sentence in this tree.
+> **Merged to `main`, still unmeasured — read this first.** The system these docs describe landed on `main` in merge `f3edc91`, bringing seven commits off `feat/memory-layer`: `80262ea` (memory layer), `abdcc9b` (eval harness repair + benchmark path), `24c7323` (this tree), `a9193ca` (doc reconciliation), `0093346` (MCP server), `a1bc585` (cross-process label allocation), `7717c3a` (supersede + honest provenance). What has *not* changed is the part that matters most: **nothing has been measured.** `git log --oneline` is the authority, not any sentence in this tree.
 
 ## Reconciliation state (2026-08-14)
 
@@ -68,16 +68,16 @@ docs/
 
 ## The one distinction this tree tries hardest to keep
 
-**Built ≠ measured.** 366 passing tests prove the memory layer does what it says. They prove nothing about whether it beats the dense-retrieval baseline it sits on. Any doc here that claims a benefit without a number in `08 - Analysis` behind it is a bug — report it.
+**Built ≠ measured.** 407 passing tests prove the memory layer does what it says. They prove nothing about whether it beats the dense-retrieval baseline it sits on. Merging to `main` did not change that, and neither did any of the polish since. Any doc here that claims a benefit without a number in `08 - Analysis` behind it is a bug — report it.
 
 ---
 
 **Verification block**: run
 
 ```powershell
-git log --oneline main..HEAD             # expect 3 commits on feat/memory-layer
+git log --oneline -1                     # expect the merge commit f3edc91 on main
 git status --short                       # expect a clean tree
-pixi run -e dev pytest -q -m "not slow"  # expect 366 passed, 13 deselected
+pixi run -e dev pytest -q -m "not slow"  # expect 407 passed, 13 deselected
 ```
 
-If the tests pass and `git status` is still dirty, the tree above is accurate. Then decide: commit, or run the first benchmark against the uncommitted tree.
+If all three hold, this tree is accurate as far as it goes — which is to say it accurately describes something that has never been benchmarked. The next thing worth doing is not another feature; it is the first `--compare` run, which is free and needs no API key.

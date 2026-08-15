@@ -1,6 +1,6 @@
 # Retrieval Ablation — dense k=10 vs no-memory baseline
 
-**Status:** Living Document — data from 2026-01-31 runs; **stale by ~6.5 months** as of 2026-08-14, predates the uncommitted `num_retries` change
+**Status:** Living Document — data from 2026-01-31 runs; **stale by ~6.5 months** as of 2026-08-14, and predates everything merged in `f3edc91`
 **Data:** 4 JSON files in `eval_results/` (gitignored — local-only; numbers preserved here deliberately)
 
 ## Executive summary (the verdict)

@@ -3,7 +3,7 @@
 **Status:** Living Document
 **Date:** 2026-08-14
 **Supersedes:** the earlier 2026-08-14 revision, which listed Phases 1–4 as unbuilt and the Decision Point as blocking Tier 2
-**Applies to:** branch `feat/memory-layer` (`80262ea`, `abdcc9b`, `24c7323` on top of `cd9f423`) — committed, not merged, not measured
+**Applies to:** `main` (merge `f3edc91`) — committed and merged, **still not measured**
 
 ## Current status
 
@@ -49,7 +49,7 @@ Deciding requires exactly two runs: a `--k 10` dense baseline and a memory/hybri
 | ~~Commit `num_retries=5` on judge/responder~~ | — | — | ✅ committed in `abdcc9b` |
 | ~~Token + latency instrumentation~~ | — | — | ✅ done |
 | ~~Decouple judge from responder~~ | — | — | ✅ done |
-| ~~Commit the working tree~~ | — | — | ✅ done — 3 commits on `feat/memory-layer`. 🔲 **not merged to `main`** |
+| ~~Commit the working tree~~ | — | — | ✅ done — 7 commits, merged to `main` in `f3edc91` |
 | Run the first benchmark: `--benchmark-file longmemeval_oracle.json --max-samples 10` | commit; LongMemEval data downloaded | Decision Point | 🔲 |
 | Run the `scores_by_position` analysis against the 2026-01-31 pair (`--compare`) | — | hypothesis H2 becoming a figure instead of a claim | 🔲 |
 | Re-run the 2026-01-31 ablation pair with the fixed models | commit | all four archived numbers were produced by a now-retired responder+judge | 🔲 |
@@ -91,9 +91,9 @@ Deciding requires exactly two runs: a `--k 10` dense baseline and a memory/hybri
 **Verification block**: run
 
 ```powershell
-git log --oneline main..HEAD                           # expect 3 commits on feat/memory-layer
-pixi run -e dev pytest -q -m "not slow"                # expect 366 passed, 13 deselected
+git log --oneline -1                                   # expect merge f3edc91 on main
+pixi run -e dev pytest -q -m "not slow"                # expect 407 passed, 13 deselected
 ls eval_results                                        # expect exactly the four 2026-01-31 files
 ```
 
-Then decide: **commit the tree**, or run the first `--max-samples 10` benchmark against the uncommitted tree to find out whether it is worth committing as-is. Committing first is the recommended order — every number produced from an uncommitted tree is unreproducible.
+The commit-first question is now closed — the tree is merged, so any number produced from here is reproducible against a named commit. The next step is the measurement itself: start with the free `--compare` ablation, then the first `--max-samples 10` benchmark.

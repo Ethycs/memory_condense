@@ -42,15 +42,15 @@ Loaded by `eval/__main__.py` via `python-dotenv`. Only the eval harness needs it
 ## 5. Tests
 
 ```powershell
-pixi run -e dev pytest -q -m "not slow"     # fast suite: 366 passed, 13 deselected
+pixi run -e dev pytest -q -m "not slow"     # fast suite: 407 passed, 13 deselected
 pixi run -e dev pytest -m slow              # model-dependent tests (downloads bge-m3)
 ```
 
-Baseline as of 2026-08-14: **366 passing, 13 slow deselected** across 25 test files (`validated`). Establish this baseline before claiming your change is clean — the suite grew from 48 tests to 366 in one working session, so any "it was already failing" claim needs a fresh baseline, not a remembered one.
+Baseline as of 2026-08-14: **407 passing, 13 slow deselected** across 25 test files (`validated`). Establish this baseline before claiming your change is clean — the suite grew from 48 tests to 407 in one working session, so any "it was already failing" claim needs a fresh baseline, not a remembered one.
 
 New test files in this working tree: `test_decay`, `test_ranking`, `test_context_packer`, `test_db`, `test_condenser`, `test_memory_store`, `test_validator`, `test_extractor`, `test_lexical`, `test_benchmark`, `test_eval_analysis`.
 
-**UNCOMMITTED**: every source and test file listed above is untracked or modified in the working tree. `git status --short` is the authority.
+**Merged**: every source and test file listed above is committed on `main` as of merge `f3edc91`. `git status --short` is the authority.
 
 ## 6. Quick smoke
 
@@ -69,4 +69,4 @@ Both download bge-m3 on first run. `similarity_demo` proves Phase 0 end-to-end; 
 pixi run -e dev pytest -q -m "not slow"
 ```
 
-Expect **366 passed, 13 deselected**. If red, diff against that baseline before touching code. Then run `git status --short` — if it still shows the memory layer as untracked, the first decision is whether to commit before running anything that costs money.
+Expect **407 passed, 13 deselected**. If red, diff against that baseline before touching code. The memory layer is merged to `main`, so `git status --short` should be clean; if it is not, find out what changed before running anything that costs money.

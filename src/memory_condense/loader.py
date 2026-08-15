@@ -315,6 +315,20 @@ def parse_locomo(data: Any) -> list[BenchmarkSample]:
         first_speaker: str | None = None
 
         for _, key in session_keys:
+            # Ingest the session's timestamp as its own turn.
+            #
+            # LoCoMo's largest question category is temporal ("When did X…?"),
+            # and the gold answers are these dates — which live in
+            # `session_N_date_time`, *not* in any turn's text. Dropping them
+            # made an entire category unanswerable from the ingested data:
+            # measured on conv-26, only 2.7% of category-2 answers appeared
+            # anywhere in the haystack, against 43-45% for the non-temporal
+            # categories. A benchmark run on that corpus would have scored the
+            # retrieval system for information it was never given.
+            date_time = conversation.get(f"{key}_date_time")
+            if isinstance(date_time, str) and date_time.strip():
+                turns.append(("system", f"[{key} took place at {date_time.strip()}]"))
+
             for j, turn in enumerate(conversation[key]):
                 if not isinstance(turn, dict):
                     continue

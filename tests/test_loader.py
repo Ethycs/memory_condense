@@ -269,9 +269,13 @@ def test_parse_locomo_orders_sessions_and_maps_speakers():
     s = samples[0]
     assert s.sample_id == "conv-26"
     # First-seen speaker (Caroline) -> user, the other -> assistant.
+    # Each session is preceded by its timestamp — see
+    # test_parse_locomo_ingests_session_timestamps for why.
     assert s.turns == [
+        ("system", "[session_1 took place at 1:56 pm on 8 May, 2023]"),
         ("user", "Hey Mel!"),
         ("assistant", "Hi Caroline!"),
+        ("system", "[session_2 took place at 4:00 pm on 20 May, 2023]"),
         ("assistant", "I adopted a dog."),
         ("user", "What is its name?"),
     ]
@@ -283,6 +287,32 @@ def test_parse_locomo_orders_sessions_and_maps_speakers():
     assert s.questions[0].evidence == ["D2:1"]
     assert s.questions[1].evidence == []
     assert s.questions[0].question_id == "conv-26_q0"
+
+
+def test_parse_locomo_ingests_session_timestamps():
+    """LoCoMo's largest question category asks *when*, and the answers are
+    these dates — which live in `session_N_date_time`, not in any turn's text.
+
+    Dropping them made that category unanswerable from the ingested data. On
+    the real conv-26, only 2.7% of category-2 gold answers appeared anywhere
+    in the haystack before this, against 43-45% for the non-temporal
+    categories; a benchmark run would have scored retrieval for information it
+    was never given.
+    """
+    samples = parse_locomo([LOCOMO_RECORD])
+    text = " ".join(t for _, t in samples[0].turns)
+
+    assert "8 May, 2023" in text
+    assert "20 May, 2023" in text
+
+
+def test_parse_locomo_tolerates_a_session_with_no_timestamp():
+    record = {
+        "sample_id": "conv-undated",
+        "conversation": {"session_1": [{"speaker": "A", "text": "hello"}]},
+        "qa": [],
+    }
+    assert parse_locomo([record])[0].turns == [("user", "hello")]
 
 
 def test_parse_locomo_sorts_sessions_numerically():

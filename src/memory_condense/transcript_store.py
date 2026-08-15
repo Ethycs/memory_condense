@@ -10,12 +10,34 @@ class TranscriptStore:
     def __init__(self, db: Database) -> None:
         self._db = db
 
+    def current_turn(self) -> int:
+        """The conversation's position — **the decay coordinate**.
+
+        Energy decays in turns, not seconds (see :mod:`memory_condense.decay`),
+        so this is the clock the whole memory layer reads. Delegates to
+        :meth:`Database.current_turn`, which ``MemoryStore`` shares.
+        """
+        return self._db.current_turn()
+
     def append(self, role: str, text: str) -> Turn:
-        """Create and persist a new turn. Returns the Turn with generated ID."""
+        """Create and persist a new turn. Returns the Turn with generated ID.
+
+        Advancing ``ordinal`` here is what makes decay happen: every item the
+        conversation did *not* reach for this turn falls one turn further
+        behind. Nothing else has to run — no sweep, no timer.
+        """
         turn = Turn(role=role, text=text)
+        ordinal = self.current_turn() + 1
         self._db.execute(
-            "INSERT INTO turns (turn_id, role, text, created_at) VALUES (?, ?, ?, ?)",
-            (turn.turn_id, turn.role, turn.text, turn.created_at.isoformat()),
+            "INSERT INTO turns (turn_id, role, text, created_at, ordinal)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                turn.turn_id,
+                turn.role,
+                turn.text,
+                turn.created_at.isoformat(),
+                ordinal,
+            ),
         )
         self._db.commit()
         return turn

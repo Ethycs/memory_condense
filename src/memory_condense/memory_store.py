@@ -6,9 +6,12 @@ Three invariants the rest of the system relies on:
 * **Nothing is ever hard-deleted.** ``delete`` flips status to ``deleted`` and
   ``supersede`` flips the old item to ``superseded``; both rows survive so the
   audit trail back to the transcript stays intact.
-* **Decay is lazy.** No timer, no background job. Energy is decayed forward
-  from ``last_access_at`` on read via :mod:`memory_condense.decay`, and
-  retrieval reheats what it returns.
+* **Decay is lazy, and counted in turns.** No timer, no background job. Energy
+  is decayed forward from ``last_access_turn`` on read via
+  :mod:`memory_condense.decay`, and retrieval reheats what it returns. Those
+  two halves *are* the mechanism: appending a turn cools everything the
+  conversation did not reach for, and ``touch`` exempts everything it did.
+  ``last_access_at`` still exists but is an audit timestamp only.
 * **Provenance travels with the item.** Loading an item always loads its
   provenance rows.
 """
@@ -24,7 +27,7 @@ from memory_condense import decay, ranking
 from memory_condense.db import Database
 from memory_condense.ranking import DEFAULT_WEIGHTS, RankWeights
 from memory_condense.schemas import (
-    DEFAULT_HALF_LIFE_S,
+    DEFAULT_HALF_LIFE_TURNS,
     CreateOp,
     DeleteOp,
     Heat,
@@ -44,7 +47,8 @@ from memory_condense.schemas import (
 
 _ITEM_COLUMNS = (
     "mem_id, type, content, details, status, supersedes, pin, energy, "
-    "half_life_s, importance, created_at, last_access_at, embedding"
+    "half_life_turns, importance, created_at, last_access_at, embedding, "
+    "last_access_turn"
 )
 
 
@@ -75,7 +79,7 @@ class MemoryStore:
         self,
         op: CreateOp,
         embedding: Any = None,
-        half_life_s: float = DEFAULT_HALF_LIFE_S,
+        half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
         supersedes: str | None = None,
         dedupe: bool = True,
     ) -> MemoryItem:
@@ -116,8 +120,12 @@ class MemoryStore:
             supersedes=supersedes,
             pin=PinState.NONE,
             energy=decay.seed_energy(op.importance),
-            half_life_s=half_life_s,
+            half_life_turns=half_life_turns,
             importance=op.importance,
+            # Creation is an access: an item enters the store at the current
+            # turn, not at turn 0. Without this every new memory would be born
+            # already `current_turn` turns behind and go COLD immediately.
+            last_access_turn=self._db.current_turn(),
             embedding=vector,
         )
         self._insert(item)
@@ -317,40 +325,51 @@ class MemoryStore:
     # Energy
     # ------------------------------------------------------------------
 
-    def touch(self, mem_id: str, now: datetime | None = None) -> MemoryItem | None:
-        """Access reheating: decay to *now*, add the reheat boost, restamp.
+    def touch(
+        self,
+        mem_id: str,
+        now_turn: int | None = None,
+        now: datetime | None = None,
+    ) -> MemoryItem | None:
+        """Access reheating: decay to *now_turn*, add the boost, restamp.
 
-        Pinned items keep their stored energy (pins override decay) but their
-        ``last_access_at`` is still refreshed so the timestamp stays honest.
+        **This is half the decay mechanism.** Advancing the turn is what makes
+        items cool; this is what exempts the ones the conversation reached for.
+        Nothing sweeps the store — an item is warm precisely because its
+        ``last_access_turn`` keeps being pushed forward, and cold precisely
+        because it stopped being.
 
-        Within :data:`decay.REHEAT_REFRACTORY_S` of the previous access the
-        item is decayed and restamped but **not** boosted: a burst of recalls
-        in one working session is one access, not ten. Restamping is still
-        correct — the access really happened — and the withheld decay over a
-        five-minute window is negligible against a seven-day half-life.
+        Pinned items keep their stored energy (pins override decay) but are
+        still restamped so the record of the access stays honest.
+
+        Within the same turn the item is restamped but **not** boosted: ten
+        recalls while answering one turn is one access, not ten. ``now`` sets
+        the audit timestamp only; it has no effect on energy.
         """
         item = self.get(mem_id)
         if item is None:
             return None
 
+        turn = self._db.current_turn() if now_turn is None else now_turn
         stamp = now or decay.now_utc()
         if item.is_pinned:
             energy = item.energy
         else:
-            energy = decay.item_energy(item, now=stamp)
-            if decay.should_reheat(item.last_access_at, now=stamp):
+            energy = decay.item_energy(item, now_turn=turn)
+            if decay.should_reheat(item.last_access_turn, now_turn=turn):
                 energy = decay.reheat(energy)
 
         self._db.execute(
-            "UPDATE memory_items SET energy = ?, last_access_at = ? WHERE mem_id = ?",
-            (float(energy), stamp.isoformat(), mem_id),
+            "UPDATE memory_items SET energy = ?, last_access_at = ?,"
+            " last_access_turn = ? WHERE mem_id = ?",
+            (float(energy), stamp.isoformat(), int(turn), mem_id),
         )
         self._db.commit()
         return self.get(mem_id)
 
     def items_by_heat(
         self,
-        now: datetime | None = None,
+        now_turn: int | None = None,
         status: MemoryStatus | None = MemoryStatus.ACTIVE,
         hot_cap: int = decay.HOT_CAP,
     ) -> dict[Heat, list[MemoryItem]]:
@@ -359,16 +378,22 @@ class MemoryStore:
         A pure read — nothing is touched, restamped, or reheated. Contrast
         :meth:`retrieve`, which reheats everything it returns.
         """
+        turn = self._db.current_turn() if now_turn is None else now_turn
         items = self.list_items(status=status)
-        tiers = decay.heat_map(items, now=now, hot_cap=hot_cap)
+        tiers = decay.heat_map(items, now_turn=turn, hot_cap=hot_cap)
         buckets: dict[Heat, list[MemoryItem]] = {h: [] for h in Heat}
         for item in items:
             buckets[tiers[item.mem_id]].append(item)
         return buckets
 
-    def heat_counts(self, now: datetime | None = None) -> dict[str, int]:
-        """How many active items sit in each HOT/WARM/COLD tier right now."""
-        buckets = self.items_by_heat(now=now)
+    def heat_counts(self, now_turn: int | None = None) -> dict[str, int]:
+        """How many active items sit in each HOT/WARM/COLD tier right now.
+
+        Before v4 this was near-vacuous — with a wall-clock coordinate and a
+        run lasting minutes, every item reported HOT. It only became a real
+        distribution once decay started counting turns.
+        """
+        buckets = self.items_by_heat(now_turn=now_turn)
         return {heat.value: len(buckets[heat]) for heat in Heat}
 
     # ------------------------------------------------------------------
@@ -380,6 +405,7 @@ class MemoryStore:
         query_embedding: Any = None,
         k: int = 10,
         weights: RankWeights = DEFAULT_WEIGHTS,
+        now_turn: int | None = None,
         now: datetime | None = None,
         include_superseded: bool = False,
         min_energy: float = 0.0,
@@ -425,12 +451,13 @@ class MemoryStore:
         if not items:
             return []
 
+        turn = self._db.current_turn() if now_turn is None else now_turn
         stamp = now or decay.now_utc()
         query_vec = _to_vector(query_embedding)
 
         scored: list[tuple[float, MemoryResult]] = []
         for item in items:
-            energy = decay.item_energy(item, now=stamp)
+            energy = decay.item_energy(item, now_turn=turn)
             if energy < min_energy:
                 continue
             relevance = self._relevance(query_vec, item)
@@ -452,13 +479,13 @@ class MemoryStore:
                         relevance=relevance,
                         importance=item.importance,
                         energy=energy,
-                        # The time factor alone, without the stored amplitude.
+                        # The turn factor alone, without the stored amplitude.
                         # Reporting both is what makes it obvious when energy
                         # is high only because the item was recently read.
                         recency=decay.decay_factor(
-                            item.last_access_at,
-                            now=stamp,
-                            half_life_s=item.half_life_s,
+                            item.last_access_turn,
+                            now_turn=turn,
+                            half_life_turns=item.half_life_turns,
                         ),
                         pin_boost=ranking.pin_boost(item.pin),
                     ),
@@ -470,7 +497,7 @@ class MemoryStore:
         results: list[MemoryResult] = []
         for _, result in best:
             if reheat:
-                refreshed = self.touch(result.item.mem_id, now=stamp)
+                refreshed = self.touch(result.item.mem_id, now_turn=turn, now=stamp)
                 if refreshed is not None:
                     result = result.model_copy(update={"item": refreshed})
             results.append(result)
@@ -493,9 +520,9 @@ class MemoryStore:
         self._db.execute(
             "INSERT INTO memory_items "
             "(mem_id, type, content, details, status, supersedes, pin, energy, "
-            "half_life_s, importance, created_at, last_access_at, embedding, "
-            "content_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "half_life_turns, importance, created_at, last_access_at, "
+            "last_access_turn, embedding, content_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 item.mem_id,
                 item.type.value,
@@ -505,10 +532,11 @@ class MemoryStore:
                 item.supersedes,
                 item.pin.value,
                 float(item.energy),
-                float(item.half_life_s),
+                float(item.half_life_turns),
                 float(item.importance),
                 item.created_at.isoformat(),
                 item.last_access_at.isoformat(),
+                int(item.last_access_turn),
                 _to_blob(item.embedding),
                 content_key(item.type, item.content),
             ),
@@ -597,10 +625,11 @@ class MemoryStore:
             supersedes=row[5],
             pin=PinState(row[6]),
             energy=row[7],
-            half_life_s=row[8],
+            half_life_turns=row[8],
             importance=row[9],
             created_at=datetime.fromisoformat(row[10]),
             last_access_at=datetime.fromisoformat(row[11]),
+            last_access_turn=row[13],
             embedding=embedding,
         )
 

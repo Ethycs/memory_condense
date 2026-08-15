@@ -241,76 +241,77 @@ def test_pin_exempts_item_from_decay(store, turn):
     kept = store.create(make_create(turn.turn_id, content="kept"))
     store.pin(PinOp(mem_id=kept.mem_id, pin=PinState.USER))
 
-    far_future = decay.now_utc() + timedelta(days=28)  # four half-lives
+    far_future = 120  # four 30-turn half-lives
     plain_item = store.get(plain.mem_id)
     kept_item = store.get(kept.mem_id)
 
-    assert decay.item_energy(plain_item, now=far_future) < 0.05
-    assert decay.item_energy(kept_item, now=far_future) == pytest.approx(kept_item.energy)
-    assert decay.item_heat(plain_item, now=far_future) is Heat.COLD
-    assert decay.item_heat(kept_item, now=far_future) is Heat.WARM
+    assert decay.item_energy(plain_item, now_turn=far_future) < 0.05
+    assert decay.item_energy(kept_item, now_turn=far_future) == pytest.approx(
+        kept_item.energy
+    )
+    assert decay.item_heat(plain_item, now_turn=far_future) is Heat.COLD
+    assert decay.item_heat(kept_item, now_turn=far_future) is Heat.WARM
 
 
 def test_touch_reheats_a_decayed_item(store, turn):
     item = store.create(make_create(turn.turn_id, importance=0.1))
-    stale = decay.now_utc() + timedelta(days=7)  # exactly one half-life
+    stale = item.last_access_turn + 30  # exactly one half-life, in turns
 
-    decayed = decay.item_energy(store.get(item.mem_id), now=stale)
+    decayed = decay.item_energy(store.get(item.mem_id), now_turn=stale)
     assert decayed == pytest.approx(decay.WARM_SEED_ENERGY / 2, abs=1e-3)
 
-    touched = store.touch(item.mem_id, now=stale)
+    touched = store.touch(item.mem_id, now_turn=stale)
     assert touched.energy > decayed
     assert touched.energy == pytest.approx(decay.reheat(decayed), abs=1e-6)
-    assert touched.last_access_at.replace(tzinfo=None) == stale.replace(tzinfo=None)
+    assert touched.last_access_turn == stale
 
 
-def test_touch_is_refractory_within_the_window(store, turn):
-    """Ten recalls in one session are one access, not ten.
+def test_touch_is_refractory_within_one_turn(store, turn):
+    """Ten recalls while answering one turn are one access, not ten.
 
     This replaces a test that asserted ten same-instant touches drove energy
     to exactly 1.0 — which was the bug, not the contract: it let any item read
     a few times in a row pin itself at maximum energy permanently.
     """
     item = store.create(make_create(turn.turn_id, importance=0.9))
-    # Past the window opened by creation itself, so the first touch counts.
-    now = item.last_access_at + timedelta(seconds=decay.REHEAT_REFRACTORY_S + 1)
-    expected = decay.reheat(decay.item_energy(item, now=now))
+    # A turn past the one creation opened, so the first touch counts.
+    now = item.last_access_turn + 1
+    expected = decay.reheat(decay.item_energy(item, now_turn=now))
 
     for _ in range(10):
-        item = store.touch(item.mem_id, now=now)
+        item = store.touch(item.mem_id, now_turn=now)
 
     # Exactly one boost applied (the first), and it saturates rather than adds.
     assert item.energy == pytest.approx(expected)
     assert item.energy < 1.0
 
 
-def test_touch_boosts_again_once_the_refractory_window_passes(store, turn):
+def test_touch_boosts_again_on_the_next_turn(store, turn):
     item = store.create(make_create(turn.turn_id, importance=0.9))
-    gap = timedelta(seconds=decay.REHEAT_REFRACTORY_S + 1)
 
-    first = store.touch(item.mem_id, now=item.last_access_at + gap)
-    later = first.last_access_at + gap
-    second = store.touch(item.mem_id, now=later)
+    first = store.touch(item.mem_id, now_turn=item.last_access_turn + 1)
+    later = first.last_access_turn + 1
+    second = store.touch(item.mem_id, now_turn=later)
 
     # Strictly above what plain decay alone would have left it at.
-    assert second.energy > decay.item_energy(first, now=later)
+    assert second.energy > decay.item_energy(first, now_turn=later)
 
 
 def test_a_fresh_item_is_not_reheated_by_being_read_immediately(store, turn):
     """Creating then recalling in the same breath is one event, not two."""
     item = store.create(make_create(turn.turn_id, importance=0.9))
-    touched = store.touch(item.mem_id, now=item.last_access_at)
+    touched = store.touch(item.mem_id, now_turn=item.last_access_turn)
     assert touched.energy == pytest.approx(item.energy)
 
 
 def test_touch_keeps_pinned_energy_but_restamps(store, turn):
     item = store.create(make_create(turn.turn_id))
     store.pin(PinOp(mem_id=item.mem_id, pin=PinState.USER))
-    later = decay.now_utc() + timedelta(days=14)
+    later = item.last_access_turn + 60
 
-    touched = store.touch(item.mem_id, now=later)
+    touched = store.touch(item.mem_id, now_turn=later)
     assert touched.energy == pytest.approx(item.energy)
-    assert touched.last_access_at.replace(tzinfo=None) == later.replace(tzinfo=None)
+    assert touched.last_access_turn == later
 
 
 def test_touch_missing_returns_none(store):
@@ -324,7 +325,7 @@ def test_heat_counts(store, turn):
 
     assert counts == {"HOT": 1, "WARM": 1, "COLD": 0}
 
-    cold = store.heat_counts(now=decay.now_utc() + timedelta(days=30))
+    cold = store.heat_counts(now_turn=store._db.current_turn() + 120)
     assert cold["COLD"] == 2
 
 
@@ -477,17 +478,17 @@ def test_hotter_item_outranks_colder_at_equal_relevance(store, turn):
     retrieve. Energy never entered the scalar at all, so this assertion could
     not have held.
     """
-    now = decay.now_utc()
+    now = store._db.current_turn()
     hot = store.create(make_create(turn.turn_id, content="hot"), embedding=[1.0, 0.0])
     cold = store.create(make_create(turn.turn_id, content="cold"), embedding=[1.0, 0.0])
-    # Age one of them by two months without touching the other.
+    # Leave one of them 60 turns behind without touching the other.
     store._db.execute(
-        "UPDATE memory_items SET last_access_at = ? WHERE mem_id = ?",
-        ((now - timedelta(days=60)).isoformat(), cold.mem_id),
+        "UPDATE memory_items SET last_access_turn = ? WHERE mem_id = ?",
+        (now - 60, cold.mem_id),
     )
     store._db.commit()
 
-    results = store.retrieve(np.asarray([1.0, 0.0]), k=2, now=now)
+    results = store.retrieve(np.asarray([1.0, 0.0]), k=2, now_turn=now)
     assert [r.item.mem_id for r in results] == [hot.mem_id, cold.mem_id]
     assert results[0].energy > results[1].energy
 
@@ -512,27 +513,27 @@ def test_relevance_still_beats_heat(store, turn):
 
 
 def test_min_energy_filters_cold_items_and_is_off_by_default(store, turn):
-    now = decay.now_utc()
+    now = store._db.current_turn()
     cold = store.create(make_create(turn.turn_id, content="cold"), embedding=[1.0, 0.0])
     store._db.execute(
-        "UPDATE memory_items SET last_access_at = ? WHERE mem_id = ?",
-        ((now - timedelta(days=90)).isoformat(), cold.mem_id),
+        "UPDATE memory_items SET last_access_turn = ? WHERE mem_id = ?",
+        (now - 90, cold.mem_id),
     )
     store._db.commit()
 
     # reheat=False on the probe, or the first call restamps the item and the
     # second one sees a freshly hot row — retrieval is a write path.
-    assert store.retrieve(np.asarray([1.0, 0.0]), k=5, now=now, reheat=False)
+    assert store.retrieve(np.asarray([1.0, 0.0]), k=5, now_turn=now, reheat=False)
     assert not store.retrieve(
-        np.asarray([1.0, 0.0]), k=5, now=now, min_energy=0.25, reheat=False
+        np.asarray([1.0, 0.0]), k=5, now_turn=now, min_energy=0.25, reheat=False
     )
 
 
 def test_retrieve_with_reheat_false_does_not_record_an_access(store, turn):
     item = store.create(make_create(turn.turn_id), embedding=[1.0, 0.0])
-    later = item.last_access_at + timedelta(days=1)
+    later = item.last_access_turn + 5
 
-    store.retrieve(np.asarray([1.0, 0.0]), k=1, now=later, reheat=False)
+    store.retrieve(np.asarray([1.0, 0.0]), k=1, now_turn=later, reheat=False)
 
     unchanged = store.get(item.mem_id)
     assert unchanged.energy == pytest.approx(item.energy)
@@ -571,17 +572,17 @@ def test_include_superseded_applies_the_penalty(store, turn):
 
 def test_retrieve_touches_returned_items(store, turn):
     item = store.create(make_create(turn.turn_id, importance=0.1))
-    later = decay.now_utc() + timedelta(days=7)  # exactly one half-life
+    later = item.last_access_turn + 30  # exactly one half-life, in turns
     seeded = item.energy
 
-    result = store.retrieve(None, k=1, now=later)[0]
+    result = store.retrieve(None, k=1, now_turn=later)[0]
     expected = decay.reheat(seeded / 2)
 
     # The reheat is persisted...
     stored = store.get(item.mem_id)
     assert stored.energy == pytest.approx(expected, abs=1e-3)
     assert stored.energy > seeded / 2
-    assert stored.last_access_at.replace(tzinfo=None) == later.replace(tzinfo=None)
+    assert stored.last_access_turn == later
     # ...and the returned MemoryResult carries the refreshed item.
     assert result.item.energy == pytest.approx(expected, abs=1e-3)
 

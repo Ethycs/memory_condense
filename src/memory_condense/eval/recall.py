@@ -10,13 +10,14 @@ memory arm's context contains the answer *less often* than the dense arm's,
 no responder can recover the difference, and the paid comparison's outcome is
 knowable in advance for zero dollars.
 
-It also answers the question that gated design Phase 4. ``08 - Analysis/01``
-showed COLD is unreachable in a live run: seeds of 0.5/0.8 against a seven-day
-half-life need 7–11.75 days of no access, while a run lasts minutes. Rather
-than inject a clock into the live path, this module **replays decay forward**
-over the recorded item state at simulated offsets, which answers "would the
-answer still be reachable once these items went cold?" with no clock
-manipulation and no waiting.
+It also answers the question that gated design Phase 4: **do COLD items hold
+answers nothing else holds?** Before schema v4 that question was unanswerable
+— decay counted wall-clock seconds, so an item needed 7–11.75 days of no
+access to reach COLD while a run lasted minutes, and the horizons this module
+projected to were mostly incapable of returning anything but zero. Decay now
+counts *turns*, so a run advances the coordinate on its own and the tiers
+populate for real. The forward projection below is consequently a genuine
+extrapolation of a live signal rather than a workaround for a dead one.
 
 Deliberately no LLM, no key, no network. It is a fifth CLI mode beside
 ``--compare``, and both are free.
@@ -25,7 +26,6 @@ Deliberately no LLM, no key, no network. It is a fifth CLI mode beside
 from __future__ import annotations
 
 import tempfile
-from datetime import timedelta
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -41,10 +41,20 @@ from memory_condense.eval.benchmark import (
 from memory_condense.eval.schemas import EvalConfig
 from memory_condense.loader import BenchmarkSample
 
-#: Simulated ages, in days, at which to re-tier the items and ask whether the
-#: answer survives. 0 is "now"; 30 is comfortably past the point where an
-#: untouched item at either seed energy has fallen below WARM.
-DEFAULT_HORIZONS_DAYS = (0, 7, 14, 30)
+#: Simulated ages, **in turns**, at which to re-tier the items and ask whether
+#: the answer survives. 0 is "now" (the transcript's current position).
+#:
+#: Chosen to straddle both crossing points at the default 30-turn half-life:
+#: an ordinary item (seed 0.5) crosses into COLD at 30 untouched turns and an
+#: important one (seed 0.8) at ~50. So 15 is inside WARM for both, 30 is the
+#: first divider, and 45 separates them.
+#:
+#: 60 is deliberately **excluded**. Energy is clamped to ``<= 1.0`` and COLD
+#: begins below ``0.25 = 1.0 * 0.5**2``, so two half-lives is the theoretical
+#: ceiling for *any* unpinned item and that horizon can only ever report 0.0%.
+#: The previous day-based set had exactly that defect in two of its four
+#: entries; a horizon that cannot vary is not a measurement.
+DEFAULT_HORIZONS_TURNS = (0, 15, 30, 45)
 
 
 class QuestionRecall(BaseModel):
@@ -60,7 +70,7 @@ class QuestionRecall(BaseModel):
     #: claim is *the same answer for fewer tokens*, so recall alone cannot
     #: show its benefit — and can make a system that spends 10x look better.
     context_tokens: int = 0
-    #: ``{horizon_days: answer_still_in_a_non_cold_item}``
+    #: ``{horizon_turns: answer_still_in_a_non_cold_item}``
     survives_horizon: dict[int, bool] = Field(default_factory=dict)
 
 
@@ -156,25 +166,28 @@ def _assemble(mc, question: str, config: EvalConfig) -> tuple[list[str], list[st
     return [], [r.chunk.text for r in results]
 
 
-def _survival(mc, gold: str, horizons_days) -> dict[int, bool]:
-    """Would the answer still sit in a non-COLD memory item after N days?
+def _survival(mc, gold: str, horizons_turns) -> dict[int, bool]:
+    """Would the answer still sit in a non-COLD memory item N turns from now?
 
-    Replays :func:`decay.effective_energy` forward over the stored items rather
-    than touching any clock the live path reads. An empty memory store (the
-    chunk arms, where nothing is extracted) yields ``False`` at every horizon —
-    correctly: there is no memory item holding the answer.
+    Projects :func:`decay.effective_energy` forward over the stored items from
+    the transcript's current position. Horizon 0 is not a projection at all —
+    it is the store as it stands, which is now a real reading because turns
+    have actually elapsed during the run.
+
+    An empty memory store (the chunk arms, where nothing is extracted) yields
+    ``False`` at every horizon — correctly: there is no memory item holding
+    the answer.
     """
     items = mc.memory.list_items()
-    now = decay.now_utc()
+    now_turn = mc.transcript.current_turn()
     out: dict[int, bool] = {}
-    for days in horizons_days:
-        at = now + timedelta(days=days)
+    for turns in horizons_turns:
         alive = [
             f"{i.content} {i.details or ''}"
             for i in items
-            if decay.item_heat(i, now=at) is not decay.Heat.COLD
+            if decay.item_heat(i, now_turn=now_turn + turns) is not decay.Heat.COLD
         ]
-        out[days] = contains_answer(alive, gold)
+        out[turns] = contains_answer(alive, gold)
     return out
 
 
@@ -183,7 +196,7 @@ def measure_sample(
     config: EvalConfig,
     data_dir: Path,
     ingest_fn: IngestFn = ingest_sample,
-    horizons_days=DEFAULT_HORIZONS_DAYS,
+    horizons_turns=DEFAULT_HORIZONS_TURNS,
 ) -> list[QuestionRecall]:
     """Ingest one sample and measure answer reachability for its questions."""
     mc = ingest_fn(sample, config, data_dir)
@@ -201,7 +214,7 @@ def measure_sample(
                     in_memory_header=contains_answer(header, question.answer),
                     in_expansions=contains_answer(body, question.answer),
                     context_tokens=sum(count_tokens(t) for t in everything),
-                    survives_horizon=_survival(mc, question.answer, horizons_days),
+                    survives_horizon=_survival(mc, question.answer, horizons_turns),
                 )
             )
         return out
@@ -215,7 +228,7 @@ def run_recall(
     benchmark: str = "",
     max_samples: int | None = None,
     ingest_fn: IngestFn = ingest_sample,
-    horizons_days=DEFAULT_HORIZONS_DAYS,
+    horizons_turns=DEFAULT_HORIZONS_TURNS,
 ) -> RecallReport:
     """Measure answer reachability across samples. Zero API calls."""
     selected = samples[:max_samples] if max_samples else samples
@@ -231,7 +244,7 @@ def run_recall(
                     config,
                     Path(tmpdir) / f"sample_{i}",
                     ingest_fn=ingest_fn,
-                    horizons_days=horizons_days,
+                    horizons_turns=horizons_turns,
                 )
             )
 
@@ -252,7 +265,7 @@ def run_recall(
         mean_context_tokens=(sum(r.context_tokens for r in results) / n) if n else 0.0,
         survival_by_horizon={
             days: _frac(r.survives_horizon.get(days, False) for r in results)
-            for days in horizons_days
+            for days in horizons_turns
         },
         by_category={k: _frac(v) for k, v in sorted(by_category.items())},
         questions=results,
@@ -286,9 +299,10 @@ def print_recall_report(report: RecallReport) -> None:
 
     if report.survival_by_horizon:
         print()
-        print("Answer still held by a non-COLD memory item, by simulated age:")
-        for days, frac in sorted(report.survival_by_horizon.items()):
-            print(f"  +{days:>3}d {frac:>7.1%}")
+        print("Answer still held by a non-COLD memory item, by turns ahead:")
+        for turns, frac in sorted(report.survival_by_horizon.items()):
+            label = "now" if turns == 0 else f"+{turns}t"
+            print(f"  {label:>5} {frac:>7.1%}")
 
     if report.by_category:
         print()

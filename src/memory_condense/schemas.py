@@ -88,8 +88,24 @@ class Heat(str, Enum):
 HOT_THRESHOLD = 0.75
 WARM_THRESHOLD = 0.25
 
-#: Default half-life for memory energy decay: 7 days.
-DEFAULT_HALF_LIFE_S = 7 * 24 * 3600.0
+#: Default half-life for memory energy decay, measured in **conversation
+#: turns**, not seconds.
+#:
+#: Wall-clock is deliberately not the coordinate. The design's intent is that
+#: each subsequent turn differentially assigns decay: items the conversation
+#: keeps reaching for stay warm, items it has moved past cool. A seconds-based
+#: half-life cannot express that — an ingest runs in minutes, so ``elapsed``
+#: rounds to nothing and *every* item keeps a decay factor of ~1.0 regardless
+#: of whether the conversation touched it. That is the same defect the old
+#: ``recency`` term had: a discriminator that evaluates to a constant.
+#:
+#: 30 turns puts the tier boundaries inside a single conversation. An ordinary
+#: item (seed 0.5) falls to COLD after one half-life untouched; an important
+#: one (seed 0.8) after ~1.68, i.e. ~50 turns. Against the 283-turn build
+#: transcript and 200-600-turn LoCoMo conversations that discriminates across
+#: the whole range. It is now a **sweepable** parameter for the first time,
+#: because a run advances the coordinate on its own.
+DEFAULT_HALF_LIFE_TURNS = 30.0
 
 _CONTENT_WHITESPACE_RE = re.compile(r"\s+")
 
@@ -141,10 +157,18 @@ class MemoryItem(BaseModel):
     supersedes: Optional[str] = None
     pin: PinState = PinState.NONE
     energy: float = 0.5
-    half_life_s: float = DEFAULT_HALF_LIFE_S
+    half_life_turns: float = DEFAULT_HALF_LIFE_TURNS
     importance: float = 0.5
     created_at: datetime = Field(default_factory=_now)
+    #: Wall-clock timestamp of the last access. **Audit only** — it is shown to
+    #: humans and never read by :mod:`memory_condense.decay`. The decay
+    #: coordinate is ``last_access_turn``.
     last_access_at: datetime = Field(default_factory=_now)
+    #: Conversation turn at which this item was last created or recalled. This
+    #: is what decay counts from. ``MemoryStore.create`` stamps it with the
+    #: store's current turn; a bare ``MemoryItem`` defaults to 0, which matches
+    #: the default ``now_turn`` of 0 and so decays by nothing.
+    last_access_turn: int = 0
     embedding: Optional[list[float]] = None
 
     model_config = {"frozen": True}

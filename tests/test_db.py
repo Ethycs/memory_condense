@@ -75,8 +75,11 @@ class TestFreshDatabase:
     def test_reopening_is_idempotent(self, tmp_path):
         path = tmp_path / "reopen.db"
         with Database(path) as db:
+            # Columns named explicitly: a bare VALUES list breaks on every
+            # additive migration, which is the normal kind.
             db.execute(
-                "INSERT INTO turns VALUES ('t1', 'user', 'hello', '2026-01-01T00:00:00+00:00')"
+                "INSERT INTO turns (turn_id, role, text, created_at, ordinal)"
+                " VALUES ('t1', 'user', 'hello', '2026-01-01T00:00:00+00:00', 1)"
             )
             db.commit()
         with Database(path) as db:
@@ -185,6 +188,106 @@ class TestSchemaParity:
         with Database(tmp_path / "fresh2.db") as db:
             fresh = self._shape(db)
         assert fresh == self._migrated(tmp_path, v2_sql, "from_v2.db")
+
+
+class TestV4TurnCoordinateBackfill:
+    """v4 moves decay from wall-clock seconds to conversation turns.
+
+    Shape parity is covered above; what it cannot catch is whether the
+    *values* the backfill writes are sane. Getting this wrong is silent data
+    loss dressed up as decay: a store upgraded with every item stamped at turn
+    0 would report its entire memory as COLD the moment it reopened.
+    """
+
+    @pytest.fixture
+    def v3_db_path(self, tmp_path):
+        from memory_condense.db import _MIGRATIONS
+
+        path = tmp_path / "v3.db"
+        sql = (
+            _V1_SCHEMA.replace(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '1');", ""
+            )
+            + _MIGRATIONS[2].replace(
+                "UPDATE meta SET value = '2' WHERE key = 'schema_version';", ""
+            )
+            + _MIGRATIONS[3].replace(
+                "UPDATE meta SET value = '3' WHERE key = 'schema_version';",
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '3');",
+            )
+        )
+        conn = sqlite3.connect(str(path))
+        conn.executescript(sql)
+        for i in range(5):
+            conn.execute(
+                "INSERT INTO turns (turn_id, role, text, created_at)"
+                " VALUES (?, 'user', ?, ?)",
+                (f"t{i}", f"turn {i}", f"2026-01-0{i + 1}T00:00:00+00:00"),
+            )
+        conn.execute(
+            "INSERT INTO memory_items (mem_id, type, content, energy, importance,"
+            " created_at, last_access_at) VALUES"
+            " ('m1', 'Decision', 'use SQLite', 0.8, 0.9,"
+            " '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_turns_are_numbered_in_insertion_order(self, v3_db_path):
+        with Database(v3_db_path) as db:
+            rows = db.execute(
+                "SELECT turn_id, ordinal FROM turns ORDER BY ordinal"
+            ).fetchall()
+        assert rows == [(f"t{i}", i + 1) for i in range(5)]
+
+    def test_ordinals_start_at_one_so_zero_still_means_never_stamped(
+        self, v3_db_path
+    ):
+        with Database(v3_db_path) as db:
+            assert db.execute("SELECT MIN(ordinal) FROM turns").fetchone()[0] == 1
+
+    def test_current_turn_reads_the_backfilled_clock(self, v3_db_path):
+        with Database(v3_db_path) as db:
+            assert db.current_turn() == 5
+
+    def test_existing_memories_enter_fresh_not_cold(self, v3_db_path):
+        """The whole point of backfilling to the latest turn rather than 0."""
+        from memory_condense import decay
+        from memory_condense.memory_store import MemoryStore
+
+        with Database(v3_db_path) as db:
+            item = MemoryStore(db).get("m1")
+            assert item.last_access_turn == 5
+            assert decay.item_heat(item, now_turn=db.current_turn()) is not (
+                decay.Heat.COLD
+            )
+
+    def test_an_empty_transcript_leaves_the_clock_at_zero(self, tmp_path):
+        with Database(tmp_path / "empty.db") as db:
+            assert db.current_turn() == 0
+
+    def test_appending_advances_the_clock(self, tmp_path):
+        from memory_condense.transcript_store import TranscriptStore
+
+        with Database(tmp_path / "advance.db") as db:
+            store = TranscriptStore(db)
+            for i in range(3):
+                store.append("user", f"hello {i}")
+            assert db.current_turn() == 3
+
+    def test_the_clock_is_max_not_count(self, tmp_path):
+        """A count would renumber backwards if a row ever went missing, aging
+        every memory item at once. MAX only ever moves forward."""
+        from memory_condense.transcript_store import TranscriptStore
+
+        with Database(tmp_path / "gap.db") as db:
+            store = TranscriptStore(db)
+            for i in range(4):
+                store.append("user", f"hello {i}")
+            db.execute("DELETE FROM turns WHERE ordinal = 2")
+            db.commit()
+            assert db.current_turn() == 4
 
 
 class TestConstraints:

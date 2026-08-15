@@ -153,10 +153,11 @@ def _describe(item: MemoryItem, heat: Heat | None = None) -> str:
     tier shown matches the tier counted — the HOT cap is pool-relative, so an
     item tiered on its own can read HOT while the store reports it as WARM."""
     pin = " PINNED" if item.is_pinned else ""
-    tier = heat if heat is not None else item_heat(item)
+    turn = _condense().transcript.current_turn()
+    tier = heat if heat is not None else item_heat(item, now_turn=turn)
     return (
         f"[{item.mem_id[:8]}] [{item.type.value}] {tier.value} "
-        f"e={item_energy(item):.2f}{pin}  {item.content}"
+        f"e={item_energy(item, now_turn=turn):.2f}{pin}  {item.content}"
     )
 
 
@@ -352,7 +353,7 @@ def memory_stats() -> str:
     heat = condenser.heat_counts()
     items = condenser.memory.list_items()
     pinned = sum(1 for i in items if i.is_pinned)
-    tiers = heat_map(items)
+    tiers = heat_map(items, now_turn=condenser.transcript.current_turn())
 
     lines = [
         f"Store: {_data_dir()}",

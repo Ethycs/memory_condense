@@ -70,12 +70,15 @@ class TestBestF1:
 class _FakeStore:
     """Chunk retrieval by token overlap; no embeddings, no downloads."""
 
-    def __init__(self, sample, mode, items=()):
+    def __init__(self, sample, mode, items=(), now_turn=100):
         self.texts = [t for _, t in sample.turns if t]
         self.mode = mode
         self._items = list(items)
         self.closed = False
         self.memory = SimpleNamespace(list_items=lambda: self._items)
+        # Decay counts turns, so the survival projection needs to know where
+        # the conversation is. 100 stands in for "a conversation has happened".
+        self.transcript = SimpleNamespace(current_turn=lambda: now_turn)
 
     def _rank(self, query, k):
         q = set(query.lower().split())
@@ -107,7 +110,8 @@ def _ingest_fn(items=()):
     return fn
 
 
-def _item(content: str, days_old: float, importance: float = 0.8):
+def _item(content: str, turns_old: float, importance: float = 0.8):
+    """A memory item last accessed ``turns_old`` turns before turn 100."""
     op = CreateOp(
         type=MemoryType.DECISION,
         content=content,
@@ -122,7 +126,7 @@ def _item(content: str, days_old: float, importance: float = 0.8):
         provenance=op.provenance,
         importance=importance,
         energy=decay.seed_energy(importance),
-        last_access_at=decay.now_utc() - timedelta(days=days_old),
+        last_access_turn=int(100 - turns_old),
     )
 
 
@@ -210,12 +214,13 @@ class TestCostIsMeasuredAlongsideRecall:
 
 
 class TestDecaySurvival:
-    """The measurement Phase 4's gate asked for, without touching a clock.
+    """The measurement Phase 4's gate asked for.
 
-    `08 - Analysis/01` showed COLD is unreachable in a live run — an item needs
-    7–11.75 days of no access and a run lasts minutes. Replaying decay forward
-    over recorded items answers the question without waiting or injecting a
-    clock into the live path.
+    Before schema v4 this could not work: decay counted wall-clock seconds, an
+    item needed 7-11.75 days of no access to reach COLD, and a run lasted
+    minutes — so horizon 0 was always "everything survives" and the far
+    horizons were always 0.0% by arithmetic. Decay now counts turns, so the
+    run advances the coordinate itself and horizon 0 is a real reading.
     """
 
     def test_a_fresh_item_holds_the_answer_now_and_loses_it_later(self):
@@ -223,23 +228,52 @@ class TestDecaySurvival:
         report = run_recall(
             [SAMPLE],
             config,
-            ingest_fn=_ingest_fn([_item("Storage is SQLite.", days_old=0)]),
-            horizons_days=(0, 7, 14, 30),
+            ingest_fn=_ingest_fn([_item("Storage is SQLite.", turns_old=0)]),
+            horizons_turns=(0, 15, 30, 45),
         )
 
         assert report.survival_by_horizon[0] == 1.0
-        # importance 0.8 seeds energy 0.8, which reaches COLD at 11.75 days.
-        assert report.survival_by_horizon[7] == 1.0
-        assert report.survival_by_horizon[14] == 0.0
-        assert report.survival_by_horizon[30] == 0.0
+        # importance 0.8 seeds energy 0.8, which reaches COLD at ~50 turns.
+        assert report.survival_by_horizon[15] == 1.0
+        assert report.survival_by_horizon[30] == 1.0
+        assert report.survival_by_horizon[45] == 1.0
+
+    def test_an_important_item_outlives_an_ordinary_one(self):
+        """The horizons must actually separate the two seed levels.
+
+        The old day-based set could not do this: two of its four entries were
+        past the theoretical ceiling for any unpinned item, so they reported
+        0.0% regardless of what the store held.
+        """
+        config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
+        ordinary = run_recall(
+            [SAMPLE],
+            config,
+            ingest_fn=_ingest_fn(
+                [_item("Storage is SQLite.", turns_old=0, importance=0.2)]
+            ),
+            horizons_turns=(0, 45),
+        )
+        important = run_recall(
+            [SAMPLE],
+            config,
+            ingest_fn=_ingest_fn(
+                [_item("Storage is SQLite.", turns_old=0, importance=0.9)]
+            ),
+            horizons_turns=(0, 45),
+        )
+
+        assert ordinary.survival_by_horizon[0] == 1.0
+        assert ordinary.survival_by_horizon[45] == 0.0
+        assert important.survival_by_horizon[45] == 1.0
 
     def test_an_already_cold_item_never_counts(self):
         config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
         report = run_recall(
             [SAMPLE],
             config,
-            ingest_fn=_ingest_fn([_item("Storage is SQLite.", days_old=60)]),
-            horizons_days=(0, 30),
+            ingest_fn=_ingest_fn([_item("Storage is SQLite.", turns_old=200)]),
+            horizons_turns=(0, 45),
         )
         assert report.survival_by_horizon[0] == 0.0
 
@@ -253,13 +287,13 @@ class TestDecaySurvival:
 
     def test_measuring_does_not_reheat(self):
         """A measurement must not make the thing it measures hotter."""
-        item = _item("Storage is SQLite.", days_old=5)
-        before = (item.energy, item.last_access_at)
+        item = _item("Storage is SQLite.", turns_old=5)
+        before = (item.energy, item.last_access_turn)
 
         config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
         run_recall([SAMPLE], config, ingest_fn=_ingest_fn([item]))
 
-        assert (item.energy, item.last_access_at) == before
+        assert (item.energy, item.last_access_turn) == before
 
 
 def test_report_prints_without_raising(capsys):

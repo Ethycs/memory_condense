@@ -137,28 +137,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k", type=int, default=10, help="Chunks retrieved (0 = no-memory baseline)")
     parser.add_argument("--ef-search", type=int, default=50)
     parser.add_argument(
+        "--mode",
+        choices=["dense", "hybrid", "memory"],
+        default="dense",
+        help=(
+            "What the responder is given: dense chunks (default), "
+            "hybrid BM25+dense chunks, or the packed memory context "
+            "(memory-item header + budgeted expansions)"
+        ),
+    )
+    parser.add_argument(
         "--hybrid",
         action="store_true",
-        help="Blend BM25 lexical retrieval with dense (default: dense only)",
+        help="Deprecated alias for --mode hybrid",
     )
     parser.add_argument(
         "--alpha",
         type=float,
         default=0.65,
-        help="Dense weight for --hybrid (1.0 = pure dense)",
+        help="Dense weight when blending (1.0 = pure dense)",
+    )
+    parser.add_argument(
+        "--k-memories",
+        type=int,
+        default=8,
+        help="Memory items requested for the header in --mode memory",
     )
 
     return parser
 
 
 def config_from_args(args: argparse.Namespace) -> EvalConfig:
+    # --hybrid predates --mode and is kept so the commands in
+    # `docs/02 - Implementation/01` keep working.
+    mode = "hybrid" if args.hybrid and args.mode == "dense" else args.mode
     return EvalConfig(
         chunker=ChunkerConfig(min_tokens=args.min_tokens, max_tokens=args.max_tokens),
         retrieval=RetrievalConfig(
             k=args.k,
             ef_search=args.ef_search,
+            mode=mode,
             hybrid=args.hybrid,
             alpha=args.alpha,
+            k_memories=args.k_memories,
         ),
         judge_model=args.judge_model,
         responder_model=args.responder_model,

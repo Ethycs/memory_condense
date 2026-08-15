@@ -51,7 +51,15 @@ def generate_configs(
             configs.append(
                 EvalConfig(
                     chunker=ChunkerConfig(min_tokens=min_tok, max_tokens=max_tok),
-                    retrieval=RetrievalConfig(k=k, ef_search=ef),
+                    # Carry the base config's retrieval settings forward and
+                    # override only what the grid varies. This used to build
+                    # `RetrievalConfig(k=k, ef_search=ef)` from nothing, which
+                    # silently discarded mode/hybrid/alpha/candidates — so a
+                    # hybrid or memory sweep ran dense, and the saved filename
+                    # did not say so either.
+                    retrieval=base_config.retrieval.model_copy(
+                        update={"k": k, "ef_search": ef}
+                    ),
                     judge_model=base_config.judge_model,
                     responder_model=base_config.responder_model,
                     conversation_dir=base_config.conversation_dir,

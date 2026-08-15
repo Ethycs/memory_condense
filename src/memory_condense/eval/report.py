@@ -17,9 +17,9 @@ def save_run_result(result: EvalRunResult, output_dir: str | Path) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     c = result.config.chunker
     r = result.config.retrieval
-    mode = f"_hybrid{r.alpha:g}" if r.hybrid else ""
     filename = (
-        f"eval_{c.min_tokens}-{c.max_tokens}_k{r.k}_ef{r.ef_search}{mode}_{timestamp}.json"
+        f"eval_{c.min_tokens}-{c.max_tokens}_k{r.k}_ef{r.ef_search}"
+        f"_{r.label}_{timestamp}.json"
     )
     path = output_dir / filename
 

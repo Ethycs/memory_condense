@@ -261,3 +261,135 @@ def test_hybrid_run_filenames_are_distinct(tmp_path):
 
     assert "hybrid" in hybrid.name
     assert "hybrid" not in dense.name
+
+
+# ---------------------------------------------------------------------------
+# Memory mode — the arm that makes build_context / ContextPacker / rank_score
+# measurable at all. Before it existed both eval paths called mc.search
+# directly and exercised none of them.
+# ---------------------------------------------------------------------------
+
+
+def _run_memory_mode(config, tmp_path):
+    from memory_condense.schemas import PackedContext
+
+    with patch("memory_condense.eval.runner.MemoryCondenser") as mock_cls, patch(
+        "memory_condense.eval.responder.litellm"
+    ) as mock_resp, patch("memory_condense.eval.judge.litellm") as mock_judge:
+        mock_resp.completion.side_effect = _mock_responder_completion
+        mock_judge.completion.side_effect = _mock_judge_completion
+
+        mc = mock_cls.return_value.__enter__.return_value
+        mc.heat_counts.return_value = {"HOT": 1, "WARM": 0, "COLD": 0}
+        mc.build_context.return_value = PackedContext(
+            messages=[{"role": "user", "content": "packed"}],
+            memory_header="Relevant memory:\n- [Decision] a\n- [Decision] b",
+            expansions=["excerpt one"],
+            token_counts={"memory_header": 12, "user_text": 3},
+            dropped={"memories": 7},
+        )
+        replay_conversation("t.txt", TWO_TURNS, config, tmp_path / "data")
+        return mock_cls, mc
+
+
+def test_memory_mode_uses_build_context_not_search(tmp_path):
+    config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
+
+    _, mc = _run_memory_mode(config, tmp_path)
+
+    assert mc.build_context.called
+    assert not mc.search.called
+    assert not mc.search_hybrid.called
+
+
+def test_memory_mode_passes_the_configured_recent_window(tmp_path):
+    """build_context defaults to 8 while the chunk arms use recent_window (4).
+
+    Letting the default through would hand the memory arm a 2x larger recent
+    window, and the measured delta would be recency rather than memory.
+    """
+    config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"), recent_window=4)
+
+    _, mc = _run_memory_mode(config, tmp_path)
+
+    assert mc.build_context.call_args.kwargs["recent_turns"] == 4
+
+
+def test_memory_mode_matches_expansion_count_to_k(tmp_path):
+    """Otherwise this compares '3 excerpts + header' against '10 chunks'."""
+    config = EvalConfig(retrieval=RetrievalConfig(k=10, mode="memory"))
+
+    mock_cls, mc = _run_memory_mode(config, tmp_path)
+
+    assert mc.build_context.call_args.kwargs["k_expansions"] == 10
+    assert mock_cls.call_args.kwargs["budget"].max_expansions == 10
+
+
+def test_memory_mode_turns_extraction_on(tmp_path):
+    """In memory mode the extractor is the thing under test, not dead cost."""
+    config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
+    mock_cls, _ = _run_memory_mode(config, tmp_path)
+    assert mock_cls.call_args.kwargs["auto_extract"] is True
+
+
+def test_dense_mode_leaves_extraction_off(tmp_path):
+    config = EvalConfig(retrieval=RetrievalConfig(k=3))
+    with patch("memory_condense.eval.runner.MemoryCondenser") as mock_cls, patch(
+        "memory_condense.eval.responder.litellm"
+    ) as mock_resp, patch("memory_condense.eval.judge.litellm") as mock_judge:
+        mock_resp.completion.side_effect = _mock_responder_completion
+        mock_judge.completion.side_effect = _mock_judge_completion
+        mock_cls.return_value.__enter__.return_value.search.return_value = []
+        replay_conversation("t.txt", TWO_TURNS, config, tmp_path / "data")
+
+    assert mock_cls.call_args.kwargs["auto_extract"] is False
+
+
+def test_memory_mode_records_the_header_drop_count(tmp_path):
+    """The per-turn measurement behind the header-budget finding."""
+    config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
+
+    with patch("memory_condense.eval.runner.MemoryCondenser") as mock_cls, patch(
+        "memory_condense.eval.responder.litellm"
+    ) as mock_resp, patch("memory_condense.eval.judge.litellm") as mock_judge:
+        from memory_condense.schemas import PackedContext
+
+        mock_resp.completion.side_effect = _mock_responder_completion
+        mock_judge.completion.side_effect = _mock_judge_completion
+        mc = mock_cls.return_value.__enter__.return_value
+        mc.heat_counts.return_value = {"HOT": 2, "WARM": 1, "COLD": 0}
+        mc.build_context.return_value = PackedContext(
+            messages=[{"role": "user", "content": "packed"}],
+            memory_header="Relevant memory:\n- [Decision] a\n- [Decision] b",
+            token_counts={"memory_header": 12},
+            dropped={"memories": 7},
+        )
+        result = replay_conversation("t.txt", TWO_TURNS, config, tmp_path / "data")
+
+    scored = result.turn_results[-1]
+    assert scored.memories_dropped == 7
+    assert scored.memory_items_packed == 2
+    assert scored.heat_counts == {"HOT": 2, "WARM": 1, "COLD": 0}
+    assert scored.context_tokens == 12
+
+
+def test_memory_run_filenames_are_distinct_from_dense(tmp_path):
+    """The two arms of the decision run must not differ only by timestamp."""
+    from memory_condense.eval.report import save_run_result
+    from memory_condense.eval.schemas import EvalRunResult
+
+    def _result(mode: str) -> EvalRunResult:
+        return EvalRunResult(
+            config=EvalConfig(retrieval=RetrievalConfig(k=10, mode=mode)),
+            conversations=[],
+            aggregate_mean_score=0.0,
+            aggregate_recall_at_4=0.0,
+            run_timestamp="2026-08-15T00:00:00+00:00",
+        )
+
+    dense = save_run_result(_result("dense"), tmp_path)
+    memory = save_run_result(_result("memory"), tmp_path)
+
+    assert "memory" in memory.name
+    assert "dense" in dense.name
+    assert dense.name != memory.name

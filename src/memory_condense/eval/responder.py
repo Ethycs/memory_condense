@@ -50,6 +50,39 @@ def build_prompt(
     return messages
 
 
+def generate_from_messages(
+    messages: list[dict[str, str]],
+    model: str = DEFAULT_RESPONDER_MODEL,
+    temperature: float = 0.3,
+    max_tokens: int = 1024,
+) -> tuple[str, UsageStats]:
+    """Generate from an already-assembled messages list.
+
+    Exists so the memory arm can send what ``ContextPacker`` produced rather
+    than re-deriving a prompt: ``build_context`` returns a budgeted
+    ``PackedContext.messages``, and the whole point of measuring that arm is
+    to send exactly those tokens.
+
+    Returns ``(generated_text, usage)``.
+    """
+    start = time.perf_counter()
+    response = litellm.completion(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        num_retries=5,
+    )
+    elapsed = time.perf_counter() - start
+
+    usage = UsageStats.from_litellm(response, elapsed)
+    try:
+        text = (response.choices[0].message.content or "").strip()
+    except (AttributeError, IndexError, TypeError):
+        text = ""
+    return text, usage
+
+
 def generate_response_with_usage(
     user_text: str,
     retrieved: list[RetrievalResult],
@@ -65,20 +98,12 @@ def generate_response_with_usage(
     The default responder is Claude Haiku 4.5, which accepts sampling
     parameters, so ``temperature`` is still passed here (unlike the judge).
     """
-    messages = build_prompt(user_text, retrieved, recent_turns)
-
-    start = time.perf_counter()
-    response = litellm.completion(
+    return generate_from_messages(
+        build_prompt(user_text, retrieved, recent_turns),
         model=model,
-        messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        num_retries=5,
     )
-    elapsed = time.perf_counter() - start
-
-    usage = UsageStats.from_litellm(response, elapsed)
-    return response.choices[0].message.content.strip(), usage
 
 
 def generate_response(

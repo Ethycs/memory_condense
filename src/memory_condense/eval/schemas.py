@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -95,18 +95,54 @@ class ChunkerConfig(BaseModel):
     model_config = {"frozen": True}
 
 
+#: What the responder is given.
+#:
+#: * ``dense``  — top-k chunks by cosine (the historical baseline)
+#: * ``hybrid`` — the same, with BM25 blended in
+#: * ``memory`` — ``MemoryCondenser.build_context``: the memory-item header,
+#:   verbatim expansions, and the recent window, all token-budgeted
+#:
+#: One field rather than a second boolean because ``hybrid=False,
+#: memory=True`` is not a meaningful cell — the memory arm decides internally
+#: whether its expansions are hybrid.
+#:
+#: **This is what makes the memory layer measurable at all.** Until it existed
+#: both eval paths called ``mc.search``/``mc.search_hybrid`` directly, so
+#: ``ContextPacker``, ``MemoryStore.retrieve``, ``rank_score`` and ``decay``
+#: were exercised by no run.
+RetrievalMode = Literal["dense", "hybrid", "memory"]
+
+
 class RetrievalConfig(BaseModel):
     k: int = 10
     ef_search: int = 50
+    mode: RetrievalMode = "dense"
     #: Blend BM25 lexical candidates with the dense ones. Off by default so the
     #: k=0/k=N ablation keeps measuring the same dense baseline as before.
+    #: Kept alongside ``mode`` for wire compatibility with runs saved before it
+    #: existed; ``effective_hybrid`` is what code should read.
     hybrid: bool = False
-    #: Dense weight when ``hybrid`` is on (1.0 == pure dense).
+    #: Dense weight when hybrid blending is on (1.0 == pure dense).
     alpha: float = 0.65
     #: Candidate pool size per side before reranking.
     candidates: int = 100
+    #: Memory items requested for the header in ``memory`` mode.
+    k_memories: int = 8
 
     model_config = {"frozen": True}
+
+    @property
+    def effective_hybrid(self) -> bool:
+        return self.mode == "hybrid" or self.hybrid
+
+    @property
+    def label(self) -> str:
+        """Short tag for filenames and run tables."""
+        if self.mode == "memory":
+            return f"memory{self.k_memories}"
+        if self.effective_hybrid:
+            return f"hybrid{self.alpha:g}"
+        return "dense"
 
 
 class EvalConfig(BaseModel):
@@ -136,6 +172,14 @@ class TurnResult(BaseModel):
     judge_usage: UsageStats = Field(default_factory=UsageStats)
     retrieval_s: float = 0.0  # time spent inside mc.search
     context_tokens: int = 0  # tiktoken count of the assembled responder prompt
+
+    # Memory-mode instrumentation. Zero in dense/hybrid mode, where no memory
+    # items are consulted. `memories_dropped` is the per-turn measurement
+    # behind `08 - Analysis/01`'s header-budget finding — without it that
+    # number stays an offline estimate rather than a run artifact.
+    memory_items_packed: int = 0
+    memories_dropped: int = 0
+    heat_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class ConversationResult(BaseModel):

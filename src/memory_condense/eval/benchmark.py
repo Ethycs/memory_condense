@@ -31,6 +31,7 @@ from typing import Callable, Optional, Protocol
 from pydantic import BaseModel, Field
 
 from memory_condense.condenser import MemoryCondenser
+from memory_condense.context_packer import ContextBudget
 from memory_condense.eval.schemas import EvalConfig
 from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
 
@@ -51,6 +52,10 @@ class SupportsSearch(Protocol):
 
     :class:`memory_condense.condenser.MemoryCondenser` satisfies this; tests
     can substitute a fake to avoid downloading an embedding model.
+
+    ``search_hybrid`` and ``build_context`` are only called in their
+    corresponding modes, so a fake that implements ``search`` alone remains
+    valid for the dense arm.
     """
 
     def search(self, query: str, k: int = ..., ef_search: int = ...): ...
@@ -229,15 +234,22 @@ def ingest_sample(
 
     The caller owns the returned condenser and must ``close()`` it.
     """
-    # auto_extract is off for the same reason as in runner.py: the QA prompt is
-    # built from retrieved chunks, not memory items, so extraction would cost
-    # time per ingest without changing a single score. Haystacks are large —
-    # this matters more here than in the replay eval.
+    # auto_extract follows the mode, as in runner.py: in dense/hybrid mode the
+    # QA prompt is built from retrieved chunks and extraction would cost time
+    # per ingest without changing a single score. Haystacks are large, so this
+    # matters more here than in the replay eval — and in memory mode it is the
+    # dominant local cost, which is why --max-samples exists.
+    memory_mode = config.retrieval.mode == "memory"
     mc = MemoryCondenser(
         data_dir=data_dir,
         chunker_min_tokens=config.chunker.min_tokens,
         chunker_max_tokens=config.chunker.max_tokens,
-        auto_extract=False,
+        auto_extract=memory_mode,
+        budget=(
+            ContextBudget(max_expansions=max(config.retrieval.k, 1))
+            if memory_mode
+            else None
+        ),
     )
     for role, text in sample.turns:
         if text:
@@ -287,21 +299,51 @@ def answer_question(
     config: EvalConfig,
     answer_fn: AnswerFn,
 ) -> tuple[str, list[str]]:
-    """Retrieve top-k chunks for ``question`` and answer from them.
+    """Assemble context for ``question`` and answer from it.
 
-    Returns ``(answer_text, retrieved_chunk_texts)``.
+    In ``dense``/``hybrid`` mode the context is the top-k chunks. In ``memory``
+    mode it is what ``build_context`` produces — the memory-item header plus
+    budgeted verbatim expansions — which is the only way this harness exercises
+    ``ContextPacker``, ``MemoryStore.retrieve``, ``rank_score`` or ``decay``.
+
+    Returns ``(answer_text, context_texts)``.
     """
-    retrieved = mc.search(
-        question.question,
-        k=config.retrieval.k,
-        ef_search=config.retrieval.ef_search,
-    )
-    chunk_texts = [r.chunk.text for r in retrieved]
+    if config.retrieval.mode == "memory":
+        packed = mc.build_context(
+            question.question,
+            # A haystack is not a live conversation: its "last 8 turns" are an
+            # arbitrary slice of someone else's dialogue and would be noise in
+            # the prompt. The QA protocol wants retrieved context only.
+            recent_turns=0,
+            k_memories=config.retrieval.k_memories,
+            k_expansions=config.retrieval.k,
+            hybrid=config.retrieval.effective_hybrid,
+        )
+        # `expansions` is already rendered text, unlike the chunk arms'
+        # RetrievalResult objects.
+        context_texts = [t for t in [packed.memory_header] if t]
+        context_texts += list(packed.expansions)
+    elif config.retrieval.effective_hybrid:
+        retrieved = mc.search_hybrid(
+            question.question,
+            k=config.retrieval.k,
+            ef_search=config.retrieval.ef_search,
+            candidates=config.retrieval.candidates,
+            alpha=config.retrieval.alpha,
+        )
+        context_texts = [r.chunk.text for r in retrieved]
+    else:
+        retrieved = mc.search(
+            question.question,
+            k=config.retrieval.k,
+            ef_search=config.retrieval.ef_search,
+        )
+        context_texts = [r.chunk.text for r in retrieved]
 
-    messages = build_qa_prompt(question.question, chunk_texts)
+    messages = build_qa_prompt(question.question, context_texts)
     answer = answer_fn(messages)
 
-    return (answer or "").strip(), chunk_texts
+    return (answer or "").strip(), context_texts
 
 
 # ---------------------------------------------------------------------------
@@ -494,9 +536,12 @@ def save_benchmark_report(
     c = result.config.chunker
     r = result.config.retrieval
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", result.benchmark) or "benchmark"
+    # The mode is in the name because the two arms of the decision run are
+    # otherwise distinguishable only by timestamp — and picking the wrong file
+    # out of eval_results/ inverts the result you report.
     filename = (
         f"benchmark_{name}_{c.min_tokens}-{c.max_tokens}"
-        f"_k{r.k}_ef{r.ef_search}_{timestamp}.json"
+        f"_k{r.k}_ef{r.ef_search}_{r.label}_{timestamp}.json"
     )
     path = output_dir / filename
 

@@ -9,8 +9,13 @@ from pathlib import Path
 
 from memory_condense._tokenizer import count_tokens
 from memory_condense.condenser import MemoryCondenser
+from memory_condense.context_packer import ContextBudget
 from memory_condense.eval.judge import judge_response_with_usage
-from memory_condense.eval.responder import build_prompt, generate_response_with_usage
+from memory_condense.eval.responder import (
+    SYSTEM_PROMPT,
+    build_prompt,
+    generate_from_messages,
+)
 from memory_condense.eval.schemas import (
     ConversationResult,
     EvalConfig,
@@ -44,16 +49,30 @@ def replay_conversation(
     *actual* recorded assistant turn, never the generated one.
     """
     turn_results: list[TurnResult] = []
+    memory_mode = config.retrieval.mode == "memory"
 
-    # auto_extract is off: this eval scores chunk retrieval, and the responder
-    # prompt never reads memory items. Leaving extraction on would add cost per
-    # ingest with zero effect on the metric. Turn it back on only alongside a
-    # responder that actually consumes `build_context`.
+    # auto_extract follows the mode. In dense/hybrid mode the responder prompt
+    # never reads memory items, so extraction would be pure cost; in memory
+    # mode it is the thing under test.
+    #
+    # The budget matters for validity, not just cost. `ContextBudget` caps
+    # expansions at 3 x 250 tokens by default, while the dense arm at k=10
+    # sends ten whole chunks — so at default budget this would compare
+    # "3 excerpts plus a header" against "10 chunks" and call the difference
+    # "memory". Matching max_expansions to k makes the arms comparable; the
+    # per-turn `context_tokens` recorded below is what settles it.
+    budget = (
+        ContextBudget(max_expansions=max(config.retrieval.k, 1))
+        if memory_mode
+        else None
+    )
+
     with MemoryCondenser(
         data_dir=data_dir,
         chunker_min_tokens=config.chunker.min_tokens,
         chunker_max_tokens=config.chunker.max_tokens,
-        auto_extract=False,
+        auto_extract=memory_mode,
+        budget=budget,
     ) as mc:
         # Process turns in pairs: (user, assistant)
         i = 0
@@ -80,9 +99,26 @@ def replay_conversation(
                 # Retrieve from memory (skip if nothing ingested yet)
                 retrieved = []
                 retrieval_s = 0.0
+                packed = None
+                recent = ingested_turns[-config.recent_window :]
+
                 if ingested_turns:
                     retrieval_start = time.perf_counter()
-                    if config.retrieval.hybrid:
+                    if memory_mode:
+                        packed = mc.build_context(
+                            user_text,
+                            system_prompt=SYSTEM_PROMPT,
+                            # Passed explicitly. `build_context` defaults to 8
+                            # while the chunk arm uses config.recent_window
+                            # (4), so leaving it out would silently hand the
+                            # memory arm a 2x larger recent window and the
+                            # measured delta would be recency, not memory.
+                            recent_turns=config.recent_window,
+                            k_memories=config.retrieval.k_memories,
+                            k_expansions=config.retrieval.k,
+                            hybrid=config.retrieval.effective_hybrid,
+                        )
+                    elif config.retrieval.effective_hybrid:
                         retrieved = mc.search_hybrid(
                             user_text,
                             k=config.retrieval.k,
@@ -98,19 +134,15 @@ def replay_conversation(
                         )
                     retrieval_s = time.perf_counter() - retrieval_start
 
-                # Build recent conversation window
-                recent = ingested_turns[-config.recent_window :]
+                if packed is not None:
+                    messages = packed.messages
+                    context_tokens = packed.total_tokens
+                else:
+                    messages = build_prompt(user_text, retrieved, recent)
+                    context_tokens = _prompt_tokens(messages)
 
-                # Measure the context the responder will actually see
-                context_tokens = _prompt_tokens(
-                    build_prompt(user_text, retrieved, recent)
-                )
-
-                # Generate response
-                generated, responder_usage = generate_response_with_usage(
-                    user_text=user_text,
-                    retrieved=retrieved,
-                    recent_turns=recent,
+                generated, responder_usage = generate_from_messages(
+                    messages,
                     model=config.responder_model,
                 )
 
@@ -128,13 +160,30 @@ def replay_conversation(
                         user_text=user_text[:500],
                         actual_response=actual_response[:500],
                         generated_response=generated[:500],
-                        retrieved_chunks=[r.chunk.text[:200] for r in retrieved[:5]],
+                        # `PackedContext.expansions` is already rendered text;
+                        # the chunk arms carry RetrievalResult objects.
+                        retrieved_chunks=(
+                            [t[:200] for t in packed.expansions[:5]]
+                            if packed is not None
+                            else [r.chunk.text[:200] for r in retrieved[:5]]
+                        ),
                         score=score,
                         judge_reasoning=reasoning,
                         responder_usage=responder_usage,
                         judge_usage=judge_usage,
                         retrieval_s=retrieval_s,
                         context_tokens=context_tokens,
+                        memory_items_packed=(
+                            len(packed.memory_header.splitlines()) - 1
+                            if packed is not None and packed.memory_header
+                            else 0
+                        ),
+                        memories_dropped=(
+                            packed.dropped.get("memories", 0)
+                            if packed is not None
+                            else 0
+                        ),
+                        heat_counts=mc.heat_counts() if memory_mode else {},
                     )
                 )
 

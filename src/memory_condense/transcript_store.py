@@ -48,6 +48,27 @@ class TranscriptStore:
         )
         return [self._row_to_turn(r) for r in cur.fetchall()]
 
+    def find_containing(self, text: str) -> Turn | None:
+        """The most recent turn containing ``text`` verbatim, if any.
+
+        Used to give a memory *real* provenance: if the fact was actually said
+        in the conversation, cite that turn rather than manufacturing a new one
+        the memory quotes from itself.
+        """
+        needle = text.strip()
+        if not needle:
+            return None
+        # LIKE's wildcards have to be escaped or a fact containing % or _ would
+        # match turns that never said it.
+        escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        cur = self._db.execute(
+            "SELECT turn_id, role, text, created_at FROM turns "
+            "WHERE text LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT 1",
+            (f"%{escaped}%",),
+        )
+        row = cur.fetchone()
+        return self._row_to_turn(row) if row is not None else None
+
     def count(self) -> int:
         """Return total number of stored turns."""
         cur = self._db.execute("SELECT COUNT(*) FROM turns")

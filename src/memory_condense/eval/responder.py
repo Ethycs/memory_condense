@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import time
+
 import litellm
 
+from memory_condense.eval.schemas import DEFAULT_RESPONDER_MODEL, UsageStats
 from memory_condense.schemas import RetrievalResult
 
 SYSTEM_PROMPT = (
@@ -47,25 +50,57 @@ def build_prompt(
     return messages
 
 
-def generate_response(
+def generate_response_with_usage(
     user_text: str,
     retrieved: list[RetrievalResult],
     recent_turns: list[tuple[str, str]],
-    model: str = "anthropic/claude-3-5-haiku-20241022",
+    model: str = DEFAULT_RESPONDER_MODEL,
     temperature: float = 0.3,
     max_tokens: int = 1024,
-) -> str:
+) -> tuple[str, UsageStats]:
     """Generate a response given memory context and recent conversation.
 
-    Returns the generated response text.
+    Returns (generated_text, usage).
+
+    The default responder is Claude Haiku 4.5, which accepts sampling
+    parameters, so ``temperature`` is still passed here (unlike the judge).
     """
     messages = build_prompt(user_text, retrieved, recent_turns)
 
+    start = time.perf_counter()
     response = litellm.completion(
         model=model,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        num_retries=5,
     )
+    elapsed = time.perf_counter() - start
 
-    return response.choices[0].message.content.strip()
+    usage = UsageStats.from_litellm(response, elapsed)
+    return response.choices[0].message.content.strip(), usage
+
+
+def generate_response(
+    user_text: str,
+    retrieved: list[RetrievalResult],
+    recent_turns: list[tuple[str, str]],
+    model: str = DEFAULT_RESPONDER_MODEL,
+    temperature: float = 0.3,
+    max_tokens: int = 1024,
+) -> str:
+    """Generate a response given memory context and recent conversation.
+
+    Returns the generated response text. Use
+    :func:`generate_response_with_usage` when you also need token/latency
+    accounting.
+    """
+    text, _ = generate_response_with_usage(
+        user_text=user_text,
+        retrieved=retrieved,
+        recent_turns=recent_turns,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return text

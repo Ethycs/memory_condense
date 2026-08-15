@@ -1,7 +1,10 @@
+"""Pydantic schemas for transcript, chunk, memory, and retrieval objects."""
+
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -13,6 +16,11 @@ def _new_id() -> str:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Transcript layer
+# ---------------------------------------------------------------------------
 
 
 class Turn(BaseModel):
@@ -41,9 +49,236 @@ class Chunk(BaseModel):
     model_config = {"frozen": True}
 
 
+# ---------------------------------------------------------------------------
+# Memory layer
+# ---------------------------------------------------------------------------
+
+
+class MemoryType(str, Enum):
+    DECISION = "Decision"
+    PREFERENCE = "Preference"
+    CONSTRAINT = "Constraint"
+    ENTITY = "Entity"
+    DEFINITION = "Definition"
+    TASK = "Task"
+    CORRECTION = "Correction"
+
+
+class MemoryStatus(str, Enum):
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    DELETED = "deleted"
+
+
+class PinState(str, Enum):
+    USER = "user_pinned"
+    SYSTEM = "system_pinned"
+    NONE = "none"
+
+
+class Heat(str, Enum):
+    HOT = "HOT"
+    WARM = "WARM"
+    COLD = "COLD"
+
+
+#: Energy thresholds separating the heat tiers (design defaults).
+HOT_THRESHOLD = 0.75
+WARM_THRESHOLD = 0.25
+
+#: Default half-life for memory energy decay: 7 days.
+DEFAULT_HALF_LIFE_S = 7 * 24 * 3600.0
+
+
+class Provenance(BaseModel):
+    """Pointer from a memory item back to the transcript that justifies it.
+
+    ``quote`` MUST appear verbatim in the referenced turn. The validator
+    rejects any item whose quote cannot be located — this is the rule that
+    keeps LLM-proposed memory from drifting into invention.
+    """
+
+    turn_id: str
+    quote: str
+    chunk_id: Optional[str] = None
+
+    model_config = {"frozen": True}
+
+
+class MemoryItem(BaseModel):
+    """A typed, compact long-term memory unit with mandatory provenance."""
+
+    mem_id: str = Field(default_factory=_new_id)
+    type: MemoryType
+    content: str
+    details: Optional[str] = None
+    provenance: list[Provenance] = Field(default_factory=list)
+    status: MemoryStatus = MemoryStatus.ACTIVE
+    supersedes: Optional[str] = None
+    pin: PinState = PinState.NONE
+    energy: float = 0.5
+    half_life_s: float = DEFAULT_HALF_LIFE_S
+    importance: float = 0.5
+    created_at: datetime = Field(default_factory=_now)
+    last_access_at: datetime = Field(default_factory=_now)
+    embedding: Optional[list[float]] = None
+
+    model_config = {"frozen": True}
+
+    @property
+    def heat(self) -> Heat:
+        """Tier derived from stored energy (not decayed to *now*).
+
+        For the decayed value use ``decay.effective_energy`` first.
+        """
+        from memory_condense.decay import heat_for
+
+        return heat_for(self.energy)
+
+    @property
+    def is_pinned(self) -> bool:
+        return self.pin is not PinState.NONE
+
+
+# ---------------------------------------------------------------------------
+# Memory operations (extraction output schema)
+# ---------------------------------------------------------------------------
+
+
+class CreateOp(BaseModel):
+    """Propose a new memory item."""
+
+    type: MemoryType
+    content: str
+    details: Optional[str] = None
+    provenance: list[Provenance] = Field(default_factory=list)
+    importance: float = 0.5
+
+    model_config = {"frozen": True}
+
+
+class UpdateOp(BaseModel):
+    """Amend an existing item in place (no semantic reversal — use supersede)."""
+
+    mem_id: str
+    content: Optional[str] = None
+    details: Optional[str] = None
+    provenance: list[Provenance] = Field(default_factory=list)
+
+    model_config = {"frozen": True}
+
+
+class SupersedeOp(BaseModel):
+    """Replace an item with a new one; the old item becomes ``superseded``."""
+
+    mem_id: str
+    replacement: CreateOp
+
+    model_config = {"frozen": True}
+
+
+class DeleteOp(BaseModel):
+    """Soft-delete an item (status becomes ``deleted``; the row survives)."""
+
+    mem_id: str
+    reason: Optional[str] = None
+
+    model_config = {"frozen": True}
+
+
+class PinOp(BaseModel):
+    """Pin or unpin an item. Pinned items are exempt from decay."""
+
+    mem_id: str
+    pin: PinState = PinState.USER
+
+    model_config = {"frozen": True}
+
+
+class MemoryOps(BaseModel):
+    """The full set of memory mutations proposed for one turn."""
+
+    create: list[CreateOp] = Field(default_factory=list)
+    update: list[UpdateOp] = Field(default_factory=list)
+    supersede: list[SupersedeOp] = Field(default_factory=list)
+    delete: list[DeleteOp] = Field(default_factory=list)
+    pin: list[PinOp] = Field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not (
+            self.create or self.update or self.supersede or self.delete or self.pin
+        )
+
+    def total_ops(self) -> int:
+        return (
+            len(self.create)
+            + len(self.update)
+            + len(self.supersede)
+            + len(self.delete)
+            + len(self.pin)
+        )
+
+
+class ValidationError(BaseModel):
+    """One rejected operation, with the reason it failed."""
+
+    op_kind: str  # "create" | "update" | "supersede" | "delete" | "pin"
+    reason: str
+    detail: str = ""
+
+
+class ValidationReport(BaseModel):
+    """Outcome of validating a MemoryOps batch against the transcript."""
+
+    accepted: MemoryOps = Field(default_factory=MemoryOps)
+    rejected: list[ValidationError] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.rejected
+
+
+# ---------------------------------------------------------------------------
+# Retrieval results
+# ---------------------------------------------------------------------------
+
+
 class RetrievalResult(BaseModel):
     """A chunk returned from similarity search, with score."""
 
     chunk: Chunk
     score: float
     turn: Optional[Turn] = None
+    dense_score: Optional[float] = None
+    lexical_score: Optional[float] = None
+
+
+class MemoryResult(BaseModel):
+    """A memory item returned from retrieval, with its score breakdown."""
+
+    item: MemoryItem
+    score: float
+    relevance: float = 0.0
+    importance: float = 0.0
+    recency: float = 0.0
+    pin_boost: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Context packing
+# ---------------------------------------------------------------------------
+
+
+class PackedContext(BaseModel):
+    """Deterministically budgeted context ready to send to an LLM."""
+
+    messages: list[dict[str, str]] = Field(default_factory=list)
+    memory_header: str = ""
+    expansions: list[str] = Field(default_factory=list)
+    recent_turns: list[tuple[str, str]] = Field(default_factory=list)
+    token_counts: dict[str, int] = Field(default_factory=dict)
+    dropped: dict[str, int] = Field(default_factory=dict)
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(self.token_counts.values())

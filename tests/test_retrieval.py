@@ -1,9 +1,34 @@
+import json
+
 import numpy as np
 import pytest
 
+from memory_condense.ranking import blend_hybrid
 from memory_condense.retrieval import SimilarityRetriever
 from memory_condense.schemas import Chunk
 from memory_condense.transcript_store import TranscriptStore
+
+DIM = 16
+
+
+def _vector(components: dict[int, float], dim: int = DIM) -> list[float]:
+    """A unit vector with the given axis weights (deterministic embeddings)."""
+    vec = np.zeros(dim, dtype=np.float32)
+    for axis, weight in components.items():
+        vec[axis] = weight
+    norm = float(np.linalg.norm(vec))
+    return (vec / norm).tolist()
+
+
+def _chunk_with(turn_id: str, text: str, embedding: list[float]) -> Chunk:
+    return Chunk(
+        turn_id=turn_id,
+        text=text,
+        start_char=0,
+        end_char=len(text),
+        token_count=len(text.split()),
+        embedding=embedding,
+    )
 
 
 def _make_chunk(turn_id: str, text: str, dim: int = 16) -> Chunk:
@@ -100,3 +125,303 @@ def test_save_and_rebuild(db, tmp_dir):
     results = retriever2.query(query_vec, k=1)
     assert len(results) == 1
     assert results[0].chunk.chunk_id == chunk.chunk_id
+
+
+# ---------------------------------------------------------------------------
+# Hybrid retrieval
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def turn_id(db):
+    return TranscriptStore(db).append("user", "hybrid fixture turn").turn_id
+
+
+@pytest.fixture
+def rescue_corpus(retriever, turn_id):
+    """Three chunks where the exact-keyword hit is the *worst* dense match."""
+    close = _chunk_with(
+        turn_id,
+        "the deployment pipeline runs nightly without supervision",
+        _vector({0: 1.0}),
+    )
+    middling = _chunk_with(
+        turn_id,
+        "we schedule the builds early in the morning",
+        _vector({0: 0.3, 1: 0.954}),
+    )
+    keyword = _chunk_with(
+        turn_id,
+        "the rollback token qx7f2 must be quoted verbatim",
+        _vector({2: 1.0}),
+    )
+    retriever.add_chunks([close, middling, keyword])
+    return close, middling, keyword
+
+
+def test_add_chunks_persists_lexical_weights_and_terms(db, retriever, turn_id):
+    chunk = _make_chunk(turn_id, "kafka kafka broker retention")
+    retriever.add_chunks([chunk])
+
+    raw = db.execute(
+        "SELECT lexical_weights, term_count FROM chunks WHERE chunk_id = ?",
+        (chunk.chunk_id,),
+    ).fetchone()
+    assert json.loads(raw[0]) == {"kafka": 2, "broker": 1, "retention": 1}
+    assert raw[1] == 4
+
+    terms = db.execute(
+        "SELECT COUNT(*) FROM chunk_terms WHERE chunk_id = ?", (chunk.chunk_id,)
+    ).fetchone()[0]
+    assert terms == 3
+
+    # And the hydrated chunk carries them back out.
+    results = retriever.query(np.array(chunk.embedding, dtype=np.float32), k=1)
+    assert results[0].chunk.lexical_weights == {
+        "kafka": 2.0,
+        "broker": 1.0,
+        "retention": 1.0,
+    }
+
+
+def test_readd_does_not_duplicate_chunk_terms(db, retriever, turn_id):
+    chunk = _make_chunk(turn_id, "idempotent kafka broker retention")
+    retriever.add_chunks([chunk])
+    retriever.add_chunks([chunk])
+    retriever.lexical.add_chunks([chunk])
+
+    count = db.execute(
+        "SELECT COUNT(*) FROM chunk_terms WHERE chunk_id = ?", (chunk.chunk_id,)
+    ).fetchone()[0]
+    assert count == 4  # idempotent, kafka, broker, retention
+    assert db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 1
+
+
+def test_hybrid_query_empty_index(retriever):
+    results = retriever.hybrid_query("anything", np.zeros(16, dtype=np.float32), k=5)
+    assert results == []
+
+
+def test_hybrid_query_populates_both_component_scores(retriever, rescue_corpus):
+    _, _, keyword = rescue_corpus
+    results = retriever.hybrid_query(
+        "qx7f2 rollback token", _vector_query({0: 1.0}), k=3, alpha=0.65
+    )
+
+    assert len(results) == 3
+    for r in results:
+        assert r.dense_score is not None
+        assert r.lexical_score is not None
+        assert r.score == pytest.approx(
+            blend_hybrid(r.dense_score, r.lexical_score, 0.65)
+        )
+
+    scores = [r.score for r in results]
+    assert scores == sorted(scores, reverse=True)
+
+    # The keyword chunk carries all the lexical signal.
+    by_id = {r.chunk.chunk_id: r for r in results}
+    assert by_id[keyword.chunk_id].lexical_score == pytest.approx(1.0)
+
+
+def test_hybrid_rescues_exact_keyword_match(retriever, rescue_corpus):
+    close, middling, keyword = rescue_corpus
+    query_vec = _vector_query({0: 1.0})
+
+    dense_order = [r.chunk.chunk_id for r in retriever.query(query_vec, k=3)]
+    assert dense_order == [close.chunk_id, middling.chunk_id, keyword.chunk_id]
+
+    hybrid_order = [
+        r.chunk.chunk_id
+        for r in retriever.hybrid_query("qx7f2", query_vec, k=3, alpha=0.65)
+    ]
+    # The literal token pulls the dense-worst chunk above the middling one.
+    assert hybrid_order.index(keyword.chunk_id) < hybrid_order.index(
+        middling.chunk_id
+    )
+
+
+def test_hybrid_alpha_zero_is_pure_lexical(retriever, rescue_corpus):
+    _, _, keyword = rescue_corpus
+    results = retriever.hybrid_query(
+        "qx7f2", _vector_query({0: 1.0}), k=3, alpha=0.0
+    )
+    assert results[0].chunk.chunk_id == keyword.chunk_id
+    assert results[0].score == pytest.approx(1.0)
+
+
+def test_hybrid_alpha_one_reproduces_dense_ordering(db, retriever, turn_id):
+    chunks = [
+        _chunk_with(
+            turn_id,
+            f"unrelated sentence number {i} about assorted topics",
+            _vector({0: 1.0 - i * 0.15, 1 + i: 0.5}),
+        )
+        for i in range(5)
+    ]
+    retriever.add_chunks(chunks)
+
+    query_vec = _vector_query({0: 1.0})
+    dense = [r.chunk.chunk_id for r in retriever.query(query_vec, k=5)]
+    hybrid = [
+        r.chunk.chunk_id
+        for r in retriever.hybrid_query("assorted topics", query_vec, k=5, alpha=1.0)
+    ]
+    assert hybrid == dense
+
+
+def test_hybrid_respects_k(retriever, rescue_corpus):
+    assert retriever.hybrid_query("qx7f2", _vector_query({0: 1.0}), k=1) != []
+    assert len(retriever.hybrid_query("qx7f2", _vector_query({0: 1.0}), k=1)) == 1
+    assert retriever.hybrid_query("qx7f2", _vector_query({0: 1.0}), k=0) == []
+
+
+def test_hybrid_lexical_only_candidate_is_reachable(retriever, rescue_corpus):
+    """A chunk outside the dense candidate window still surfaces via BM25."""
+    _, _, keyword = rescue_corpus
+    results = retriever.hybrid_query(
+        "qx7f2", _vector_query({0: 1.0}), k=2, candidates=1, alpha=0.4
+    )
+    ids = [r.chunk.chunk_id for r in results]
+    assert keyword.chunk_id in ids
+
+
+def test_delete_chunk_removes_from_both_indexes(db, retriever, rescue_corpus):
+    close, middling, keyword = rescue_corpus
+
+    assert retriever.delete_chunk(keyword.chunk_id) is True
+    assert retriever.lexical.search("qx7f2") == []
+
+    query_vec = _vector_query({0: 1.0})
+    dense_ids = [r.chunk.chunk_id for r in retriever.query(query_vec, k=5)]
+    assert keyword.chunk_id not in dense_ids
+    assert set(dense_ids) == {close.chunk_id, middling.chunk_id}
+
+    hybrid_ids = [
+        r.chunk.chunk_id for r in retriever.hybrid_query("qx7f2", query_vec, k=5)
+    ]
+    assert keyword.chunk_id not in hybrid_ids
+
+    row = db.execute(
+        "SELECT embedding, hnsw_label, term_count FROM chunks WHERE chunk_id = ?",
+        (keyword.chunk_id,),
+    ).fetchone()
+    assert row == (None, None, None)
+
+
+def test_delete_unknown_chunk_returns_false(retriever):
+    assert retriever.delete_chunk("does-not-exist") is False
+
+
+def _vector_query(components: dict[int, float]) -> np.ndarray:
+    return np.array(_vector(components), dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent sessions. Two Claude Code windows on one project open two
+# retrievers on the same store; before labels were allocated through the
+# database this crashed the second writer with
+# "UNIQUE constraint failed: chunks.hnsw_label" on its first ingest.
+# ---------------------------------------------------------------------------
+
+
+def _seed(retriever, db, prefix, n, dim=8):
+    """Add n chunks through `retriever`, returning their ids."""
+    from memory_condense.schemas import Chunk, Turn
+
+    ids = []
+    for i in range(n):
+        turn = Turn(role="user", text=f"{prefix} turn {i}")
+        db.execute(
+            "INSERT OR IGNORE INTO turns (turn_id, role, text, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (turn.turn_id, turn.role, turn.text, turn.created_at.isoformat()),
+        )
+        db.commit()
+        vec = [0.0] * dim
+        vec[i % dim] = 1.0
+        chunk = Chunk(
+            turn_id=turn.turn_id,
+            text=f"{prefix} chunk {i}",
+            start_char=0,
+            end_char=10,
+            token_count=3,
+            embedding=vec,
+        )
+        retriever.add_chunks([chunk])
+        ids.append(chunk.chunk_id)
+    return ids
+
+
+def test_two_retrievers_on_one_store_do_not_collide(tmp_path):
+    """The regression: the second writer used to raise IntegrityError."""
+    from memory_condense.db import Database
+    from memory_condense.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "shared.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    a = SimilarityRetriever(db=db_a, dim=8, index_path=tmp_path / "a.bin")
+    b = SimilarityRetriever(db=db_b, dim=8, index_path=tmp_path / "b.bin")
+
+    _seed(a, db_a, "alpha", 3)
+    _seed(b, db_b, "beta", 3)  # used to raise here
+
+    labels = [
+        r[0]
+        for r in db_a.execute(
+            "SELECT hnsw_label FROM chunks WHERE hnsw_label IS NOT NULL"
+        ).fetchall()
+    ]
+    assert len(labels) == 6
+    assert len(set(labels)) == 6, "labels must be globally unique across processes"
+
+    db_a.close()
+    db_b.close()
+
+
+def test_a_session_adopts_another_sessions_writes(tmp_path):
+    """SQLite is the source of truth, so a live session must reconcile to it."""
+    from memory_condense.db import Database
+    from memory_condense.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "shared.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    a = SimilarityRetriever(db=db_a, dim=8, index_path=tmp_path / "a.bin")
+    b = SimilarityRetriever(db=db_b, dim=8, index_path=tmp_path / "b.bin")
+
+    _seed(a, db_a, "alpha", 2)
+    _seed(b, db_b, "beta", 2)
+
+    probe = _vector_query({0: 1.0})
+    # Each retriever should see all four vectors, not just its own two.
+    assert len(a.query(probe, k=10)) == 4
+    assert len(b.query(probe, k=10)) == 4
+
+    db_a.close()
+    db_b.close()
+
+
+def test_label_counter_repairs_a_store_written_before_it_existed(tmp_path):
+    """Older stores have labels but no counter row; allocation must not reuse them."""
+    from memory_condense.db import Database
+    from memory_condense.retrieval import SimilarityRetriever
+
+    db = Database(tmp_path / "legacy.db")
+    retriever = SimilarityRetriever(db=db, dim=8, index_path=tmp_path / "i.bin")
+    _seed(retriever, db, "old", 3)
+
+    # Simulate a pre-fix store: drop the counter, keep the labels.
+    db.execute("DELETE FROM meta WHERE key = 'next_hnsw_label'")
+    db.commit()
+
+    fresh = SimilarityRetriever(db=db, dim=8, index_path=tmp_path / "i2.bin")
+    _seed(fresh, db, "new", 2)
+
+    labels = [
+        r[0]
+        for r in db.execute(
+            "SELECT hnsw_label FROM chunks WHERE hnsw_label IS NOT NULL"
+        ).fetchall()
+    ]
+    assert len(set(labels)) == len(labels) == 5
+    db.close()

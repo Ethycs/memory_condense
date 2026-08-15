@@ -25,7 +25,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `04 - Reference/00 - Competitive Landscape 2026.md` | — | Not touched this pass |
 | `08 - Analysis/00 - Retrieval Ablation…` | ✅ | Sweep corrected to 54 configs; a position-bin analysis was added and then **retracted the same day** — it does not replicate on the second run pair, and every bin-to-bin difference is inside noise. The aggregate ablation result stands |
 | `08 - Analysis/01 - Extraction and Decay Audit` | **new** | 70.6% of memory items never reach the prompt; COLD is unreachable by construction; the default extractor is 65% spurious `Constraint`s. All free, all previously unmeasured |
-| `07 - Status Reports/…` | ✅ | Two dated handoffs; the earlier one's "expect 48 passed" is superseded by **366** in the later one |
+| `07 - Status Reports/…` | ✅ | Three dated handoffs; **2026-08-15 is the current one** and supersedes the earlier test counts (48 → 366 → 523) |
 
 ## The tree
 
@@ -60,7 +60,7 @@ docs/
 
 ## Where to start
 
-- Resuming cold? → newest file in `07 - Status Reports/`, then the branch note above.
+- Resuming cold? → `07 - Status Reports/2026-08-15_retrieval-measurement-session.md` — the newest handoff, and the one that explains why every pre-2026-08-15 retrieval number came from a single corpus shape.
 - "What does the system do?" → `03 - Architecture/00 - System Overview.md`.
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
@@ -69,16 +69,16 @@ docs/
 
 ## The one distinction this tree tries hardest to keep
 
-**Built ≠ measured.** 407 passing tests prove the memory layer does what it says. They prove nothing about whether it beats the dense-retrieval baseline it sits on. Merging to `main` did not change that, and neither did any of the polish since. Any doc here that claims a benefit without a number in `08 - Analysis` behind it is a bug — report it.
+**Built ≠ measured.** 523 passing tests prove the memory layer does what it says. They prove nothing about whether it beats the dense-retrieval baseline it sits on. Merging to `main` did not change that, and neither did any of the polish since. Any doc here that claims a benefit without a number in `08 - Analysis` behind it is a bug — report it.
 
 ---
 
 **Verification block**: run
 
 ```powershell
-git log --oneline -1                     # expect the merge commit f3edc91 on main
+git log --oneline -1                     # expect f77781b on main
 git status --short                       # expect a clean tree
-pixi run -e dev pytest -q -m "not slow"  # expect 407 passed, 13 deselected
+pixi run -e dev pytest -q -m "not slow"  # expect 523 passed, 13 deselected
 ```
 
-If all three hold, this tree is accurate as far as it goes — which is to say it accurately describes something that has never been benchmarked. The next thing worth doing is not another feature; it is the first `--compare` run, which is free and needs no API key.
+If all three hold, this tree is accurate as far as it goes — which is to say it accurately describes something whose *external* competitiveness has never been measured. Retrieval itself now has numbers: see `07 - Status Reports/2026-08-15`. The next thing worth doing is not another feature; it is `--answer-recall` against the long-form corpus, which is free and needs no API key.

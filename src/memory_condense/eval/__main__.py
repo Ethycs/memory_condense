@@ -38,6 +38,7 @@ from memory_condense.eval.benchmark import (
     save_benchmark_report,
 )
 from memory_condense.eval.judge import JUDGE_MAX_TOKENS
+from memory_condense.eval.recall import print_recall_report, run_recall
 from memory_condense.eval.report import (
     print_run_summary,
     print_sweep_table,
@@ -87,6 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=2,
         metavar=("BASELINE", "TREATMENT"),
         help="Compare two saved eval_results JSON files offline (no API calls)",
+    )
+    parser.add_argument(
+        "--answer-recall",
+        metavar="BENCHMARK_FILE",
+        help=(
+            "Measure whether the gold answer is even reachable from the "
+            "assembled context, and whether it survives simulated decay. "
+            "Ingests and retrieves locally; makes no API calls"
+        ),
     )
 
     # Models — import the defaults so the CLI can never drift from the schema.
@@ -258,6 +268,44 @@ def run_compare(args: argparse.Namespace) -> None:
         print(f"\nPer-turn CSV written to {args.csv}")
 
 
+def run_answer_recall(args: argparse.Namespace) -> None:
+    """Offline: is the gold answer even reachable from the assembled context?
+
+    Free, keyless, and the cheap predictor of the paid comparison — if the
+    memory arm's context holds the answer less often than the dense arm's, no
+    responder can recover the difference.
+    """
+    print(f"Loading benchmark from {args.answer_recall}...")
+    samples = load_benchmark(args.answer_recall, args.benchmark_format)
+    if not samples:
+        print("No samples parsed. Check --benchmark-format.")
+        return
+
+    config = config_from_args(args)
+    print(
+        f"{len(samples)} sample(s); measuring "
+        f"{args.max_samples or len(samples)} in {config.retrieval.mode} mode. "
+        "No API calls will be made."
+    )
+    report = run_recall(
+        samples,
+        config,
+        benchmark=Path(args.answer_recall).stem,
+        max_samples=args.max_samples,
+    )
+    print_recall_report(report)
+
+    if args.csv:
+        rows = ["question_id,category,in_context,best_f1,in_header,in_expansions"]
+        rows += [
+            f"{q.question_id},{q.category},{int(q.in_context)},"
+            f"{q.best_f1:.4f},{int(q.in_memory_header)},{int(q.in_expansions)}"
+            for q in report.questions
+        ]
+        Path(args.csv).write_text("\n".join(rows) + "\n", encoding="utf-8")
+        print(f"Per-question CSV written to {args.csv}")
+
+
 def run_benchmark_mode(args: argparse.Namespace) -> None:
     print(f"Loading benchmark from {args.benchmark_file}...")
     samples = load_benchmark(args.benchmark_file, args.benchmark_format)
@@ -325,21 +373,30 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    modes = [bool(args.compare), bool(args.benchmark_file), bool(args.conversation_dir)]
+    modes = [
+        bool(args.compare),
+        bool(args.answer_recall),
+        bool(args.benchmark_file),
+        bool(args.conversation_dir),
+    ]
     if sum(modes) > 1:
         parser.error(
-            "--compare, --benchmark-file, and --conversation-dir are mutually exclusive"
+            "--compare, --answer-recall, --benchmark-file, and --conversation-dir "
+            "are mutually exclusive"
         )
 
     if args.compare:
         run_compare(args)
+    elif args.answer_recall:
+        run_answer_recall(args)
     elif args.benchmark_file:
         run_benchmark_mode(args)
     elif args.conversation_dir:
         run_replay_mode(args)
     else:
         parser.error(
-            "one of --conversation-dir, --benchmark-file, or --compare is required"
+            "one of --conversation-dir, --benchmark-file, --compare, or "
+            "--answer-recall is required"
         )
 
 

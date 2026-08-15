@@ -5,16 +5,31 @@
 **Supersedes**: the two-mode (single run / sweep) revision, whose flag table listed the now-retired `claude-3-5-haiku-20241022` defaults
 **Depends on**: `00 - Setup and Environment.md` (needs `.env` with `ANTHROPIC_API_KEY` for every mode except `--compare`)
 
-## 0. Four modes
+## 0. Five modes
 
 | Mode | Selector flag | API calls | What it produces |
 | --- | --- | --- | --- |
 | Self-replay | `--conversation-dir <path>` | 2 per scored turn (respond + judge) | `eval_results/eval_*.json` |
 | Sweep | `--conversation-dir <path> --sweep` | 2 × scored turns × **54 configs** | `eval_results/sweep_*.json` |
 | Benchmark QA | `--benchmark-file <path>` | 1 per question (2 with `--use-judge`) | `eval_results/benchmark_*.json` |
+| **Answer reachability** | `--answer-recall <path>` | **none — free** | stdout tables + optional `--csv` |
 | Offline comparison | `--compare BASELINE TREATMENT` | **none — free** | stdout tables + optional `--csv` |
 
-`--conversation-dir`, `--benchmark-file` and `--compare` are **mutually exclusive**; the CLI errors if more than one is given, and errors if none is.
+All five selectors are **mutually exclusive**; the CLI errors if more than one is given, and errors if none is.
+
+### What each retrieval mode measures
+
+`--mode` decides what the responder is given, and it is the difference between measuring chunk retrieval and measuring *this project*:
+
+| `--mode` | Context sent | Exercises |
+| --- | --- | --- |
+| `dense` (default) | top-k chunks by cosine | the retrieval baseline |
+| `hybrid` | the same, with BM25 blended | `lexical.py`, `blend_hybrid` |
+| `memory` | `build_context`: memory-item header + budgeted expansions | `ContextPacker`, `MemoryStore.retrieve`, `rank_score`, `decay` |
+
+Until `memory` existed, **every subsystem in the right-hand column was measured by nothing** — both eval paths called `mc.search` directly. `--hybrid` is kept as a deprecated alias for `--mode hybrid`.
+
+Two defaults are overridden in `memory` mode for validity, not convenience: `recent_turns` is forced to the configured `--recent-window` (`build_context` defaults to 8, and the chunk arms use 4, so the untouched default would make the memory arm win on recency), and `max_expansions` is set to `--k` (the default 3 × 250 tokens would otherwise be compared against ten whole chunks). Compare the arms on the recorded `context_tokens`, not on the flag alone.
 
 ## 1. Input data
 
@@ -57,7 +72,10 @@ Point `--conversation-dir` at a directory of such files; `load_directory` return
 | `--min-tokens` / `--max-tokens` | 120 / 250 | all but compare | Chunker bounds (cl100k tokens) |
 | `--k` | 10 | all but compare | Chunks retrieved per query; **`--k 0` = no-memory baseline** |
 | `--ef-search` | 50 | all but compare | hnswlib query-time ef |
-| `--hybrid` | off | replay, sweep | Blend BM25 lexical candidates with the dense ones. Off by default so the k=0/k=N ablation keeps measuring the same dense baseline |
+| `--mode` | `dense` | replay, sweep, benchmark, answer-recall | `dense` \| `hybrid` \| `memory` — see the table above |
+| `--hybrid` | off | replay, sweep | Deprecated alias for `--mode hybrid` |
+| `--k-memories` | 8 | `--mode memory` | Memory items requested for the header |
+| `--answer-recall` | — | answer-recall | Benchmark file; measures whether the gold answer is reachable at all. **Free** |
 | `--alpha` | 0.65 | replay, sweep | Dense weight when `--hybrid` is on. `1.0` reproduces dense ordering, `0.0` is pure BM25 |
 | `--csv PATH` | — | replay, compare | Per-scored-turn CSV; with `--compare` it writes the **treatment** run |
 
@@ -122,6 +140,31 @@ Grid: `min_tokens ∈ {80,120,180} × max_tokens ∈ {200,300,400} × k ∈ {5,1
 1. **The sweep re-ingests (re-chunks, re-embeds) the whole corpus per config** — self-documented at `sweep.py:78`. 54 configs × corpus embedding time is the dominant local cost. **known rough edge**; cache embeddings per chunker-config if this becomes painful.
 2. **Cost scales with turns × 2 LLM calls × 54.** A full sweep over a 283-turn conversation is ~15k call pairs. Use `--max-conversations 1` first, and read the token totals from a single run before extrapolating.
 3. As of 2026-08-14 **no sweep has ever completed** — `eval_results/` contains only the 4 single-run files from 2026-01-31 (see `08 - Analysis`).
+
+## 6.5 Answer reachability — the free rung before you spend anything
+
+```powershell
+pixi run python -m memory_condense.eval --answer-recall data/locomo10.json --benchmark-format locomo --mode dense
+pixi run python -m memory_condense.eval --answer-recall data/locomo10.json --benchmark-format locomo --mode memory
+```
+
+**No API calls, no key.** Every benchmark question ships a gold answer, so retrieval quality is measurable without generating anything: ingest the haystack, assemble the context the responder *would* see, and ask locally whether the answer is in it.
+
+This is the cheap predictor of the expensive run. **If the memory arm's context contains the answer less often than the dense arm's, no responder can recover the difference** — the paid comparison's outcome is knowable in advance, for free. Run this before §5.
+
+It also settles the question that gated design Phase 4. `08 - Analysis/01` showed COLD is unreachable in a live run: an item needs 7–11.75 days of no access and a run lasts minutes. Rather than inject a clock into the live path, this replays `decay.effective_energy` forward over the recorded items at simulated ages and reports whether the answer is still held by a non-COLD item:
+
+```
+Answer still held by a non-COLD memory item, by simulated age:
+  +  0d  100.0%
+  +  7d  100.0%
+  + 14d    0.0%
+  + 30d    0.0%
+```
+
+That is the shape to look for. An answer that survives to +30d is one cold-tier summarisation would preserve; one that vanishes by +14d is what Phase 4 exists to rescue — or evidence that it was never worth keeping. Measuring is a `--mode memory` run away, and it costs nothing.
+
+Reading the output: `answer present in context` is SQuAD-normalized containment, and `mean best token-F1` is the softer signal that still scores a reworded answer. In `memory` mode the report splits reachability by *where* the answer came from — the memory header or the verbatim expansions — which tells you whether the memory layer is contributing or merely riding on the chunks beside it. Chunk modes report 0% survival by construction: they hold the answer in chunks, not memory items.
 
 ## 7. Offline comparison and CSV export
 

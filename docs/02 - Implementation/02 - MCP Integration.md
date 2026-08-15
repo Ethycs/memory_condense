@@ -125,7 +125,22 @@ Selection is *designed* — and the design is sound — but two of its four mech
 
 So "ingest broadly and let decay sort it out" now describes retrieval as well as `decay.py` — but note what is still true: **the 900-token header remains the binding constraint**, and it is checked after ranking, not instead of it. Decay changes *which* items win the header; it does not change how many fit.
 
-The extraction half is measured too: the default `RuleBasedExtractor` produces **65% `Constraint` and 93% assistant-sourced** items on a 4,554-turn corpus, because its `must|never|always|cannot` pattern fires on ordinary technical modality. `Decision` and `Preference` together account for 8 items out of 4,463. `LLMExtractor` exists and is tested but has no provider binding.
+The extraction half is measured too: the default `RuleBasedExtractor` produces **65% `Constraint` and 93% assistant-sourced** items on a 4,554-turn corpus, because its `must|never|always|cannot` pattern fires on ordinary technical modality. `Decision` and `Preference` together account for 8 items out of 4,463.
+
+### Turning on LLM extraction
+
+`LLMExtractor` now has a provider binding. Set in the server's environment:
+
+| Variable | Values | Default |
+| --- | --- | --- |
+| `MEMORY_CONDENSE_EXTRACTOR` | `rules` · `llm` · `auto` | `rules` |
+| `MEMORY_CONDENSE_LLM_MODEL` | any litellm model string | `anthropic/claude-haiku-4-5` |
+
+`auto` uses the LLM when a key resolves and rules otherwise. **The default stays `rules` on purpose**: auto-extraction fires on every `ingest`, so an LLM default would spend money on every tool call without being asked. The choice, including any fallback, is logged once per process to stderr — visible in the client's MCP logs — because a silent fallback looks like bad extraction rather than a missing key.
+
+Nothing here can fail the server: a missing key, an unknown mode, or an SDK that will not import all return the rule-based extractor. That matters because, as §2 notes, the stdio client does not forward the parent environment, so **no key present is the normal case**. To pass one deliberately, add an `env` block to a user-scoped registration; `.env` in the working directory is also read.
+
+The core package still imports no LLM SDK at module scope — `llm_provider` does `import litellm` inside the function that needs it, and `tests/test_architecture.py` enforces that over the AST rather than trusting a doc.
 
 Consent remains genuinely a user decision: recording every turn of every session should not be inherited from a default.
 

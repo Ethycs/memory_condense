@@ -33,6 +33,7 @@ from mcp.server.fastmcp import FastMCP
 from memory_condense.condenser import MemoryCondenser
 from memory_condense import decay as decay_module
 from memory_condense.decay import heat_map, item_energy, item_heat
+from memory_condense.llm_provider import resolve_extractor
 from memory_condense.schemas import (
     CreateOp,
     Heat,
@@ -72,8 +73,14 @@ def _condense() -> MemoryCondenser:
     global _condenser
     if _condenser is None:
         target = _data_dir()
+        extractor, reason = resolve_extractor()
         logger.info("opening memory store at %s", target)
-        _condenser = MemoryCondenser(data_dir=target)
+        # Logged once per process, to stderr, so the choice is visible in the
+        # client's MCP logs. Falling back to rules when no key is present is
+        # the normal case here — the stdio client does not forward the parent
+        # environment — and a silent fallback would look like bad extraction.
+        logger.info("memory extraction: %s", reason)
+        _condenser = MemoryCondenser(data_dir=target, extractor=extractor)
         atexit.register(_close)
     return _condenser
 

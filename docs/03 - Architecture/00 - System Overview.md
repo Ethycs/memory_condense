@@ -151,7 +151,9 @@ memory_condense is now the full local memory manager the design called for: tran
 
 ## Design axioms (non-negotiable)
 
-1. **Local/API split.** Chunking, embedding, both indexes, the memory state machine, and context packing live locally; the API is generation-only. `import litellm` appears in exactly three files, all under `eval/` (`judge.py`, `responder.py`, `__main__.py`) — `validated` by grep. The core honours this even where an LLM is *useful*: `extractor.LLMExtractor` and `benchmark.run_benchmark` take **injected callables** (`complete`, `answer_fn`, `judge_fn`) instead of importing a provider, so the Phase-2 LLM path exists without a provider dependency reaching the core package.
+1. **Local/API split.** Chunking, embedding, both indexes, the memory state machine, and context packing live locally; the API is generation-only. **No core module imports an LLM SDK at module scope.** `llm_provider.py` is the single seam that binds one, and it does `import litellm` *inside* the function that needs it, so `import memory_condense` still costs nothing and needs no credentials. Everything else takes **injected callables** — `extractor.LLMExtractor(complete=…)`, `benchmark.run_benchmark(answer_fn=…, judge_fn=…)` — so the LLM paths exist without a provider dependency reaching the core.
+
+   This was previously stated as "validated by grep", which is validated exactly once, on the day someone runs it. It is now `tests/test_architecture.py`, checked over the AST (so a docstring mentioning litellm is not an offence) plus a subprocess assertion that importing the package pulls no SDK into `sys.modules`.
 2. **Transcript is append-only**; all derived state (chunks, terms, embeddings, memory) must be reconstructible from it + config.
 3. **Provenance over trust.** Any LLM-written memory must quote real turn spans. This is now enforced code, not intent: `Validator` is the only path into `MemoryStore.apply` used by `MemoryCondenser.extract_memory`.
 4. **One tokenizer proxy**: cl100k_base (`_tokenizer.py`) for all budgeting, regardless of runtime LLM.

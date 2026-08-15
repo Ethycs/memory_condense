@@ -31,6 +31,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from memory_condense import decay
+from memory_condense._tokenizer import count_tokens
 from memory_condense.eval.benchmark import (
     IngestFn,
     ingest_sample,
@@ -47,7 +48,7 @@ DEFAULT_HORIZONS_DAYS = (0, 7, 14, 30)
 
 
 class QuestionRecall(BaseModel):
-    """Whether one question's answer was reachable, and from where."""
+    """Whether one question's answer was reachable, from where, and at what cost."""
 
     question_id: str
     category: str = ""
@@ -55,12 +56,23 @@ class QuestionRecall(BaseModel):
     best_f1: float = 0.0
     in_memory_header: bool = False
     in_expansions: bool = False
+    #: tiktoken count of the assembled context. Load-bearing: condensation's
+    #: claim is *the same answer for fewer tokens*, so recall alone cannot
+    #: show its benefit — and can make a system that spends 10x look better.
+    context_tokens: int = 0
     #: ``{horizon_days: answer_still_in_a_non_cold_item}``
     survives_horizon: dict[int, bool] = Field(default_factory=dict)
 
 
 class RecallReport(BaseModel):
-    """Aggregate answer-reachability for one config over one benchmark."""
+    """Aggregate answer-reachability for one config over one benchmark.
+
+    Reports **recall and cost together**. Condensation's claim is not "finds
+    the answer more often" but "finds it as often for fewer tokens", so a
+    recall-only comparison structurally cannot show its benefit, and rewards
+    whichever arm simply sends more text. ``recall_per_1k_tokens`` is the
+    efficiency figure; ``mean_context_tokens`` is what it is normalised by.
+    """
 
     benchmark: str = ""
     mode: str = "dense"
@@ -70,9 +82,17 @@ class RecallReport(BaseModel):
     mean_best_f1: float = 0.0
     header_recall: float = 0.0
     expansion_recall: float = 0.0
+    mean_context_tokens: float = 0.0
     survival_by_horizon: dict[int, float] = Field(default_factory=dict)
     by_category: dict[str, float] = Field(default_factory=dict)
     questions: list[QuestionRecall] = Field(default_factory=list)
+
+    @property
+    def recall_per_1k_tokens(self) -> float:
+        """Recall points earned per 1,000 tokens of context spent."""
+        if not self.mean_context_tokens:
+            return 0.0
+        return self.recall * 100.0 / (self.mean_context_tokens / 1000.0)
 
 
 def contains_answer(texts: list[str], gold: str) -> bool:
@@ -115,7 +135,13 @@ def _assemble(mc, question: str, config: EvalConfig) -> tuple[list[str], list[st
         header = [packed.memory_header] if packed.memory_header else []
         return header, list(packed.expansions)
 
-    if config.retrieval.effective_hybrid:
+    if config.retrieval.mode == "span":
+        results = mc.search_spans(
+            question,
+            levels=config.retrieval.span_levels,
+            k_per_level=config.retrieval.k_per_level,
+        )
+    elif config.retrieval.effective_hybrid:
         results = mc.search_hybrid(
             question,
             k=config.retrieval.k,
@@ -174,6 +200,7 @@ def measure_sample(
                     best_f1=best_f1(everything, question.answer),
                     in_memory_header=contains_answer(header, question.answer),
                     in_expansions=contains_answer(body, question.answer),
+                    context_tokens=sum(count_tokens(t) for t in everything),
                     survives_horizon=_survival(mc, question.answer, horizons_days),
                 )
             )
@@ -222,6 +249,7 @@ def run_recall(
         mean_best_f1=(sum(r.best_f1 for r in results) / n) if n else 0.0,
         header_recall=_frac(r.in_memory_header for r in results),
         expansion_recall=_frac(r.in_expansions for r in results),
+        mean_context_tokens=(sum(r.context_tokens for r in results) / n) if n else 0.0,
         survival_by_horizon={
             days: _frac(r.survives_horizon.get(days, False) for r in results)
             for days in horizons_days
@@ -250,6 +278,11 @@ def print_recall_report(report: RecallReport) -> None:
     if report.mode == "memory":
         print(f"{'  ...via the memory header':<34}{report.header_recall:>8.1%}")
         print(f"{'  ...via verbatim expansions':<34}{report.expansion_recall:>8.1%}")
+    print()
+    print(f"{'mean context tokens':<34}{report.mean_context_tokens:>8.0f}")
+    print(f"{'recall per 1k tokens':<34}{report.recall_per_1k_tokens:>8.2f}")
+    print("  (condensation wins by costing less, not only by recalling more —")
+    print("   compare arms on this row as well as the one above)")
 
     if report.survival_by_horizon:
         print()

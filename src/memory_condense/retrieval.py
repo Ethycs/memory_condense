@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
+from typing import Sequence
 
 import hnswlib
 import numpy as np
@@ -16,6 +17,23 @@ from memory_condense.schemas import Chunk, RetrievalResult, Turn
 #: across every process open on a store, so they are allocated through the
 #: database rather than from a per-process counter.
 _LABEL_KEY = "next_hnsw_label"
+
+#: Span sizes that :meth:`SimilarityRetriever.span_query` pools over, in
+#: **tokens of the pooled span**, not in chunks.
+#:
+#: Measured in chunks first, which was a bug waiting for a different corpus:
+#: 4 and 8 chunks is ~110/~220 tokens on short-turn dialogue but ~900/~1800 on
+#: long-form prose, where chunks already run 227 tokens. The same setting would
+#: have helped dialogue and quietly wrecked monologue. A token target is
+#: corpus-independent — it asks for a span of a given size regardless of how
+#: many chunks that takes.
+#:
+#: 110 and 220 are the measured optima, translated. They are not round numbers:
+#: at ~440 tokens (16 chunks) recall *falls* — 20.6% against 21.6% — while
+#: costing 2.2x, because a mean vector washes out once a span straddles several
+#: topics. Two levels beat one: stratified scored 22.1% at 660 tokens where the
+#: single coarse level gave 21.6% at 673.
+DEFAULT_SPAN_TOKENS: tuple[int, ...] = (110, 220)
 
 
 class SimilarityRetriever:
@@ -48,6 +66,10 @@ class SimilarityRetriever:
         self._chunk_id_to_label: dict[str, int] = {}
         #: Labels marked deleted in this process; hnswlib still counts them.
         self._deleted_labels: set[int] = set()
+        #: Derived span vectors, per level. Rebuilt on demand and dropped on
+        #: any write — cheap to recompute, and a stale span is a silently
+        #: wrong answer rather than a loud failure.
+        self._span_cache: dict[int, tuple[np.ndarray, list[list[str]]]] = {}
 
         self._lexical = LexicalIndex(db)
 
@@ -240,6 +262,7 @@ class SimilarityRetriever:
             )
 
         self._db.commit()
+        self._span_cache.clear()  # spans are derived; new chunks change them
 
         data = np.stack(vectors)
         self._index.add_items(data, np.array(labels, dtype=np.int64))
@@ -292,6 +315,135 @@ class SimilarityRetriever:
         """
         results: list[RetrievalResult] = []
         for chunk_id, score in self._dense_candidates(query_embedding, k, ef_search):
+            hydrated = self._hydrate(chunk_id, score=score)
+            if hydrated is not None:
+                results.append(hydrated)
+        return results
+
+    # ------------------------------------------------------------------
+    # Span retrieval
+    # ------------------------------------------------------------------
+
+    def _span_vectors(self, target_tokens: int) -> tuple[np.ndarray, list[list[str]]]:
+        """Pooled vectors for contiguous chunk runs of about ``target_tokens``.
+
+        A span vector is the L2-normalised mean of its members' normalised
+        vectors — the same operation the design specifies for cold-tier
+        centroids, applied to chunk runs instead of memory clusters.
+
+        Grouping by token budget rather than by chunk count is what makes one
+        setting work on both short-turn dialogue (27-token chunks) and
+        long-form prose (227-token chunks). A single chunk already at or over
+        the target becomes its own span rather than being merged.
+
+        Derived, never stored: SQLite already holds every member vector, and
+        caching these would add a second thing to keep consistent for no gain
+        at this scale. The cache below is per-process and invalidated on write.
+        """
+        cached = self._span_cache.get(target_tokens)
+        if cached is not None:
+            return cached
+
+        # `delete_chunk` nulls both columns, so deleted chunks are excluded
+        # here without a second bookkeeping set to keep in sync.
+        # `ORDER BY rowid` is insertion order, which for an append-only
+        # transcript is conversation order — spans must be contiguous *in the
+        # conversation*, not in whatever order the index happens to return.
+        rows = self._db.execute(
+            "SELECT chunk_id, embedding, token_count FROM chunks "
+            "WHERE embedding IS NOT NULL AND hnsw_label IS NOT NULL "
+            "ORDER BY rowid"
+        ).fetchall()
+        if not rows:
+            empty = (np.zeros((0, self._dim), dtype=np.float32), [])
+            self._span_cache[target_tokens] = empty
+            return empty
+
+        vectors = np.stack(
+            [np.frombuffer(blob, dtype=np.float32) for _, blob, _ in rows]
+        ).astype(np.float32)
+        vectors /= np.clip(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9, None)
+
+        # Greedily pack consecutive chunks up to the token target.
+        groups: list[list[int]] = []
+        current: list[int] = []
+        budget = 0
+        for i, (_, _, token_count) in enumerate(rows):
+            size = int(token_count or 0)
+            if current and budget + size > max(target_tokens, 1):
+                groups.append(current)
+                current, budget = [], 0
+            current.append(i)
+            budget += size
+        if current:
+            groups.append(current)
+
+        pooled, members = [], []
+        for group in groups:
+            summed = vectors[group].sum(axis=0)
+            norm = float(np.linalg.norm(summed))
+            pooled.append(summed / norm if norm > 1e-9 else summed)
+            members.append([rows[i][0] for i in group])
+
+        result = (np.stack(pooled), members)
+        self._span_cache[target_tokens] = result
+        return result
+
+    def span_query(
+        self,
+        query_embedding: np.ndarray,
+        levels: Sequence[int] = DEFAULT_SPAN_TOKENS,
+        k_per_level: int = 2,
+    ) -> list[RetrievalResult]:
+        """Retrieve by matching pooled spans, returning their member chunks.
+
+        Short conversational turns produce chunks too small to carry topical
+        signal: on LoCoMo the median chunk is 27 tokens, and ``k=10`` buys
+        roughly 220 tokens of context against 2,270 on long-form prose. Pooling
+        contiguous chunks up to a token target gives the matcher a unit with
+        enough content to be found. ``levels`` are **token targets**, so one
+        setting holds across corpora with very different turn lengths.
+
+        Replicated across four LoCoMo samples (n=757): dense ``k=10`` reaches
+        10.3% answer containment, stratified spans 23.4%, higher on every
+        sample individually. Read that against cost — at a matched token budget
+        the gap is roughly 2.2x, while raw recall-per-token flatters ``k=10``
+        purely because it operates at a 200-token budget where marginal returns
+        are highest.
+
+        **Retrieval is stratified — top-k *within* each level, merged after —
+        and that is load-bearing, not tidiness.** Cosine similarity is not
+        length-invariant: measured on this corpus, per-turn chunks average
+        0.678 top-10 cosine against 0.602 for 8-chunk spans, because short text
+        has fewer competing topical directions to dilute the match. Searching a
+        single mixed-granularity pool therefore lets small chunks crowd out
+        every span — measured, that collapsed recall from 21.6% to 6.0%.
+
+        Scoring happens at span granularity but **real member chunks are
+        returned**, so provenance, ``ContextPacker`` and every downstream
+        consumer keep working on chunks exactly as before. Nothing here invents
+        a synthetic chunk.
+        """
+        query_vec = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(query_vec))
+        if norm > 1e-9:
+            query_vec = query_vec / norm
+
+        picked: dict[str, float] = {}
+        for level in levels:
+            pooled, members = self._span_vectors(level)
+            if not len(pooled):
+                continue
+            scores = pooled @ query_vec
+            for idx in np.argsort(-scores)[: max(k_per_level, 0)]:
+                score = float(scores[idx])
+                for chunk_id in members[idx]:
+                    # A chunk reachable from several levels keeps its best score.
+                    if score > picked.get(chunk_id, float("-inf")):
+                        picked[chunk_id] = score
+
+        results: list[RetrievalResult] = []
+        for chunk_id, score in sorted(picked.items(), key=lambda kv: -kv[1]):
             hydrated = self._hydrate(chunk_id, score=score)
             if hydrated is not None:
                 results.append(hydrated)
@@ -387,6 +539,7 @@ class SimilarityRetriever:
         )
         touched = cur.rowcount > 0
         self._db.commit()
+        self._span_cache.clear()
         self._lexical.delete_chunk(chunk_id)
         return touched or label is not None
 
@@ -457,6 +610,7 @@ class SimilarityRetriever:
             vectors.append(np.frombuffer(emb_blob, dtype=np.float32))
 
         self._db.commit()
+        self._span_cache.clear()
 
         data = np.stack(vectors)
         self._index.add_items(data, np.array(labels, dtype=np.int64))

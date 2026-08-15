@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -12,7 +13,7 @@ from memory_condense.embedding import EmbeddingService
 from memory_condense.extractor import Extractor, RuleBasedExtractor
 from memory_condense.memory_store import MemoryStore
 from memory_condense.ranking import DEFAULT_WEIGHTS, RankWeights
-from memory_condense.retrieval import SimilarityRetriever
+from memory_condense.retrieval import DEFAULT_SPAN_TOKENS, SimilarityRetriever
 from memory_condense.schemas import (
     Chunk,
     MemoryResult,
@@ -141,6 +142,31 @@ class MemoryCondenser:
             ef_search=ef_search,
             candidates=candidates,
             alpha=alpha,
+        )
+
+    def search_spans(
+        self,
+        query: str,
+        levels: Sequence[int] = DEFAULT_SPAN_TOKENS,
+        k_per_level: int = 2,
+    ) -> list[RetrievalResult]:
+        """Search pooled spans of contiguous chunks rather than single chunks.
+
+        For short conversational turns this recovers most of what per-chunk
+        search loses: a 27-token turn carries too little topical signal to be
+        matched, while a ~110-220 token span carries enough. ``levels`` are
+        token targets, so the same setting works on corpora whose turns differ
+        by an order of magnitude in length. Returns the member chunks of the
+        winning spans, so callers handle ordinary ``RetrievalResult``s.
+
+        Not the default. It replicates on four LoCoMo samples (10.3% -> 23.4%
+        answer containment, better on every sample), but ``search`` remains the
+        baseline the eval ablations compare against, and nothing has yet
+        measured this on the long-form corpus the original ablation used.
+        """
+        query_embedding = self._embedder.embed_query(query)
+        return self._retriever.span_query(
+            query_embedding, levels=levels, k_per_level=k_per_level
         )
 
     def recall_memories(

@@ -118,6 +118,12 @@ def replay_conversation(
                             k_expansions=config.retrieval.k,
                             hybrid=config.retrieval.effective_hybrid,
                         )
+                    elif config.retrieval.mode == "span":
+                        retrieved = mc.search_spans(
+                            user_text,
+                            levels=config.retrieval.span_levels,
+                            k_per_level=config.retrieval.k_per_level,
+                        )
                     elif config.retrieval.effective_hybrid:
                         retrieved = mc.search_hybrid(
                             user_text,

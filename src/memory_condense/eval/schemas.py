@@ -110,7 +110,10 @@ class ChunkerConfig(BaseModel):
 #: both eval paths called ``mc.search``/``mc.search_hybrid`` directly, so
 #: ``ContextPacker``, ``MemoryStore.retrieve``, ``rank_score`` and ``decay``
 #: were exercised by no run.
-RetrievalMode = Literal["dense", "hybrid", "memory"]
+#: * ``span``   — pools contiguous chunks up to a token target and matches the
+#:   pooled vector, returning member chunks. The arm that matters on short-turn
+#:   dialogue, where a single chunk is too small to carry retrievable signal.
+RetrievalMode = Literal["dense", "hybrid", "memory", "span"]
 
 
 class RetrievalConfig(BaseModel):
@@ -128,6 +131,13 @@ class RetrievalConfig(BaseModel):
     candidates: int = 100
     #: Memory items requested for the header in ``memory`` mode.
     k_memories: int = 8
+    #: Token target per pooled span, per level, in ``span`` mode. Tokens rather
+    #: than chunk counts so one setting holds across corpora whose turns differ
+    #: by an order of magnitude in length.
+    span_levels: tuple[int, ...] = (110, 220)
+    #: Spans taken from each level before merging. Stratified deliberately —
+    #: a single mixed-granularity pool lets short chunks crowd out every span.
+    k_per_level: int = 2
 
     model_config = {"frozen": True}
 
@@ -138,6 +148,9 @@ class RetrievalConfig(BaseModel):
     @property
     def label(self) -> str:
         """Short tag for filenames and run tables."""
+        if self.mode == "span":
+            levels = "-".join(str(x) for x in self.span_levels)
+            return f"span{levels}x{self.k_per_level}"
         if self.mode == "memory":
             return f"memory{self.k_memories}"
         if self.effective_hybrid:

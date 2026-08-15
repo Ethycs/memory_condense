@@ -148,13 +148,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ef-search", type=int, default=50)
     parser.add_argument(
         "--mode",
-        choices=["dense", "hybrid", "memory"],
+        choices=["dense", "hybrid", "memory", "span"],
         default="dense",
         help=(
             "What the responder is given: dense chunks (default), "
-            "hybrid BM25+dense chunks, or the packed memory context "
-            "(memory-item header + budgeted expansions)"
+            "hybrid BM25+dense chunks, the packed memory context "
+            "(memory-item header + budgeted expansions), or pooled spans of "
+            "contiguous chunks (best on short-turn dialogue)"
         ),
+    )
+    parser.add_argument(
+        "--span-levels",
+        default="110,220",
+        help="Comma-separated token targets per span level for --mode span (default 110,220)",
+    )
+    parser.add_argument(
+        "--k-per-level",
+        type=int,
+        default=2,
+        help="Spans taken from each level in --mode span (default 2)",
     )
     parser.add_argument(
         "--hybrid",
@@ -190,6 +202,10 @@ def config_from_args(args: argparse.Namespace) -> EvalConfig:
             hybrid=args.hybrid,
             alpha=args.alpha,
             k_memories=args.k_memories,
+            span_levels=tuple(
+                int(x) for x in str(args.span_levels).split(",") if x.strip()
+            ),
+            k_per_level=args.k_per_level,
         ),
         judge_model=args.judge_model,
         responder_model=args.responder_model,
@@ -296,10 +312,14 @@ def run_answer_recall(args: argparse.Namespace) -> None:
     print_recall_report(report)
 
     if args.csv:
-        rows = ["question_id,category,in_context,best_f1,in_header,in_expansions"]
+        rows = [
+            "question_id,category,in_context,best_f1,in_header,in_expansions,"
+            "context_tokens"
+        ]
         rows += [
             f"{q.question_id},{q.category},{int(q.in_context)},"
-            f"{q.best_f1:.4f},{int(q.in_memory_header)},{int(q.in_expansions)}"
+            f"{q.best_f1:.4f},{int(q.in_memory_header)},{int(q.in_expansions)},"
+            f"{q.context_tokens}"
             for q in report.questions
         ]
         Path(args.csv).write_text("\n".join(rows) + "\n", encoding="utf-8")

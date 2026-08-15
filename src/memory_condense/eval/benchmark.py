@@ -323,6 +323,15 @@ def answer_question(
         # RetrievalResult objects.
         context_texts = [t for t in [packed.memory_header] if t]
         context_texts += list(packed.expansions)
+    elif config.retrieval.mode == "span":
+        context_texts = [
+            r.chunk.text
+            for r in mc.search_spans(
+                question.question,
+                levels=config.retrieval.span_levels,
+                k_per_level=config.retrieval.k_per_level,
+            )
+        ]
     elif config.retrieval.effective_hybrid:
         retrieved = mc.search_hybrid(
             question.question,

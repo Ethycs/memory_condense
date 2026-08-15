@@ -179,6 +179,36 @@ class TestRunRecall:
         assert report.by_category == {"single-session-user": 1.0}
 
 
+class TestCostIsMeasuredAlongsideRecall:
+    """Condensation's claim is fewer tokens, not more hits.
+
+    A recall-only comparison structurally cannot show that, and actively
+    rewards whichever arm sends more text — so cost is reported beside it.
+    """
+
+    def test_context_tokens_are_recorded(self):
+        config = EvalConfig(retrieval=RetrievalConfig(k=3))
+        report = run_recall([SAMPLE], config, ingest_fn=_ingest_fn())
+
+        assert report.mean_context_tokens > 0
+        assert all(q.context_tokens > 0 for q in report.questions)
+
+    def test_recall_per_1k_tokens_rewards_the_cheaper_arm(self):
+        """Equal recall at half the tokens must score twice as efficient."""
+        from memory_condense.eval.recall import RecallReport
+
+        cheap = RecallReport(recall=0.5, mean_context_tokens=1000)
+        pricey = RecallReport(recall=0.5, mean_context_tokens=2000)
+
+        assert cheap.recall_per_1k_tokens == pytest.approx(50.0)
+        assert pricey.recall_per_1k_tokens == pytest.approx(25.0)
+
+    def test_efficiency_is_zero_rather_than_dividing_by_zero(self):
+        from memory_condense.eval.recall import RecallReport
+
+        assert RecallReport(recall=0.5).recall_per_1k_tokens == 0.0
+
+
 class TestDecaySurvival:
     """The measurement Phase 4's gate asked for, without touching a clock.
 

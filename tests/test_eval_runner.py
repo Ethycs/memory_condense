@@ -284,6 +284,7 @@ def _run_memory_mode(config, tmp_path):
         mc.build_context.return_value = PackedContext(
             messages=[{"role": "user", "content": "packed"}],
             memory_header="Relevant memory:\n- [Decision] a\n- [Decision] b",
+            memory_ids=["a", "b"],
             expansions=["excerpt one"],
             token_counts={"memory_header": 12, "user_text": 3},
             dropped={"memories": 7},
@@ -325,6 +326,14 @@ def test_memory_mode_matches_expansion_count_to_k(tmp_path):
     assert mock_cls.call_args.kwargs["budget"].max_expansions == 10
 
 
+def test_memory_mode_uses_hybrid_expansions_by_default(tmp_path):
+    config = EvalConfig(retrieval=RetrievalConfig(k=10, mode="memory"))
+
+    _, mc = _run_memory_mode(config, tmp_path)
+
+    assert mc.build_context.call_args.kwargs["hybrid"] is True
+
+
 def test_memory_mode_turns_extraction_on(tmp_path):
     """In memory mode the extractor is the thing under test, not dead cost."""
     config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
@@ -361,6 +370,7 @@ def test_memory_mode_records_the_header_drop_count(tmp_path):
         mc.build_context.return_value = PackedContext(
             messages=[{"role": "user", "content": "packed"}],
             memory_header="Relevant memory:\n- [Decision] a\n- [Decision] b",
+            memory_ids=["a", "b"],
             token_counts={"memory_header": 12},
             dropped={"memories": 7},
         )

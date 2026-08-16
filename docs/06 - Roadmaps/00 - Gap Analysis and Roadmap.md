@@ -15,7 +15,7 @@ Everything marked ✅ below is **built and unit-tested but not committed**. `git
 | TranscriptStore / Chunker / bge-m3 / ANN index / similarity demo | ✅ Complete |
 | ~~Hybrid sparse retrieval (lexical weights)~~ | ✅ Complete — BM25 (`lexical.py`) + `hybrid_query(alpha=0.65)`; `chunks.lexical_weights` and `chunk_terms` are populated by `add_chunks` |
 | ~~Rerank formula (importance/energy/pins)~~ | ✅ Complete — `ranking.py`. The fourth term was `recency`, computed from a **second copy** of the decay kernel that had drifted from `decay.py` and, because `touch` restamps `last_access_at`, evaluated to a constant 1.0 for every item ever recalled. Collapsed to one kernel; the term is now decayed energy |
-| ~~ContextPacker (token budgets)~~ | ✅ Complete — `context_packer.py`, 4500/900/800, ≤3 expansions × ≤250 tok, drops counted |
+| ~~ContextPacker (token budgets)~~ | ✅ Complete — `context_packer.py`, 4500/900/800, up to 10 ranked expansions × ≤250 tok, aggregate ceiling decisive, drops counted |
 | ~~MemoryItem / MemoryOps / Validator / provenance~~ | ✅ Complete — `schemas.py`, `memory_store.py`, `validator.py`, `extractor.py` |
 | ~~Decay / HOT-WARM-COLD tiering~~ | ✅ Complete **and now wired** — `decay.py` was built in isolation and consumed only by display code; nothing filtered, evicted, or ranked by it. Decayed energy is now the scalar's fourth term, reheat saturates with a refractory window, and the design's HOT cap is enforced at tier derivation |
 | ~~Token + latency instrumentation in eval~~ | ✅ Complete — `UsageStats` through `TurnResult` → `ConversationResult` → `EvalRunResult` |

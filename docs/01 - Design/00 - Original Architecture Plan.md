@@ -93,7 +93,7 @@ All of the above is committed and merged to `main` as of 2026-08-14 (merge `f3ed
 
 Chunk 120–250 tokens · candidate top-100 · memory header ~900 tokens · expansions max 3 × ≤250 tokens · HOT cap ~20 · heat thresholds HOT ≥ 0.75, WARM ≥ 0.25 · pins override decay.
 
-Realized defaults, for reference: `ContextBudget` 4500 / 900 / 800 with ≤3 expansions of ≤250 tokens; `RankWeights` relevance 1.0, importance 0.3, pin 0.5, **energy** 0.2, superseded penalty 1.0; hybrid `alpha` 0.65 (dense weight) over 100 candidates per side; half-life 7 days; reheat closes 25% of remaining headroom with a 300 s refractory window. The design's **HOT cap ~20 is now enforced** (`decay.heat_map`) — pool-relative and applied at tier derivation, so heat stays derived-never-stored.
+Realized defaults, for reference: `ContextBudget` 4500 / 900 / 800 with up to 10 ranked expansions of ≤250 tokens (the 800-token aggregate ceiling decides how many fit); `RankWeights` relevance 1.0, importance 0.3, pin 0.5, **energy** 0.2, superseded penalty 1.0; hybrid `alpha` 0.65 (dense weight) over 100 candidates per side; half-life 30 conversation turns; reheat closes 25% of remaining headroom at most once per turn. The design's **HOT cap ~20 is now enforced** (`decay.heat_map`) — pool-relative and applied at tier derivation, so heat stays derived-never-stored.
 
 Two departures from the plan's wording, both deliberate and both corrections of as-built behaviour:
 

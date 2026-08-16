@@ -42,7 +42,7 @@ Per-turn context is bounded by a constant, so session cost is O(N). There is **n
 
 **Amendment (operator, 2026-08-16)**: occasional expensive operations against the memory system are permitted — index rebuilds, era summarization, dedup passes — as amortized maintenance, *off the per-turn path*. The constraint is the **schedule**, not the existence of expensive work: nothing O(N) may run on every turn.
 
-- **State**: **Violated in one place.** `add_chunks` clears the span cache on every append ([`retrieval.py:265`](../../src/memory_condense/retrieval.py#L265)), so the next query rebuilds pooled vectors over all chunks: O(N) per turn, O(N²) per session, in the currently-winning retriever. Fix is incremental or threshold-triggered rebuild — the right operation on the wrong schedule.
+- **State**: **Partly met.** The per-append re-pooling violation is fixed: cached levels advance from a SQLite rowid high-water mark and update only their open tail span, with geometric vector-buffer growth. Deletion and explicit rebuild remain occasional full invalidations. The score pass is still a dot product over every pooled span, so strict constant-time retrieval across the full envelope remains open (span ANN or bounded era hierarchy).
 - Under this requirement, Phase 4 era summaries are re-justified: they are the mechanism that **bounds pool growth** so per-turn cost stays constant — periodic compaction of the *index* is what permits never compacting the *context*.
 
 ## R6 — The benchmark is the deployment corpus
@@ -68,7 +68,7 @@ The deployed use case is **agentic coding** (Claude Code sessions: ~500 tokens/t
 
 ## Known violations & wiring gaps (work list)
 
-1. `add_chunks` span-cache clear — R5 violation, fix schedule (incremental/threshold).
+1. ~~`add_chunks` span-cache clear~~ — fixed with incremental tail updates; the remaining R5 gap is the linear pooled-span score pass.
 2. `build_context` cannot draw expansions from span — R3 wiring gap, one-line class of fix.
 3. Static `ContextBudget` — R4, needs regime-aware policy (`send-everything` below crossover).
 4. No whole-system measurement with all layers live — R3.

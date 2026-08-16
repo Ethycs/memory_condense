@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "purpose": "Small controlled probe for deciding whether the Qwen3-8B layers 0-6 are useful for live-memory CAVs. Held-out examples deliberately reduce keyword overlap with the training examples.",
+  "concepts": [
+    {
+      "name": "context_dependency",
+      "description": "The statement depends on information, decisions, identities, or evidence established earlier rather than being self-contained.",
+      "train": {
+        "positive": [
+          "Remember the database choice we made earlier and use it for this migration.",
+          "Retrieve the user's preferred timezone from the prior conversation.",
+          "This bug is connected to the benchmark result mentioned several turns ago.",
+          "Continue the implementation from the checkpoint recorded in our previous session.",
+          "Use the API contract that we agreed on before generating the client.",
+          "Recall which model produced the earlier baseline and compare against it.",
+          "The current request refers back to the filename supplied at the start.",
+          "Find the old decision about token limits before packing this context.",
+          "Link this correction to the claim it superseded in the conversation history.",
+          "Resume the unresolved task from our last exchange.",
+          "Apply the naming convention established in the preceding design discussion.",
+          "The answer requires the credentials policy that was stated previously."
+        ],
+        "negative": [
+          "A triangle has three sides and three interior angles.",
+          "The package weighs two kilograms before shipping.",
+          "Water freezes at zero degrees Celsius under standard pressure.",
+          "The function sorts a list of integers in ascending order.",
+          "A solar panel converts sunlight into electrical energy.",
+          "The meeting begins at nine o'clock on Tuesday morning.",
+          "This recipe combines flour, salt, water, and yeast.",
+          "The blue button opens the settings panel.",
+          "The report contains twelve tables and four diagrams.",
+          "A checksum detects accidental changes in transmitted data.",
+          "The train travels directly from Portland to Seattle.",
+          "The sensor records temperature once every minute."
+        ]
+      },
+      "test": {
+        "positive": [
+          "Her preferred timezone was stated near the beginning; apply it to this schedule.",
+          "The answer depends on the API decision made several sessions ago.",
+          "Reconnect this exception to the earlier benchmark failure.",
+          "Use the directory I specified before, not a newly invented one.",
+          "The unresolved question from our first discussion determines the next step.",
+          "Find which prior change introduced this regression.",
+          "Continue from the last verified checkpoint.",
+          "The nickname established earlier should appear in the reply."
+        ],
+        "negative": [
+          "Copper conducts electricity and thermal energy.",
+          "The archive contains seven compressed files.",
+          "A compass needle aligns with a magnetic field.",
+          "The script prints the current date in ISO format.",
+          "The garden receives direct sunlight during the afternoon.",
+          "Each container holds exactly sixteen liters.",
+          "The camera stores photographs on a removable card.",
+          "The bridge crosses the river north of the city."
+        ]
+      }
+    },
+    {
+      "name": "binding_constraint",
+      "description": "A prescriptive requirement, prohibition, limit, or invariant rather than a descriptive observation.",
+      "train": {
+        "positive": [
+          "The implementation must preserve source provenance for every memory.",
+          "Never place authentication tokens in the repository.",
+          "Use Pixi for all project Python commands.",
+          "Retrieval may return at most ten chunks.",
+          "The response must not exceed the available context budget.",
+          "Always validate the resolved path before deleting an artifact.",
+          "Only memories belonging to the active user may be retrieved.",
+          "The API identifier must remain stable across migrations.",
+          "Do not treat an attention weight as causal evidence.",
+          "Every compressed summary needs a pointer to its original turns.",
+          "The worker is required to finish writes before acknowledging success.",
+          "Prefer reversible pruning until the retention policy is validated."
+        ],
+        "negative": [
+          "The implementation currently stores provenance beside each memory.",
+          "Authentication tokens were found in an environment file.",
+          "The project uses Pixi to create its Python environment.",
+          "Retrieval returned ten chunks during the benchmark.",
+          "The response consumed most of the available context budget.",
+          "The resolved path points to a temporary artifact directory.",
+          "These memories belong to the active user.",
+          "The API identifier remained stable during the last migration.",
+          "The attention weight was larger in the final layer.",
+          "Each compressed summary contains a source pointer.",
+          "The worker finished its writes before sending the acknowledgement.",
+          "The current pruning operation moves records into cold storage."
+        ]
+      },
+      "test": {
+        "positive": [
+          "Ship only after the regression suite passes.",
+          "Any retrieved claim needs a source pointer.",
+          "Keep credentials outside version control.",
+          "Limit graph traversal to three hops.",
+          "The response should fit within twelve hundred tokens.",
+          "Do not merge records from different users.",
+          "Prefer existing identifiers when importing data.",
+          "The cache directory has to remain disposable."
+        ],
+        "negative": [
+          "The regression suite passed before the release shipped.",
+          "The retrieved claim includes a source pointer.",
+          "Credentials are stored outside version control.",
+          "Graph traversal reached three hops in this run.",
+          "The response occupied twelve hundred tokens.",
+          "The two records came from different users.",
+          "The import retained all existing identifiers.",
+          "The cache directory was empty after the process ended."
+        ]
+      }
+    }
+  ]
+}

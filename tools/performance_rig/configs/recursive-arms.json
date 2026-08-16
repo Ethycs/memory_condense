@@ -1,0 +1,88 @@
+{
+  "arms": [
+    {
+      "name": "hybrid_k3",
+      "k": 3,
+      "association_slots": 0,
+      "qk_reserve": 0,
+      "neighbors_per_anchor": 0,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k3_s1_h2_cap16",
+      "k": 3,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 16,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k3_s1_h2_cap64",
+      "k": 3,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 64,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k3_s1_h3_cap64",
+      "k": 3,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 3,
+      "max_association_candidates": 64,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "hybrid_k5",
+      "k": 5,
+      "association_slots": 0,
+      "qk_reserve": 0,
+      "neighbors_per_anchor": 0,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k5_s1_h2_cap64",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 64,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k5_s1_h3_cap64",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 3,
+      "max_association_candidates": 64,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k5_s2_h3_cap64",
+      "k": 5,
+      "association_slots": 2,
+      "qk_reserve": 2,
+      "neighbors_per_anchor": 3,
+      "association_hops": 3,
+      "max_association_candidates": 64,
+      "cav_candidates": 0,
+      "repeats": 5
+    }
+  ]
+}

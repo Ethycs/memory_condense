@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "cav_weight": 0.0,
+  "purpose": "Two-step association smoke with a held-out relation split. Heads are selected using the first four anchor-to-fact links; queries evaluate the remaining four unseen links.",
+  "memories": [
+    {
+      "id": "aurora_anchor",
+      "text": "Project Aurora uses the deployment profile called cobalt."
+    },
+    {
+      "id": "aurora_fact",
+      "text": "The cobalt deployment profile permits only two retries."
+    },
+    {
+      "id": "atlas_anchor",
+      "text": "Project Atlas stores its records under the cedar profile."
+    },
+    {
+      "id": "atlas_fact",
+      "text": "The cedar storage profile is backed by PostgreSQL version sixteen."
+    },
+    {
+      "id": "beacon_anchor",
+      "text": "Service Beacon follows the archival profile named amber."
+    },
+    {
+      "id": "beacon_fact",
+      "text": "The amber archival profile retains records for thirty days."
+    },
+    {
+      "id": "comet_anchor",
+      "text": "Job Comet executes with the silver worker profile."
+    },
+    {
+      "id": "comet_fact",
+      "text": "The silver worker profile allows at most three concurrent workers."
+    },
+    {
+      "id": "delta_anchor",
+      "text": "Application Delta is assigned to the indigo hosting profile."
+    },
+    {
+      "id": "delta_fact",
+      "text": "The indigo hosting profile deploys exclusively in the eu-west region."
+    },
+    {
+      "id": "ember_anchor",
+      "text": "Component Ember uses the cache configuration called violet."
+    },
+    {
+      "id": "ember_fact",
+      "text": "The violet cache configuration reserves five hundred twelve megabytes."
+    },
+    {
+      "id": "fable_anchor",
+      "text": "Account Fable follows the credential profile named ochre."
+    },
+    {
+      "id": "fable_fact",
+      "text": "The ochre credential profile rotates secrets every seven days."
+    },
+    {
+      "id": "grove_anchor",
+      "text": "Database Grove uses the backup schedule called teal."
+    },
+    {
+      "id": "grove_fact",
+      "text": "The teal backup schedule starts each day at 02:00 UTC."
+    }
+  ],
+  "associations": [
+    ["aurora_anchor", "aurora_fact"],
+    ["atlas_anchor", "atlas_fact"],
+    ["beacon_anchor", "beacon_fact"],
+    ["comet_anchor", "comet_fact"]
+  ],
+  "queries": [
+    {
+      "text": "Where is Application Delta required to be hosted?",
+      "answer_id": "delta_fact"
+    },
+    {
+      "text": "How much cache capacity is allocated to Component Ember?",
+      "answer_id": "ember_fact"
+    },
+    {
+      "text": "How often must secrets associated with Account Fable change?",
+      "answer_id": "fable_fact"
+    },
+    {
+      "text": "At what time does the backup used by Database Grove begin?",
+      "answer_id": "grove_fact"
+    }
+  ]
+}

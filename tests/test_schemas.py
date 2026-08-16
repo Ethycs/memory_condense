@@ -6,6 +6,7 @@ def test_turn_defaults():
     assert t.turn_id  # non-empty
     assert t.role == "user"
     assert t.text == "hello"
+    assert t.source_id is None
     assert t.created_at is not None
 
 

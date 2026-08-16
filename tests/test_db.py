@@ -65,12 +65,25 @@ class TestFreshDatabase:
             "chunk_terms",
             "memory_items",
             "memory_provenance",
+            "association_artifacts",
+            "chunk_cav_signatures",
+            "chunk_head_edges",
+            "hebbian_access_events",
+            "hebbian_chunk_nodes",
+            "hebbian_chunk_edges",
             "meta",
         } <= tables
 
     def test_chunks_has_term_count(self, tmp_path):
         with Database(tmp_path / "fresh.db") as db:
             assert "term_count" in _column_names(db, "chunks")
+
+    def test_turns_have_source_identity(self, tmp_path):
+        with Database(tmp_path / "source.db") as db:
+            assert "source_id" in _column_names(db, "turns")
+            assert "idx_turns_source" in {
+                row[1] for row in db.execute("PRAGMA index_list(turns)").fetchall()
+            }
 
     def test_reopening_is_idempotent(self, tmp_path):
         path = tmp_path / "reopen.db"
@@ -132,6 +145,10 @@ class TestMigrationFromV1:
     def test_content_hash_column_added(self, v1_db_path):
         with Database(v1_db_path) as db:
             assert "content_hash" in _column_names(db, "memory_items")
+
+    def test_source_id_column_added(self, v1_db_path):
+        with Database(v1_db_path) as db:
+            assert "source_id" in _column_names(db, "turns")
 
 
 class TestSchemaParity:

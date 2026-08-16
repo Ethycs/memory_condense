@@ -12,6 +12,13 @@ def test_append_and_get(db):
     assert fetched.text == "Hello world"
 
 
+def test_source_id_round_trips(db):
+    store = TranscriptStore(db)
+    turn = store.append("user", "session fact", source_id="session-2")
+    assert turn.source_id == "session-2"
+    assert store.get_turn(turn.turn_id).source_id == "session-2"
+
+
 def test_get_turn_not_found(db):
     store = TranscriptStore(db)
     assert store.get_turn("nonexistent") is None

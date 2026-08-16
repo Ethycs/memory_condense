@@ -4,15 +4,23 @@ name = "memory_condense"
 platforms = ["win-64", "linux-64"]
 preview = ["pixi-build"]
 
+[system-requirements]
+cuda = "12.0"
+
 [activation.env]
 KMP_DUPLICATE_LIB_OK = "TRUE"
 
 [dependencies]
 python = ">=3.11,<3.13"
 numpy = ">=1.26"
-pytorch = ">=2.0"
+pytorch-gpu = ">=2.0"
+cuda-version = "12.6.*"
 pydantic = ">=2.0,<3"
 sentence-transformers = ">=3.0"
+transformers = ">=4.51,<5"
+huggingface_hub = ">=0.30"
+safetensors = ">=0.5"
+accelerate = ">=1.0"
 hnswlib = ">=0.8"
 pysbd = ">=0.3"
 litellm = ">=1.40"
@@ -22,10 +30,16 @@ python-dotenv = ">=1.0"
 [pypi-dependencies]
 memory_condense = { path = ".", editable = true }
 # MCP server so the memory system is callable from Claude Code / Desktop.
-mcp = ">=1.2"
+mcp = ">=1.2,<2"
 
 [tasks]
 mcp = "python -m memory_condense.mcp_server"
+qwen-download-prefix = "hf download Qwen/Qwen3-8B README.md config.json generation_config.json tokenizer.json tokenizer_config.json vocab.json merges.txt model.safetensors.index.json model-00001-of-00005.safetensors --local-dir .cache/models/Qwen3-8B"
+qwen-download-full-teacher = "hf download Qwen/Qwen3-8B model-00002-of-00005.safetensors model-00003-of-00005.safetensors model-00004-of-00005.safetensors model-00005-of-00005.safetensors --local-dir .cache/models/Qwen3-8B"
+qwen-smoke = "python -m memory_condense.qwen_prefix --model-dir .cache/models/Qwen3-8B --layers 7 --capture-layer 6 --dtype bfloat16"
+qwen-cav-probe = "python -m memory_condense.cav_probe --model-dir .cache/models/Qwen3-8B --dataset examples/cav/live_memory_concepts.json --layers all --prefix-layers 7 --batch-size 8 --output eval_results/qwen3_prefix_cav_probe.json"
+qwen-head-memory-smoke = "python -m memory_condense.head_memory --model-dir .cache/models/Qwen3-8B --cav-report eval_results/qwen3_prefix_cav_probe.json --cav-vectors eval_results/qwen3_prefix_cav_probe.safetensors --dataset examples/cav/live_head_memory_smoke.json --layer 5 --output eval_results/qwen3_live_head_memory_smoke.json"
+qwen-head-association-smoke = "python -m memory_condense.head_memory --model-dir .cache/models/Qwen3-8B --cav-report eval_results/qwen3_prefix_cav_probe.json --cav-vectors eval_results/qwen3_prefix_cav_probe.safetensors --dataset examples/cav/live_head_association_smoke.json --layer 5 --association-layer 1 --output eval_results/qwen3_live_head_association_layer_5_1.json"
 
 [feature.dev.dependencies]
 pytest = ">=8.0"

@@ -135,6 +135,14 @@ def test_embed_chunks_with_stub_preserves_metadata():
     assert result.lexical_weights == {"hello": 1.0, "world": 1.0}
 
 
+def test_embed_queries_batches_the_model_call():
+    model = FakeModel(dim=4)
+    svc = _service_with(model)
+    values = svc.embed_queries(["one", "two", "three"])
+    assert values.shape == (3, 4)
+    assert model.encode_calls == 1
+
+
 def test_embed_empty_list_without_model():
     svc = EmbeddingService()
     assert svc.embed_chunks([]) == []

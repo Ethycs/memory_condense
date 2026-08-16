@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "cav_weight": 0.1,
+  "purpose": "Wiring smoke test for immediate writes, per-head QK addressing, binding-constraint CAV gating, and bounded OV recursion. Each answer has a lexically related descriptive distractor.",
+  "memories": [
+    {
+      "id": "constraint_graph_hops",
+      "text": "Recursive graph traversal must stop after three hops."
+    },
+    {
+      "id": "observation_graph_hops",
+      "text": "The previous graph traversal happened to stop after three hops."
+    },
+    {
+      "id": "constraint_provenance",
+      "text": "Every retrieved claim must retain a pointer to its original source."
+    },
+    {
+      "id": "observation_provenance",
+      "text": "The latest retrieved claim contained a pointer to its original source."
+    },
+    {
+      "id": "constraint_user_isolation",
+      "text": "Never merge memory records that belong to different users."
+    },
+    {
+      "id": "observation_user_isolation",
+      "text": "Two memory records in the audit belonged to different users."
+    },
+    {
+      "id": "constraint_token_budget",
+      "text": "The assembled response must remain below twelve hundred context tokens."
+    },
+    {
+      "id": "observation_token_budget",
+      "text": "The assembled response used twelve hundred context tokens in the last run."
+    },
+    {
+      "id": "constraint_pixi",
+      "text": "All Python commands for this project must run through Pixi."
+    },
+    {
+      "id": "observation_pixi",
+      "text": "The most recent Python command for this project ran through Pixi."
+    },
+    {
+      "id": "constraint_pruning",
+      "text": "Memory pruning must remain reversible until retention is validated."
+    },
+    {
+      "id": "observation_pruning",
+      "text": "The latest memory pruning operation was reversible."
+    },
+    {
+      "id": "constraint_identifier",
+      "text": "API identifiers must remain stable when stored memories are migrated."
+    },
+    {
+      "id": "observation_identifier",
+      "text": "API identifiers remained stable during the previous memory migration."
+    },
+    {
+      "id": "constraint_credentials",
+      "text": "Authentication credentials must never be committed to version control."
+    },
+    {
+      "id": "observation_credentials",
+      "text": "No authentication credentials were found in version control during the audit."
+    }
+  ],
+  "queries": [
+    {
+      "text": "What limit is required for recursive graph traversal?",
+      "answer_id": "constraint_graph_hops"
+    },
+    {
+      "text": "What source-tracking rule applies to retrieved claims?",
+      "answer_id": "constraint_provenance"
+    },
+    {
+      "text": "What is the rule about combining memories from separate users?",
+      "answer_id": "constraint_user_isolation"
+    },
+    {
+      "text": "What context-token ceiling must the assembled response obey?",
+      "answer_id": "constraint_token_budget"
+    },
+    {
+      "text": "How are Python commands required to run in this project?",
+      "answer_id": "constraint_pixi"
+    },
+    {
+      "text": "What reversibility requirement governs memory pruning?",
+      "answer_id": "constraint_pruning"
+    },
+    {
+      "text": "What stability requirement applies to API identifiers during migration?",
+      "answer_id": "constraint_identifier"
+    },
+    {
+      "text": "What prohibition applies to authentication credentials and version control?",
+      "answer_id": "constraint_credentials"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
@@ -83,6 +83,20 @@ class EmbeddingService:
         model = self._load_model()
         return model.encode([query], normalize_embeddings=False)[0]
 
+    def embed_queries(self, queries: Sequence[str]) -> np.ndarray:
+        """Embed a query batch in one model call for evaluation fan-out."""
+        if not queries:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        model = self._load_model()
+        return np.asarray(
+            model.encode(
+                list(queries),
+                batch_size=self._batch_size,
+                normalize_embeddings=False,
+            ),
+            dtype=np.float32,
+        )
+
     @property
     def model_name(self) -> str:
         """The configured sentence-transformers model id."""
@@ -112,7 +126,11 @@ class EmbeddingService:
         if self._model is None and self._model_name == DEFAULT_MODEL_NAME:
             return DEFAULT_MODEL_DIM
 
-        reported = self._load_model().get_sentence_embedding_dimension()
+        model = self._load_model()
+        getter = getattr(model, "get_embedding_dimension", None)
+        if getter is None:  # sentence-transformers < the rename
+            getter = model.get_sentence_embedding_dimension
+        reported = getter()
         if reported is None:
             # Some wrappers do not expose it; fall back to encoding a probe.
             reported = len(self.embed_query(""))

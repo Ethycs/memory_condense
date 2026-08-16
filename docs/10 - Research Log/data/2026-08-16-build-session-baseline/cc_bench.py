@@ -1,14 +1,35 @@
 """R6: the build session itself as a benchmark. Free, keyless, in-regime."""
-import json, random, sys, tempfile, time
+import argparse
+import json, random, tempfile, time
+from pathlib import Path
 from memory_condense._tokenizer import count_tokens
 from memory_condense.eval.benchmark import ingest_sample
 from memory_condense.eval.recall import _assemble, contains_answer
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
 from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
 
-SCR = r"C:/Users/Keytone/AppData/Local/Temp/claude/f--Keytone-Documents-GitHub-memory-condense/8f7f7561-e2af-4bab-8f13-8fab1e2d71bb/scratchpad"
-turns = json.load(open(f"{SCR}/session_turns.json", encoding="utf-8"))
-probe = json.load(open(f"{SCR}/cc_probe.json", encoding="utf-8"))
+ROOT = Path(__file__).resolve().parents[4]
+BASE = Path(__file__).resolve().parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--turns",
+    type=Path,
+    default=ROOT / "data" / "build-session-8f7f7561.turns.json",
+)
+parser.add_argument("--probe", type=Path, default=BASE / "cc_probe.json")
+parser.add_argument(
+    "--output",
+    type=Path,
+    default=ROOT / "eval_results" / "build_session_b0_reproduction.json",
+)
+parser.add_argument(
+    "--skip-memory",
+    action="store_true",
+    help="Reproduce only B0's raw retrieval arms; skip the slower extracted-memory treatment.",
+)
+args = parser.parse_args()
+turns = json.loads(args.turns.read_text(encoding="utf-8"))
+probe = json.loads(args.probe.read_text(encoding="utf-8"))
 
 sample = BenchmarkSample(
     sample_id="build-session-8f7f7561",
@@ -19,6 +40,14 @@ sample = BenchmarkSample(
     ],
 )
 print(f"{sample.sample_id}: {len(sample.turns)} turns, {len(sample.questions)} questions", flush=True)
+
+diagnostics = {
+    "sample_id": sample.sample_id,
+    "protocol": "bs-probe-v1 / unchanged B0 raw-retrieval arms",
+    "turns_path": str(args.turns),
+    "probe_path": str(args.probe),
+    "arms": {},
+}
 
 t0 = time.time()
 mc = ingest_sample(sample, EvalConfig(retrieval=RetrievalConfig()), tempfile.mkdtemp())
@@ -37,6 +66,29 @@ try:
         hits = sum(contains_answer(ts, q.answer) for ts, q in zip(per_q_texts, qs))
         ctx = sum(per_q_tokens) / n
         print(f"{name:<18}{hits/n:>7.1%}{ctx:>9.0f}", flush=True)
+        diagnostics["arms"][name] = {
+            "recall": hits / n,
+            "mean_context_tokens": ctx,
+            "questions": [
+                {
+                    "question_id": q.question_id,
+                    "category": q.category,
+                    "question": q.question,
+                    "answer": q.answer,
+                    "hit": contains_answer(texts, q.answer),
+                    "context_tokens": tokens,
+                    "answer_rank": next(
+                        (
+                            rank
+                            for rank, text in enumerate(texts, start=1)
+                            if contains_answer([text], q.answer)
+                        ),
+                        None,
+                    ),
+                }
+                for q, texts, tokens in zip(qs, per_q_texts, per_q_tokens)
+            ],
+        }
         return hits / n
 
     print(f"\n{'arm':<18}{'recall':>7}{'ctx tok':>9}", flush=True)
@@ -93,8 +145,43 @@ try:
         print(f"  {c}: {hit_c[c]}/{tot_c[c]}", flush=True)
     missed = [qs[i].answer for i in range(n) if i not in (hitsets["span x4"] | hitsets["hybrid k=50"])]
     print("\nmissed by both best arms:", missed, flush=True)
+
+    # Preserve enough evidence to diagnose B0's misses without repeating the
+    # 15-minute corpus ingest.  Only questions missed by hybrid k=10 are
+    # included; excerpts are bounded because this file is a diagnostic, not a
+    # second copy of the private transcript snapshot.
+    b0_misses = sorted(set(range(n)) - hitsets["hybrid k=10"])
+    diagnostics["b0_misses"] = []
+    for i in b0_misses:
+        question = qs[i]
+        ranked = mc.search_hybrid(question.question, k=50)
+        diagnostics["b0_misses"].append(
+            {
+                "question_id": question.question_id,
+                "question": question.question,
+                "answer": question.answer,
+                "top_50": [
+                    {
+                        "rank": rank,
+                        "score": result.score,
+                        "dense_score": result.dense_score,
+                        "lexical_score": result.lexical_score,
+                        "token_count": result.chunk.token_count,
+                        "answer_hit": contains_answer(
+                            [result.chunk.text], question.answer
+                        ),
+                        "text_excerpt": result.chunk.text[:600],
+                    }
+                    for rank, result in enumerate(ranked, start=1)
+                ],
+            }
+        )
 finally:
     mc.close()
+
+args.output.parent.mkdir(parents=True, exist_ok=True)
+args.output.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+print(f"diagnostics: {args.output}", flush=True)
 
 # Memory is a stateful treatment, not a different read over the chunk store
 # above.  It must be ingested in memory mode so extraction is enabled and the
@@ -102,20 +189,21 @@ finally:
 # dense-ingested store here, so its row had no memory items, used dense rather
 # than hybrid expansions, and packed at most three hits.  Keep the extra ingest
 # explicit even though it is slow; otherwise the row is not the system.
-memory_config = EvalConfig(
-    retrieval=RetrievalConfig(k=10, mode="memory", k_memories=8)
-)
-print("\ningesting a separate, extraction-enabled memory treatment...", flush=True)
-t0 = time.time()
-memory_mc = ingest_sample(sample, memory_config, tempfile.mkdtemp())
-print(f"memory ingest: {time.time()-t0:.0f}s", flush=True)
-try:
-    texts_per_q, toks_per_q = [], []
-    for question in qs:
-        header, body = _assemble(memory_mc, question.question, memory_config)
-        texts = header + body
-        texts_per_q.append(texts)
-        toks_per_q.append(sum(count_tokens(text) for text in texts))
-    report("memory k=10 (true)", texts_per_q, toks_per_q)
-finally:
-    memory_mc.close()
+if not args.skip_memory:
+    memory_config = EvalConfig(
+        retrieval=RetrievalConfig(k=10, mode="memory", k_memories=8)
+    )
+    print("\ningesting a separate, extraction-enabled memory treatment...", flush=True)
+    t0 = time.time()
+    memory_mc = ingest_sample(sample, memory_config, tempfile.mkdtemp())
+    print(f"memory ingest: {time.time()-t0:.0f}s", flush=True)
+    try:
+        texts_per_q, toks_per_q = [], []
+        for question in qs:
+            header, body = _assemble(memory_mc, question.question, memory_config)
+            texts = header + body
+            texts_per_q.append(texts)
+            toks_per_q.append(sum(count_tokens(text) for text in texts))
+        report("memory k=10 (true)", texts_per_q, toks_per_q)
+    finally:
+        memory_mc.close()

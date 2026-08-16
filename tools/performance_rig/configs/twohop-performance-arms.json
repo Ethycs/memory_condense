@@ -1,0 +1,90 @@
+{
+  "arms": [
+    {
+      "name": "hybrid_k5",
+      "k": 5,
+      "association_slots": 0,
+      "qk_reserve": 0,
+      "neighbors_per_anchor": 0,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d1_cap8",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 1,
+      "association_hops": 2,
+      "max_association_candidates": 8,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d1_cap16",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 1,
+      "association_hops": 2,
+      "max_association_candidates": 16,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d2_cap8",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 2,
+      "association_hops": 2,
+      "max_association_candidates": 8,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d2_cap16",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 2,
+      "association_hops": 2,
+      "max_association_candidates": 16,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d3_cap8",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 8,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d3_cap16",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 16,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d3_cap32",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 32,
+      "cav_candidates": 0,
+      "repeats": 10
+    }
+  ]
+}

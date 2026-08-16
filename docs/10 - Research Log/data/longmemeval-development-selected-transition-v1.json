@@ -1,0 +1,35 @@
+{
+  "format": "memory-condense-development-policy-selection-v1",
+  "status": "superseded_after_exact_chunk_token_fix",
+  "superseded_by": "longmemeval-development-selected-transition-v2.json",
+  "dataset_sha256": "821a2034d219ab45846873dd14c14f12cfe7776e73527a483f9dac095d38620c",
+  "split_manifest": "longmemeval-95-target-split-v1.json",
+  "split": "development",
+  "trace": {
+    "format": "memory-condense-transition-candidate-trace-v1",
+    "internal_sha256": "672f6f7d6583cd6cd7c9428d0031050ec361c11d21be836eee0ddc8da785d941",
+    "file_sha256": "aedbdc0137f0a5c1adba0b4b06408642bfbbd2f5346157a2d0139f2c73f3a77e"
+  },
+  "retrieval": {
+    "mode": "hybrid_neighbor",
+    "k": 10,
+    "alpha": 0.65,
+    "candidates": 100,
+    "neighbor_radius": 6,
+    "neighbor_slots": 22,
+    "neighbor_replacement_slots": 0,
+    "max_prompt_tokens": 8000
+  },
+  "development_metrics": {
+    "questions": 200,
+    "haystack_literal_ceiling": 0.475,
+    "literal_recall": 0.47,
+    "mean_context_tokens": 3779.775,
+    "evidence_source_recall": 1.0,
+    "evidence_all_source_recall": 1.0,
+    "gained_vs_hybrid": 7,
+    "lost_vs_hybrid": 0
+  },
+  "sweep_file_sha256": "af2452ef92f7d4028c0baa557a5811adfa5ebc3207dcc02b1485eb3eba0bf663",
+  "admission": "Semantic answer accuracy is unmeasured. Do not consume validation until responder calibration is complete and this policy is frozen."
+}

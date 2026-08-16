@@ -45,6 +45,11 @@ class TestTruncateToTokens:
     def test_zero_budget_returns_empty(self):
         assert truncate_to_tokens("anything", 0) == ""
 
+    def test_literal_special_token_text_is_counted_as_corpus_data(self):
+        text = "A chat export literally contains <|endoftext|> here."
+        assert count_tokens(text) > 0
+        assert truncate_to_tokens(text, 100) == text
+
 
 class TestMemoryHeader:
     def test_empty_memories_produce_no_header(self):
@@ -76,6 +81,16 @@ class TestMemoryHeader:
         packed = ContextPacker().pack(memories=[wrapped])
         assert "wrapped item" in packed.memory_header
 
+    def test_records_only_memory_ids_that_reach_the_header(self):
+        first = _memory("first compact decision")
+        oversized = _memory("detail " * 100)
+        packed = ContextPacker(ContextBudget(memory_header_tokens=20)).pack(
+            memories=[first, oversized]
+        )
+
+        assert packed.memory_ids == [first.mem_id]
+        assert packed.dropped["memories"] == 1
+
     def test_header_respects_budget_and_counts_drops(self):
         budget = ContextBudget(memory_header_tokens=40)
         items = [_memory(f"decision number {i} " + "detail " * 20) for i in range(10)]
@@ -105,6 +120,13 @@ class TestRecentTurns:
 
 
 class TestExpansions:
+    def test_default_count_allows_all_ten_retrieval_candidates(self):
+        results = [_result(f"short excerpt {i}") for i in range(10)]
+        packed = ContextPacker().pack(expansions=results)
+
+        assert len(packed.expansions) == 10
+        assert packed.dropped["expansions"] == 0
+
     def test_expansions_capped_by_count(self):
         budget = ContextBudget(max_expansions=2)
         results = [_result(f"excerpt {i}") for i in range(5)]
@@ -116,6 +138,22 @@ class TestExpansions:
         budget = ContextBudget(max_expansion_tokens=10)
         packed = ContextPacker(budget).pack(expansions=[_result("word " * 200)])
         assert count_tokens(packed.expansions[0]) <= 15  # 10 + index marker
+
+    def test_final_expansion_uses_the_remaining_aggregate_budget(self):
+        budget = ContextBudget(
+            expansion_tokens=50,
+            max_expansions=10,
+            max_expansion_tokens=30,
+        )
+        packed = ContextPacker(budget).pack(
+            expansions=[_result("alpha " * 100), _result("beta " * 100)]
+        )
+
+        assert len(packed.expansions) == 2
+        assert packed.token_counts["expansions"] <= 50
+        assert count_tokens(packed.expansions[1]) < count_tokens(
+            packed.expansions[0]
+        )
 
     def test_expansions_are_numbered(self):
         packed = ContextPacker().pack(expansions=[_result("alpha"), _result("beta")])

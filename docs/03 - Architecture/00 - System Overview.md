@@ -1,13 +1,23 @@
 # memory_condense System Overview (as-built)
 
 **Status**: CURRENT
-**Date**: 2026-08-14
+**Date**: 2026-08-16
 **Supersedes**: the earlier 2026-08-14 "dense-retrieval-only / no condensation yet" version of this document, which described the tree at commit `cd9f423`
-**Applies to**: `main` — the memory layer, eval harness, docs tree, and MCP server, merged in `f3edc91`. Committed and merged; **still not measured**.
+**Applies to**: the current working tree — core memory, compiled Qwen
+association artifacts, bounded associative reads, eval harness, and MCP server.
 
 ## Executive summary
 
-memory_condense is now the full local memory manager the design called for: transcript → chunker → bge-m3 dense index **and** a BM25 inverted index, a typed `MemoryItem` store with provenance-enforced extraction, exponential energy decay with HOT/WARM/COLD tiering, a deterministic rerank scalar, and a hard-budgeted `ContextPacker`. Everything stateful is local (SQLite schema v2 + bge-m3 + hnswlib + BM25); the only LLM callers in the repo are still under `eval/`, and the core stays provider-agnostic by taking an injected completion callable instead of importing an SDK. What is **not** built: cold-tier "era summaries" (design Phase 4), and — separately — nothing here has yet been *measured* on a public benchmark.
+memory_condense is a local memory manager: transcript → chunker → bge-m3
+dense index plus BM25, a typed `MemoryItem` store with provenance-enforced
+extraction, exponential energy decay, deterministic reranking, and a
+hard-budgeted `ContextPacker`. An optional staged Qwen3 prefix compiler emits
+compact CAV signatures and sparse QK/OV association edges into SQLite schema
+v7, whose turns also retain document/session source identity and whose live
+Hebbian projection learns bounded same-turn chunk co-access. Ordinary
+associative reads do not load Qwen; they traverse only external
+IDs and scalars, then hydrate the selected chunks. The core remains
+provider-agnostic, while public common-benchmark validation remains open.
 
 ## 1. Architecture
 
@@ -39,7 +49,7 @@ memory_condense is now the full local memory manager the design called for: tran
         │                 │            │ touch(reheat)  │                 │
         │                 │            │ brute-force cos│                 │
         │                 │            └───────┬────────┘                 │
-        │                 │                    │  decay.py (½-life 7d)    │
+        │                 │                    │ decay.py (½-life 30 turn)│
         │                 │                    │  ranking.py (rerank)     │
         │                 ▼                    │                          │
         │   ┌───────────────────────────┐      │                          │
@@ -51,10 +61,11 @@ memory_condense is now the full local memory manager the design called for: tran
         │   └─────────────┬─────────────┘      │
         ▼                 ▼                    ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ SQLite — db.py: WAL, foreign_keys=ON, schema_version 2 (v1 migrates up)   │
-│   turns · chunks(text, embedding, lexical_weights, hnsw_label, term_count)│
+│ SQLite — db.py: WAL, foreign_keys=ON, schema_version 7 (v1 migrates up)   │
+│   turns(source_id) · chunks(text, embedding, lexical weights, hnsw label) │
 │   chunk_terms(term, chunk_id, tf)          ← BM25 inverted index          │
 │   memory_items(...) · memory_provenance(...) ← mandatory provenance rows  │
+│   CAV/QK/OV artifacts + bounded Hebbian co-access nodes/edges/receipts     │
 │   meta(schema_version)                                                    │
 │   + hnsw_index.bin  (cache only — rebuildable via rebuild_index())        │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -68,7 +79,7 @@ memory_condense is now the full local memory manager the design called for: tran
 ## 2. Per-subsystem
 
 ### TranscriptStore — `transcript_store.py`
-- **Domain**: durable raw history. **Runs at**: every `ingest`. **Inputs**: `(role, text)`. **Outputs**: `Turn` rows.
+- **Domain**: durable raw history. **Runs at**: every `ingest`. **Inputs**: `(role, text, source_id?)`. **Outputs**: source-identified `Turn` rows.
 - **Structure**: append-only `turns` table; `append` / `get_turn` / `get_recent` / `get_all` / `count`.
 - **Hard constraint**: never mutated, never deleted. Every other table is derivable from it.
 
@@ -90,23 +101,86 @@ memory_condense is now the full local memory manager the design called for: tran
 - **Domain**: chunk candidate generation + ranking. **Outputs**: `RetrievalResult`.
 - **`query(query_embedding, k, ef_search)`** — pure dense, `score = 1 − cosine_distance`. **Deliberately unchanged**: the `k=0` / `k=N` ablation and every historical number depend on it.
 - **`hybrid_query(query_text, query_embedding, k, ef_search, candidates=100, alpha=0.65)`** — pulls `candidates` from each side, min-max normalizes each side independently, unions them (dense candidates in rank order, then lexical-only ones), blends with `ranking.blend_hybrid(dense, lexical, alpha)` where `alpha` is the **dense** weight. `alpha=1.0` reproduces the dense ordering; `alpha=0.0` is pure BM25. Results carry the blend in `score` and the normalized components in `dense_score` / `lexical_score`, so `score == blend_hybrid(dense_score, lexical_score, alpha)` exactly.
+- **`source_query(query_embedding, k_sources)`** — mean-pools normalized chunk embeddings per durable source, ranks sources, then returns complete winning sources in conversation order. It is a diagnostic/whole-document arm and remains subject to the same final prompt cap.
+- **`hydrate_source_neighbors(anchors, radius, max_neighbors)`** — keeps ranked
+  anchors first, then exposes bounded earlier/later chunk shells inside only
+  their activated sources. It carries IDs and scalar scores until final chunk
+  hydration; it neither stores token state nor loads a transformer.
+- **Source-conditioned second stage** — direct hybrid anchors remain stable
+  while a separately bounded ranked prefix activates source IDs. Lower-ranked
+  chunks may enter only through those source IDs. This separates evidence
+  discovery from the number of chunks immediately returned.
 - **`add_chunks`** writes the dense index, persists the embedding, **populates `chunks.lexical_weights`** with the chunk's term-frequency map, and feeds the same chunks to the BM25 index. The column that was always NULL is now real.
 - **`delete_chunk(chunk_id)`** — clears embedding + `hnsw_label` in SQLite (authoritative), marks the label deleted in the live hnswlib graph best-effort, and drops the BM25 postings. The chunk **row** survives so memory provenance pointing at it cannot dangle.
 - **Structure**: hnswlib `space="cosine"`, `M=16`, `ef_construction=200`, `max_elements=100_000`; chunk↔label mapping lives in `chunks.hnsw_label` (single source of truth); `rebuild_index()` reconstructs the `.bin` from SQLite blobs.
+
+### Compiled and live association plane — `association_store.py`, `associative_retrieval.py`, `heat_diffusion.py`, `hebbian_retrieval.py`
+
+- **Write-time domain**: a bounded Qwen3 prefix inspects small candidate sets
+  and compiles fixed-width CAV signatures plus per-head QK/OV edge evidence.
+  The model slice is a linker, not the durable memory store.
+- **Durable state**: versioned association artifacts, float32 CAV signatures,
+  and degree-bounded sparse edges. No token K/V or residual sequence is
+  persisted; source chunks and exact transcript provenance remain authoritative.
+- **Ranked read**: bounded max-path traversal reserves association slots inside
+  the existing `k`, protects strong lexical anchors, and can reject a result
+  set that adds prompt tokens.
+- **Heat read**: a finite restart walk row-normalizes stored edge utility,
+  accumulates support from multiple parents, and caps the live frontier to
+  chunk IDs, scalar heat, and one compact path. Text is hydrated only for the
+  final candidates.
+- **Selected policy**: one ranked-QK exploitation slot plus one heat exploration
+  slot, two hops, at most 16 frontier entries, and degree-two physical pruning.
+  This is a development policy pending a new locked or public evaluation.
+- **Live Hebbian projection**: the final chunks retrieved together in one turn
+  may be observed as an idempotent access event. Rank-discounted co-access mass
+  forms symmetric chunk edges; node-mass normalization suppresses hubs and an
+  independent turn-decay term cools stale links. Reads use reserved tail slots
+  inside the existing `k` and default to zero prompt-token increase. Events are
+  capped at 12 nodes, node degree at 32, and retry receipts at 4,096. Receipts
+  retain only an event ID plus membership hash. Query text and transformer token
+  state are never persisted. See
+  [`02 - Live Hebbian Co-Retrieval Memory.md`](../00%20-%20Theory/02%20-%20Live%20Hebbian%20Co-Retrieval%20Memory.md).
+
+### Causal transition policy — `transition_policy.py`
+
+- **Prediction order**: rank a bounded QK/OV candidate set using only state
+  through turn `t`; reveal turn `t+1` only afterward.
+- **Learning signal**: next-source correctness plus optional alignment between
+  projected per-head OV CAV deltas and the observed CAV change.
+- **Evolving attention**: separate user→assistant and assistant→user decayed
+  head utilities become multiplicative gates for the following QK decision;
+  sparse recurrent edge utility can provide a second bounded score.
+- **Durable state**: only scalar reward sums, decayed mass, counts, role/head
+  IDs, and source/destination IDs. The one-turn decision may carry compact CAV
+  deltas in memory, but snapshots exclude them and all transformer token state.
+- **Admission rule**: this policy is implemented but not yet admitted to QA
+  retrieval or pruning. Exact-target and 2-D CAV/velocity chronological replays
+  failed to transfer to a separate compiled store, so they remain diagnostics.
+- **Local transition arm**: `search_hybrid_neighbors` tests bounded source-local
+  previous/next moves. Radius and extra slots are hard-capped; transition
+  candidates may either be appended or compete with weak anchors. Development
+  measurements reject both unconditional append and five-way replacement as
+  production defaults, so `stay` remains mandatory in any learned controller.
+- **Graph-union arm**: `search_hybrid_graph` preserves the direct anchors,
+  admits a bounded directional transition shell, then fills remaining
+  candidates from a bounded source-conditioned rerank. Only chunk/source IDs
+  and scalar scores exist during the walk; the final evaluator prompt cap is
+  still authoritative.
 
 ### MemoryStore — `memory_store.py`
 - **Domain**: the typed long-term memory state machine. **Inputs**: validated `MemoryOps`. **Outputs**: `MemoryItem` / `MemoryResult`.
 - **Structure**: `create · get · list_items · count · update · supersede · delete · pin · apply · touch · heat_counts · retrieve`, over `memory_items` + `memory_provenance`.
 - **Hard constraints**:
   1. **Nothing is ever hard-deleted.** `delete` flips status to `deleted`; `supersede` creates the replacement (with `supersedes` pointing back) and flips the old row to `superseded`. Both rows survive, so the correction chain stays walkable.
-  2. **Decay is lazy** — no timer, no background job. Energy is decayed forward from `last_access_at` on read.
+  2. **Decay is lazy** — no timer, no background job. Energy is decayed forward from `last_access_turn` to the transcript's current ordinal on read; `last_access_at` is audit-only.
   3. **Retrieval is brute-force exact cosine with numpy**, deliberately **not** a second ANN index: memory items number in the tens-to-low-hundreds, so an exact scan is faster and simpler than maintaining a second hnswlib graph, and it can never return a stale neighbour after a supersede. Cosine is mapped `(cos + 1) / 2` into `[0, 1]` so it composes with the other rank components.
-  4. Every item returned by `retrieve` is `touch`ed (access reheating), so returned items reflect post-reheat energy while their `score` reflects query-time state.
+  4. Every item returned by `retrieve` is reheated, so returned items reflect post-reheat energy while their `score` reflects query-time state. The rows are updated with one batched SQLite transaction, and provenance is hydrated for the final top-k with one query rather than once per candidate.
 
 ### Decay — `decay.py`
 - **Domain**: how hot an item is *now*. Pure functions, no I/O.
-- **Structure**: `effective_energy = energy × 0.5^(elapsed / half_life_s)`, clamped to `[0, 1]`; default half-life 7 days (`604800 s`). `heat_for`: HOT ≥ `0.75`, WARM ≥ `0.25`, else COLD. `reheat` adds `+0.25` capped at 1.0. `seed_energy`: `0.8` when `importance ≥ 0.7`, else `0.5` — important items enter HOT, everything else WARM.
-- **Hard constraint**: **pins override decay entirely.** A pinned item returns its stored energy regardless of elapsed time (`MemoryStore.touch` still refreshes `last_access_at` so recency stays honest).
+- **Structure**: `effective_energy = energy × 0.5^(turns_elapsed / half_life_turns)`, clamped to `[0, 1]`; default half-life 30 turns. `heat_for`: HOT ≥ `0.75`, WARM ≥ `0.25`, else COLD. `reheat` closes `0.25` of remaining headroom and can boost only once per turn. `seed_energy`: `0.8` when `importance ≥ 0.7`, else `0.5` — important items enter HOT, everything else WARM.
+- **Hard constraint**: **pins override decay entirely.** A pinned item returns its stored energy regardless of elapsed turns (`MemoryStore.touch` still refreshes the wall-clock audit stamp).
 
 ### Ranking — `ranking.py`
 - **Domain**: the one place the design's rerank scalar lives. Pure functions.
@@ -126,23 +200,44 @@ memory_condense is now the full local memory manager the design called for: tran
 ### ContextPacker — `context_packer.py`
 - **Domain**: making context cost *predictable*. **Inputs**: system prompt, memories, recent turns, expansions, user text. **Outputs**: `PackedContext`.
 - **Structure**: `ContextBudget` = recent window `4500` tok · memory header `900` tok · expansions `800` tok, at most `3` expansions of `≤250` tok each. Section order: system → memory header (typed bullets, active only, pinned marked `*`) → recent turns (chronological, most-recent-first fitting) → expansions (verbatim excerpts) → current user message.
+- **Heat-aware option**: expansion candidates can be scheduled by source heat
+  per token with a per-source expansion fraction. The packer reports actual
+  expansion tokens by source in `expansion_source_token_counts`, making "heat
+  equals amount of source text seen" observable rather than metaphorical.
 - **Hard constraint**: every section has an independent ceiling, and **anything that does not fit is dropped and counted** in `PackedContext.dropped` (`memories` / `recent_turns` / `expansions`) — never silently truncated without a record. Token accounting per section lands in `token_counts`.
 
 ### MemoryCondenser — `condenser.py`
 - **Domain**: the facade that wires all of the above. **Hard constraint**: makes no LLM call itself.
-- `ingest(role, text)` → store turn → chunk → embed → dense+lexical index → (when `auto_extract=True`, the default) extract → validate → apply.
-- `search` (dense) · `search_hybrid` (dense+BM25) · `recall_memories` (ranked `MemoryResult`, reheats) · `build_context` (packed prompt; `hybrid=True` by default) · `heat_counts` · properties `transcript` / `memory` / `retriever` / `validator`.
+- `ingest(role, text, source_id=None)` → store source-identified turn → chunk → embed → dense+lexical index → (when `auto_extract=True`, the default) extract → validate → apply.
+- `search` (dense) · `search_hybrid` (dense+BM25) ·
+  `search_hybrid_neighbors` (bounded source-local transitions) ·
+  `search_hybrid_sources` (source-conditioned second stage) ·
+  `search_hybrid_graph` (directional transition/source union) · `search_associative`
+  (ranked compiled links) · `search_heat_associative` (dual QK/heat allocation)
+  · `search_hebbian` / `observe_retrieval_access` (bounded live co-access)
+  · `recall_memories` (ranked `MemoryResult`, reheats) · `build_context`
+  (packed prompt; `hybrid=True` by default) · `heat_counts` · properties
+  `transcript` / `memory` / `retriever` / `validator`.
 - Constructor params of note: `extractor`, `budget`, `auto_extract`, and **`embedder`** — injectable so tests substitute a fake and never download bge-m3.
 
 ### Loader — `loader.py`
 - **Domain**: corpus ingestion, two families.
 - Claude exports: `.txt` (`User:` / `Claude:`) and `.md` (`**User:**` / `**Assistant:**`) — unchanged.
-- Public benchmarks: `BenchmarkQuestion`, `BenchmarkSample`, `parse_longmemeval`, `parse_locomo`, `detect_benchmark_format`, `load_benchmark(path, format="auto")`. Accepts `.json` and `.jsonl`; malformed records are skipped rather than failing the file. LoCoMo has no intrinsic user/assistant split, so the **first speaker seen in the earliest session maps to `user`** and every other speaker to `assistant`; sessions are ordered by numeric suffix (`session_10` follows `session_9`).
+- Public benchmarks: `BenchmarkQuestion`, `BenchmarkSample`, `parse_longmemeval`, `parse_locomo`, `detect_benchmark_format`, `load_benchmark(path, format="auto")`. Accepts `.json` and `.jsonl`; malformed records are skipped rather than failing the file. Session/document IDs remain parallel to flattened turns, source timestamps are ingested as system turns, and LongMemEval's question date prefixes its query. LoCoMo has no intrinsic user/assistant split, so the **first speaker seen in the earliest session maps to `user`** and every other speaker to `assistant`; sessions are ordered by numeric suffix (`session_10` follows `session_9`).
 
 ### Eval harness — `eval/`
 - **Domain**: measurement. Two protocols plus an offline analysis mode.
 - **Self-replay** (`runner.py`) — teacher-forced: after scoring, ingest the *actual* recorded turns, never the generated ones. Metrics: mean judge score, Recall@4.
-- **Benchmark QA probes** (`benchmark.py`) — ingest a sample's whole haystack, answer each question from top-k retrieved chunks only, grade with SQuAD-normalized token F1 + exact match, optional LLM `judge_fn` for semantic equivalence, per-category breakdown. `answer_fn` / `judge_fn` are **injected**; the module imports no litellm.
+- **Benchmark QA probes** (`benchmark.py`) — ingest a sample's whole haystack, enforce a hard full-prompt ceiling, answer each question from dense/hybrid/span/source/memory context, and grade with SQuAD-normalized token F1 + exact match plus an optional LLM `judge_fn` for semantic equivalence. `answer_fn` / `judge_fn` are **injected**; the module imports no litellm.
+- **Free retrieval diagnostics** (`recall.py`) — report gold-string reachability and tokens together, plus any/all/fractional gold evidence-source coverage when the benchmark supplies source labels.
+- **Compiled benchmark cache** (`compiled_cache.py`) — content-addressed,
+  per-sample SQLite/HNSW artifacts keyed by all write-time inputs. Manifests
+  hold exact file hashes and are published last; verified reads cannot rewrite
+  the ANN file.
+- **Transition trace** (`transition_trace.py`) — batch-encodes queries once and
+  exports a self-hashed, provenance-complete direct/previous/next candidate
+  plane for model-free policy recomposition. Gold-bearing traces are tuning
+  artifacts and must respect the locked split protocol.
 - **Analysis** (`analysis.py`) — `binned_scores`, `compare_runs`, `ascii_curve`, `to_csv`, `print_comparison`. Pure functions over saved JSON; no API calls, no cost.
 - **Instrumentation** (`validated`): `UsageStats` (input / output / cache-read tokens, `elapsed_s`, `calls`) flows through `TurnResult.responder_usage` + `.judge_usage` + `.retrieval_s` + `.context_tokens` → `ConversationResult.usage` → `EvalRunResult.usage` / `.total_elapsed_s` / `.mean_context_tokens` / `.tokens_per_scored_turn`.
 - **Retrieval mode is configurable**: `RetrievalConfig.hybrid` (with `alpha`, `candidates`) switches `runner.replay_conversation` between `mc.search` and `mc.search_hybrid`; dense stays the default so the k=0/k=N ablation keeps measuring the same baseline. Hybrid runs get a distinct result filename so they cannot overwrite the dense run being compared against.
@@ -165,9 +260,9 @@ memory_condense is now the full local memory manager the design called for: tran
 **Verification block**: run
 
 ```powershell
-pixi run -e dev pytest -q -m "not slow"        # expect 407 passed, 13 deselected
+pixi run --frozen -e dev pytest -q -m "not slow"
 pixi run python -c "from memory_condense.db import Database; import tempfile, pathlib; d=Database(pathlib.Path(tempfile.mkdtemp())/'v.db'); print('schema_version', d.schema_version)"
 git log --oneline -1                            # expect merge f3edc91 on main
 ```
 
-Expect `schema_version 2`. Then decide: commit the memory layer as one change, or split the eval-model fix (`eval/schemas.py`, `judge.py`, `responder.py`) into its own commit first since it is the only part that unblocks *running* anything.
+Expect `schema_version 6`.

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 7
 
 #: DDL introduced by v3, written once and reused by both the fresh-database
 #: path and the migration path.
@@ -19,18 +19,119 @@ _V3_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_memory_content_hash ON memory_items(content_hash);
 """
 
+#: Compact, external association state introduced by v5.  These tables are
+#: intentionally incapable of storing the transformer's growing token state:
+#: a row contains one fixed-width CAV signature or one sparse episode edge.
+#: Source text remains in ``chunks`` and every attention workspace is
+#: disposable after it emits these records.
+_V5_ASSOCIATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS association_artifacts (
+    artifact_id      TEXT PRIMARY KEY,
+    model_id         TEXT NOT NULL,
+    checkpoint_id    TEXT NOT NULL,
+    prefix_layers    INTEGER NOT NULL CHECK(prefix_layers > 0),
+    head_layer       INTEGER NOT NULL CHECK(head_layer >= 0),
+    cav_layer        INTEGER CHECK(cav_layer IS NULL OR cav_layer >= 0),
+    concept_names    TEXT NOT NULL,
+    head_count       INTEGER NOT NULL CHECK(head_count > 0),
+    created_at       TEXT NOT NULL,
+    metadata         TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS chunk_cav_signatures (
+    chunk_id         TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    artifact_id      TEXT NOT NULL REFERENCES association_artifacts(artifact_id)
+                     ON DELETE CASCADE,
+    signature        BLOB NOT NULL,
+    created_turn     INTEGER NOT NULL DEFAULT 0 CHECK(created_turn >= 0),
+    access_count     INTEGER NOT NULL DEFAULT 0 CHECK(access_count >= 0),
+    last_access_turn INTEGER NOT NULL DEFAULT 0 CHECK(last_access_turn >= 0),
+    PRIMARY KEY (chunk_id, artifact_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_cav_artifact
+ON chunk_cav_signatures(artifact_id, chunk_id);
+
+CREATE TABLE IF NOT EXISTS chunk_head_edges (
+    source_chunk_id      TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    destination_chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    artifact_id          TEXT NOT NULL REFERENCES association_artifacts(artifact_id)
+                         ON DELETE CASCADE,
+    head_weights         BLOB NOT NULL,
+    qk_score             REAL NOT NULL CHECK(qk_score >= 0.0),
+    ov_transport         REAL NOT NULL DEFAULT 0.0 CHECK(ov_transport >= 0.0),
+    evidence_count       INTEGER NOT NULL DEFAULT 1 CHECK(evidence_count > 0),
+    traversal_count      INTEGER NOT NULL DEFAULT 0 CHECK(traversal_count >= 0),
+    last_access_turn     INTEGER NOT NULL DEFAULT 0 CHECK(last_access_turn >= 0),
+    temporal_forward     INTEGER CHECK(temporal_forward IN (0, 1)
+                                       OR temporal_forward IS NULL),
+    PRIMARY KEY (source_chunk_id, destination_chunk_id, artifact_id),
+    CHECK(source_chunk_id <> destination_chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_head_edges_destination
+ON chunk_head_edges(artifact_id, destination_chunk_id);
+"""
+
+#: Live access learning introduced by v7.  The graph stores only durable chunk
+#: IDs and scalar, turn-decayed co-access statistics.  ``event_fingerprint`` is
+#: an idempotency receipt (a SHA-256 digest), not a serialized retrieval set;
+#: callers cap receipt history so event bookkeeping cannot grow without bound.
+_V7_HEBBIAN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS hebbian_access_events (
+    artifact_id       TEXT NOT NULL REFERENCES association_artifacts(artifact_id)
+                      ON DELETE CASCADE,
+    event_id          TEXT NOT NULL,
+    observed_turn     INTEGER NOT NULL CHECK(observed_turn >= 0),
+    event_fingerprint TEXT NOT NULL,
+    member_count      INTEGER NOT NULL CHECK(member_count >= 0),
+    PRIMARY KEY (artifact_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hebbian_events_turn
+ON hebbian_access_events(artifact_id, observed_turn);
+
+CREATE TABLE IF NOT EXISTS hebbian_chunk_nodes (
+    artifact_id     TEXT NOT NULL REFERENCES association_artifacts(artifact_id)
+                    ON DELETE CASCADE,
+    chunk_id        TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    access_mass     REAL NOT NULL DEFAULT 0.0 CHECK(access_mass >= 0.0),
+    access_count    INTEGER NOT NULL DEFAULT 0 CHECK(access_count >= 0),
+    last_access_turn INTEGER NOT NULL DEFAULT 0 CHECK(last_access_turn >= 0),
+    PRIMARY KEY (artifact_id, chunk_id)
+);
+
+CREATE TABLE IF NOT EXISTS hebbian_chunk_edges (
+    artifact_id         TEXT NOT NULL REFERENCES association_artifacts(artifact_id)
+                        ON DELETE CASCADE,
+    chunk_low           TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    chunk_high          TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    coaccess_mass       REAL NOT NULL DEFAULT 0.0 CHECK(coaccess_mass >= 0.0),
+    coaccess_count      INTEGER NOT NULL DEFAULT 0 CHECK(coaccess_count >= 0),
+    last_reinforced_turn INTEGER NOT NULL DEFAULT 0
+                         CHECK(last_reinforced_turn >= 0),
+    PRIMARY KEY (artifact_id, chunk_low, chunk_high),
+    CHECK(chunk_low < chunk_high)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hebbian_edges_high
+ON hebbian_chunk_edges(artifact_id, chunk_high);
+"""
+
 #: Full schema for a freshly created database (already at CURRENT_SCHEMA_VERSION).
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS turns (
     turn_id    TEXT PRIMARY KEY,
     role       TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
     text       TEXT NOT NULL,
+    source_id  TEXT,
     created_at TEXT NOT NULL,
     ordinal    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_turns_created ON turns(created_at);
 CREATE INDEX IF NOT EXISTS idx_turns_ordinal ON turns(ordinal);
+CREATE INDEX IF NOT EXISTS idx_turns_source ON turns(source_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id        TEXT PRIMARY KEY,
@@ -101,6 +202,8 @@ CREATE TABLE IF NOT EXISTS meta (
 _SCHEMA_SQL = (
     _SCHEMA_SQL
     + _V3_INDEXES
+    + _V5_ASSOCIATION_SCHEMA
+    + _V7_HEBBIAN_SCHEMA
     + f"\nINSERT OR REPLACE INTO meta (key, value)"
     f" VALUES ('schema_version', '{CURRENT_SCHEMA_VERSION}');\n"
 )
@@ -173,6 +276,21 @@ ALTER TABLE turns ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_turns_ordinal ON turns(ordinal);
 
 UPDATE meta SET value = '4' WHERE key = 'schema_version';
+""",
+    5: _V5_ASSOCIATION_SCHEMA
+    + """
+UPDATE meta SET value = '5' WHERE key = 'schema_version';
+""",
+    6: """
+ALTER TABLE turns ADD COLUMN source_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_turns_source ON turns(source_id, ordinal);
+
+UPDATE meta SET value = '6' WHERE key = 'schema_version';
+""",
+    7: _V7_HEBBIAN_SCHEMA
+    + """
+UPDATE meta SET value = '7' WHERE key = 'schema_version';
 """,
 }
 
@@ -292,6 +410,11 @@ class Database:
     @property
     def connection(self) -> sqlite3.Connection:
         return self._conn
+
+    @property
+    def path(self) -> Path:
+        """Absolute/relative database path used by independent read workers."""
+        return self._path
 
     def current_turn(self) -> int:
         """The conversation's position — **the decay coordinate**.

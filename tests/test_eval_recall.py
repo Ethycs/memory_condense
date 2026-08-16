@@ -75,6 +75,7 @@ class _FakeStore:
         self.mode = mode
         self._items = list(items)
         self.closed = False
+        self.last_build_kwargs = None
         self.memory = SimpleNamespace(list_items=lambda: self._items)
         # Decay counts turns, so the survival projection needs to know where
         # the conversation is. 100 stands in for "a conversation has happened".
@@ -85,7 +86,13 @@ class _FakeStore:
         scored = sorted(
             self.texts, key=lambda t: len(q & set(t.lower().split())), reverse=True
         )
-        return [SimpleNamespace(chunk=SimpleNamespace(text=t)) for t in scored[:k]]
+        return [
+            SimpleNamespace(
+                chunk=SimpleNamespace(text=t),
+                turn=SimpleNamespace(source_id=f"source_{self.texts.index(t)}"),
+            )
+            for t in scored[:k]
+        ]
 
     def search(self, query, k=10, ef_search=50):
         return self._rank(query, k)
@@ -93,7 +100,23 @@ class _FakeStore:
     def search_hybrid(self, query, k=10, **kwargs):
         return self._rank(query, k)
 
+    def search_sources(self, query, k_sources=4):
+        return self._rank(query, k_sources)
+
+    def search_anchored_sources(self, query, k=10, **kwargs):
+        return self._rank(query, k)
+
+    def search_hybrid_sources(self, query, k=10, **kwargs):
+        return self._rank(query, k)
+
+    def search_hybrid_graph(self, query, k=10, **kwargs):
+        return self._rank(query, k)
+
+    def search_hybrid_neighbors(self, query, k=10, **kwargs):
+        return self._rank(query, k)
+
     def build_context(self, query, **kwargs):
+        self.last_build_kwargs = kwargs
         return PackedContext(
             memory_header="Relevant memory:\n- [Decision] Storage is SQLite.",
             expansions=[r.chunk.text for r in self._rank(query, kwargs.get("k_expansions", 3))],
@@ -136,9 +159,67 @@ class TestRunRecall:
         report = run_recall([SAMPLE], config, ingest_fn=_ingest_fn())
 
         assert report.n_questions == 1
+        assert report.haystack_recall == 1.0
         assert report.recall == 1.0
         assert report.expansion_recall == 1.0
         assert report.header_recall == 0.0
+
+    def test_source_mode_is_measured(self):
+        config = EvalConfig(
+            retrieval=RetrievalConfig(mode="source", k_sources=2)
+        )
+        report = run_recall([SAMPLE], config, ingest_fn=_ingest_fn())
+        assert report.recall == 1.0
+
+    def test_anchored_source_mode_is_measured(self):
+        config = EvalConfig(
+            retrieval=RetrievalConfig(mode="anchored_source", k=2)
+        )
+        report = run_recall([SAMPLE], config, ingest_fn=_ingest_fn())
+        assert report.recall == 1.0
+
+    def test_hybrid_source_mode_is_measured(self):
+        config = EvalConfig(
+            retrieval=RetrievalConfig(mode="hybrid_source", k=2, source_slots=4)
+        )
+        report = run_recall([SAMPLE], config, ingest_fn=_ingest_fn())
+        assert report.recall == 1.0
+
+    def test_hybrid_graph_mode_is_measured(self):
+        config = EvalConfig(
+            retrieval=RetrievalConfig(mode="hybrid_graph", k=2)
+        )
+        report = run_recall([SAMPLE], config, ingest_fn=_ingest_fn())
+        assert report.recall == 1.0
+
+    def test_hybrid_neighbor_mode_is_measured(self):
+        config = EvalConfig(
+            retrieval=RetrievalConfig(mode="hybrid_neighbor", k=2, neighbor_radius=1)
+        )
+        report = run_recall([SAMPLE], config, ingest_fn=_ingest_fn())
+        assert report.recall == 1.0
+
+    def test_evidence_source_coverage_scores_multi_source_retrieval(self):
+        sample = SAMPLE.model_copy(
+            update={
+                "questions": [
+                    SAMPLE.questions[0].model_copy(
+                        update={"evidence_sources": ["source_0", "source_2"]}
+                    )
+                ]
+            }
+        )
+        config = EvalConfig(retrieval=RetrievalConfig(mode="source", k_sources=1))
+
+        report = run_recall([sample], config, ingest_fn=_ingest_fn())
+
+        question = report.questions[0]
+        assert question.evidence_source_hit is True
+        assert question.evidence_source_recall == 0.5
+        assert question.all_evidence_sources is False
+        assert report.evidence_source_recall == 0.5
+        assert report.evidence_any_source_recall == 1.0
+        assert report.evidence_all_source_recall == 0.0
 
     def test_memory_mode_reports_where_the_answer_came_from(self):
         config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
@@ -146,6 +227,15 @@ class TestRunRecall:
 
         assert report.header_recall == 1.0
         assert report.expansion_recall == 1.0
+
+    def test_memory_measurement_is_hybrid_and_does_not_reheat(self):
+        store = _FakeStore(SAMPLE, "memory")
+        config = EvalConfig(retrieval=RetrievalConfig(k=3, mode="memory"))
+
+        run_recall([SAMPLE], config, ingest_fn=lambda *args, **kwargs: store)
+
+        assert store.last_build_kwargs["hybrid"] is True
+        assert store.last_build_kwargs["reheat_memories"] is False
 
     def test_an_unanswerable_question_scores_zero(self):
         sample = SAMPLE.model_copy(
@@ -163,6 +253,7 @@ class TestRunRecall:
         report = run_recall([sample], config, ingest_fn=_ingest_fn())
 
         assert report.recall == 0.0
+        assert report.haystack_recall == 0.0
 
     def test_max_samples_limits_work(self):
         config = EvalConfig(retrieval=RetrievalConfig(k=3))

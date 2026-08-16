@@ -25,11 +25,14 @@ All five selectors are **mutually exclusive**; the CLI errors if more than one i
 | --- | --- | --- |
 | `dense` (default) | top-k chunks by cosine | the retrieval baseline |
 | `hybrid` | the same, with BM25 blended | `lexical.py`, `blend_hybrid` |
+| `hybrid_neighbor` | hybrid anchors plus bounded source-local transitions | local chronology without loading whole sessions |
+| `hybrid_source` | anchors plus lower-ranked candidates from activated sources | bounded second-stage source reranking |
+| `hybrid_graph` | anchors, directional transitions, then activated-source candidates | the measured transition/source union under one prompt cap |
 | `memory` | `build_context`: memory-item header + budgeted expansions | `ContextPacker`, `MemoryStore.retrieve`, `rank_score`, `decay` |
 
 Until `memory` existed, **every subsystem in the right-hand column was measured by nothing** — both eval paths called `mc.search` directly. `--hybrid` is kept as a deprecated alias for `--mode hybrid`.
 
-Two defaults are overridden in `memory` mode for validity, not convenience: `recent_turns` is forced to the configured `--recent-window` (`build_context` defaults to 8, and the chunk arms use 4, so the untouched default would make the memory arm win on recency), and `max_expansions` is set to `--k` (the default 3 × 250 tokens would otherwise be compared against ten whole chunks). Compare the arms on the recorded `context_tokens`, not on the flag alone.
+Two defaults are controlled explicitly in `memory` mode for validity, not convenience: `recent_turns` is forced to the configured `--recent-window` (`build_context` defaults to 8, and the chunk arms use 4, so the untouched default would make the memory arm win on recency), and `max_expansions` is set to `--k`. The facade now defaults to ten candidates under the unchanged 800-token aggregate ceiling; setting the count from `--k` keeps non-default eval arms comparable. Memory expansions use hybrid retrieval, matching the production facade and B0's strongest in-regime component. Compare the arms on the recorded `context_tokens`, not on the flag alone.
 
 ## 1. Input data
 
@@ -61,6 +64,8 @@ Point `--conversation-dir` at a directory of such files; `load_directory` return
 | `--sweep` | off | replay | Run the full parameter sweep instead of one config |
 | `--benchmark-file` | — | benchmark | LongMemEval/LoCoMo `.json` or `.jsonl` |
 | `--benchmark-format` | `auto` | benchmark | `auto` \| `longmemeval` \| `locomo` |
+| `--benchmark-split-manifest` | — | benchmark, answer-recall | Dataset-hash-verified locked partition manifest |
+| `--benchmark-split` | — | benchmark, answer-recall | Partition name from the manifest; both split flags are required together |
 | `--compare BASELINE TREATMENT` | — | compare | Two saved `eval_results` JSON files, compared offline |
 | `--judge-model` | `anthropic/claude-sonnet-5` | replay, sweep, benchmark (`--use-judge` only) | litellm model string for judging |
 | `--responder-model` | `anthropic/claude-haiku-4-5` | replay, sweep, benchmark | litellm model string for generation / answering |
@@ -68,11 +73,19 @@ Point `--conversation-dir` at a directory of such files; `load_directory` return
 | `--max-conversations` | none | replay, sweep | Cap conversations evaluated |
 | `--max-samples` | none | benchmark | Cap benchmark samples evaluated — **use it** |
 | `--use-judge` | off | benchmark | Also grade answers with a semantic-equivalence judge; **doubles API cost** |
+| `--accuracy-target` | `0.95` | benchmark | Judge-accuracy target recorded in the report |
+| `--min-target-questions` | `100` | benchmark | A smaller judged smoke is reported as insufficient even if perfect |
+| `--max-prompt-tokens` | `8000` | benchmark | Hard cl100k content-token ceiling applied before every responder call |
 | `--recent-window` | 4 | replay, sweep | Recent turns always in the responder prompt |
 | `--min-tokens` / `--max-tokens` | 120 / 250 | all but compare | Chunker bounds (cl100k tokens) |
 | `--k` | 10 | all but compare | Chunks retrieved per query; **`--k 0` = no-memory baseline** |
 | `--ef-search` | 50 | all but compare | hnswlib query-time ef |
-| `--mode` | `dense` | replay, sweep, benchmark, answer-recall | `dense` \| `hybrid` \| `memory` — see the table above |
+| `--mode` | `dense` | replay, sweep, benchmark, answer-recall | retrieval arm; see the mode table above |
+| `--source-slots` | 24 | `hybrid_source`, `hybrid_graph` | Hard count of second-stage chunks admitted from activated sources |
+| `--source-activation-k` | `--k` | `hybrid_source`, `hybrid_graph` | Ranked pool prefix allowed to activate source identities without increasing direct anchors |
+| `--source-candidate-pool` | 200 | `hybrid_source`, `hybrid_graph` | Hard candidate boundary for source reranking |
+| `--neighbor-radius` / `--neighbor-slots` | 1 / 5 | `hybrid_neighbor`, `hybrid_graph` | Source-local transition distance and count bounds |
+| `--neighbor-direction` | `both` | `hybrid_graph` | Admit `previous`, `next`, or both transition directions |
 | `--hybrid` | off | replay, sweep | Deprecated alias for `--mode hybrid` |
 | `--k-memories` | 8 | `--mode memory` | Memory items requested for the header |
 | `--answer-recall` | — | answer-recall | Benchmark file; measures whether the gold answer is reachable at all. **Free** |
@@ -114,18 +127,71 @@ Same code path both times; the delta isolates retrieval's contribution. The thir
 pixi run python -m memory_condense.eval --benchmark-file longmemeval_oracle.json --max-samples 10
 
 # with semantic judging (2× cost)
-pixi run python -m memory_condense.eval --benchmark-file data/locomo10.json --max-samples 3 --use-judge
+pixi run python -m memory_condense.eval --benchmark-file data/locomo10.json `
+  --max-samples 3 --use-judge --max-provider-calls 6
 ```
+
+Remote benchmark execution is fail-closed: `--max-provider-calls` defaults to
+zero and must cover every planned answer plus judge call. Provider retries also
+default to zero. Each saved question and aggregate report records actual answer
+and judge input/output tokens, latency, and call count. Increasing retries is an
+explicit cost decision via `--provider-retries`; it is never silently enabled.
+Paid reports also record the dataset, locked-split manifest, complete Python
+source tree, Pixi lock, and optional frozen-policy SHA-256 values. Saving a
+report writes a sibling `.json.sha256` file, so later comparison can detect any
+result-file change.
 
 Protocol (`eval/benchmark.py`), deliberately different from replay: ingest a sample's **entire** haystack into a fresh store → for each question, retrieve top-k chunks → answer from **those chunks only** → grade with SQuAD-normalized token F1 + exact match (+ optional judge). This is the protocol LongMemEval and LoCoMo publish, so the numbers are comparable to published SimpleMem / Mem0 / Zep results.
 
-The summary prints aggregate F1 / EM / judge accuracy plus a per-category breakdown (LongMemEval's `question_type`, LoCoMo's `category`), which is how published results are reported.
+The operational headline is semantic answer accuracy after the conversation is
+complete, with the responder receiving only the bounded retrieved context. A
+saved report includes completed-transcript tokens, retrieved-context tokens,
+the context fraction, transcript-token savings, maximum prompt size, and prompt
+budget compliance. The treatment never sends the completed transcript. A run
+cannot pass the accuracy target if it exceeds the configured prompt boundary.
+Source coverage and literal answer containment are diagnostics for explaining
+failures, not substitutes for answer accuracy.
+
+Stores remain isolated per sample, but the harness now reuses one stateless
+`EmbeddingService` across them. This is especially important for LongMemEval
+oracle, where one question equals one sample: reloading bge-m3 for every fresh
+SQLite store made a 20-question preflight exceed ten minutes; shared weights
+complete it in about one minute without sharing any memory state.
+
+For repeated non-memory retrieval arms, persist isolated compiled stores rather
+than re-embedding every haystack:
+
+```powershell
+pixi run --frozen -e dev python -m memory_condense.eval `
+  --answer-recall data/longmemeval_oracle.json `
+  --benchmark-split-manifest "docs/10 - Research Log/data/longmemeval-95-target-split-v1.json" `
+  --benchmark-split development `
+  --mode hybrid --k 10 --max-prompt-tokens 8000 `
+  --compiled-store-cache "C:\Users\Keytone\Downloads\memory-condense-rig\longmemeval-compiled-v1"
+```
+
+Every cache hit verifies the manifest plus SQLite/HNSW SHA-256 values. The key
+includes the complete sample, chunker, embedding model/dimension, and schema;
+retrieval-only settings intentionally reuse the same compiled bytes. Extracting
+`memory` mode is rejected because its write state is policy-dependent.
+
+The summary prints aggregate F1 / EM / judge accuracy, mean and p95 responder
+prompt tokens, the 95% target status, and a per-category breakdown
+(LongMemEval's `question_type`, LoCoMo's `category`). A run can pass only when
+judge accuracy reaches the configured target over at least the configured
+minimum number of questions; unjudged and undersized runs are explicit.
 
 **Gotchas**:
 
-1. **known rough edge**: the saved filename uses `--benchmark-format` as its label, so the default run writes `benchmark_auto_120-250_k10_ef50_*.json` rather than naming the dataset. Pass `--benchmark-format longmemeval` explicitly to get a self-describing filename.
-2. The benchmark path uses dense `mc.search` (`k`, `ef_search`), not `search_hybrid` — same as the replay runner. Comparing dense vs hybrid on a benchmark is an open task.
-3. `answer_fn` is called with `temperature=0.0`, `max_tokens=256`; the optional `judge_fn` passes **no** temperature (Sonnet 5 rejects it). Both use `num_retries=5`.
+1. The benchmark path supports dense, hybrid, memory, and pooled-span modes.
+   Compiled QK/heat artifacts are not yet exposed by this generic harness;
+   that is the next integration required for the 95% campaign.
+2. `answer_fn` is called with `temperature=0.0`, `max_tokens=256`; the optional
+   `judge_fn` passes **no** temperature (Sonnet 5 rejects it). Both use
+   `num_retries=5`.
+3. The prompt cap counts message content with the project's cl100k proxy. It
+   includes the QA instructions, question, excerpt labels, and excerpts, but
+   not provider-specific chat framing tokens.
 
 ## 6. Sweep mode
 

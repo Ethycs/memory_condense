@@ -34,7 +34,9 @@ from memory_condense import decay
 from memory_condense._tokenizer import count_tokens
 from memory_condense.eval.benchmark import (
     IngestFn,
+    cap_context_to_prompt_budget,
     ingest_sample,
+    shared_embedding_ingest_fn,
     normalize_answer,
     f1_score,
 )
@@ -62,6 +64,7 @@ class QuestionRecall(BaseModel):
 
     question_id: str
     category: str = ""
+    in_haystack: bool = False
     in_context: bool = False
     best_f1: float = 0.0
     in_memory_header: bool = False
@@ -70,6 +73,12 @@ class QuestionRecall(BaseModel):
     #: claim is *the same answer for fewer tokens*, so recall alone cannot
     #: show its benefit — and can make a system that spends 10x look better.
     context_tokens: int = 0
+    #: Source-level diagnostics are scored only when the benchmark supplies
+    #: gold evidence source IDs. They measure retrieval, not answer wording.
+    evidence_source_hit: bool | None = None
+    evidence_source_recall: float | None = None
+    all_evidence_sources: bool | None = None
+    retrieved_source_ids: list[str] = Field(default_factory=list)
     #: ``{horizon_turns: answer_still_in_a_non_cold_item}``
     survives_horizon: dict[int, bool] = Field(default_factory=dict)
 
@@ -88,11 +97,16 @@ class RecallReport(BaseModel):
     mode: str = "dense"
     k: int = 10
     n_questions: int = 0
+    haystack_recall: float = 0.0
     recall: float = 0.0
     mean_best_f1: float = 0.0
     header_recall: float = 0.0
     expansion_recall: float = 0.0
     mean_context_tokens: float = 0.0
+    #: Mean fraction of each question's required evidence sources retrieved.
+    evidence_source_recall: float | None = None
+    evidence_any_source_recall: float | None = None
+    evidence_all_source_recall: float | None = None
     survival_by_horizon: dict[int, float] = Field(default_factory=dict)
     by_category: dict[str, float] = Field(default_factory=dict)
     questions: list[QuestionRecall] = Field(default_factory=list)
@@ -128,8 +142,10 @@ def best_f1(texts: list[str], gold: str) -> float:
     return max((f1_score(t, gold) for t in texts), default=0.0)
 
 
-def _assemble(mc, question: str, config: EvalConfig) -> tuple[list[str], list[str]]:
-    """The context this config would send. Returns ``(header_texts, body_texts)``.
+def _assemble(
+    mc, question: str, config: EvalConfig
+) -> tuple[list[str], list[str], list[str | None]]:
+    """Return header, body, and the body items' durable source IDs.
 
     ``reheat`` is off throughout: this is a measurement, and an item must not
     become hotter merely because a measurement looked at it.
@@ -140,16 +156,69 @@ def _assemble(mc, question: str, config: EvalConfig) -> tuple[list[str], list[st
             recent_turns=0,
             k_memories=config.retrieval.k_memories,
             k_expansions=config.retrieval.k,
-            hybrid=config.retrieval.effective_hybrid,
+            # Hybrid is the production facade's default expansion retriever
+            # and B0's strongest in-regime arm.  Memory mode should not
+            # silently override it back to dense.
+            hybrid=True,
+            reheat_memories=False,
         )
         header = [packed.memory_header] if packed.memory_header else []
-        return header, list(packed.expansions)
+        return header, list(packed.expansions), []
 
     if config.retrieval.mode == "span":
         results = mc.search_spans(
             question,
             levels=config.retrieval.span_levels,
             k_per_level=config.retrieval.k_per_level,
+        )
+    elif config.retrieval.mode == "source":
+        results = mc.search_sources(
+            question,
+            k_sources=config.retrieval.k_sources,
+        )
+    elif config.retrieval.mode == "anchored_source":
+        results = mc.search_anchored_sources(
+            question,
+            k=config.retrieval.k,
+            ef_search=config.retrieval.ef_search,
+            candidates=config.retrieval.candidates,
+            alpha=config.retrieval.alpha,
+        )
+    elif config.retrieval.mode == "hybrid_source":
+        results = mc.search_hybrid_sources(
+            question,
+            k=config.retrieval.k,
+            source_slots=config.retrieval.source_slots,
+            source_candidate_pool=config.retrieval.source_candidate_pool,
+            source_activation_k=config.retrieval.source_activation_k,
+            ef_search=config.retrieval.ef_search,
+            candidates=config.retrieval.candidates,
+            alpha=config.retrieval.alpha,
+        )
+    elif config.retrieval.mode == "hybrid_graph":
+        results = mc.search_hybrid_graph(
+            question,
+            k=config.retrieval.k,
+            neighbor_radius=config.retrieval.neighbor_radius,
+            neighbor_slots=config.retrieval.neighbor_slots,
+            neighbor_direction=config.retrieval.neighbor_direction,
+            source_slots=config.retrieval.source_slots,
+            source_candidate_pool=config.retrieval.source_candidate_pool,
+            source_activation_k=config.retrieval.source_activation_k,
+            ef_search=config.retrieval.ef_search,
+            candidates=config.retrieval.candidates,
+            alpha=config.retrieval.alpha,
+        )
+    elif config.retrieval.mode == "hybrid_neighbor":
+        results = mc.search_hybrid_neighbors(
+            question,
+            k=config.retrieval.k,
+            radius=config.retrieval.neighbor_radius,
+            max_neighbors=config.retrieval.neighbor_slots,
+            replacement_slots=config.retrieval.neighbor_replacement_slots,
+            ef_search=config.retrieval.ef_search,
+            candidates=config.retrieval.candidates,
+            alpha=config.retrieval.alpha,
         )
     elif config.retrieval.effective_hybrid:
         results = mc.search_hybrid(
@@ -163,7 +232,11 @@ def _assemble(mc, question: str, config: EvalConfig) -> tuple[list[str], list[st
         results = mc.search(
             question, k=config.retrieval.k, ef_search=config.retrieval.ef_search
         )
-    return [], [r.chunk.text for r in results]
+    return (
+        [],
+        [r.chunk.text for r in results],
+        [getattr(getattr(r, "turn", None), "source_id", None) for r in results],
+    )
 
 
 def _survival(mc, gold: str, horizons_turns) -> dict[int, bool]:
@@ -202,18 +275,51 @@ def measure_sample(
     mc = ingest_fn(sample, config, data_dir)
     try:
         out: list[QuestionRecall] = []
+        haystack_texts = [text for _role, text in sample.turns]
         for question in sample.questions:
-            header, body = _assemble(mc, question.question, config)
+            query_text = question.dated_question
+            header, body, body_sources = _assemble(mc, query_text, config)
+            header_count = len(header)
+            capped = cap_context_to_prompt_budget(
+                query_text,
+                header + body,
+                config.max_prompt_tokens,
+            )
+            header = capped[:header_count]
+            body = capped[header_count:]
+            body_sources = body_sources[: len(body)]
             everything = header + body
+            expected_sources = set(question.evidence_sources)
+            retrieved_sources = {source for source in body_sources if source}
+            evidence_coverage = (
+                len(expected_sources & retrieved_sources) / len(expected_sources)
+                if expected_sources
+                else None
+            )
             out.append(
                 QuestionRecall(
                     question_id=question.question_id,
                     category=question.category or "",
+                    in_haystack=contains_answer(haystack_texts, question.answer),
                     in_context=contains_answer(everything, question.answer),
                     best_f1=best_f1(everything, question.answer),
                     in_memory_header=contains_answer(header, question.answer),
                     in_expansions=contains_answer(body, question.answer),
                     context_tokens=sum(count_tokens(t) for t in everything),
+                    evidence_source_hit=(
+                        bool(expected_sources & retrieved_sources)
+                        if expected_sources
+                        else None
+                    ),
+                    evidence_source_recall=evidence_coverage,
+                    all_evidence_sources=(
+                        evidence_coverage == 1.0
+                        if evidence_coverage is not None
+                        else None
+                    ),
+                    retrieved_source_ids=list(
+                        dict.fromkeys(source for source in body_sources if source)
+                    ),
                     survives_horizon=_survival(mc, question.answer, horizons_turns),
                 )
             )
@@ -232,6 +338,11 @@ def run_recall(
 ) -> RecallReport:
     """Measure answer reachability across samples. Zero API calls."""
     selected = samples[:max_samples] if max_samples else samples
+    effective_ingest_fn = (
+        shared_embedding_ingest_fn(config.embedding_device)
+        if ingest_fn is ingest_sample
+        else ingest_fn
+    )
 
     results: list[QuestionRecall] = []
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -243,7 +354,7 @@ def run_recall(
                     sample,
                     config,
                     Path(tmpdir) / f"sample_{i}",
-                    ingest_fn=ingest_fn,
+                    ingest_fn=effective_ingest_fn,
                     horizons_turns=horizons_turns,
                 )
             )
@@ -253,16 +364,43 @@ def run_recall(
     for r in results:
         by_category.setdefault(r.category or "uncategorized", []).append(r.in_context)
 
+    source_any_scored = [
+        result.evidence_source_hit
+        for result in results
+        if result.evidence_source_hit is not None
+    ]
+    source_coverage_scored = [
+        result.evidence_source_recall
+        for result in results
+        if result.evidence_source_recall is not None
+    ]
+    source_all_scored = [
+        result.all_evidence_sources
+        for result in results
+        if result.all_evidence_sources is not None
+    ]
     return RecallReport(
         benchmark=benchmark,
         mode=config.retrieval.mode,
         k=config.retrieval.k,
         n_questions=n,
+        haystack_recall=_frac(r.in_haystack for r in results),
         recall=_frac(r.in_context for r in results),
         mean_best_f1=(sum(r.best_f1 for r in results) / n) if n else 0.0,
         header_recall=_frac(r.in_memory_header for r in results),
         expansion_recall=_frac(r.in_expansions for r in results),
         mean_context_tokens=(sum(r.context_tokens for r in results) / n) if n else 0.0,
+        evidence_source_recall=(
+            sum(source_coverage_scored) / len(source_coverage_scored)
+            if source_coverage_scored
+            else None
+        ),
+        evidence_any_source_recall=(
+            _frac(source_any_scored) if source_any_scored else None
+        ),
+        evidence_all_source_recall=(
+            _frac(source_all_scored) if source_all_scored else None
+        ),
         survival_by_horizon={
             days: _frac(r.survives_horizon.get(days, False) for r in results)
             for days in horizons_turns
@@ -286,6 +424,7 @@ def print_recall_report(report: RecallReport) -> None:
     print(f"  mode     : {report.mode}  k={report.k}")
     print(f"  questions: {report.n_questions}")
     print("=" * 72)
+    print(f"{'answer present anywhere in haystack':<34}{report.haystack_recall:>8.1%}")
     print(f"{'answer present in context':<34}{report.recall:>8.1%}")
     print(f"{'mean best token-F1':<34}{report.mean_best_f1:>8.3f}")
     if report.mode == "memory":
@@ -296,6 +435,12 @@ def print_recall_report(report: RecallReport) -> None:
     print(f"{'recall per 1k tokens':<34}{report.recall_per_1k_tokens:>8.2f}")
     print("  (condensation wins by costing less, not only by recalling more —")
     print("   compare arms on this row as well as the one above)")
+
+    if report.evidence_source_recall is not None:
+        print()
+        print(f"{'mean evidence-source coverage':<34}{report.evidence_source_recall:>8.1%}")
+        print(f"{'questions with any evidence':<34}{report.evidence_any_source_recall:>8.1%}")
+        print(f"{'questions with all evidence':<34}{report.evidence_all_source_recall:>8.1%}")
 
     if report.survival_by_horizon:
         print()

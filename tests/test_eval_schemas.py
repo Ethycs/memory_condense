@@ -22,6 +22,41 @@ def test_retrieval_config_defaults():
     assert r.ef_search == 50
 
 
+def test_hybrid_neighbor_label_captures_transition_budget():
+    config = RetrievalConfig(
+        mode="hybrid_neighbor",
+        k=10,
+        neighbor_radius=6,
+        neighbor_slots=22,
+        neighbor_replacement_slots=0,
+    )
+
+    assert config.label == "hybrid-neighbor-k10-r6-s22"
+
+
+def test_hybrid_source_label_captures_second_stage_bounds():
+    config = RetrievalConfig(
+        mode="hybrid_source", k=10, source_slots=24, source_candidate_pool=200
+    )
+
+    assert config.label == "hybrid-source-k10-s24-a10-p200"
+
+
+def test_hybrid_graph_label_captures_both_link_budgets():
+    config = RetrievalConfig(
+        mode="hybrid_graph",
+        k=10,
+        neighbor_radius=5,
+        neighbor_slots=24,
+        neighbor_direction="next",
+        source_slots=24,
+        source_candidate_pool=200,
+        source_activation_k=20,
+    )
+
+    assert config.label == "hybrid-graph-k10-r5-n24-next-s24-a20-p200"
+
+
 def test_eval_config_defaults():
     ec = EvalConfig()
     # The 3.5-Haiku defaults were retired 2026-02-19 and now 404.

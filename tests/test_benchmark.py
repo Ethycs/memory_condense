@@ -16,6 +16,7 @@ import pytest
 from memory_condense.eval.benchmark import (
     BenchmarkRunResult,
     build_qa_prompt,
+    cap_context_to_prompt_budget,
     exact_match,
     f1_score,
     ingest_sample,
@@ -23,7 +24,12 @@ from memory_condense.eval.benchmark import (
     run_benchmark,
     save_benchmark_report,
 )
-from memory_condense.eval.schemas import ChunkerConfig, EvalConfig, RetrievalConfig
+from memory_condense.eval.schemas import (
+    ChunkerConfig,
+    EvalConfig,
+    RetrievalConfig,
+    UsageStats,
+)
 from memory_condense.loader import BenchmarkQuestion, BenchmarkSample, load_benchmark
 
 # ---------------------------------------------------------------------------
@@ -56,6 +62,21 @@ class FakeCondenser:
             SimpleNamespace(chunk=SimpleNamespace(text=text), score=float(score))
             for score, text in scored[:k]
         ]
+
+    def search_sources(self, query: str, k_sources: int = 4):
+        return self.search(query, k=max(k_sources, 1))
+
+    def search_anchored_sources(self, query: str, k: int = 10, **kwargs):
+        return self.search(query, k=k)
+
+    def search_hybrid_sources(self, query: str, k: int = 10, **kwargs):
+        return self.search(query, k=k)
+
+    def search_hybrid_graph(self, query: str, k: int = 10, **kwargs):
+        return self.search(query, k=k)
+
+    def search_hybrid_neighbors(self, query: str, k: int = 10, **kwargs):
+        return self.search(query, k=k)
 
     def close(self) -> None:
         self.closed = True
@@ -156,6 +177,49 @@ def test_build_qa_prompt_without_chunks():
     assert "no excerpts" in messages[1]["content"]
 
 
+def test_dated_question_reaches_retrieval_and_prompt():
+    dated = SAMPLE.questions[0].model_copy(
+        update={"question_date": "2026/08/16 10:00"}
+    )
+    sample = SAMPLE.model_copy(update={"questions": [dated]})
+    seen: list[str] = []
+
+    run_benchmark(
+        samples=[sample],
+        config=make_config(k=1),
+        answer_fn=lambda messages: seen.append(messages[1]["content"]) or "Boston",
+        ingest_fn=fake_ingest_fn,
+    )
+
+    assert "Question asked at 2026/08/16" in seen[0]
+
+
+def test_source_mode_reaches_the_benchmark_prompt():
+    config = make_config(k=1).model_copy(
+        update={"retrieval": RetrievalConfig(mode="source", k_sources=1)}
+    )
+    seen: list[str] = []
+    run_benchmark(
+        samples=[SAMPLE],
+        config=config,
+        answer_fn=lambda messages: seen.append(messages[1]["content"]) or "x",
+        ingest_fn=fake_ingest_fn,
+    )
+    assert len(seen) == 2
+
+
+def test_prompt_budget_caps_and_truncates_context():
+    from memory_condense._tokenizer import count_tokens
+
+    uncapped = ["Boston " * 200, "Pepper " * 200]
+    capped = cap_context_to_prompt_budget("Where?", uncapped, 120)
+    prompt = build_qa_prompt("Where?", capped)
+
+    assert capped
+    assert len(capped) == 1
+    assert sum(count_tokens(message["content"]) for message in prompt) <= 120
+
+
 # ---------------------------------------------------------------------------
 # run_benchmark (fake retriever)
 # ---------------------------------------------------------------------------
@@ -180,6 +244,16 @@ def test_run_benchmark_end_to_end_with_stub_answer_fn():
     assert result.mean_f1 == pytest.approx(0.5)
     assert result.exact_match_rate == pytest.approx(0.5)
     assert result.judge_accuracy is None
+    assert result.target_status == "ungraded"
+    assert result.accuracy_target_met is None
+    assert result.mean_prompt_tokens > result.mean_context_tokens
+    assert result.mean_transcript_tokens > result.mean_context_tokens
+    assert 0.0 < result.mean_context_fraction < 1.0
+    assert result.mean_transcript_token_savings == pytest.approx(
+        1.0 - result.mean_context_fraction
+    )
+    assert result.prompt_budget_compliance is True
+    assert result.max_prompt_tokens_observed > 0
     assert result.benchmark == "fixture"
     assert result.run_timestamp
 
@@ -239,6 +313,65 @@ def test_run_benchmark_with_judge_fn():
     assert qr.judge_correct is True
     assert qr.judge_reasoning == "substring check"
     assert result.by_category["multi-session"].judge_accuracy == pytest.approx(0.0)
+    assert result.target_status == "insufficient_questions"
+    assert result.accuracy_target_met is False
+
+
+def test_accuracy_target_requires_enough_questions_and_passes():
+    sample = SAMPLE.model_copy(update={"questions": [SAMPLE.questions[0]] * 3})
+    config = make_config().model_copy(
+        update={"accuracy_target": 0.95, "min_target_questions": 3}
+    )
+    result = run_benchmark(
+        samples=[sample],
+        config=config,
+        answer_fn=lambda messages: "Boston",
+        judge_fn=lambda question, gold, prediction: (True, "correct"),
+        ingest_fn=fake_ingest_fn,
+    )
+
+    assert result.judge_accuracy == 1.0
+    assert result.accuracy_target_met is True
+    assert result.target_status == "passed"
+    assert result.p95_prompt_tokens >= result.mean_prompt_tokens
+    assert result.prompt_budget_compliance is True
+
+
+def test_accuracy_target_fails_when_operational_prompt_budget_is_exceeded(
+    monkeypatch,
+):
+    import memory_condense.eval.benchmark as benchmark_module
+
+    sample = SAMPLE.model_copy(update={"questions": [SAMPLE.questions[0]]})
+    config = make_config().model_copy(
+        update={
+            "accuracy_target": 0.95,
+            "min_target_questions": 1,
+            "max_prompt_tokens": 10,
+        }
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "answer_question",
+        lambda mc, question, config, answer_fn: (
+            "Boston",
+            [],
+            config.max_prompt_tokens + 1,
+            UsageStats(),
+        ),
+    )
+
+    result = run_benchmark(
+        samples=[sample],
+        config=config,
+        answer_fn=lambda messages: "Boston",
+        judge_fn=lambda question, gold, prediction: (True, "correct"),
+        ingest_fn=fake_ingest_fn,
+    )
+
+    assert result.prompt_budget_compliance is False
+    assert result.accuracy_target_met is False
+    assert result.target_status == "prompt_budget_exceeded"
 
 
 def test_run_benchmark_max_samples():
@@ -292,6 +425,34 @@ def test_run_benchmark_closes_the_store():
     assert created and all(mc.closed for mc in created)
 
 
+def test_run_benchmark_aggregates_metered_answer_and_judge_usage():
+    answer_usage = UsageStats(input_tokens=20, output_tokens=2, calls=1)
+    judge_usage = UsageStats(input_tokens=5, output_tokens=3, calls=1)
+
+    result = run_benchmark(
+        samples=[SAMPLE],
+        config=make_config(),
+        answer_fn=lambda messages: ("Boston", answer_usage),
+        judge_fn=lambda question, gold, prediction: (
+            True,
+            "CORRECT",
+            judge_usage,
+        ),
+        ingest_fn=fake_ingest_fn,
+    )
+
+    assert result.responder_usage == UsageStats(
+        input_tokens=40,
+        output_tokens=4,
+        calls=2,
+    )
+    assert result.judge_usage == UsageStats(
+        input_tokens=10,
+        output_tokens=6,
+        calls=2,
+    )
+
+
 def test_run_benchmark_empty_samples():
     result = run_benchmark(
         samples=[],
@@ -319,6 +480,9 @@ def test_save_benchmark_report(tmp_path: Path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["num_questions"] == 2
     assert "by_category" in payload
+    checksum = path.parent / f"{path.name}.sha256"
+    assert checksum.exists()
+    assert checksum.read_text(encoding="ascii").strip().endswith(path.name)
 
 
 # ---------------------------------------------------------------------------

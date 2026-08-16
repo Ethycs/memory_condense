@@ -7,7 +7,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,9 @@ class Turn(BaseModel):
     turn_id: str = Field(default_factory=_new_id)
     role: str  # "user" | "assistant" | "system"
     text: str
+    #: Stable external source boundary: conversation session, document, file,
+    #: or another provenance-bearing unit. ``None`` preserves legacy turns.
+    source_id: Optional[str] = None
     created_at: datetime = Field(default_factory=_now)
 
     model_config = {"frozen": True}
@@ -299,6 +302,27 @@ class RetrievalResult(BaseModel):
     turn: Optional[Turn] = None
     dense_score: Optional[float] = None
     lexical_score: Optional[float] = None
+    # Route is diagnostic only: scoring and the fixed result budget remain
+    # explicit in the retrieval method that produced the row.
+    route: Optional[str] = None
+    association_score: Optional[float] = None
+    anchor_chunk_id: Optional[str] = None
+    association_hop: Optional[int] = Field(default=None, ge=1)
+    edge_source_chunk_id: Optional[str] = None
+    # IDs only: this explains a bounded graph walk without retaining text,
+    # activations, or any other transformer-shaped state between hops.
+    association_path: Optional[tuple[str, ...]] = None
+    # Heat is a conserved, external scalar derived from compact association
+    # edges. It is not a transformer attention tensor or retained token state.
+    diffusion_heat: Optional[float] = Field(default=None, ge=0.0)
+    association_support: Optional[int] = Field(default=None, ge=0)
+    memory_source_id: Optional[str] = None
+    source_heat: Optional[float] = Field(default=None, ge=0.0)
+    source_token_budget: Optional[int] = Field(default=None, ge=0)
+    # Source-local transition diagnostics. These are compact routing metadata,
+    # not retained activations or evidence text.
+    transition_distance: Optional[int] = Field(default=None, ge=1)
+    transition_direction: Optional[Literal["previous", "next"]] = None
 
 
 class MemoryResult(BaseModel):
@@ -330,9 +354,17 @@ class PackedContext(BaseModel):
 
     messages: list[dict[str, str]] = Field(default_factory=list)
     memory_header: str = ""
+    #: Memory rows that actually reached ``memory_header``.  Selection and
+    #: packing are separate steps, so this is also the authoritative set to
+    #: reheat: a ranked item dropped by the token budget was not accessed by
+    #: the model and must continue to cool.
+    memory_ids: list[str] = Field(default_factory=list)
     expansions: list[str] = Field(default_factory=list)
     recent_turns: list[tuple[str, str]] = Field(default_factory=list)
     token_counts: dict[str, int] = Field(default_factory=dict)
+    # Actual excerpt content tokens exposed from each heat source. Labels and
+    # section prefixes remain accounted for in ``token_counts`` instead.
+    expansion_source_token_counts: dict[str, int] = Field(default_factory=dict)
     dropped: dict[str, int] = Field(default_factory=dict)
 
     @property

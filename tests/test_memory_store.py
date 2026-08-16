@@ -318,6 +318,28 @@ def test_touch_missing_returns_none(store):
     assert store.touch("ghost") is None
 
 
+def test_touch_many_uses_one_transaction_and_preserves_order(store, turn):
+    first = store.create(make_create(turn.turn_id, content="first"))
+    second = store.create(make_create(turn.turn_id, content="second"))
+    commits = 0
+
+    def trace(sql):
+        nonlocal commits
+        if sql.strip().upper() == "COMMIT":
+            commits += 1
+
+    store._db.connection.set_trace_callback(trace)
+    touched = store.touch_many(
+        [second.mem_id, "ghost", first.mem_id, second.mem_id],
+        now_turn=first.last_access_turn + 5,
+    )
+    store._db.connection.set_trace_callback(None)
+
+    assert [item.mem_id for item in touched] == [second.mem_id, first.mem_id]
+    assert all(item.last_access_turn == first.last_access_turn + 5 for item in touched)
+    assert commits == 1
+
+
 def test_heat_counts(store, turn):
     store.create(make_create(turn.turn_id, content="hot", importance=0.9))
     store.create(make_create(turn.turn_id, content="warm", importance=0.2))
@@ -416,6 +438,22 @@ def test_retrieve_ranks_by_cosine_relevance(store, turn):
     assert results[0].relevance == pytest.approx(1.0)
     assert results[1].relevance == pytest.approx(0.0)
     assert results[0].score > results[1].score
+
+
+def test_retrieve_batches_provenance_and_returns_it(store, turn):
+    for i in range(5):
+        store.create(make_create(turn.turn_id, content=f"fact {i}"))
+    statements = []
+    store._db.connection.set_trace_callback(statements.append)
+
+    results = store.retrieve(None, k=3, reheat=False)
+
+    store._db.connection.set_trace_callback(None)
+    provenance_reads = [
+        sql for sql in statements if "FROM memory_provenance" in sql
+    ]
+    assert len(provenance_reads) == 1
+    assert all(result.item.provenance for result in results)
 
 
 def test_retrieve_populates_score_components(store, turn):
@@ -595,6 +633,24 @@ def test_retrieve_does_not_touch_unreturned_items(store, turn):
     results = store.retrieve(None, k=1)
     assert results[0].item.mem_id == kept.mem_id
     assert store.get(ignored.mem_id).last_access_at == before
+
+
+def test_retrieve_reheats_all_results_in_one_transaction(store, turn):
+    for i in range(5):
+        store.create(make_create(turn.turn_id, content=f"item {i}"))
+    commits = 0
+
+    def trace(sql):
+        nonlocal commits
+        if sql.strip().upper() == "COMMIT":
+            commits += 1
+
+    store._db.connection.set_trace_callback(trace)
+    results = store.retrieve(None, k=5, now_turn=10)
+    store._db.connection.set_trace_callback(None)
+
+    assert len(results) == 5
+    assert commits == 1
 
 
 def test_retrieve_honours_k(store, turn):

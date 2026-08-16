@@ -115,9 +115,17 @@ class BenchmarkQuestion(BaseModel):
 
     question_id: str
     question: str
-    answer: str
+    answer: str = Field(min_length=1)
     category: str | None = None
     evidence: list[str] = Field(default_factory=list)
+    evidence_sources: list[str] = Field(default_factory=list)
+    question_date: str | None = None
+
+    @property
+    def dated_question(self) -> str:
+        if not self.question_date:
+            return self.question
+        return f"[Question asked at {self.question_date}]\n{self.question}"
 
 
 class BenchmarkSample(BaseModel):
@@ -130,6 +138,9 @@ class BenchmarkSample(BaseModel):
 
     sample_id: str
     turns: list[tuple[str, str]] = Field(default_factory=list)
+    #: One source/session/document ID per flattened turn. Empty means legacy
+    #: input without source boundaries.
+    turn_source_ids: list[str | None] = Field(default_factory=list)
     questions: list[BenchmarkQuestion] = Field(default_factory=list)
 
 
@@ -166,6 +177,24 @@ def _as_text(value: Any) -> str:
                 if isinstance(inner, str):
                     parts.append(inner)
         return "\n".join(parts).strip()
+    return ""
+
+
+def _as_answer_text(value: Any) -> str:
+    """Normalize a benchmark gold answer without discarding numeric labels.
+
+    LongMemEval's current official cleaned file stores 32 counting answers as
+    JSON integers. They are answer labels, not message content, so the stricter
+    :func:`_as_text` contract is wrong for this field: it used to turn all 32
+    into an empty gold string and silently corrupt both metrics and traces.
+    """
+    text = _as_text(value)
+    if text:
+        return text
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
     return ""
 
 
@@ -227,13 +256,29 @@ def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
         sample_id = str(record.get("question_id") or f"longmemeval_{i}")
 
         turns: list[tuple[str, str]] = []
+        turn_source_ids: list[str | None] = []
         sessions = record.get("haystack_sessions") or []
         if not isinstance(sessions, list):
             sessions = []
 
-        for session in sessions:
+        session_ids = _as_str_list(record.get("haystack_session_ids"))
+        session_dates = _as_str_list(record.get("haystack_dates"))
+        for session_index, session in enumerate(sessions):
             if not isinstance(session, list):
                 continue
+            source_id = (
+                session_ids[session_index]
+                if session_index < len(session_ids)
+                else f"session_{session_index + 1}"
+            )
+            if session_index < len(session_dates) and session_dates[session_index]:
+                turns.append(
+                    (
+                        "system",
+                        f"[{source_id} took place at {session_dates[session_index]}]",
+                    )
+                )
+                turn_source_ids.append(source_id)
             for j, turn in enumerate(session):
                 if not isinstance(turn, dict):
                     continue
@@ -241,21 +286,32 @@ def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
                 if not text:
                     continue
                 turns.append((_normalize_role(turn.get("role"), j), text))
+                turn_source_ids.append(source_id)
 
+        answer = _as_answer_text(record.get("answer"))
+        if not answer:
+            continue
         question = BenchmarkQuestion(
             question_id=sample_id,
             question=question_text.strip(),
-            answer=_as_text(record.get("answer")),
+            answer=answer,
             category=(
                 str(record["question_type"])
                 if record.get("question_type") is not None
                 else None
             ),
             evidence=_as_str_list(record.get("answer_session_ids")),
+            evidence_sources=_as_str_list(record.get("answer_session_ids")),
+            question_date=_as_text(record.get("question_date")) or None,
         )
 
         samples.append(
-            BenchmarkSample(sample_id=sample_id, turns=turns, questions=[question])
+            BenchmarkSample(
+                sample_id=sample_id,
+                turns=turns,
+                turn_source_ids=turn_source_ids,
+                questions=[question],
+            )
         )
 
     return samples
@@ -312,6 +368,7 @@ def parse_locomo(data: Any) -> list[BenchmarkSample]:
         session_keys.sort()
 
         turns: list[tuple[str, str]] = []
+        turn_source_ids: list[str | None] = []
         first_speaker: str | None = None
 
         for _, key in session_keys:
@@ -328,6 +385,7 @@ def parse_locomo(data: Any) -> list[BenchmarkSample]:
             date_time = conversation.get(f"{key}_date_time")
             if isinstance(date_time, str) and date_time.strip():
                 turns.append(("system", f"[{key} took place at {date_time.strip()}]"))
+                turn_source_ids.append(key)
 
             for j, turn in enumerate(conversation[key]):
                 if not isinstance(turn, dict):
@@ -346,6 +404,7 @@ def parse_locomo(data: Any) -> list[BenchmarkSample]:
                     role = _normalize_role(None, j)
 
                 turns.append((role, text))
+                turn_source_ids.append(key)
 
         questions: list[BenchmarkQuestion] = []
         qa_list = record.get("qa") or []
@@ -359,7 +418,11 @@ def parse_locomo(data: Any) -> list[BenchmarkSample]:
             if not isinstance(q_text, str) or not q_text.strip():
                 continue
             # Adversarial LoCoMo items use "adversarial_answer" instead.
-            answer = _as_text(qa.get("answer", qa.get("adversarial_answer")))
+            answer = _as_answer_text(
+                qa.get("answer", qa.get("adversarial_answer"))
+            )
+            if not answer:
+                continue
             questions.append(
                 BenchmarkQuestion(
                     question_id=f"{sample_id}_q{q_index}",
@@ -369,11 +432,23 @@ def parse_locomo(data: Any) -> list[BenchmarkSample]:
                         str(qa["category"]) if qa.get("category") is not None else None
                     ),
                     evidence=_as_str_list(qa.get("evidence")),
+                    evidence_sources=sorted(
+                        {
+                            f"session_{match.group(1)}"
+                            for value in _as_str_list(qa.get("evidence"))
+                            if (match := re.match(r"^D(\d+):", value))
+                        }
+                    ),
                 )
             )
 
         samples.append(
-            BenchmarkSample(sample_id=sample_id, turns=turns, questions=questions)
+            BenchmarkSample(
+                sample_id=sample_id,
+                turns=turns,
+                turn_source_ids=turn_source_ids,
+                questions=questions,
+            )
         )
 
     return samples

@@ -113,7 +113,17 @@ class ChunkerConfig(BaseModel):
 #: * ``span``   — pools contiguous chunks up to a token target and matches the
 #:   pooled vector, returning member chunks. The arm that matters on short-turn
 #:   dialogue, where a single chunk is too small to carry retrievable signal.
-RetrievalMode = Literal["dense", "hybrid", "memory", "span"]
+RetrievalMode = Literal[
+    "dense",
+    "hybrid",
+    "memory",
+    "span",
+    "source",
+    "anchored_source",
+    "hybrid_source",
+    "hybrid_graph",
+    "hybrid_neighbor",
+]
 
 
 class RetrievalConfig(BaseModel):
@@ -138,6 +148,22 @@ class RetrievalConfig(BaseModel):
     #: Spans taken from each level before merging. Stratified deliberately —
     #: a single mixed-granularity pool lets short chunks crowd out every span.
     k_per_level: int = 2
+    #: Complete conversation/document sources selected in ``source`` mode.
+    k_sources: int = Field(default=4, ge=1)
+    #: Lower-ranked hybrid candidates admitted from sources activated by top-k.
+    source_slots: int = Field(default=24, ge=0)
+    #: Bounded global pool searched before source-conditioned admission.
+    source_candidate_pool: int = Field(default=200, ge=1)
+    #: Pool prefix whose source identities may admit second-stage candidates.
+    source_activation_k: int | None = Field(default=None, ge=1)
+    #: Source-local chunk shells exposed around hybrid anchors.
+    neighbor_radius: int = Field(default=1, ge=0)
+    #: Hard count of additional neighbor chunks; direct anchors never compete.
+    neighbor_slots: int = Field(default=5, ge=0)
+    #: When positive, transition candidates replace this many weakest anchors.
+    neighbor_replacement_slots: int = Field(default=0, ge=0)
+    #: Restrict transition expansion to the useful temporal direction.
+    neighbor_direction: Literal["both", "previous", "next"] = "both"
 
     model_config = {"frozen": True}
 
@@ -151,6 +177,34 @@ class RetrievalConfig(BaseModel):
         if self.mode == "span":
             levels = "-".join(str(x) for x in self.span_levels)
             return f"span{levels}x{self.k_per_level}"
+        if self.mode == "source":
+            return f"source{self.k_sources}"
+        if self.mode == "anchored_source":
+            return f"anchored-source-k{self.k}"
+        if self.mode == "hybrid_source":
+            activation = self.source_activation_k or self.k
+            return (
+                f"hybrid-source-k{self.k}-s{self.source_slots}"
+                f"-a{activation}-p{self.source_candidate_pool}"
+            )
+        if self.mode == "hybrid_graph":
+            activation = self.source_activation_k or self.k
+            return (
+                f"hybrid-graph-k{self.k}-r{self.neighbor_radius}"
+                f"-n{self.neighbor_slots}-{self.neighbor_direction}"
+                f"-s{self.source_slots}-a{activation}"
+                f"-p{self.source_candidate_pool}"
+            )
+        if self.mode == "hybrid_neighbor":
+            replacement = (
+                f"-replace{self.neighbor_replacement_slots}"
+                if self.neighbor_replacement_slots
+                else ""
+            )
+            return (
+                f"hybrid-neighbor-k{self.k}-r{self.neighbor_radius}"
+                f"-s{self.neighbor_slots}{replacement}"
+            )
         if self.mode == "memory":
             return f"memory{self.k_memories}"
         if self.effective_hybrid:
@@ -165,10 +219,20 @@ class EvalConfig(BaseModel):
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     judge_model: str = DEFAULT_JUDGE_MODEL
     responder_model: str = DEFAULT_RESPONDER_MODEL
+    embedding_device: str | None = None
     conversation_dir: str = ""
     results_dir: str = "./eval_results"
     max_conversations: int | None = None
     recent_window: int = 4  # number of recent turns to include in context
+    #: Accuracy-first long-chat gate. Judge accuracy is the headline metric;
+    #: F1/EM and retrieval containment remain diagnostics.
+    accuracy_target: float = Field(default=0.95, ge=0.0, le=1.0)
+    #: A small smoke cannot certify a 95% target even if it happens to be
+    #: perfect. Paid/public runs must grade at least this many questions.
+    min_target_questions: int = Field(default=100, ge=1)
+    #: Hard cap over message-content tokens sent to the responder. ``None``
+    #: preserves historical uncapped behavior; the CLI defaults to 8k.
+    max_prompt_tokens: int | None = Field(default=None, ge=1)
 
 
 class TurnResult(BaseModel):

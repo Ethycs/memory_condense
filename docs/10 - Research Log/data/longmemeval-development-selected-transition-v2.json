@@ -1,0 +1,38 @@
+{
+  "format": "memory-condense-development-policy-selection-v2",
+  "status": "development_candidate_not_validated",
+  "dataset_sha256": "821a2034d219ab45846873dd14c14f12cfe7776e73527a483f9dac095d38620c",
+  "split_manifest": "longmemeval-95-target-split-v1.json",
+  "split": "development",
+  "compiled_store_cache_revision": 2,
+  "trace": {
+    "format": "memory-condense-transition-candidate-trace-v1",
+    "internal_sha256": "90d68b1c21a2394d4d171710ebd50909d65460a864657175118944ec6bb96702",
+    "file_sha256": "c6da5054a377d0fe08094bb5b7be007b9db63a91c62b85dbb6b90f09f3a1e652"
+  },
+  "retrieval": {
+    "mode": "hybrid_neighbor",
+    "k": 10,
+    "ef_search": 50,
+    "alpha": 0.65,
+    "candidates": 100,
+    "neighbor_radius": 6,
+    "neighbor_slots": 23,
+    "neighbor_replacement_slots": 0,
+    "max_prompt_tokens": 8000,
+    "chunker_min_tokens": 120,
+    "chunker_max_tokens": 250
+  },
+  "development_metrics": {
+    "questions": 200,
+    "haystack_literal_ceiling": 0.475,
+    "literal_recall": 0.47,
+    "mean_context_tokens": 3817.48,
+    "evidence_source_recall": 1.0,
+    "evidence_all_source_recall": 1.0,
+    "gained_vs_hybrid": 7,
+    "lost_vs_hybrid": 0
+  },
+  "sweep_file_sha256": "a618206174343795c418a47f4cf4c02881476e83ae1d1f149e88f3b746cc1cf4",
+  "admission": "Semantic answer accuracy is unmeasured. Do not consume validation until responder calibration is complete and this policy is frozen."
+}

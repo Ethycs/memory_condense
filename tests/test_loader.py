@@ -224,13 +224,17 @@ def test_parse_longmemeval_flattens_sessions_in_order():
     s = samples[0]
     assert s.sample_id == "lme_001"
     assert [t[0] for t in s.turns] == [
+        "system",
         "user",
         "assistant",
+        "system",
         "user",
         "assistant",
     ]
-    assert s.turns[0][1] == "I am thinking about relocating."
-    assert s.turns[2][1] == "I moved to Boston last week."
+    assert "2023/05/01" in s.turns[0][1]
+    assert s.turns[1][1] == "I am thinking about relocating."
+    assert s.turns[4][1] == "I moved to Boston last week."
+    assert s.turn_source_ids == ["s1", "s1", "s1", "s2", "s2", "s2"]
 
     assert len(s.questions) == 1
     q = s.questions[0]
@@ -238,6 +242,9 @@ def test_parse_longmemeval_flattens_sessions_in_order():
     assert q.answer == "Boston"
     assert q.category == "multi-session"
     assert q.evidence == ["s2"]
+    assert q.evidence_sources == ["s2"]
+    assert q.question_date == "2023/06/01 (Thu) 10:00"
+    assert "Question asked at 2023/06/01" in q.dated_question
 
 
 def test_parse_longmemeval_tolerates_missing_optional_keys():
@@ -247,6 +254,23 @@ def test_parse_longmemeval_tolerates_missing_optional_keys():
     assert samples[0].turns == []
     assert samples[0].questions[0].category is None
     assert samples[0].questions[0].evidence == []
+
+
+def test_parse_longmemeval_preserves_numeric_gold_answers():
+    record = {
+        "question_id": "count-1",
+        "question_type": "multi-session",
+        "question": "How many courses did I finish?",
+        "answer": 5,
+        "haystack_sessions": [],
+    }
+    samples = parse_longmemeval([record])
+    assert samples[0].questions[0].answer == "5"
+
+
+def test_parse_longmemeval_rejects_empty_gold_answers():
+    assert parse_longmemeval([{"question": "Q?", "answer": ""}]) == []
+    assert parse_longmemeval([{"question": "Q?", "answer": None}]) == []
 
 
 def test_parse_longmemeval_skips_malformed_records():
@@ -285,8 +309,17 @@ def test_parse_locomo_orders_sessions_and_maps_speakers():
     ]
     assert s.questions[0].category == "2"
     assert s.questions[0].evidence == ["D2:1"]
+    assert s.questions[0].evidence_sources == ["session_2"]
     assert s.questions[1].evidence == []
     assert s.questions[0].question_id == "conv-26_q0"
+    assert s.turn_source_ids == [
+        "session_1",
+        "session_1",
+        "session_1",
+        "session_2",
+        "session_2",
+        "session_2",
+    ]
 
 
 def test_parse_locomo_ingests_session_timestamps():
@@ -348,6 +381,16 @@ def test_parse_locomo_skips_malformed_records():
     assert samples[0].questions[0].question == "Real?"
 
 
+def test_parse_locomo_preserves_numeric_gold_answers():
+    record = {
+        "sample_id": "numeric",
+        "conversation": {},
+        "qa": [{"question": "How many?", "answer": 3}],
+    }
+    samples = parse_locomo([record])
+    assert samples[0].questions[0].answer == "3"
+
+
 def test_detect_benchmark_format():
     assert detect_benchmark_format([LONGMEMEVAL_RECORD]) == "longmemeval"
     assert detect_benchmark_format([LOCOMO_RECORD]) == "locomo"
@@ -360,7 +403,7 @@ def test_load_benchmark_auto_detects_longmemeval(tmp_path: Path):
     f.write_text(json.dumps([LONGMEMEVAL_RECORD]), encoding="utf-8")
     samples = load_benchmark(f)
     assert len(samples) == 1
-    assert len(samples[0].turns) == 4
+    assert len(samples[0].turns) == 6
 
 
 def test_load_benchmark_auto_detects_locomo(tmp_path: Path):

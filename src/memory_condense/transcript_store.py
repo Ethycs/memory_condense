@@ -19,22 +19,24 @@ class TranscriptStore:
         """
         return self._db.current_turn()
 
-    def append(self, role: str, text: str) -> Turn:
+    def append(self, role: str, text: str, *, source_id: str | None = None) -> Turn:
         """Create and persist a new turn. Returns the Turn with generated ID.
 
         Advancing ``ordinal`` here is what makes decay happen: every item the
         conversation did *not* reach for this turn falls one turn further
         behind. Nothing else has to run — no sweep, no timer.
         """
-        turn = Turn(role=role, text=text)
+        normalized_source = source_id.strip() if source_id and source_id.strip() else None
+        turn = Turn(role=role, text=text, source_id=normalized_source)
         ordinal = self.current_turn() + 1
         self._db.execute(
-            "INSERT INTO turns (turn_id, role, text, created_at, ordinal)"
-            " VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO turns (turn_id, role, text, source_id, created_at, ordinal)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
             (
                 turn.turn_id,
                 turn.role,
                 turn.text,
+                turn.source_id,
                 turn.created_at.isoformat(),
                 ordinal,
             ),
@@ -45,7 +47,7 @@ class TranscriptStore:
     def get_turn(self, turn_id: str) -> Turn | None:
         """Retrieve a single turn by ID."""
         cur = self._db.execute(
-            "SELECT turn_id, role, text, created_at FROM turns WHERE turn_id = ?",
+            "SELECT turn_id, role, text, source_id, created_at FROM turns WHERE turn_id = ?",
             (turn_id,),
         )
         row = cur.fetchone()
@@ -56,8 +58,8 @@ class TranscriptStore:
     def get_recent(self, n: int = 20) -> list[Turn]:
         """Return the N most recent turns, ordered oldest-first."""
         cur = self._db.execute(
-            "SELECT turn_id, role, text, created_at FROM turns "
-            "ORDER BY created_at DESC LIMIT ?",
+            "SELECT turn_id, role, text, source_id, created_at FROM turns "
+            "ORDER BY ordinal DESC LIMIT ?",
             (n,),
         )
         rows = cur.fetchall()
@@ -66,7 +68,7 @@ class TranscriptStore:
     def get_all(self) -> list[Turn]:
         """Return all turns, ordered by created_at."""
         cur = self._db.execute(
-            "SELECT turn_id, role, text, created_at FROM turns ORDER BY created_at"
+            "SELECT turn_id, role, text, source_id, created_at FROM turns ORDER BY ordinal"
         )
         return [self._row_to_turn(r) for r in cur.fetchall()]
 
@@ -84,7 +86,7 @@ class TranscriptStore:
         # match turns that never said it.
         escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         cur = self._db.execute(
-            "SELECT turn_id, role, text, created_at FROM turns "
+            "SELECT turn_id, role, text, source_id, created_at FROM turns "
             "WHERE text LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT 1",
             (f"%{escaped}%",),
         )
@@ -102,5 +104,6 @@ class TranscriptStore:
             turn_id=row[0],
             role=row[1],
             text=row[2],
-            created_at=row[3],
+            source_id=row[3],
+            created_at=row[4],
         )

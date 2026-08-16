@@ -174,7 +174,9 @@ class MemoryStore:
             params = params + (int(limit),)
 
         cur = self._db.execute(sql, params)
-        return [self._row_to_item(row) for row in cur.fetchall()]
+        rows = cur.fetchall()
+        provenance = self._load_provenance_many(row[0] for row in rows)
+        return [self._row_to_item(row, provenance[row[0]]) for row in rows]
 
     def count(self, status: MemoryStatus | None = None) -> int:
         if status is None:
@@ -346,26 +348,75 @@ class MemoryStore:
         recalls while answering one turn is one access, not ten. ``now`` sets
         the audit timestamp only; it has no effect on energy.
         """
-        item = self.get(mem_id)
-        if item is None:
-            return None
+        touched = self.touch_many([mem_id], now_turn=now_turn, now=now)
+        return touched[0] if touched else None
 
+    def touch_many(
+        self,
+        memories: Iterable[str | MemoryItem],
+        now_turn: int | None = None,
+        now: datetime | None = None,
+    ) -> list[MemoryItem]:
+        """Reheat several memory rows in one SQLite transaction.
+
+        Context assembly commonly exposes 8–50 items at once.  Calling
+        :meth:`touch` in a loop previously paid one durable commit per item;
+        the access is one logical event and should be one transaction.  Input
+        order is preserved and duplicate ids are touched once. Callers that
+        already loaded ranked items may pass those objects and avoid another
+        SELECT per row; ids remain accepted for the ordinary public API.
+        """
+        seen: set[str] = set()
+        items: list[MemoryItem] = []
+        for memory in memories:
+            item = memory if isinstance(memory, MemoryItem) else self.get(memory)
+            if item is None:
+                continue
+            mem_id = item.mem_id
+            if mem_id in seen:
+                continue
+            seen.add(mem_id)
+            items.append(item)
+        return self._touch_items(items, now_turn=now_turn, now=now)
+
+    def _touch_items(
+        self,
+        items: list[MemoryItem],
+        now_turn: int | None = None,
+        now: datetime | None = None,
+    ) -> list[MemoryItem]:
+        """Batch-update already-loaded items, avoiding reads and commits per row."""
+        if not items:
+            return []
         turn = self._db.current_turn() if now_turn is None else now_turn
         stamp = now or decay.now_utc()
-        if item.is_pinned:
-            energy = item.energy
-        else:
-            energy = decay.item_energy(item, now_turn=turn)
-            if decay.should_reheat(item.last_access_turn, now_turn=turn):
-                energy = decay.reheat(energy)
+        updates: list[tuple[float, str, int, str]] = []
+        refreshed: list[MemoryItem] = []
+        for item in items:
+            if item.is_pinned:
+                energy = item.energy
+            else:
+                energy = decay.item_energy(item, now_turn=turn)
+                if decay.should_reheat(item.last_access_turn, now_turn=turn):
+                    energy = decay.reheat(energy)
+            updates.append((float(energy), stamp.isoformat(), int(turn), item.mem_id))
+            refreshed.append(
+                item.model_copy(
+                    update={
+                        "energy": float(energy),
+                        "last_access_at": stamp,
+                        "last_access_turn": int(turn),
+                    }
+                )
+            )
 
-        self._db.execute(
+        self._db.executemany(
             "UPDATE memory_items SET energy = ?, last_access_at = ?,"
             " last_access_turn = ? WHERE mem_id = ?",
-            (float(energy), stamp.isoformat(), int(turn), mem_id),
+            updates,
         )
         self._db.commit()
-        return self.get(mem_id)
+        return refreshed
 
     def items_by_heat(
         self,
@@ -447,7 +498,14 @@ class MemoryStore:
 
         items: list[MemoryItem] = []
         for status in statuses:
-            items.extend(self.list_items(status=status))
+            rows = self._db.execute(
+                f"SELECT {_ITEM_COLUMNS} FROM memory_items "
+                "WHERE status = ? ORDER BY created_at DESC",
+                (status.value,),
+            ).fetchall()
+            # Provenance is irrelevant to scoring. Hydrate it for the top-k
+            # only, after ranking, instead of issuing one query per candidate.
+            items.extend(self._row_to_item(row, []) for row in rows)
         if not items:
             return []
 
@@ -494,14 +552,31 @@ class MemoryStore:
 
         best = ranking.top_k(scored, k)
 
-        results: list[MemoryResult] = []
-        for _, result in best:
-            if reheat:
-                refreshed = self.touch(result.item.mem_id, now_turn=turn, now=stamp)
-                if refreshed is not None:
-                    result = result.model_copy(update={"item": refreshed})
-            results.append(result)
-        return results
+        results = [result for _, result in best]
+        provenance = self._load_provenance_many(
+            result.item.mem_id for result in results
+        )
+        results = [
+            result.model_copy(
+                update={
+                    "item": result.item.model_copy(
+                        update={"provenance": provenance[result.item.mem_id]}
+                    )
+                }
+            )
+            for result in results
+        ]
+        if not reheat:
+            return results
+
+        refreshed = self._touch_items(
+            [result.item for result in results], now_turn=turn, now=stamp
+        )
+        by_id = {item.mem_id: item for item in refreshed}
+        return [
+            result.model_copy(update={"item": by_id[result.item.mem_id]})
+            for result in results
+        ]
 
     @staticmethod
     def _relevance(query_vec: np.ndarray | None, item: MemoryItem) -> float:
@@ -610,7 +685,30 @@ class MemoryStore:
             for row in cur.fetchall()
         ]
 
-    def _row_to_item(self, row: tuple) -> MemoryItem:
+    def _load_provenance_many(
+        self, mem_ids: Iterable[str]
+    ) -> dict[str, list[Provenance]]:
+        """Load provenance for many items without an N+1 query sequence."""
+        ids = list(dict.fromkeys(mem_ids))
+        out: dict[str, list[Provenance]] = {mem_id: [] for mem_id in ids}
+        # Stay below SQLite builds whose variable limit is the traditional 999.
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._db.execute(
+                "SELECT mem_id, turn_id, chunk_id, quote "
+                f"FROM memory_provenance WHERE mem_id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            for mem_id, turn_id, chunk_id, quote in rows:
+                out[mem_id].append(
+                    Provenance(turn_id=turn_id, chunk_id=chunk_id, quote=quote)
+                )
+        return out
+
+    def _row_to_item(
+        self, row: tuple, provenance: list[Provenance] | None = None
+    ) -> MemoryItem:
         embedding = None
         if row[12] is not None:
             embedding = np.frombuffer(row[12], dtype=np.float32).tolist()
@@ -620,7 +718,11 @@ class MemoryStore:
             type=MemoryType(row[1]),
             content=row[2],
             details=row[3],
-            provenance=self._load_provenance(row[0]),
+            provenance=(
+                self._load_provenance(row[0])
+                if provenance is None
+                else provenance
+            ),
             status=MemoryStatus(row[4]),
             supersedes=row[5],
             pin=PinState(row[6]),

@@ -20,7 +20,10 @@ def count_tokens(text: str, encoding: str = DEFAULT_ENCODING) -> int:
     Uses cl100k_base (GPT-4 family) as a reasonable proxy
     for token budgets across modern LLMs.
     """
-    return len(_get_encoder(encoding).encode(text))
+    # Corpus text is untrusted data. Strings such as ``<|endoftext|>`` may
+    # occur literally in web/chat exports and must be budgeted as ordinary
+    # text, never interpreted as tokenizer control input.
+    return len(_get_encoder(encoding).encode(text, disallowed_special=()))
 
 
 def truncate_to_tokens(
@@ -34,7 +37,7 @@ def truncate_to_tokens(
     if max_tokens <= 0:
         return ""
     enc = _get_encoder(encoding)
-    tokens = enc.encode(text)
+    tokens = enc.encode(text, disallowed_special=())
     if len(tokens) <= max_tokens:
         return text
     return enc.decode(tokens[:max_tokens])

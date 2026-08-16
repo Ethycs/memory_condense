@@ -9,8 +9,8 @@ build/
 .pixi/
 
 # Runtime data
-data/
-demo_data/
+/data/
+/demo_data/
 *.db
 
 # hnswlib index files

@@ -6,11 +6,19 @@ meta/caveat records, command wrappers, sidechains, and non-message records.
 Tool results truncated to 2000 chars (a hook would store a bounded record,
 and untruncated dumps run to 30k chars). Truncation is flagged in stats.
 """
-import json, sys
+import argparse
+import json
+from pathlib import Path
 
-SNAP = r"C:/Users/Keytone/AppData/Local/Temp/claude/f--Keytone-Documents-GitHub-memory-condense/8f7f7561-e2af-4bab-8f13-8fab1e2d71bb/scratchpad/session_snapshot.jsonl"
-OUT  = r"C:/Users/Keytone/AppData/Local/Temp/claude/f--Keytone-Documents-GitHub-memory-condense/8f7f7561-e2af-4bab-8f13-8fab1e2d71bb/scratchpad/session_turns.json"
+ROOT = Path(__file__).resolve().parents[4]
+DEFAULT_SNAPSHOT = ROOT / "data" / "build-session-8f7f7561.snapshot.jsonl"
+DEFAULT_OUTPUT = ROOT / "data" / "build-session-8f7f7561.turns.json"
 TOOL_RESULT_CAP = 2000
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
+parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+args = parser.parse_args()
 
 def block_text(b):
     if isinstance(b, str):
@@ -29,7 +37,7 @@ def block_text(b):
 
 turns = []  # (role, kind, text)
 truncated = 0
-with open(SNAP, encoding="utf-8") as f:
+with args.snapshot.open(encoding="utf-8") as f:
     for line in f:
         try:
             r = json.loads(line)
@@ -78,7 +86,9 @@ with open(SNAP, encoding="utf-8") as f:
             if t:
                 turns.append(("assistant", "assistant_text", t))
 
-json.dump(turns, open(OUT, "w", encoding="utf-8"), ensure_ascii=False)
+args.output.parent.mkdir(parents=True, exist_ok=True)
+with args.output.open("w", encoding="utf-8") as output_file:
+    json.dump(turns, output_file, ensure_ascii=False)
 
 from memory_condense._tokenizer import count_tokens
 from collections import Counter

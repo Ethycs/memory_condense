@@ -1,0 +1,44 @@
+{
+  "protocol": "fixed after dual-channel replay: verify degree-two pruning at the selected two-hop dual-channel operating point",
+  "arms": [
+    {
+      "name": "dual_qk1_heat1_h2_cap16",
+      "k": 5,
+      "association_slots": 2,
+      "qk_reserve": 2,
+      "ranked_qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 16,
+      "retrieval_strategy": "heat",
+      "diffusion_restart_probability": 0.2,
+      "edge_temperature": 2.0,
+      "lexical_protection_threshold": 0.9,
+      "max_prompt_token_increase": 0,
+      "max_source_token_fraction": 0.6,
+      "heat_weighted_packing": true,
+      "packing_token_budget": 1024,
+      "repeats": 10
+    },
+    {
+      "name": "dual_qk1_heat1_h2_cap16_pruned_d2",
+      "k": 5,
+      "association_slots": 2,
+      "qk_reserve": 2,
+      "ranked_qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 16,
+      "retrieval_strategy": "heat",
+      "diffusion_restart_probability": 0.2,
+      "edge_temperature": 2.0,
+      "lexical_protection_threshold": 0.9,
+      "max_prompt_token_increase": 0,
+      "max_source_token_fraction": 0.6,
+      "heat_weighted_packing": true,
+      "packing_token_budget": 1024,
+      "prune_max_neighbors": 2,
+      "repeats": 10
+    }
+  ]
+}

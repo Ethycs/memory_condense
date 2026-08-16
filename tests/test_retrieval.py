@@ -104,6 +104,122 @@ def test_multiple_chunks_ranked(db, retriever):
     assert scores == sorted(scores, reverse=True)
 
 
+def test_source_query_returns_complete_best_source_in_turn_order(db, retriever):
+    store = TranscriptStore(db)
+    a1 = store.append("user", "alpha first", source_id="session-a")
+    b1 = store.append("user", "beta only", source_id="session-b")
+    a2 = store.append("assistant", "alpha second", source_id="session-a")
+    chunks = [
+        _chunk_with(a1.turn_id, "alpha first", _vector({0: 1.0})),
+        _chunk_with(b1.turn_id, "beta only", _vector({1: 1.0})),
+        _chunk_with(a2.turn_id, "alpha second", _vector({0: 0.9, 2: 0.1})),
+    ]
+    retriever.add_chunks(chunks)
+
+    results = retriever.source_query(_vector_query({0: 1.0}), k_sources=1)
+    assert [result.chunk.text for result in results] == [
+        "alpha first",
+        "alpha second",
+    ]
+    assert all(result.route == "source" for result in results)
+    assert all(result.turn.source_id == "session-a" for result in results)
+
+
+def test_source_query_empty_or_zero(retriever):
+    assert retriever.source_query(_vector_query({0: 1.0}), k_sources=1) == []
+    assert retriever.source_query(_vector_query({0: 1.0}), k_sources=0) == []
+
+
+def test_hydrate_sources_round_robins_selected_source_chunks(db, retriever):
+    store = TranscriptStore(db)
+    a1 = store.append("user", "alpha first", source_id="session-a")
+    a2 = store.append("assistant", "alpha second", source_id="session-a")
+    b1 = store.append("user", "beta first", source_id="session-b")
+    retriever.add_chunks(
+        [
+            _chunk_with(a1.turn_id, "alpha first", _vector({0: 1.0})),
+            _chunk_with(a2.turn_id, "alpha second", _vector({0: 1.0})),
+            _chunk_with(b1.turn_id, "beta first", _vector({1: 1.0})),
+        ]
+    )
+
+    results = retriever.hydrate_sources(
+        ["session-a", "session-b"],
+        source_scores={"session-a": 0.9, "session-b": 0.8},
+    )
+
+    assert [result.chunk.text for result in results] == [
+        "alpha first",
+        "beta first",
+        "alpha second",
+    ]
+    assert [result.score for result in results] == [0.9, 0.8, 0.9]
+    assert all(result.route == "anchored_source" for result in results)
+
+
+def test_hydrate_source_neighbors_walks_ranked_shells_and_deduplicates(
+    db, retriever
+):
+    store = TranscriptStore(db)
+    turns = [
+        store.append("user", f"turn {index}", source_id="session-a")
+        for index in range(5)
+    ]
+    chunks = [
+        _chunk_with(turn.turn_id, f"chunk {index}", _vector({index: 1.0}))
+        for index, turn in enumerate(turns)
+    ]
+    retriever.add_chunks(chunks)
+    anchors = [
+        retriever._hydrate(chunks[2].chunk_id, score=0.9),
+        retriever._hydrate(chunks[3].chunk_id, score=0.8),
+    ]
+
+    results = retriever.hydrate_source_neighbors(anchors, radius=2)
+
+    assert [result.chunk.text for result in results] == [
+        "chunk 2",
+        "chunk 3",
+        "chunk 1",
+        "chunk 4",
+        "chunk 0",
+    ]
+    assert [result.route for result in results[2:]] == [
+        "hybrid_neighbor",
+        "hybrid_neighbor",
+        "hybrid_neighbor",
+    ]
+    assert results[2].anchor_chunk_id == chunks[2].chunk_id
+    assert results[2].transition_distance == 1
+    assert results[2].transition_direction == "previous"
+    assert results[3].transition_direction == "next"
+
+
+def test_hydrate_source_neighbors_validates_radius(retriever):
+    with pytest.raises(ValueError, match="radius"):
+        retriever.hydrate_source_neighbors([], radius=-1)
+
+
+def test_hydrate_source_neighbors_enforces_extra_slot_budget(db, retriever):
+    store = TranscriptStore(db)
+    turns = [
+        store.append("user", f"turn {index}", source_id="session-a")
+        for index in range(3)
+    ]
+    chunks = [
+        _chunk_with(turn.turn_id, f"chunk {index}", _vector({index: 1.0}))
+        for index, turn in enumerate(turns)
+    ]
+    retriever.add_chunks(chunks)
+    anchor = retriever._hydrate(chunks[1].chunk_id, score=0.9)
+
+    results = retriever.hydrate_source_neighbors(
+        [anchor], radius=2, max_neighbors=1
+    )
+
+    assert [result.chunk.text for result in results] == ["chunk 1", "chunk 0"]
+
+
 def test_save_and_rebuild(db, tmp_dir):
     store = TranscriptStore(db)
     turn = store.append("user", "persistence test")
@@ -507,14 +623,73 @@ def test_a_chunk_reachable_from_two_levels_keeps_its_best_score(
     assert all(len(v) == 1 for v in by_id.values()), "a chunk was returned twice"
 
 
-def test_span_cache_is_dropped_when_chunks_are_added(retriever, span_corpus, turn_id):
+def test_span_cache_is_extended_when_chunks_are_added(retriever, span_corpus, turn_id):
     before, _ = retriever._span_vectors(4 * CHUNK_TOKENS)
+    before = before.copy()
+    high_water = retriever._span_cached_through_rowid[4 * CHUNK_TOKENS]
     retriever.add_chunks(
         [_chunk_with(turn_id, "a later turn", _vector({7: 1.0}))]
     )
     after, _ = retriever._span_vectors(4 * CHUNK_TOKENS)
 
-    assert len(after) != len(before), "stale spans would silently answer wrongly"
+    assert len(after) == len(before) + 1
+    assert np.array_equal(after[: len(before)], before)
+    assert retriever._span_cached_through_rowid[4 * CHUNK_TOKENS] > high_water
+
+
+def test_span_append_loads_only_rows_after_the_cache_high_water(
+    retriever, span_corpus, turn_id, monkeypatch
+):
+    level = 4 * CHUNK_TOKENS
+    retriever._span_vectors(level)
+    high_water = retriever._span_cached_through_rowid[level]
+    retriever.add_chunks(
+        [_chunk_with(turn_id, "incremental tail", _vector({8: 1.0}))]
+    )
+    calls = []
+    original = retriever._load_span_rows
+
+    def tracked(after_rowid=None):
+        calls.append(after_rowid)
+        return original(after_rowid)
+
+    monkeypatch.setattr(retriever, "_load_span_rows", tracked)
+    retriever._span_vectors(level)
+
+    assert calls == [high_water]
+
+
+@pytest.mark.parametrize("appended", [2, 5])
+def test_incremental_span_tail_matches_a_clean_rebuild(
+    retriever, turn_id, appended
+):
+    level = 4 * CHUNK_TOKENS
+    retriever.add_chunks(
+        [
+            _chunk_with(turn_id, f"seed {i}", _vector({i % 3: 1.0})).model_copy(
+                update={"token_count": CHUNK_TOKENS}
+            )
+            for i in range(5)
+        ]
+    )
+    retriever._span_vectors(level)
+    retriever.add_chunks(
+        [
+            _chunk_with(turn_id, f"tail {i}", _vector({5 + i: 1.0})).model_copy(
+                update={"token_count": CHUNK_TOKENS}
+            )
+            for i in range(appended)
+        ]
+    )
+
+    incremental_vectors, incremental_members = retriever._span_vectors(level)
+    incremental_vectors = incremental_vectors.copy()
+    incremental_members = [list(group) for group in incremental_members]
+    retriever._clear_span_cache()
+    rebuilt_vectors, rebuilt_members = retriever._span_vectors(level)
+
+    assert incremental_members == rebuilt_members
+    assert np.allclose(incremental_vectors, rebuilt_vectors, atol=1e-6)
 
 
 def test_span_cache_is_dropped_when_a_chunk_is_deleted(retriever, span_corpus):

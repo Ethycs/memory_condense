@@ -20,6 +20,10 @@ class Chunker:
         min_tokens: int = 120,
         max_tokens: int = 250,
     ) -> None:
+        if min_tokens < 1:
+            raise ValueError("min_tokens must be positive")
+        if max_tokens < min_tokens:
+            raise ValueError("max_tokens must be at least min_tokens")
         self.min_tokens = min_tokens
         self.max_tokens = max_tokens
         self._segmenter = pysbd.Segmenter(language="en", clean=False)
@@ -74,23 +78,34 @@ class Chunker:
         return self._hard_split(text)
 
     def _hard_split(self, text: str) -> list[str]:
-        """Split text into roughly max_tokens-sized pieces by words."""
-        words = text.split()
+        """Split at character boundaries while enforcing the exact maximum."""
         parts: list[str] = []
-        current: list[str] = []
-        current_tokens = 0
+        remaining = text.strip()
+        while remaining:
+            if count_tokens(remaining) <= self.max_tokens:
+                parts.append(remaining)
+                break
 
-        for word in words:
-            word_tokens = count_tokens(word)
-            if current_tokens + word_tokens > self.max_tokens and current:
-                parts.append(" ".join(current))
-                current = []
-                current_tokens = 0
-            current.append(word)
-            current_tokens += word_tokens
-
-        if current:
-            parts.append(" ".join(current))
+            low, high = 1, len(remaining)
+            best = 0
+            while low <= high:
+                middle = (low + high) // 2
+                if count_tokens(remaining[:middle]) <= self.max_tokens:
+                    best = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            # A single Unicode code point can occupy multiple tokens when a
+            # caller configures an unrealistically tiny maximum. Preserve the
+            # source character rather than corrupting it; normal production
+            # maxima are hundreds of tokens.
+            best = max(best, 1)
+            whitespace = remaining.rfind(" ", 0, best + 1)
+            cut = whitespace if whitespace > 0 else best
+            part = remaining[:cut].rstrip()
+            if part:
+                parts.append(part)
+            remaining = remaining[cut:].lstrip()
         return parts
 
     def _compute_offsets(
@@ -130,26 +145,31 @@ class Chunker:
         current_start = offsets[0][0] if offsets else 0
 
         for i, (sent, (start, end)) in enumerate(zip(sentences, offsets)):
-            sent_tokens = count_tokens(sent)
+            prospective_text = " ".join([*current_sents, sent])
+            prospective_tokens = count_tokens(prospective_text)
 
-            if current_tokens + sent_tokens > self.max_tokens and current_sents:
+            if prospective_tokens > self.max_tokens and current_sents:
                 # Emit current chunk
                 chunk_text = " ".join(current_sents)
+                exact_tokens = count_tokens(chunk_text)
                 chunks.append(
                     Chunk(
                         turn_id=turn_id,
                         text=chunk_text,
                         start_char=current_start,
                         end_char=offsets[i - 1][1],
-                        token_count=current_tokens,
+                        token_count=exact_tokens,
                     )
                 )
                 current_sents = []
                 current_tokens = 0
                 current_start = start
 
+                prospective_text = sent
+                prospective_tokens = count_tokens(sent)
+
             current_sents.append(sent)
-            current_tokens += sent_tokens
+            current_tokens = prospective_tokens
 
         # Emit final chunk
         if current_sents:
@@ -164,14 +184,14 @@ class Chunker:
             )
 
             # Merge small final chunk into previous if possible
+            merged_text = chunks[-1].text + " " + chunk_text if chunks else ""
+            merged_tokens = count_tokens(merged_text) if chunks else 0
             if (
                 current_tokens < self.min_tokens
                 and chunks
-                and chunks[-1].token_count + current_tokens <= self.max_tokens
+                and merged_tokens <= self.max_tokens
             ):
                 prev = chunks.pop()
-                merged_text = prev.text + " " + chunk_text
-                merged_tokens = prev.token_count + current_tokens
                 chunks.append(
                     Chunk(
                         turn_id=turn_id,

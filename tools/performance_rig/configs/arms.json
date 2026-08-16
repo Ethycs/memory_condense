@@ -1,0 +1,76 @@
+{
+  "arms": [
+    {
+      "name": "hybrid_k3",
+      "k": 3,
+      "association_slots": 0,
+      "qk_reserve": 0,
+      "neighbors_per_anchor": 0,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k3_s1_d1",
+      "k": 3,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 1,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k3_s1_d3",
+      "k": 3,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "hybrid_k5",
+      "k": 5,
+      "association_slots": 0,
+      "qk_reserve": 0,
+      "neighbors_per_anchor": 0,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_k5_s1_d3",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "cav_candidates": 0,
+      "repeats": 5
+    },
+    {
+      "name": "qk_cav_k5_s2_d3",
+      "k": 5,
+      "association_slots": 2,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "cav_candidates": 16,
+      "repeats": 5
+    },
+    {
+      "name": "qk_cav_k7_s2_d3",
+      "k": 7,
+      "association_slots": 2,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "cav_candidates": 16,
+      "repeats": 5
+    },
+    {
+      "name": "qk_cav_k10_s3_d3",
+      "k": 10,
+      "association_slots": 3,
+      "qk_reserve": 2,
+      "neighbors_per_anchor": 3,
+      "cav_candidates": 24,
+      "repeats": 5
+    }
+  ]
+}

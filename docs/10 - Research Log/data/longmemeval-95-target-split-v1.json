@@ -1,0 +1,11 @@
+{
+  "format": "memory-condense-locked-benchmark-split-v1",
+  "dataset_sha256": "821a2034d219ab45846873dd14c14f12cfe7776e73527a483f9dac095d38620c",
+  "salt": "memory-condense-longmemeval-95-v1-2026-08-16",
+  "algorithm": "stratified-largest-remainder-v1",
+  "splits": {
+    "development": 200,
+    "validation": 100,
+    "confirmation": 200
+  }
+}

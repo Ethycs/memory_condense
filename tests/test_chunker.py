@@ -1,5 +1,6 @@
 import pytest
 
+from memory_condense._tokenizer import count_tokens
 from memory_condense.chunker import Chunker
 
 
@@ -48,7 +49,7 @@ def test_token_count_populated():
     text = "This is a simple sentence with several words in it."
     chunks = chunker.chunk_turn("t1", text)
     assert len(chunks) == 1
-    assert chunks[0].token_count > 0
+    assert chunks[0].token_count == count_tokens(chunks[0].text)
 
 
 def test_long_text_splits():
@@ -62,6 +63,27 @@ def test_long_text_splits():
     )
     chunks = chunker.chunk_turn("t1", text)
     assert len(chunks) > 1
-    # Each chunk should respect max_tokens (approximately)
+    # Every persisted count and boundary is exact.
     for chunk in chunks:
-        assert chunk.token_count <= 20  # some margin for merge edge cases
+        assert chunk.token_count == count_tokens(chunk.text)
+        assert chunk.token_count <= 15
+
+
+def test_hard_split_preserves_unicode_and_exact_maximum():
+    chunker = Chunker(min_tokens=2, max_tokens=10)
+    text = "🙂" * 40
+
+    chunks = chunker.chunk_turn("t1", text)
+
+    assert "".join(chunk.text for chunk in chunks) == text
+    assert all(chunk.token_count == count_tokens(chunk.text) for chunk in chunks)
+    assert all(chunk.token_count <= 10 for chunk in chunks)
+
+
+@pytest.mark.parametrize(
+    ("min_tokens", "max_tokens"),
+    [(0, 10), (10, 9)],
+)
+def test_invalid_token_bounds_are_rejected(min_tokens, max_tokens):
+    with pytest.raises(ValueError):
+        Chunker(min_tokens=min_tokens, max_tokens=max_tokens)

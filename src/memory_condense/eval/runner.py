@@ -116,7 +116,7 @@ def replay_conversation(
                             recent_turns=config.recent_window,
                             k_memories=config.retrieval.k_memories,
                             k_expansions=config.retrieval.k,
-                            hybrid=config.retrieval.effective_hybrid,
+                            hybrid=True,
                         )
                     elif config.retrieval.mode == "span":
                         retrieved = mc.search_spans(
@@ -180,9 +180,7 @@ def replay_conversation(
                         retrieval_s=retrieval_s,
                         context_tokens=context_tokens,
                         memory_items_packed=(
-                            len(packed.memory_header.splitlines()) - 1
-                            if packed is not None and packed.memory_header
-                            else 0
+                            len(packed.memory_ids) if packed is not None else 0
                         ),
                         memories_dropped=(
                             packed.dropped.get("memories", 0)

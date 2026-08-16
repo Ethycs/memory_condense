@@ -9,6 +9,7 @@ import hnswlib
 import numpy as np
 
 from memory_condense import lexical, ranking
+from memory_condense.association_store import AssociationStore
 from memory_condense.db import Database
 from memory_condense.lexical import LexicalIndex
 from memory_condense.schemas import Chunk, RetrievalResult, Turn
@@ -36,6 +37,75 @@ _LABEL_KEY = "next_hnsw_label"
 DEFAULT_SPAN_TOKENS: tuple[int, ...] = (110, 220)
 
 
+def load_chunk_payload(db: Database, chunk_id: str) -> Chunk | None:
+    """Load a chunk without decoding its unused dense embedding."""
+    row = db.execute(
+        "SELECT chunk_id, turn_id, text, start_char, end_char, token_count, "
+        "lexical_weights FROM chunks WHERE chunk_id = ?",
+        (chunk_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    lexical_weights = None if row[6] is None else json.loads(row[6])
+    return Chunk(
+        chunk_id=row[0],
+        turn_id=row[1],
+        text=row[2],
+        start_char=row[3],
+        end_char=row[4],
+        token_count=row[5],
+        embedding=None,
+        lexical_weights=lexical_weights,
+    )
+
+
+def load_turn_payload(db: Database, turn_id: str) -> Turn | None:
+    row = db.execute(
+        "SELECT turn_id, role, text, source_id, created_at FROM turns WHERE turn_id = ?",
+        (turn_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return Turn(
+        turn_id=row[0],
+        role=row[1],
+        text=row[2],
+        source_id=row[3],
+        created_at=row[4],
+    )
+
+
+def hydrate_chunk_result(
+    db: Database,
+    chunk_id: str,
+    *,
+    score: float,
+    dense_score: float | None = None,
+    lexical_score: float | None = None,
+    route: str | None = None,
+    association_score: float | None = None,
+    anchor_chunk_id: str | None = None,
+    transition_distance: int | None = None,
+    transition_direction: str | None = None,
+) -> RetrievalResult | None:
+    """Hydrate an external-memory ID without constructing an ANN retriever."""
+    chunk = load_chunk_payload(db, chunk_id)
+    if chunk is None:
+        return None
+    return RetrievalResult(
+        chunk=chunk,
+        score=score,
+        turn=load_turn_payload(db, chunk.turn_id),
+        dense_score=dense_score,
+        lexical_score=lexical_score,
+        route=route,
+        association_score=association_score,
+        anchor_chunk_id=anchor_chunk_id,
+        transition_distance=transition_distance,
+        transition_direction=transition_direction,
+    )
+
+
 class SimilarityRetriever:
     """Chunk retrieval over hnswlib (dense) and BM25 (lexical).
 
@@ -53,6 +123,7 @@ class SimilarityRetriever:
         ef_construction: int = 200,
         M: int = 16,
         max_elements: int = 100_000,
+        association_store: AssociationStore | None = None,
     ) -> None:
         self._db = db
         self._dim = dim
@@ -60,16 +131,25 @@ class SimilarityRetriever:
         self._ef_construction = ef_construction
         self._M = M
         self._max_elements = max_elements
+        self._associations = association_store
 
         # label <-> chunk_id mapping
         self._label_to_chunk_id: dict[int, str] = {}
         self._chunk_id_to_label: dict[str, int] = {}
         #: Labels marked deleted in this process; hnswlib still counts them.
         self._deleted_labels: set[int] = set()
-        #: Derived span vectors, per level. Rebuilt on demand and dropped on
-        #: any write — cheap to recompute, and a stale span is a silently
-        #: wrong answer rather than a loud failure.
+        #: Derived span vectors, per level.  The first query builds them; later
+        #: appends update only the open tail span.  Rebuilding every level over
+        #: the full transcript after every turn made the span path O(N^2) over
+        #: a session despite its bounded output.
         self._span_cache: dict[int, tuple[np.ndarray, list[list[str]]]] = {}
+        # Capacity-backed arrays make starting a new span amortized O(1).  A
+        # naive ``vstack`` would copy every old vector on each append and put
+        # the same quadratic schedule back under a different name.
+        self._span_vector_buffers: dict[int, np.ndarray] = {}
+        self._span_tail_sums: dict[int, np.ndarray] = {}
+        self._span_tail_tokens: dict[int, int] = {}
+        self._span_cached_through_rowid: dict[int, int] = {}
 
         self._lexical = LexicalIndex(db)
 
@@ -262,7 +342,9 @@ class SimilarityRetriever:
             )
 
         self._db.commit()
-        self._span_cache.clear()  # spans are derived; new chunks change them
+        # Do not invalidate spans here. `_span_vectors` consumes rows after its
+        # per-level high-water mark and changes only the last open span, so an
+        # append costs O(new chunks) instead of rebuilding O(all chunks).
 
         data = np.stack(vectors)
         self._index.add_items(data, np.array(labels, dtype=np.int64))
@@ -315,7 +397,7 @@ class SimilarityRetriever:
         """
         results: list[RetrievalResult] = []
         for chunk_id, score in self._dense_candidates(query_embedding, k, ef_search):
-            hydrated = self._hydrate(chunk_id, score=score)
+            hydrated = self._hydrate(chunk_id, score=score, route="dense")
             if hydrated is not None:
                 results.append(hydrated)
         return results
@@ -336,58 +418,129 @@ class SimilarityRetriever:
         long-form prose (227-token chunks). A single chunk already at or over
         the target becomes its own span rather than being merged.
 
-        Derived, never stored: SQLite already holds every member vector, and
-        caching these would add a second thing to keep consistent for no gain
-        at this scale. The cache below is per-process and invalidated on write.
+        Derived, never stored: SQLite already holds every member vector.  The
+        per-process cache records a rowid high-water mark and the unnormalised
+        sum of its last span.  Because the transcript is append-only, new rows
+        can only extend that last span or start later ones; earlier spans never
+        need to be revisited.  Deletion and index rebuild remain rare full
+        invalidations.
         """
         cached = self._span_cache.get(target_tokens)
         if cached is not None:
-            return cached
+            rows = self._load_span_rows(
+                after_rowid=self._span_cached_through_rowid[target_tokens]
+            )
+            if rows:
+                self._extend_span_cache(target_tokens, rows)
+            return self._span_cache[target_tokens]
 
-        # `delete_chunk` nulls both columns, so deleted chunks are excluded
-        # here without a second bookkeeping set to keep in sync.
-        # `ORDER BY rowid` is insertion order, which for an append-only
-        # transcript is conversation order — spans must be contiguous *in the
-        # conversation*, not in whatever order the index happens to return.
-        rows = self._db.execute(
-            "SELECT chunk_id, embedding, token_count FROM chunks "
-            "WHERE embedding IS NOT NULL AND hnsw_label IS NOT NULL "
-            "ORDER BY rowid"
-        ).fetchall()
+        rows = self._load_span_rows()
         if not rows:
             empty = (np.zeros((0, self._dim), dtype=np.float32), [])
             self._span_cache[target_tokens] = empty
+            self._span_vector_buffers[target_tokens] = empty[0]
+            self._span_tail_sums[target_tokens] = np.zeros(
+                self._dim, dtype=np.float32
+            )
+            self._span_tail_tokens[target_tokens] = 0
+            self._span_cached_through_rowid[target_tokens] = 0
             return empty
 
-        vectors = np.stack(
-            [np.frombuffer(blob, dtype=np.float32) for _, blob, _ in rows]
-        ).astype(np.float32)
-        vectors /= np.clip(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9, None)
+        self._span_cache[target_tokens] = (
+            np.zeros((0, self._dim), dtype=np.float32),
+            [],
+        )
+        self._span_vector_buffers[target_tokens] = self._span_cache[target_tokens][0]
+        self._span_tail_sums[target_tokens] = np.zeros(self._dim, dtype=np.float32)
+        self._span_tail_tokens[target_tokens] = 0
+        self._span_cached_through_rowid[target_tokens] = 0
+        self._extend_span_cache(target_tokens, rows)
+        return self._span_cache[target_tokens]
 
-        # Greedily pack consecutive chunks up to the token target.
-        groups: list[list[int]] = []
-        current: list[int] = []
-        budget = 0
-        for i, (_, _, token_count) in enumerate(rows):
+    def _load_span_rows(
+        self, after_rowid: int | None = None
+    ) -> list[tuple[int, str, bytes, int]]:
+        """Load live span inputs, optionally only after a cache high-water mark."""
+        # `delete_chunk` nulls both indexed columns, so deleted chunks are
+        # excluded without another bookkeeping set.  rowid is append order,
+        # hence conversation order for the append-only transcript.
+        sql = (
+            "SELECT rowid, chunk_id, embedding, token_count FROM chunks "
+            "WHERE embedding IS NOT NULL AND hnsw_label IS NOT NULL"
+        )
+        params: tuple[int, ...] = ()
+        if after_rowid is not None:
+            sql += " AND rowid > ?"
+            params = (after_rowid,)
+        return self._db.execute(sql + " ORDER BY rowid", params).fetchall()
+
+    def _extend_span_cache(
+        self,
+        target_tokens: int,
+        rows: list[tuple[int, str, bytes, int]],
+    ) -> None:
+        """Append rows to one cached level, touching only its open tail span."""
+        _, members = self._span_cache[target_tokens]
+        buffer = self._span_vector_buffers[target_tokens]
+        tail_sum = self._span_tail_sums[target_tokens].copy()
+        tail_tokens = self._span_tail_tokens[target_tokens]
+        target = max(target_tokens, 1)
+
+        for rowid, chunk_id, blob, token_count in rows:
+            vector = np.frombuffer(blob, dtype=np.float32).copy()
+            norm = float(np.linalg.norm(vector))
+            if norm > 1e-9:
+                vector /= norm
             size = int(token_count or 0)
-            if current and budget + size > max(target_tokens, 1):
-                groups.append(current)
-                current, budget = [], 0
-            current.append(i)
-            budget += size
-        if current:
-            groups.append(current)
 
-        pooled, members = [], []
-        for group in groups:
-            summed = vectors[group].sum(axis=0)
-            norm = float(np.linalg.norm(summed))
-            pooled.append(summed / norm if norm > 1e-9 else summed)
-            members.append([rows[i][0] for i in group])
+            if members and tail_tokens + size <= target:
+                tail_sum += vector
+                tail_tokens += size
+                members[-1].append(chunk_id)
+                tail_norm = float(np.linalg.norm(tail_sum))
+                buffer[len(members) - 1] = (
+                    tail_sum / tail_norm if tail_norm > 1e-9 else tail_sum.copy()
+                )
+            else:
+                buffer = self._ensure_span_capacity(
+                    target_tokens, len(members) + 1
+                )
+                tail_sum = vector.copy()
+                tail_tokens = size
+                members.append([chunk_id])
+                buffer[len(members) - 1] = vector
 
-        result = (np.stack(pooled), members)
-        self._span_cache[target_tokens] = result
-        return result
+            self._span_cached_through_rowid[target_tokens] = int(rowid)
+
+        self._span_cache[target_tokens] = (
+            buffer[: len(members)],
+            members,
+        )
+        self._span_tail_sums[target_tokens] = tail_sum
+        self._span_tail_tokens[target_tokens] = tail_tokens
+
+    def _ensure_span_capacity(
+        self, target_tokens: int, required: int
+    ) -> np.ndarray:
+        """Grow a level's vector buffer geometrically, amortizing append cost."""
+        buffer = self._span_vector_buffers[target_tokens]
+        if required <= len(buffer):
+            return buffer
+        capacity = max(required, max(8, len(buffer) * 2))
+        grown = np.zeros((capacity, self._dim), dtype=np.float32)
+        count = len(self._span_cache[target_tokens][1])
+        if count:
+            grown[:count] = buffer[:count]
+        self._span_vector_buffers[target_tokens] = grown
+        return grown
+
+    def _clear_span_cache(self) -> None:
+        """Invalidate every piece of derived span state after a non-append write."""
+        self._span_cache.clear()
+        self._span_vector_buffers.clear()
+        self._span_tail_sums.clear()
+        self._span_tail_tokens.clear()
+        self._span_cached_through_rowid.clear()
 
     def span_query(
         self,
@@ -444,9 +597,236 @@ class SimilarityRetriever:
 
         results: list[RetrievalResult] = []
         for chunk_id, score in sorted(picked.items(), key=lambda kv: -kv[1]):
-            hydrated = self._hydrate(chunk_id, score=score)
+            hydrated = self._hydrate(chunk_id, score=score, route="span")
             if hydrated is not None:
                 results.append(hydrated)
+        return results
+
+    def source_query(
+        self,
+        query_embedding: np.ndarray,
+        *,
+        k_sources: int = 4,
+    ) -> list[RetrievalResult]:
+        """Retrieve whole provenance sources using pooled chunk embeddings.
+
+        A source is a conversation session, document, or file recorded on its
+        turns. Legacy turns fall back to one source per turn. Source vectors
+        are exact normalized means over normalized member chunks; no additional
+        ANN or persisted activation state is created. Winning sources return
+        their real chunks in conversation order so prompt caps and provenance
+        continue to operate normally.
+        """
+
+        if k_sources <= 0:
+            return []
+        query_vec = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+        query_norm = float(np.linalg.norm(query_vec))
+        if query_norm > 1e-9:
+            query_vec = query_vec / query_norm
+
+        rows = self._db.execute(
+            "SELECT c.chunk_id, c.embedding, COALESCE(t.source_id, t.turn_id), "
+            "t.ordinal, c.rowid FROM chunks AS c "
+            "JOIN turns AS t ON t.turn_id = c.turn_id "
+            "WHERE c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            "ORDER BY t.ordinal, c.rowid"
+        ).fetchall()
+        if not rows:
+            return []
+
+        members: dict[str, list[str]] = {}
+        sums: dict[str, np.ndarray] = {}
+        for chunk_id, blob, source_id, _ordinal, _rowid in rows:
+            vector = np.frombuffer(blob, dtype=np.float32).copy()
+            norm = float(np.linalg.norm(vector))
+            if norm > 1e-9:
+                vector /= norm
+            key = str(source_id)
+            members.setdefault(key, []).append(str(chunk_id))
+            if key in sums:
+                sums[key] += vector
+            else:
+                sums[key] = vector
+
+        scored: list[tuple[float, str]] = []
+        for source_id, vector_sum in sums.items():
+            norm = float(np.linalg.norm(vector_sum))
+            pooled = vector_sum / norm if norm > 1e-9 else vector_sum
+            scored.append((float(pooled @ query_vec), source_id))
+        selected = sorted(scored, key=lambda item: (item[0], item[1]), reverse=True)[
+            :k_sources
+        ]
+
+        results: list[RetrievalResult] = []
+        for score, source_id in selected:
+            for chunk_id in members[source_id]:
+                hydrated = self._hydrate(chunk_id, score=score, route="source")
+                if hydrated is not None:
+                    results.append(hydrated)
+        return results
+
+    def hydrate_sources(
+        self,
+        source_ids: Sequence[str],
+        *,
+        source_scores: dict[str, float] | None = None,
+        interleave: bool = True,
+        route: str = "anchored_source",
+    ) -> list[RetrievalResult]:
+        """Hydrate selected sources without reranking their member chunks.
+
+        Sources retain caller order. With ``interleave=True`` one chunk per
+        source is emitted per round, so a final hard prompt cap cannot let one
+        long session crowd every other selected evidence source out.
+        """
+        selected = list(dict.fromkeys(str(source_id) for source_id in source_ids))
+        if not selected:
+            return []
+        placeholders = ",".join("?" for _ in selected)
+        rows = self._db.execute(
+            "SELECT c.chunk_id, COALESCE(t.source_id, t.turn_id) "
+            "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
+            f"WHERE COALESCE(t.source_id, t.turn_id) IN ({placeholders}) "
+            "AND c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            "ORDER BY t.ordinal, c.rowid",
+            tuple(selected),
+        ).fetchall()
+        members: dict[str, list[str]] = {source_id: [] for source_id in selected}
+        for chunk_id, source_id in rows:
+            key = str(source_id)
+            if key in members:
+                members[key].append(str(chunk_id))
+
+        ordered_ids: list[tuple[str, str]] = []
+        if interleave:
+            depth = 0
+            while any(depth < len(members[source_id]) for source_id in selected):
+                for source_id in selected:
+                    if depth < len(members[source_id]):
+                        ordered_ids.append((source_id, members[source_id][depth]))
+                depth += 1
+        else:
+            ordered_ids = [
+                (source_id, chunk_id)
+                for source_id in selected
+                for chunk_id in members[source_id]
+            ]
+
+        scores = source_scores or {}
+        results: list[RetrievalResult] = []
+        for source_id, chunk_id in ordered_ids:
+            hydrated = self._hydrate(
+                chunk_id,
+                score=float(scores.get(source_id, 0.0)),
+                route=route,
+            )
+            if hydrated is not None:
+                results.append(hydrated)
+        return results
+
+    def hydrate_source_neighbors(
+        self,
+        anchors: Sequence[RetrievalResult],
+        *,
+        radius: int = 1,
+        max_neighbors: int | None = None,
+        route: str = "hybrid_neighbor",
+    ) -> list[RetrievalResult]:
+        """Expand ranked anchors by bounded distance inside their sources.
+
+        Direct anchors remain first and retain their hybrid score components.
+        Neighbor shells then follow stepwise: distance one around every anchor,
+        then distance two, and so on. This keeps the useful retrieval ranking
+        intact while exposing local conversational transitions without loading
+        an entire source or persisting any token/attention state.
+        """
+        if radius < 0:
+            raise ValueError("radius must be non-negative")
+        if max_neighbors is not None and max_neighbors < 0:
+            raise ValueError("max_neighbors must be non-negative or None")
+        if not anchors:
+            return []
+
+        unique_anchors: list[RetrievalResult] = []
+        seen: set[str] = set()
+        for anchor in anchors:
+            chunk_id = anchor.chunk.chunk_id
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            unique_anchors.append(anchor)
+        if radius == 0 or max_neighbors == 0:
+            return unique_anchors
+
+        source_ids = list(
+            dict.fromkeys(
+                str(anchor.turn.source_id or anchor.turn.turn_id)
+                for anchor in unique_anchors
+                if anchor.turn is not None
+            )
+        )
+        if not source_ids:
+            return unique_anchors
+
+        placeholders = ",".join("?" for _ in source_ids)
+        rows = self._db.execute(
+            "SELECT c.chunk_id, COALESCE(t.source_id, t.turn_id) "
+            "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
+            f"WHERE COALESCE(t.source_id, t.turn_id) IN ({placeholders}) "
+            "AND c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            "ORDER BY t.ordinal, c.rowid",
+            tuple(source_ids),
+        ).fetchall()
+        members: dict[str, list[str]] = {source_id: [] for source_id in source_ids}
+        for chunk_id, source_id in rows:
+            key = str(source_id)
+            if key in members:
+                members[key].append(str(chunk_id))
+        positions = {
+            (source_id, chunk_id): index
+            for source_id, chunk_ids in members.items()
+            for index, chunk_id in enumerate(chunk_ids)
+        }
+
+        results = list(unique_anchors)
+        for distance in range(1, radius + 1):
+            for anchor in unique_anchors:
+                if anchor.turn is None:
+                    continue
+                source_id = str(anchor.turn.source_id or anchor.turn.turn_id)
+                position = positions.get((source_id, anchor.chunk.chunk_id))
+                if position is None:
+                    continue
+                chunk_ids = members[source_id]
+                # Earlier context precedes the following response at each
+                # shell, matching ordinary conversation reading order.
+                for neighbor_position in (position - distance, position + distance):
+                    if not 0 <= neighbor_position < len(chunk_ids):
+                        continue
+                    chunk_id = chunk_ids[neighbor_position]
+                    if chunk_id in seen:
+                        continue
+                    hydrated = self._hydrate(
+                        chunk_id,
+                        score=float(anchor.score),
+                        route=route,
+                        anchor_chunk_id=anchor.chunk.chunk_id,
+                        transition_distance=distance,
+                        transition_direction=(
+                            "previous"
+                            if neighbor_position < position
+                            else "next"
+                        ),
+                    )
+                    if hydrated is not None:
+                        seen.add(chunk_id)
+                        results.append(hydrated)
+                        if (
+                            max_neighbors is not None
+                            and len(results) - len(unique_anchors) >= max_neighbors
+                        ):
+                            return results
         return results
 
     def hybrid_query(
@@ -508,6 +888,7 @@ class SimilarityRetriever:
                 score=blended,
                 dense_score=dense_scores.get(chunk_id, 0.0),
                 lexical_score=lexical_scores.get(chunk_id, 0.0),
+                route="hybrid",
             )
             if hydrated is not None:
                 results.append(hydrated)
@@ -539,9 +920,12 @@ class SimilarityRetriever:
         )
         touched = cur.rowcount > 0
         self._db.commit()
-        self._span_cache.clear()
+        self._clear_span_cache()
         self._lexical.delete_chunk(chunk_id)
-        return touched or label is not None
+        artifacts_removed = 0
+        if self._associations is not None:
+            artifacts_removed = self._associations.remove_chunk_artifacts(chunk_id)
+        return touched or label is not None or artifacts_removed > 0
 
     @property
     def lexical(self) -> LexicalIndex:
@@ -554,21 +938,47 @@ class SimilarityRetriever:
         score: float,
         dense_score: float | None = None,
         lexical_score: float | None = None,
+        route: str | None = None,
+        association_score: float | None = None,
+        anchor_chunk_id: str | None = None,
+        transition_distance: int | None = None,
+        transition_direction: str | None = None,
     ) -> RetrievalResult | None:
         """Build a RetrievalResult from SQLite, or None if the chunk is gone."""
-        chunk = self._load_chunk(chunk_id)
-        if chunk is None:
-            return None
-        return RetrievalResult(
-            chunk=chunk,
+        return hydrate_chunk_result(
+            self._db,
+            chunk_id,
             score=score,
-            turn=self._load_turn(chunk.turn_id),
             dense_score=dense_score,
             lexical_score=lexical_score,
+            route=route,
+            association_score=association_score,
+            anchor_chunk_id=anchor_chunk_id,
+            transition_distance=transition_distance,
+            transition_direction=transition_direction,
+        )
+
+    def hydrate_chunk(
+        self,
+        chunk_id: str,
+        *,
+        score: float,
+        route: str | None = None,
+        association_score: float | None = None,
+        anchor_chunk_id: str | None = None,
+    ) -> RetrievalResult | None:
+        """Hydrate a known external-memory ID without searching the ANN index."""
+        return self._hydrate(
+            chunk_id,
+            score=score,
+            route=route,
+            association_score=association_score,
+            anchor_chunk_id=anchor_chunk_id,
         )
 
     def rebuild_index(self) -> None:
         """Rebuild the hnswlib index from all embeddings in SQLite."""
+        self._clear_span_cache()
         cur = self._db.execute(
             "SELECT chunk_id, embedding, hnsw_label FROM chunks "
             "WHERE embedding IS NOT NULL"
@@ -610,7 +1020,6 @@ class SimilarityRetriever:
             vectors.append(np.frombuffer(emb_blob, dtype=np.float32))
 
         self._db.commit()
-        self._span_cache.clear()
 
         data = np.stack(vectors)
         self._index.add_items(data, np.array(labels, dtype=np.int64))
@@ -622,43 +1031,16 @@ class SimilarityRetriever:
             self._index.save_index(str(self._index_path))
 
     def _load_chunk(self, chunk_id: str) -> Chunk | None:
-        """Load a chunk from SQLite by ID."""
-        cur = self._db.execute(
-            "SELECT chunk_id, turn_id, text, start_char, end_char, "
-            "token_count, embedding, lexical_weights "
-            "FROM chunks WHERE chunk_id = ?",
-            (chunk_id,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
+        """Load retrieval payload only; the 1024-float source vector stays put.
 
-        embedding = None
-        if row[6] is not None:
-            embedding = np.frombuffer(row[6], dtype=np.float32).tolist()
-
-        lexical_weights = None
-        if row[7] is not None:
-            lexical_weights = json.loads(row[7])
-
-        return Chunk(
-            chunk_id=row[0],
-            turn_id=row[1],
-            text=row[2],
-            start_char=row[3],
-            end_char=row[4],
-            token_count=row[5],
-            embedding=embedding,
-            lexical_weights=lexical_weights,
-        )
+        Returning every stored embedding made each candidate hydration decode
+        ~4 KiB of data that ranking and context assembly never read.  The ANN
+        index already consumed the vector before this point, so retrieval
+        results intentionally carry ``embedding=None``. Lexical weights remain
+        because they are part of the hydrated chunk's public contract.
+        """
+        return load_chunk_payload(self._db, chunk_id)
 
     def _load_turn(self, turn_id: str) -> Turn | None:
         """Load a turn from SQLite by ID."""
-        cur = self._db.execute(
-            "SELECT turn_id, role, text, created_at FROM turns WHERE turn_id = ?",
-            (turn_id,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        return Turn(turn_id=row[0], role=row[1], text=row[2], created_at=row[3])
+        return load_turn_payload(self._db, turn_id)

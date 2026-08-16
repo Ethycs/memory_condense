@@ -1,0 +1,65 @@
+{
+  "protocol": "post-v2 fixed safe admission: lexical-tail protection 0.90 and zero prompt-token increase",
+  "arms": [
+    {
+      "name": "hybrid_k5",
+      "k": 5,
+      "association_slots": 0,
+      "qk_reserve": 0,
+      "neighbors_per_anchor": 0,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d3_cap8_unprotected",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 8,
+      "cav_candidates": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_d3_cap8_safe",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 8,
+      "cav_candidates": 0,
+      "lexical_protection_threshold": 0.9,
+      "max_prompt_token_increase": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_cav_k5_h2_s2_d3_cap8_safe",
+      "k": 5,
+      "association_slots": 2,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 8,
+      "cav_candidates": 8,
+      "lexical_protection_threshold": 0.9,
+      "max_prompt_token_increase": 0,
+      "repeats": 10
+    },
+    {
+      "name": "qk_k5_h2_cap8_pruned_d2_safe",
+      "k": 5,
+      "association_slots": 1,
+      "qk_reserve": 1,
+      "neighbors_per_anchor": 3,
+      "association_hops": 2,
+      "max_association_candidates": 8,
+      "cav_candidates": 0,
+      "lexical_protection_threshold": 0.9,
+      "max_prompt_token_increase": 0,
+      "prune_max_neighbors": 2,
+      "repeats": 10
+    }
+  ]
+}

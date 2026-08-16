@@ -1,0 +1,27 @@
+build-session-8f7f7561: 2420 turns, 39 questions
+ingest: 937s
+chunks: 2917, median 81 tok, total 297,767 tok
+
+arm                recall  ctx tok
+----------------------------------
+ceiling (turns)    100.0%  305,103
+ceiling (chunks)   100.0%  297,767
+random k=40          2.6%     4054
+recent k=40         35.9%     6545
+dense k=10          87.2%     1573
+hybrid k=10         92.3%     1533
+hybrid k=50         94.9%     7540
+span x2             66.7%      477
+span x4             79.5%      958
+memory k=10         64.1%      481
+
+union span x4 + hybrid k=50: 94.9%
+
+by phase (span x4):
+  A: 3/3
+  B: 7/7
+  C: 3/5
+  D: 12/15
+  E: 6/9
+
+missed by both best arms: ['unrelated chatter', 'expensive operations']

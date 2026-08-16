@@ -5,6 +5,12 @@
 **Probe**: `bs-probe-v1`, 39 questions ([data/2026-08-16-build-session-baseline/](data/2026-08-16-build-session-baseline/))
 **Cost**: $0. Local, keyless. One-time ingest 937 s (bge-m3 on CPU, ~318 tok/s).
 
+**Post-B0 correction**: the 92.3% hybrid baseline and every raw-retriever row
+below remain valid. The row originally labelled `memory k=10` is retracted as a
+whole-system measurement: the shared store was ingested in dense mode, so it
+contained no extracted memories, used dense expansions, and retained the
+three-item facade cap. See [research log 01](01%20-%202026-08-16%20-%20Post-B0%20assembly%20and%20memory%20lifecycle%20corrections.md).
+
 ## The baseline
 
 > **B0: hybrid k=10 — 92.3% recall at 1,533 context tokens (0.50% of a 305k-token transcript), 60.2 recall-pts per 1k tokens, per-turn cost flat.**
@@ -21,7 +27,7 @@
 | hybrid k=50 | 94.9% | 7,540 | 12.6 |
 | span x2 | 66.7% | 477 | 139.8 |
 | span x4 | 79.5% | 958 | 83.0 |
-| memory k=10 (assembled) | 64.1% | 481 | 133.3 |
+| retracted “memory k=10” (actually budgeted dense top-3) | 64.1% | 481 | 133.3 |
 
 Marginal cost along the frontier: span x2 → x4 ≈ 27 pp/1k; → hybrid k=10 ≈ 22 pp/1k; → hybrid k=50 ≈ **0.4 pp/1k**. The knee is B0. The per-1k column alone would rank span x2 first — the standing trap: never read the ratio without absolute recall beside it.
 
@@ -29,7 +35,7 @@ Marginal cost along the frontier: span x2 → x4 ≈ 27 pp/1k; → hybrid k=10 �
 
 ## Method (reproducibility)
 
-1. **Snapshot first** — the session JSONL was copied *before* any probe question was authored, so authoring turns cannot appear in the corpus (contamination guard). The 13 MB snapshot itself is deliberately not committed; scripts + probe are.
+1. **Snapshot first** — the session JSONL was copied *before* any probe question was authored, so authoring turns cannot appear in the corpus (contamination guard). The 13 MB snapshot is deliberately not committed (full session content); it lives at **`data/build-session-8f7f7561.snapshot.jsonl`** (gitignored, durable), pinned by SHA-256 `4947dce90ec8f19ebd6720428b8ff1e160bd7dba42fbc6b6b5a214e4d9048a69` (13,098,320 bytes, 3,737 lines). **The live session file cannot substitute for it**: everything after the snapshot moment discusses the probe answers openly, so a re-snapshot is contaminated by construction. Lose this file and B0 is not reproducible.
 2. **Parse** (`cc_parse.py`): user text and assistant text as turns; `tool_use` (input truncated 300 ch) and `tool_result` (truncated 2,000 ch) as system turns; thinking blocks, meta/caveat records, command wrappers, sidechains excluded. Yield: 2,420 turns, 305,103 tokens — user 7%, assistant 14%, tool_use 26%, tool_result 53% (tool traffic 79%, matching the earlier 71%-of-chunks census).
 3. **Probe** (`cc_questions.py` → `cc_verify.py`): 48 hand-authored Q/A pairs across five session phases; kept only answers verbatim-present (SQuAD-normalized containment) in ≥1 turn and ≤25 turns (ubiquity filter). 39 survive; most answers live in 1–5 turns of 2,420.
 4. **Measure** (`cc_bench.py`): ingest via `ingest_sample`, all arms via `eval.recall._assemble`, `reheat=False` throughout.
@@ -46,7 +52,12 @@ Marginal cost along the frontier: span x2 → x4 ≈ 27 pp/1k; → hybrid k=10 �
 
 No retriever dominates across regimes. `t` and chunk size are observable at runtime and predict the right arm: short-turn chat → span; agentic/long-form → hybrid. (Confound, stated: the probe is needle-type by construction, which favours hybrid/dense; corpus and question-type effects are not fully separated.)
 
-**The assembled system trails its own retriever by 28 pp.** memory k=10 = 64.1% where raw hybrid k=10 = 92.3%: `ContextPacker.max_expansions=3` discards 7 of the 10 hits while using only 481 of its ~1,700-token budget. The C3 confound from the original plan, now quantified. Fix is R3's top work-list item.
+**The apparent 28 pp assembly gap was confounded.** The recorded 64.1% row
+used an empty memory header, dense rather than hybrid expansions, and at most
+three excerpts. It still exposed a real facade count/budget mismatch, now
+fixed, but it cannot quantify the memory layer's penalty. A true memory result
+requires a separate extraction-enabled ingest; the corrected script now does
+that. See research log 01.
 
 **What the corpus cannot contain.** Probe answers that existed only inside Edit-tool payloads (`REHEAT_ONCE_PER_TURN`, `COALESCE(MAX(ordinal), 0)`, `idx_turns_ordinal`…) are **absent from the ingested corpus** — bounded tool records never carried them. The memory can only recall what the session surface said. Deployment property, now measured, dropped 6 of 48 authored questions.
 
@@ -78,8 +89,8 @@ Decay re-coordinated from wall-clock to turns (schema v4, `9aea4cd`) after estab
 
 ## Open, in priority order
 
-1. **R3**: lift `max_expansions` to use the budget; re-measure the assembled system against B0 (expected to close most of the 28 pp).
-2. **R5**: span-cache invalidation schedule (`add_chunks` clears per append — O(N)/turn in the span path).
+1. **R3**: ~~lift `max_expansions` to use the budget~~ done; re-measure the true, extraction-enabled assembled system against B0.
+2. **R5**: ~~span-cache invalidation schedule~~ incremental tail updates built; the remaining linear span score pass is open.
 3. Adaptive arm choice from observable regime (`t`, chunk size) — hybrid vs span per corpus (R4).
 4. The $4 distractor-slice native comparison; the $12 full one.
 5. A semantic probe (paraphrased questions, judge-scored) — the slice B0 cannot see.

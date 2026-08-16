@@ -1,0 +1,15 @@
+Post-B0 runtime probe, same machine and script configuration
+
+BEFORE batched reheat/provenance (after incremental span-cache change):
+memory retrieve k=8: median=28.018 ms, commits/call=8
+memory retrieve k=50: median=115.385 ms, commits/call=50
+span append refresh (20,000 chunks): incremental=0.302 ms, full-rebuild=342.851 ms, speedup=1134.5x
+
+AFTER batched reheat and top-k provenance hydration:
+memory retrieve k=8: median=9.046 ms, commits/call=1
+memory retrieve k=50: median=11.677 ms, commits/call=1
+span append refresh (20,000 chunks): incremental=0.218 ms, full-rebuild=271.430 ms, speedup=1244.5x
+
+The span before/after variation is ordinary timing noise: both rows use the
+incremental implementation. Its comparison of interest is incremental versus
+forced full rebuild within the same run.

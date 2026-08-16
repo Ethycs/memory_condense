@@ -1,0 +1,236 @@
+[
+ [
+  "What was the commit message of cd9f423?",
+  "Good compressor",
+  "A",
+  17
+ ],
+ [
+  "Which merge commit brought the memory layer to main?",
+  "f3edc91",
+  "A",
+  12
+ ],
+ [
+  "Which commit added supersede over MCP?",
+  "7717c3a",
+  "A",
+  9
+ ],
+ [
+  "Which submodule is the reference implementation?",
+  "claude-forest-atlas",
+  "B",
+  5
+ ],
+ [
+  "What does DHS stand for?",
+  "Direct Hierarchical Summarization",
+  "B",
+  2
+ ],
+ [
+  "What does HSC stand for?",
+  "Hierarchical Semantic Contraction",
+  "B",
+  2
+ ],
+ [
+  "Which library does the SOM strategy import?",
+  "minisom",
+  "B",
+  2
+ ],
+ [
+  "What dishonest literal did HSC hardcode?",
+  "coverage_percentage=100.0",
+  "B",
+  1
+ ],
+ [
+  "Which segmenter function enriches code blocks with prose?",
+  "_enrich_with_adjacent_context",
+  "B",
+  1
+ ],
+ [
+  "How does DHS pick its anchor nodes?",
+  "PageRank",
+  "B",
+  5
+ ],
+ [
+  "What is the v4 backfill function called?",
+  "_backfill_turn_ordinals",
+  "C",
+  2
+ ],
+ [
+  "Which commit moved decay onto turns?",
+  "9aea4cd",
+  "C",
+  3
+ ],
+ [
+  "Which commit documented the coordinate finding?",
+  "249e4bb",
+  "C",
+  5
+ ],
+ [
+  "What text filled the 60 smoke-test turns?",
+  "unrelated chatter",
+  "C",
+  1
+ ],
+ [
+  "How long did an important item need to reach COLD under wall-clock?",
+  "11.75 days",
+  "C",
+  7
+ ],
+ [
+  "What was the whole-transcript ceiling on conv-26?",
+  "33.2%",
+  "D",
+  16
+ ],
+ [
+  "What recall did span x4 get on conv-26?",
+  "23.1%",
+  "D",
+  17
+ ],
+ [
+  "How much recall did dense add to the oracle union?",
+  "0.0pp",
+  "D",
+  2
+ ],
+ [
+  "What was the router's oracle ceiling over span plus hybrid?",
+  "+2.0pp",
+  "D",
+  1
+ ],
+ [
+  "How many ms does embedding a query cost?",
+  "155.3",
+  "D",
+  2
+ ],
+ [
+  "Which baseline scored worse than random?",
+  "worse than random",
+  "D",
+  1
+ ],
+ [
+  "What did span replicate to across 4 samples?",
+  "23.4%",
+  "D",
+  18
+ ],
+ [
+  "What are the two cosine similarity means showing length bias?",
+  "0.678 vs 0.602",
+  "D",
+  2
+ ],
+ [
+  "What are the default span token levels?",
+  "(110, 220)",
+  "D",
+  3
+ ],
+ [
+  "What is the chunker's cross-turn defect?",
+  "never merges across turns",
+  "D",
+  4
+ ],
+ [
+  "What was LoCoMo's median chunk size in tokens?",
+  "27 tok",
+  "D",
+  9
+ ],
+ [
+  "What was the median item age in the heat probe?",
+  "p50=220",
+  "D",
+  1
+ ],
+ [
+  "What line of the sweep output names the energy reorder test?",
+  "top-5 order changed by energy",
+  "D",
+  1
+ ],
+ [
+  "How many tokens of transcript does conv-26 have?",
+  "13,455 tokens",
+  "D",
+  3
+ ],
+ [
+  "What was the memory arm's mean context in tokens?",
+  "391",
+  "D",
+  7
+ ],
+ [
+  "What operating envelope did the operator set?",
+  "1-1M tokens",
+  "E",
+  1
+ ],
+ [
+  "What per-turn cost goal did the operator state?",
+  "linear token expense per turn",
+  "E",
+  1
+ ],
+ [
+  "What comment marks the span-cache invalidation?",
+  "spans are derived; new chunks change them",
+  "E",
+  2
+ ],
+ [
+  "Which line stops the packer reaching span?",
+  "self.search_hybrid if hybrid else self.search",
+  "E",
+  2
+ ],
+ [
+  "What is the total ContextBudget in tokens?",
+  "6,200",
+  "E",
+  4
+ ],
+ [
+  "What does mean-pooling do when a span straddles topics?",
+  "washes out once a span straddles topics",
+  "E",
+  2
+ ],
+ [
+  "What sheaf condition does mean-pooling fail?",
+  "fails gluing",
+  "E",
+  1
+ ],
+ [
+  "What fraction of gold answers appear nowhere verbatim?",
+  "two-thirds",
+  "E",
+  1
+ ],
+ [
+  "What did the operator permit from time to time?",
+  "expensive operations",
+  "E",
+  2
+ ]
+]

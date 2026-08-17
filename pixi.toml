@@ -26,6 +26,7 @@ pysbd = ">=0.3"
 litellm = ">=1.40"
 tiktoken = ">=0.7"
 python-dotenv = ">=1.0"
+truststore = ">=0.10.4,<0.11"
 
 [pypi-dependencies]
 memory_condense = { path = ".", editable = true }

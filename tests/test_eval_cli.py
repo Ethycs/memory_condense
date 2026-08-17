@@ -274,6 +274,26 @@ def test_metered_provider_wrappers_disable_retries(monkeypatch):
     assert [call["num_retries"] for call in calls] == [0, 0]
 
 
+def test_codex_sdk_answerer_omits_temperature(monkeypatch):
+    calls = []
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="answer"))],
+        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=3),
+    )
+
+    def completion(**kwargs):
+        calls.append(kwargs)
+        return response
+
+    monkeypatch.setattr(litellm, "completion", completion)
+
+    answer_fn = _make_answer_fn("openai/codex_sdk/gpt-5.6-luna")
+    answer, _usage = answer_fn([{"role": "user", "content": "question"}])
+
+    assert answer == "answer"
+    assert "temperature" not in calls[0]
+
+
 def test_policy_manifest_must_match_active_retrieval_config(tmp_path: Path):
     config = EvalConfig(
         retrieval=RetrievalConfig(

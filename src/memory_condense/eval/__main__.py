@@ -21,6 +21,7 @@ import argparse
 import csv
 import io
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -654,17 +655,43 @@ def _make_answer_fn(model: str, *, retries: int = 0):
     """Answer a benchmark question. Short, deterministic answers — F1/EM depend on it."""
     import litellm
 
+    central_dev_client = None
+    api_base = os.environ.get("OPENAI_API_BASE", "")
+    if "codex_sdk/" in model and "central-dev.zt" in api_base:
+        # central-dev terminates TLS with the trusted internal Caddy CA.
+        # Give OpenAI/LiteLLM an explicit transport backed by the Windows trust
+        # store; their default certifi transport cannot see that installed CA.
+        import ssl
+
+        import httpx
+        import truststore
+        from openai import OpenAI
+
+        ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        central_dev_client = OpenAI(
+            api_key=os.environ.get("OPENAI_API_KEY"),
+            base_url=api_base,
+            http_client=httpx.Client(verify=ssl_context),
+        )
+
     def answer_fn(
         messages: list[dict[str, str]],
     ) -> tuple[str, UsageStats]:
         started = time.perf_counter()
-        response = litellm.completion(
-            model=model,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=256,
-            num_retries=retries,
-        )
+        request = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 256,
+            "num_retries": retries,
+        }
+        # Codex GPT-5 routes reject non-default temperature values. Omitting
+        # the field keeps the central-dev codex_sdk gateway compatible while
+        # preserving deterministic temperature=0 for historical model routes.
+        if "codex_sdk/" not in model:
+            request["temperature"] = 0.0
+        if central_dev_client is not None:
+            request["client"] = central_dev_client
+        response = litellm.completion(**request)
         return _content(response), UsageStats.from_litellm(
             response,
             time.perf_counter() - started,
@@ -1365,6 +1392,26 @@ def run_benchmark_mode(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     samples = _apply_sample_offset(args, _apply_locked_split(args, samples))
+    stress_tokens = getattr(args, "stress_context_tokens", None)
+    if stress_tokens is not None:
+        from memory_condense.eval.context_stress import (
+            compose_context_stress_sample,
+            transcript_tokens,
+        )
+
+        samples = [
+            compose_context_stress_sample(
+                samples,
+                target_tokens=stress_tokens,
+                max_questions=getattr(args, "stress_questions", 10),
+            )
+        ]
+        actual_tokens = transcript_tokens(samples[0])
+        print(
+            f"Context stress memory: {actual_tokens:,} tokens, "
+            f"{len(samples[0].turns):,} turns, "
+            f"{len(samples[0].questions)} questions"
+        )
     questions = sum(len(s.questions) for s in samples)
     print(f"Loaded {len(samples)} samples / {questions} questions")
 

@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Protocol, Sequence
 
 import numpy as np
 
+from memory_condense._tokenizer import count_tokens, truncate_to_tokens
 from memory_condense.association_store import AssociationStore, HebbianUpdate
 from memory_condense.associative_retrieval import expand_associative_results
 from memory_condense.heat_diffusion import expand_heat_diffusion_results
@@ -47,6 +48,78 @@ SAFE_ASSOCIATION_LEXICAL_THRESHOLD = 0.9
 SAFE_ASSOCIATION_MAX_TOKEN_INCREASE = 0
 
 
+def _source_partition(source_id: str, separator: str) -> str:
+    """Top-level durable partition encoded by ``partition::source``."""
+
+    return source_id.split(separator, 1)[0]
+
+
+def select_source_partitions(
+    candidates: Sequence[RetrievalResult],
+    *,
+    slots: int,
+    separator: str = "::",
+    max_hits_per_partition: int = 8,
+) -> list[str]:
+    """Rank coarse partitions by reciprocal-rank heat over chunk hits.
+
+    A single lucky chunk should not route an entire million-token memory.
+    Accumulating bounded reciprocal-rank mass rewards partitions that produce
+    several independently relevant candidates while remaining insensitive to
+    their raw source or transcript length.
+    """
+
+    if slots < 1:
+        raise ValueError("partition slots must be positive")
+    if not separator:
+        raise ValueError("partition separator must be non-empty")
+    if max_hits_per_partition < 1:
+        raise ValueError("max_hits_per_partition must be positive")
+    scores: dict[str, float] = {}
+    first_rank: dict[str, int] = {}
+    hit_counts: dict[str, int] = {}
+    for rank, result in enumerate(candidates, start=1):
+        if result.turn is None:
+            continue
+        source_id = str(result.turn.source_id or result.turn.turn_id)
+        partition = _source_partition(source_id, separator)
+        count = hit_counts.get(partition, 0)
+        if count >= max_hits_per_partition:
+            continue
+        hit_counts[partition] = count + 1
+        scores[partition] = scores.get(partition, 0.0) + 1.0 / (60.0 + rank)
+        first_rank.setdefault(partition, rank)
+    return sorted(
+        scores,
+        key=lambda partition: (
+            -scores[partition],
+            first_rank[partition],
+            partition,
+        ),
+    )[:slots]
+
+
+class SourceCandidateReranker(Protocol):
+    candidate_pool: int
+    last_report: Any
+
+    def rerank(
+        self,
+        query: str,
+        candidates: Sequence[RetrievalResult],
+        *,
+        top_k: int,
+    ) -> list[RetrievalResult]: ...
+
+    def select(
+        self,
+        query: str,
+        candidates: Sequence[RetrievalResult],
+        *,
+        top_k: int,
+    ) -> list[RetrievalResult]: ...
+
+
 class MemoryCondenser:
     """High-level facade wiring the full memory pipeline.
 
@@ -77,6 +150,7 @@ class MemoryCondenser:
         auto_extract: bool = True,
         embedder: EmbeddingService | None = None,
         persist_index_on_close: bool = True,
+        retriever_max_elements: int = 100_000,
     ) -> None:
         data_dir = Path(data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -98,6 +172,7 @@ class MemoryCondenser:
             dim=self._embedder.dim,
             index_path=data_dir / "hnsw_index.bin",
             association_store=self._associations,
+            max_elements=retriever_max_elements,
         )
         self._memory = MemoryStore(self._db, embedder=self._embedder)
         self._consolidation = LiveConsolidationStore(self._db)
@@ -106,6 +181,18 @@ class MemoryCondenser:
         self._packer = ContextPacker(budget)
         self._auto_extract = auto_extract
         self._persist_index_on_close = persist_index_on_close
+        self._source_candidate_reranker: SourceCandidateReranker | None = None
+        self.last_source_rerank_report: dict[str, Any] = {}
+        self.last_partition_routing_report: dict[str, Any] = {}
+
+    def set_source_candidate_reranker(
+        self,
+        reranker: SourceCandidateReranker | None,
+    ) -> None:
+        """Attach one shared transient reranker; no model state enters SQLite."""
+
+        self._source_candidate_reranker = reranker
+        self.last_source_rerank_report = {}
 
     # -- ingestion ----------------------------------------------------------
 
@@ -683,6 +770,8 @@ class MemoryCondenser:
         source_slots: int = 24,
         source_candidate_pool: int = 200,
         source_activation_k: int | None = None,
+        source_local_search: bool = False,
+        use_source_reranker: bool = False,
         ef_search: int = 50,
         candidates: int = 100,
         alpha: float = 0.65,
@@ -695,6 +784,7 @@ class MemoryCondenser:
         elsewhere in a relevant conversation without hydrating whole sources
         or retaining model/token state.
         """
+        self.last_source_rerank_report = {}
         if k <= 0:
             return []
         if source_slots < 0:
@@ -704,6 +794,8 @@ class MemoryCondenser:
         activation_k = k if source_activation_k is None else source_activation_k
         if activation_k < k or activation_k > source_candidate_pool:
             raise ValueError("source_activation_k must be between k and the pool")
+        if use_source_reranker and not source_local_search:
+            raise ValueError("source reranking requires source_local_search")
 
         query_embedding = self._embedder.embed_query(query)
         anchors = self.search_hybrid_from_embedding(
@@ -727,14 +819,50 @@ class MemoryCondenser:
             return anchors
 
         anchor_by_source: dict[str, str] = {}
+        source_scores: dict[str, float] = {}
         for result in pool[:activation_k]:
             if result.turn is None:
                 continue
             source_id = result.turn.source_id or result.turn.turn_id
             anchor_by_source.setdefault(source_id, result.chunk.chunk_id)
+            source_scores[source_id] = max(
+                source_scores.get(source_id, 0.0), float(result.score)
+            )
+
+        anchor_ids = {result.chunk.chunk_id for result in anchors}
+        if source_local_search:
+            if use_source_reranker and self._source_candidate_reranker is None:
+                raise RuntimeError("source reranking requested but no reranker is attached")
+            result_limit = source_slots
+            if use_source_reranker:
+                result_limit = max(
+                    result_limit,
+                    self._source_candidate_reranker.candidate_pool,
+                )
+            local = self._retriever.hybrid_query_sources(
+                query,
+                query_embedding,
+                list(anchor_by_source),
+                k=result_limit,
+                candidates_per_source=source_candidate_pool,
+                alpha=alpha,
+                source_scores=source_scores,
+                anchor_chunk_ids=anchor_by_source,
+                exclude_chunk_ids=tuple(anchor_ids),
+            )
+            if use_source_reranker:
+                local = self._source_candidate_reranker.rerank(
+                    query,
+                    local,
+                    top_k=source_slots,
+                )
+                report = self._source_candidate_reranker.last_report
+                self.last_source_rerank_report = (
+                    report.model_dump() if report is not None else {}
+                )
+            return [*anchors, *local]
 
         extras: list[RetrievalResult] = []
-        anchor_ids = {result.chunk.chunk_id for result in anchors}
         for result in pool:
             if result.turn is None or result.chunk.chunk_id in anchor_ids:
                 continue
@@ -765,6 +893,22 @@ class MemoryCondenser:
         source_slots: int = 24,
         source_candidate_pool: int = 200,
         source_activation_k: int | None = None,
+        source_tfisf_activation: bool = False,
+        source_tfisf_slots: int = 8,
+        source_hsc_activation: bool = False,
+        source_hsc_slots: int = 8,
+        source_hsc_hops: int = 2,
+        source_hsc_chunk_slots: int = 8,
+        source_partition_routing: bool = False,
+        source_partition_slots: int = 3,
+        source_partition_separator: str = "::",
+        source_local_search: bool = False,
+        use_source_reranker: bool = False,
+        use_attention_feedback: bool = False,
+        feedback_slots: int = 12,
+        feedback_seed_slots: int = 6,
+        feedback_evidence_tokens: int = 48,
+        feedback_query_tokens: int = 384,
         ef_search: int = 50,
         candidates: int = 100,
         alpha: float = 0.65,
@@ -775,27 +919,105 @@ class MemoryCondenser:
         lower-ranked candidates from activated sources.  The caller's prompt
         cap remains the final hard byte/token boundary.
         """
+        self.last_source_rerank_report = {}
         if k <= 0:
             return []
         if neighbor_radius < 0 or neighbor_slots < 0 or source_slots < 0:
             raise ValueError("graph retrieval bounds must be non-negative")
+        if use_attention_feedback and (
+            feedback_slots < 0 or feedback_slots > source_slots
+        ):
+            raise ValueError("feedback_slots must lie in [0, source_slots]")
+        if feedback_seed_slots < 1:
+            raise ValueError("feedback_seed_slots must be positive")
+        if feedback_evidence_tokens < 1 or feedback_query_tokens < 1:
+            raise ValueError("feedback token caps must be positive")
         if neighbor_direction not in {"both", "previous", "next"}:
             raise ValueError("invalid neighbor_direction")
         if source_candidate_pool < k:
             raise ValueError("source_candidate_pool must be at least k")
+        if source_tfisf_slots < 1:
+            raise ValueError("source_tfisf_slots must be positive")
+        if source_hsc_slots < 1 or source_hsc_hops < 1:
+            raise ValueError("source HSC slots and hops must be positive")
+        if source_hsc_activation and (
+            source_hsc_chunk_slots < 1 or source_hsc_chunk_slots > source_slots
+        ):
+            raise ValueError("source_hsc_chunk_slots must lie in [1, source_slots]")
         activation_k = k if source_activation_k is None else source_activation_k
         if activation_k < k or activation_k > source_candidate_pool:
             raise ValueError("source_activation_k must be between k and the pool")
+        if use_source_reranker and not source_local_search:
+            raise ValueError("source reranking requires source_local_search")
+        if use_attention_feedback and not source_local_search:
+            raise ValueError("attention feedback requires source_local_search")
+        if use_source_reranker and use_attention_feedback:
+            raise ValueError("reranking and attention feedback are separate arms")
+        if (
+            use_attention_feedback
+            and self._source_candidate_reranker is None
+        ):
+            raise RuntimeError(
+                "attention feedback requested but no Qwen controller is attached"
+            )
+        if source_partition_routing and source_partition_slots < 1:
+            raise ValueError("source_partition_slots must be positive")
+        if source_partition_routing and not source_partition_separator:
+            raise ValueError("source_partition_separator must be non-empty")
 
+        self.last_partition_routing_report = {}
         query_embedding = self._embedder.embed_query(query)
-        anchors = self.search_hybrid_from_embedding(
-            query,
-            query_embedding,
-            k=k,
-            ef_search=ef_search,
-            candidates=candidates,
-            alpha=alpha,
-        )
+        pool_size = max(k, source_candidate_pool)
+        if source_partition_routing:
+            coarse_pool = self.search_hybrid_from_embedding(
+                query,
+                query_embedding,
+                k=pool_size,
+                ef_search=ef_search,
+                candidates=max(candidates, pool_size),
+                alpha=alpha,
+            )
+            partition_ids = select_source_partitions(
+                coarse_pool,
+                slots=source_partition_slots,
+                separator=source_partition_separator,
+            )
+            routed_source_ids = self._retriever.source_ids_in_partitions(
+                partition_ids,
+                separator=source_partition_separator,
+            )
+            pool = self._retriever.hybrid_query_sources(
+                query,
+                query_embedding,
+                routed_source_ids,
+                k=pool_size,
+                candidates_per_source=source_candidate_pool,
+                alpha=alpha,
+            )
+            self.last_partition_routing_report = {
+                "coarse_candidates": len(coarse_pool),
+                "selected_partitions": partition_ids,
+                "routed_sources": len(routed_source_ids),
+                "routed_candidates": len(pool),
+            }
+            anchors = pool[:k]
+        else:
+            anchors = self.search_hybrid_from_embedding(
+                query,
+                query_embedding,
+                k=k,
+                ef_search=ef_search,
+                candidates=candidates,
+                alpha=alpha,
+            )
+            pool = self.search_hybrid_from_embedding(
+                query,
+                query_embedding,
+                k=pool_size,
+                ef_search=ef_search,
+                candidates=max(candidates, pool_size),
+                alpha=alpha,
+            )
         expanded = self.expand_source_neighbors(
             anchors,
             radius=neighbor_radius,
@@ -807,43 +1029,320 @@ class MemoryCondenser:
             or result.transition_direction == neighbor_direction
         ][:neighbor_slots]
 
-        pool_size = max(k, source_candidate_pool)
-        pool = self.search_hybrid_from_embedding(
-            query,
-            query_embedding,
-            k=pool_size,
-            ef_search=ef_search,
-            candidates=max(candidates, pool_size),
-            alpha=alpha,
-        )
         anchor_by_source: dict[str, str] = {}
+        source_scores: dict[str, float] = {}
+        first_pool_result_by_source: dict[str, RetrievalResult] = {}
+        for result in pool:
+            if result.turn is None:
+                continue
+            source_id = str(result.turn.source_id or result.turn.turn_id)
+            first_pool_result_by_source.setdefault(source_id, result)
         for result in pool[:activation_k]:
             if result.turn is not None:
-                source_id = result.turn.source_id or result.turn.turn_id
+                source_id = str(result.turn.source_id or result.turn.turn_id)
                 anchor_by_source.setdefault(source_id, result.chunk.chunk_id)
+                source_scores[source_id] = max(
+                    source_scores.get(source_id, 0.0), float(result.score)
+                )
+
+        tfisf_ranked = (
+            self._retriever.source_tfisf_query(
+                query,
+                k_sources=source_tfisf_slots,
+            )
+            if source_tfisf_activation
+            else []
+        )
+        tfisf_admitted: list[str] = []
+        for source_id, source_score in tfisf_ranked:
+            candidate = first_pool_result_by_source.get(source_id)
+            if candidate is None:
+                continue
+            if source_id not in anchor_by_source:
+                tfisf_admitted.append(source_id)
+            anchor_by_source.setdefault(source_id, candidate.chunk.chunk_id)
+            source_scores[source_id] = max(
+                source_scores.get(source_id, 0.0), float(source_score)
+            )
+        self.last_source_tfisf_report = {
+            "enabled": source_tfisf_activation,
+            "ranked_sources": [source_id for source_id, _score in tfisf_ranked],
+            "admitted_sources": tfisf_admitted,
+            "activated_sources": len(anchor_by_source),
+        }
+
+        hsc_ranked = (
+            self._retriever.source_hsc_expand(
+                query_embedding,
+                list(anchor_by_source),
+                slots=source_hsc_slots,
+                hops=source_hsc_hops,
+            )
+            if source_hsc_activation
+            else []
+        )
+        hsc_source_ids = [source_id for source_id, _score in hsc_ranked]
+        hsc_source_scores = dict(hsc_ranked)
+        hsc_anchor_by_source = {
+            source_id: first_pool_result_by_source[source_id].chunk.chunk_id
+            for source_id in hsc_source_ids
+            if source_id in first_pool_result_by_source
+        }
+        self.last_source_hsc_report = {
+            "enabled": source_hsc_activation,
+            "seed_sources": len(anchor_by_source),
+            "expanded_sources": hsc_source_ids,
+            "pool_visible_sources": len(hsc_anchor_by_source),
+            "reserved_chunk_slots": (
+                source_hsc_chunk_slots if source_hsc_activation else 0
+            ),
+        }
 
         seen = {
             result.chunk.chunk_id for result in [*anchors, *neighbors]
         }
-        source_extras: list[RetrievalResult] = []
-        for result in pool:
-            if result.turn is None or result.chunk.chunk_id in seen:
-                continue
-            source_id = result.turn.source_id or result.turn.turn_id
-            anchor_id = anchor_by_source.get(source_id)
-            if anchor_id is None:
-                continue
-            source_extras.append(
-                result.model_copy(
-                    update={
-                        "route": "hybrid_source",
-                        "anchor_chunk_id": anchor_id,
-                    }
+        regular_source_slots = source_slots - (
+            source_hsc_chunk_slots if source_hsc_activation else 0
+        )
+        if source_local_search:
+            if use_source_reranker and self._source_candidate_reranker is None:
+                raise RuntimeError("source reranking requested but no reranker is attached")
+            result_limit = regular_source_slots
+            if use_source_reranker:
+                result_limit = max(
+                    result_limit,
+                    self._source_candidate_reranker.candidate_pool,
                 )
+            source_extras = self._retriever.hybrid_query_sources(
+                query,
+                query_embedding,
+                list(anchor_by_source),
+                k=result_limit,
+                candidates_per_source=source_candidate_pool,
+                alpha=alpha,
+                source_scores=source_scores,
+                anchor_chunk_ids=anchor_by_source,
+                exclude_chunk_ids=tuple(seen),
             )
-            seen.add(result.chunk.chunk_id)
-            if len(source_extras) >= source_slots:
-                break
+            if use_source_reranker:
+                source_extras = self._source_candidate_reranker.rerank(
+                    query,
+                    source_extras,
+                top_k=regular_source_slots,
+                )
+                report = self._source_candidate_reranker.last_report
+                self.last_source_rerank_report = (
+                    report.model_dump() if report is not None else {}
+                )
+        else:
+            source_extras = []
+            for result in pool:
+                if regular_source_slots == 0:
+                    break
+                if result.turn is None or result.chunk.chunk_id in seen:
+                    continue
+                source_id = result.turn.source_id or result.turn.turn_id
+                anchor_id = anchor_by_source.get(source_id)
+                if anchor_id is None:
+                    continue
+                source_extras.append(
+                    result.model_copy(
+                        update={
+                            "route": "hybrid_source",
+                            "anchor_chunk_id": anchor_id,
+                        }
+                    )
+                )
+                seen.add(result.chunk.chunk_id)
+                if len(source_extras) >= regular_source_slots:
+                    break
+
+        hsc_extras: list[RetrievalResult] = []
+        if source_hsc_activation and hsc_source_ids:
+            hsc_extras = self._retriever.hybrid_query_sources(
+                query,
+                query_embedding,
+                hsc_source_ids,
+                k=source_hsc_chunk_slots,
+                candidates_per_source=source_candidate_pool,
+                alpha=alpha,
+                source_scores=hsc_source_scores,
+                anchor_chunk_ids=hsc_anchor_by_source,
+                exclude_chunk_ids=tuple(
+                    {
+                        *seen,
+                        *(result.chunk.chunk_id for result in source_extras),
+                    }
+                ),
+            )
+            hsc_extras = [
+                result.model_copy(update={"route": "hsc_contraction"})
+                for result in hsc_extras
+            ]
+        source_extras = [*source_extras, *hsc_extras]
+
+        if use_attention_feedback and feedback_slots:
+            # Sample every first-round route instead of letting the longest
+            # route monopolize the Qwen workspace. IDs/scalars cross rounds;
+            # token state does not.
+            groups = [list(anchors), list(neighbors), list(source_extras)]
+            attention_candidates: list[RetrievalResult] = []
+            attention_seen: set[str] = set()
+            position = 0
+            while len(attention_candidates) < self._source_candidate_reranker.candidate_pool:
+                added = False
+                for group in groups:
+                    if position >= len(group):
+                        continue
+                    result = group[position]
+                    if result.chunk.chunk_id not in attention_seen:
+                        attention_seen.add(result.chunk.chunk_id)
+                        attention_candidates.append(result)
+                        added = True
+                        if len(attention_candidates) >= self._source_candidate_reranker.candidate_pool:
+                            break
+                if not added:
+                    break
+                position += 1
+
+            seeds = self._source_candidate_reranker.select(
+                query,
+                attention_candidates,
+                top_k=feedback_seed_slots,
+            )
+            initial_report = self._source_candidate_reranker.last_report
+            feedback_source_ids: list[str] = []
+            feedback_source_scores: dict[str, float] = {}
+            feedback_anchor_by_source: dict[str, str] = {}
+            for seed in seeds:
+                if seed.turn is None:
+                    continue
+                source_id = seed.turn.source_id or seed.turn.turn_id
+                if source_id not in feedback_source_scores:
+                    feedback_source_ids.append(source_id)
+                    feedback_anchor_by_source[source_id] = seed.chunk.chunk_id
+                feedback_source_scores[source_id] = max(
+                    feedback_source_scores.get(source_id, 0.0),
+                    float(seed.association_score or 0.0),
+                )
+
+            activation_pieces = [
+                f"Original question: {truncate_to_tokens(query, 96)}",
+                "Attended evidence:",
+                *[
+                    truncate_to_tokens(seed.chunk.text, feedback_evidence_tokens)
+                    for seed in seeds
+                ],
+            ]
+            activation_window = truncate_to_tokens(
+                "\n".join(activation_pieces),
+                feedback_query_tokens,
+            )
+            feedback_results: list[RetrievalResult] = []
+            combined_report = None
+            if feedback_source_ids:
+                initial_ids = {
+                    result.chunk.chunk_id
+                    for result in [*anchors, *neighbors, *source_extras]
+                }
+                second_pool = self._retriever.hybrid_query_sources(
+                    query,
+                    query_embedding,
+                    feedback_source_ids,
+                    k=self._source_candidate_reranker.candidate_pool,
+                    candidates_per_source=source_candidate_pool,
+                    alpha=alpha,
+                    source_scores=feedback_source_scores,
+                    anchor_chunk_ids=feedback_anchor_by_source,
+                    exclude_chunk_ids=tuple(initial_ids),
+                )
+                activation_selected = self._source_candidate_reranker.select(
+                    activation_window,
+                    second_pool,
+                    top_k=feedback_slots,
+                )
+                combined_report = self._source_candidate_reranker.last_report
+                activation_ids = {
+                    result.chunk.chunk_id for result in activation_selected
+                }
+                feedback_results = [
+                    result.model_copy(update={"route": "qwen_activation_feedback"})
+                    for result in activation_selected
+                ]
+                for result in second_pool:
+                    if len(feedback_results) >= feedback_slots:
+                        break
+                    if result.chunk.chunk_id in activation_ids:
+                        continue
+                    feedback_results.append(
+                        result.model_copy(update={"route": "feedback_scalar_fill"})
+                    )
+
+            protected_source_count = max(0, source_slots - feedback_slots)
+            selected_source = list(source_extras[:protected_source_count])
+            selected_ids = {result.chunk.chunk_id for result in selected_source}
+            for result in feedback_results:
+                if len(selected_source) >= source_slots:
+                    break
+                if result.chunk.chunk_id in selected_ids:
+                    continue
+                selected_source.append(result)
+                selected_ids.add(result.chunk.chunk_id)
+            for result in source_extras[protected_source_count:]:
+                if len(selected_source) >= source_slots:
+                    break
+                if result.chunk.chunk_id in selected_ids:
+                    continue
+                selected_source.append(result)
+                selected_ids.add(result.chunk.chunk_id)
+            source_extras = selected_source
+            initial_stats = (
+                initial_report.model_dump() if initial_report is not None else {}
+            )
+            combined_stats = (
+                combined_report.model_dump() if combined_report is not None else {}
+            )
+            self.last_source_rerank_report = dict(combined_stats)
+            self.last_source_rerank_report.update(
+                {
+                    "passes": int(initial_stats.get("passes", 0))
+                    + int(combined_stats.get("passes", 0)),
+                    "total_candidate_inspections": int(
+                        initial_stats.get("total_candidate_inspections", 0)
+                    )
+                    + int(combined_stats.get("total_candidate_inspections", 0)),
+                    "max_workspace_candidates": max(
+                        int(initial_stats.get("max_workspace_candidates", 0)),
+                        int(combined_stats.get("max_workspace_candidates", 0)),
+                    ),
+                    "max_workspace_tokens": max(
+                        int(initial_stats.get("max_workspace_tokens", 0)),
+                        int(combined_stats.get("max_workspace_tokens", 0)),
+                    ),
+                    "qwen_candidates_added": int(
+                        initial_stats.get("qwen_candidates_added", 0)
+                    )
+                    + int(combined_stats.get("qwen_candidates_added", 0)),
+                }
+            )
+            self.last_source_rerank_report.update(
+                {
+                    "feedback_rounds": 1,
+                    "feedback_seed_sources": len(feedback_source_ids),
+                    "feedback_candidates_added": sum(
+                        result.route in {
+                            "qwen_activation_feedback",
+                            "feedback_scalar_fill",
+                        }
+                        for result in source_extras
+                    ),
+                    "feedback_activation_candidates": sum(
+                        result.route == "qwen_activation_feedback"
+                        for result in source_extras
+                    ),
+                    "feedback_query_tokens": count_tokens(activation_window),
+                }
+            )
         return [*anchors, *neighbors, *source_extras]
 
     def search_hybrid_neighbors(
@@ -938,6 +1437,7 @@ class MemoryCondenser:
         consolidation_candidates: int = 32,
         consolidation_diffusion_width: int = 32,
         access_event_id: str | None = None,
+        expansion_results: Sequence[RetrievalResult] | None = None,
     ) -> PackedContext:
         """Assemble a token-budgeted prompt for ``user_text``.
 
@@ -958,9 +1458,12 @@ class MemoryCondenser:
             else []
         )
 
-        expansions: list[RetrievalResult] = []
+        expansions: list[RetrievalResult] = list(expansion_results or ())
         query_embedding: np.ndarray | None = None
-        if k_expansions:
+        if expansion_results is not None:
+            if use_consolidation and expansions:
+                query_embedding = self._embedder.embed_query(user_text)
+        elif k_expansions:
             query_embedding = self._embedder.embed_query(user_text)
             if hybrid:
                 expansions = self.search_hybrid_from_embedding(
@@ -1235,9 +1738,12 @@ class MemoryCondenser:
 
     def close(self) -> None:
         """Persist index and close database."""
-        if self._persist_index_on_close:
-            self._retriever.save()
-        self._db.close()
+        try:
+            if self._persist_index_on_close:
+                self._retriever.save()
+        finally:
+            self._retriever.release()
+            self._db.close()
 
     def __enter__(self) -> MemoryCondenser:
         return self

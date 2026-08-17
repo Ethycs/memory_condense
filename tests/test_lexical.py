@@ -260,3 +260,57 @@ def test_longer_documents_are_penalised(index, turn_id):
 
     ranked = dict(index.search("kafka broker"))
     assert ranked[short.chunk_id] > ranked[long.chunk_id]
+
+
+def test_search_sources_scans_only_selected_partition_and_bounds_each(db, index):
+    transcript = TranscriptStore(db)
+    alpha = transcript.append("user", "alpha", source_id="session-alpha")
+    beta = transcript.append("user", "beta", source_id="session-beta")
+    alpha_target = _make_chunk(alpha.turn_id, "cerulean launch code")
+    alpha_other = _make_chunk(alpha.turn_id, "cerulean background note")
+    beta_target = _make_chunk(beta.turn_id, "cerulean launch code repeated")
+    index.add_chunks([alpha_other, beta_target, alpha_target])
+
+    ranked = index.search_sources(
+        "cerulean launch code",
+        ["session-alpha"],
+        limit_per_source=1,
+    )
+
+    assert list(ranked) == ["session-alpha"]
+    assert ranked["session-alpha"][0][0] == alpha_target.chunk_id
+    assert len(ranked["session-alpha"]) == 1
+
+
+def test_source_tfisf_promotes_rare_terms_across_live_sources(db, index):
+    transcript = TranscriptStore(db)
+    alpha = transcript.append("user", "alpha", source_id="session-alpha")
+    beta = transcript.append("user", "beta", source_id="session-beta")
+    gamma = transcript.append("user", "gamma", source_id="session-gamma")
+    index.add_chunks(
+        [
+            _make_chunk(alpha.turn_id, "shared deployment cerulean cerulean"),
+            _make_chunk(beta.turn_id, "shared deployment ordinary"),
+            _make_chunk(gamma.turn_id, "shared deployment routine"),
+        ]
+    )
+
+    assert index.search_source_tfisf("cerulean deployment", limit=2)[0][0] == (
+        "session-alpha"
+    )
+
+
+def test_source_tfisf_updates_without_a_rebuild(db, index):
+    transcript = TranscriptStore(db)
+    first = transcript.append("user", "first", source_id="source-first")
+    index.add_chunks([_make_chunk(first.turn_id, "orchid")])
+    assert [source for source, _score in index.search_source_tfisf("orchid")] == [
+        "source-first"
+    ]
+
+    second = transcript.append("user", "second", source_id="source-second")
+    index.add_chunks([_make_chunk(second.turn_id, "orchid orchid")])
+    assert {source for source, _score in index.search_source_tfisf("orchid")} == {
+        "source-first",
+        "source-second",
+    }

@@ -25,6 +25,7 @@ Deliberately no LLM, no key, no network. It is a fifth CLI mode beside
 
 from __future__ import annotations
 
+import gc
 import tempfile
 from pathlib import Path
 
@@ -79,6 +80,21 @@ class QuestionRecall(BaseModel):
     evidence_source_recall: float | None = None
     all_evidence_sources: bool | None = None
     retrieved_source_ids: list[str] = Field(default_factory=list)
+    direct_chunks: int = 0
+    consolidation_chunks: int = 0
+    causal_events: int = 0
+    causal_graph_edges: int = 0
+    causal_write_s: float = 0.0
+    qwen_rerank_passes: int = 0
+    qwen_candidate_inspections: int = 0
+    qwen_max_workspace_candidates: int = 0
+    qwen_max_workspace_tokens: int = 0
+    qwen_candidates_added: int = 0
+    qwen_feedback_rounds: int = 0
+    qwen_feedback_seed_sources: int = 0
+    qwen_feedback_candidates_added: int = 0
+    qwen_feedback_activation_candidates: int = 0
+    qwen_feedback_query_tokens: int = 0
     #: ``{horizon_turns: answer_still_in_a_non_cold_item}``
     survives_horizon: dict[int, bool] = Field(default_factory=dict)
 
@@ -144,27 +160,107 @@ def best_f1(texts: list[str], gold: str) -> float:
 
 def _assemble(
     mc, question: str, config: EvalConfig
-) -> tuple[list[str], list[str], list[str | None]]:
+) -> tuple[list[str], list[str], list[str | None], list[bool]]:
     """Return header, body, and the body items' durable source IDs.
 
     ``reheat`` is off throughout: this is a measurement, and an item must not
     become hotter merely because a measurement looked at it.
     """
-    if config.retrieval.mode == "memory":
+    if config.retrieval.mode in {
+        "memory",
+        "causal_consolidation",
+        "causal_graph",
+    }:
+        causal = config.retrieval.mode in {
+            "causal_consolidation",
+            "causal_graph",
+        }
+        graph_results = (
+            mc.search_hybrid_graph(
+                question,
+                k=config.retrieval.k,
+                neighbor_radius=config.retrieval.neighbor_radius,
+                neighbor_slots=config.retrieval.neighbor_slots,
+                neighbor_direction=config.retrieval.neighbor_direction,
+                source_slots=config.retrieval.source_slots,
+                source_candidate_pool=config.retrieval.source_candidate_pool,
+                source_activation_k=config.retrieval.source_activation_k,
+                source_tfisf_activation=(
+                    config.retrieval.source_tfisf_activation
+                ),
+                source_tfisf_slots=config.retrieval.source_tfisf_slots,
+                source_hsc_activation=config.retrieval.source_hsc_activation,
+                source_hsc_slots=config.retrieval.source_hsc_slots,
+                source_hsc_hops=config.retrieval.source_hsc_hops,
+                source_hsc_chunk_slots=(
+                    config.retrieval.source_hsc_chunk_slots
+                ),
+                source_partition_routing=(
+                    config.retrieval.source_partition_routing
+                ),
+                source_partition_slots=config.retrieval.source_partition_slots,
+                source_partition_separator=(
+                    config.retrieval.source_partition_separator
+                ),
+                source_local_search=config.retrieval.source_local_search,
+                use_source_reranker=config.retrieval.qwen_rerank,
+                use_attention_feedback=config.retrieval.qwen_feedback,
+                feedback_slots=config.retrieval.qwen_feedback_slots,
+                feedback_seed_slots=config.retrieval.qwen_feedback_seed_slots,
+                feedback_evidence_tokens=(
+                    config.retrieval.qwen_feedback_evidence_tokens
+                ),
+                feedback_query_tokens=config.retrieval.qwen_feedback_query_tokens,
+                ef_search=config.retrieval.ef_search,
+                candidates=config.retrieval.candidates,
+                alpha=config.retrieval.alpha,
+            )
+            if config.retrieval.mode == "causal_graph"
+            else None
+        )
         packed = mc.build_context(
             question,
             recent_turns=0,
-            k_memories=config.retrieval.k_memories,
-            k_expansions=config.retrieval.k,
+            k_memories=0 if causal else config.retrieval.k_memories,
+            k_expansions=(0 if graph_results is not None else config.retrieval.k),
             # Hybrid is the production facade's default expansion retriever
             # and B0's strongest in-regime arm.  Memory mode should not
             # silently override it back to dense.
             hybrid=True,
             reheat_memories=False,
+            use_consolidation=causal,
             learn_consolidation=False,
+            consolidation_memory_slots=0 if causal else 1,
+            consolidation_chunk_slots=(
+                config.retrieval.consolidation_chunk_slots if causal else 1
+            ),
+            consolidation_min_count=config.retrieval.consolidation_min_count,
+            consolidation_hops=config.retrieval.consolidation_hops,
+            consolidation_candidates=config.retrieval.consolidation_candidates,
+            consolidation_diffusion_width=(
+                config.retrieval.consolidation_diffusion_width
+            ),
+            expansion_results=graph_results,
         )
         header = [packed.memory_header] if packed.memory_header else []
-        return header, list(packed.expansions), []
+        sources: list[str | None] = []
+        if causal:
+            for chunk_id in packed.expansion_chunk_ids:
+                hydrated = mc.retriever.hydrate_chunk(
+                    chunk_id,
+                    score=0.0,
+                    route="source_diagnostic",
+                )
+                sources.append(
+                    getattr(getattr(hydrated, "turn", None), "source_id", None)
+                )
+        direct = set(packed.direct_expansion_chunk_ids)
+        return (
+            header,
+            list(packed.expansions),
+            sources,
+            [chunk_id not in direct for chunk_id in packed.expansion_chunk_ids],
+        )
 
     if config.retrieval.mode == "span":
         results = mc.search_spans(
@@ -192,6 +288,13 @@ def _assemble(
             source_slots=config.retrieval.source_slots,
             source_candidate_pool=config.retrieval.source_candidate_pool,
             source_activation_k=config.retrieval.source_activation_k,
+            source_partition_routing=config.retrieval.source_partition_routing,
+            source_partition_slots=config.retrieval.source_partition_slots,
+            source_partition_separator=(
+                config.retrieval.source_partition_separator
+            ),
+            source_local_search=config.retrieval.source_local_search,
+            use_source_reranker=config.retrieval.qwen_rerank,
             ef_search=config.retrieval.ef_search,
             candidates=config.retrieval.candidates,
             alpha=config.retrieval.alpha,
@@ -206,6 +309,21 @@ def _assemble(
             source_slots=config.retrieval.source_slots,
             source_candidate_pool=config.retrieval.source_candidate_pool,
             source_activation_k=config.retrieval.source_activation_k,
+            source_tfisf_activation=config.retrieval.source_tfisf_activation,
+            source_tfisf_slots=config.retrieval.source_tfisf_slots,
+            source_hsc_activation=config.retrieval.source_hsc_activation,
+            source_hsc_slots=config.retrieval.source_hsc_slots,
+            source_hsc_hops=config.retrieval.source_hsc_hops,
+            source_hsc_chunk_slots=config.retrieval.source_hsc_chunk_slots,
+            source_local_search=config.retrieval.source_local_search,
+            use_source_reranker=config.retrieval.qwen_rerank,
+            use_attention_feedback=config.retrieval.qwen_feedback,
+            feedback_slots=config.retrieval.qwen_feedback_slots,
+            feedback_seed_slots=config.retrieval.qwen_feedback_seed_slots,
+            feedback_evidence_tokens=(
+                config.retrieval.qwen_feedback_evidence_tokens
+            ),
+            feedback_query_tokens=config.retrieval.qwen_feedback_query_tokens,
             ef_search=config.retrieval.ef_search,
             candidates=config.retrieval.candidates,
             alpha=config.retrieval.alpha,
@@ -237,6 +355,7 @@ def _assemble(
         [],
         [r.chunk.text for r in results],
         [getattr(getattr(r, "turn", None), "source_id", None) for r in results],
+        [False] * len(results),
     )
 
 
@@ -279,7 +398,9 @@ def measure_sample(
         haystack_texts = [text for _role, text in sample.turns]
         for question in sample.questions:
             query_text = question.dated_question
-            header, body, body_sources = _assemble(mc, query_text, config)
+            header, body, body_sources, body_is_consolidation = _assemble(
+                mc, query_text, config
+            )
             header_count = len(header)
             capped = cap_context_to_prompt_budget(
                 query_text,
@@ -289,6 +410,7 @@ def measure_sample(
             header = capped[:header_count]
             body = capped[header_count:]
             body_sources = body_sources[: len(body)]
+            body_is_consolidation = body_is_consolidation[: len(body)]
             everything = header + body
             expected_sources = set(question.evidence_sources)
             retrieved_sources = {source for source in body_sources if source}
@@ -297,6 +419,10 @@ def measure_sample(
                 if expected_sources
                 else None
             )
+            causal_stats = getattr(mc, "causal_consolidation_stats", {})
+            staging_stats = causal_stats.get("staging", {})
+            learning_stats = causal_stats.get("learning", {})
+            qwen_stats = getattr(mc, "last_source_rerank_report", {})
             out.append(
                 QuestionRecall(
                     question_id=question.question_id,
@@ -320,6 +446,42 @@ def measure_sample(
                     ),
                     retrieved_source_ids=list(
                         dict.fromkeys(source for source in body_sources if source)
+                    ),
+                    direct_chunks=sum(not value for value in body_is_consolidation),
+                    consolidation_chunks=sum(body_is_consolidation),
+                    causal_events=int(staging_stats.get("events", 0)),
+                    causal_graph_edges=int(
+                        learning_stats.get("graph", {}).get("edges", 0)
+                    ),
+                    causal_write_s=float(staging_stats.get("elapsed_s", 0.0))
+                    + float(learning_stats.get("elapsed_s", 0.0)),
+                    qwen_rerank_passes=int(qwen_stats.get("passes", 0)),
+                    qwen_candidate_inspections=int(
+                        qwen_stats.get("total_candidate_inspections", 0)
+                    ),
+                    qwen_max_workspace_candidates=int(
+                        qwen_stats.get("max_workspace_candidates", 0)
+                    ),
+                    qwen_max_workspace_tokens=int(
+                        qwen_stats.get("max_workspace_tokens", 0)
+                    ),
+                    qwen_candidates_added=int(
+                        qwen_stats.get("qwen_candidates_added", 0)
+                    ),
+                    qwen_feedback_rounds=int(
+                        qwen_stats.get("feedback_rounds", 0)
+                    ),
+                    qwen_feedback_seed_sources=int(
+                        qwen_stats.get("feedback_seed_sources", 0)
+                    ),
+                    qwen_feedback_candidates_added=int(
+                        qwen_stats.get("feedback_candidates_added", 0)
+                    ),
+                    qwen_feedback_activation_candidates=int(
+                        qwen_stats.get("feedback_activation_candidates", 0)
+                    ),
+                    qwen_feedback_query_tokens=int(
+                        qwen_stats.get("feedback_query_tokens", 0)
                     ),
                     survives_horizon=_survival(mc, question.answer, horizons_turns),
                 )
@@ -359,6 +521,10 @@ def run_recall(
                     horizons_turns=horizons_turns,
                 )
             )
+            if config.retrieval.mode in {"causal_consolidation", "causal_graph"}:
+                # hnswlib and Pydantic chunk graphs may contain native/cyclic
+                # allocations that CPython does not reclaim at frame exit.
+                gc.collect()
 
     n = len(results)
     by_category: dict[str, list[bool]] = {}

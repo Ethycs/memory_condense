@@ -392,3 +392,149 @@ The token-first `s32` CSV is
 `ee85063e2f412cda750db3de91482d77fb8afd4bb2d5ee2bccc6b93f5cc06404`;
 the failure-audit CSV is
 `2bf16f3ee6e072fe3d79060b3123df8c7ecb7aca2e6c6e117133bd5e7375d18c`.
+
+## Live causal-consolidation LongMemEval-S preflight
+
+Schema-v9 causal replay is now integrated into isolated LongMemEval stores.
+On the same locked first-40 development preflight, the frozen causal-graph arm
+matches the previous wide arm's 57.5% literal recall row-for-row while reducing
+mean retrieved context from 7,302 to 6,638 tokens. Mean evidence-source
+coverage is 99.5%; all expected sources are present for 39/40 questions.
+
+This moves the bottleneck but does not pass the target. Source coverage means
+the correct sessions were activated; it does not guarantee that the right
+within-session chunk survived packing or that a responder correctly performs
+temporal, counting, update, and multi-session reasoning. Only 24/40 answers
+have a normalized literal span anywhere in the haystack, and 23 are retrieved.
+Answer-stage accuracy remains unmeasured because no provider calls were
+authorized or made.
+
+Implementation, performance corrections, cache identity, and the frozen
+development policy are recorded in
+`10 - 2026-08-16 - LongMemEval live consolidation preflight.md`.
+
+An explicit partition-local source scan was subsequently implemented and
+tested on the same 40 development questions. After correcting an invalid
+per-source normalization that caused one temporal regression, the globally
+calibrated local arm matched all 23 baseline literal hits but used 29 more mean
+tokens and additional scan work. It is therefore retained as an ablation, not
+selected. The only remaining haystack-literal discrepancy is a coincidental
+"two weeks" outside the gold evidence; the gold sessions themselves require
+date arithmetic and are both retrieved. This strengthens the case that the
+next gate is answer-stage reasoning rather than broader search.
+
+The follow-up gold-source audit makes that conclusion measurable. On the same
+40 questions, only 50% of capped labelled sessions contain a normalized literal
+answer; the other 50% require inference, aggregation, or semantic paraphrase.
+The selected context retains 52.5%
+literal containment specifically inside retrieved gold-source excerpts.
+Therefore 99.5% source coverage is a routing metric, not 99.5% answerable
+context and certainly not 99.5% answer accuracy. The new sufficiency harness
+can judge the gold-source oracle and retrieved context independently once a
+judge is authorized.
+
+Every question with a literal answer in its capped gold sources is already a
+retrieved-gold-source literal hit (20/20). There is no observed literal
+within-partition search miss left on this prefix. The next accuracy experiment
+must score semantic premise sufficiency and answer generation, not widen the
+candidate pool again.
+
+A bounded two-layer Qwen QK+OV candidate reserve was also exercised on the
+first five development rows. It made six source-candidate substitutions per
+question within an eight-candidate/1,024-token transient workspace, but matched
+the scalar arm exactly at 3/5 literal hits and 100% source coverage while adding
+substantial latency. It remains an opt-in experimental arm; the result does not
+justify replacing the frozen scalar policy.
+
+The subsequent recursive treatment uses the requested combined activation
+rather than text feedback: the original question selects first-round evidence,
+then `question + selected evidence` is re-encoded as a bounded Qwen window and
+its QK/OV state searches a fresh lower-ranked pool. On the first five rows it
+again matched 3/5 literal hits and 100% source coverage, with 2.4 additional
+mean context tokens. It selected 30 genuinely new candidates through the
+combined activation while remaining below eight candidates / 936 tokens per
+forward. This validates the live recurrence but still cannot be promoted from
+literal metrics that are already saturated.
+
+## One-million-token context reduction
+
+The first one-million-token construction combines ten complete locked
+development histories into a single 1,039,203-token, 5,400-turn memory. This
+is a deliberately harsher candidate-competition test than the isolated
+LongMemEval protocol. It makes no provider calls and does not measure answer
+generation.
+
+The policy originally frozen for the 100k experiment did not scale: it reached
+only 81.3% mean evidence-source coverage and all required sources on 7/10
+questions. Widening source activation to 80 and its candidate pool to 1,000
+raised those values to 98.3% and 9/10. Subsequent bounded sweeps found that 65
+activated candidates and a 750-item pool retain the same aggregate metrics.
+At an unmodified 3,250-token evidence cap that arm returns 3,176 mean tokens.
+
+A deterministic query-aware sentence packer now runs only after durable chunks
+have been retrieved. It uses the existing pySBD boundaries and lexical tokens,
+keeps up to two best matching sentences in source order, preserves each durable
+chunk ID, and falls back to the full chunk when no lexical match exists. It
+does not retain activations, add a language-model call, or change retrieval
+scores. The feature remains opt-in.
+
+| 1M development arm (n=10) | Literal recall | Best token-F1 | Mean context | Mean source coverage | All sources |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Wide coverage, `a80/p1000`, 6,750 cap | 40% | 0.145 | 6,203 | 98.3% | 90% |
+| Compact, `a65/p750`, 3,250 cap | 40% | 0.145 | 3,176 | 98.3% | 90% |
+| Sentence-packed, `a65/p750`, 3,250 cap | 40% | 0.182 | 3,148 | 98.3% | 90% |
+| **Sentence-packed, `a65/p750`, 2,250 cap** | **40%** | **0.182** | **2,178** | **98.3%** | **90%** |
+| Sentence-packed, `a65/p750`, 2,125 cap | 30% | 0.173 | 2,056 | 98.3% | 90% |
+| Sentence-packed, `a65/p750`, 1,500 cap | 20% | 0.158 | 1,448 | 93.3% | 80% |
+
+The selected development point returns about 0.210% of the stored transcript,
+or roughly 477:1 context compression. It cuts returned context by 64.9% from
+the wide coverage arm and by 31.4% from the verified compact unpruned arm while
+preserving their aggregate source and literal checks. The 2,125 result locates
+the stricter literal-recall knee, so 2,250 is selected with a small margin.
+
+These results do not establish 95% answer accuracy. They show that deterministic
+linguistic preprocessing can improve the density of already-retrieved evidence;
+it cannot replace semantic source routing, temporal composition, or the
+downstream responder. The bound artifact and exact policy are recorded in
+`data/longmemeval-million-context-pareto-development-v1.json`. A larger locked
+development run is required before this becomes the default policy.
+
+### TF-ISF, lazy source contraction, and information-rate pruning
+
+The next source-routing pass added two bounded, opt-in channels. TF-ISF scores
+the query against aggregate source/session term statistics without copying
+source text. A lazy HSC-style contraction tree derives source centroids from
+authoritative chunk embeddings and stores only transient parent/child pointers
+and centroids. Reserving four final chunk slots for query-seeded HSC siblings
+recovered the remaining expected source: mean source coverage reached 100% and
+all expected sources were packed for 10/10 questions. An eight-chunk HSC reserve
+was worse because it displaced a previously covered source; channel allocation,
+not raw candidate volume, was the constraint.
+
+An initial global information-gain reranker repeated that displacement failure.
+It was replaced by a monotone rate-distortion filter that preserves retrieval
+order and rejects only candidates below a conditional information-per-token
+floor. Candidate-set IDF supplies surprise; lexical/dense score supplies query
+relevance; already accepted concepts, sources, and numbers supply diminishing
+returns. Multi-fact queries (sets, orderings, comparisons, all/each) receive a
+0.70 threshold multiplier because repeated topical language can carry distinct
+required facts.
+
+| HSC4 1M development arm (n=10) | Literal recall | Best token-F1 | Mean context | Mean source coverage | All sources |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Unfiltered | 40% | 0.182 | 2,179 | 100% | 100% |
+| Information floor 0.0055, no multi-fact guard | 40% | 0.182 | 2,155 | 100% | 100% |
+| **Information floor 0.008, multi-fact guard** | **40%** | **0.182** | **1,986** | **100%** | **100%** |
+| Information floor 0.00825, multi-fact guard | 30% | 0.177 | 1,957 | 100% | 100% |
+
+The selected point removes 193 mean tokens (8.9%) from the HSC4 prompt without
+changing any measured aggregate recall metric, returning about 0.191% of the
+1,039,203-token transcript—roughly 523:1 compression. The 0.00825 boundary is
+important: source coverage remained 100% while literal recall fell, because a
+session-level source label cannot prove that every answer-bearing fact within
+that session survived. Exact policy, hashes, and the rejected boundary are in
+`data/longmemeval-million-context-information-rate-development-v2.json`.
+
+This remains a ten-question locked-development result. No responder or judge
+was called, and no 95% semantic-answer claim is made.

@@ -101,15 +101,16 @@ def _batched(items: Sequence[str], size: int = 500) -> Iterable[Sequence[str]]:
 class LexicalIndex:
     """BM25 index backed by the ``chunk_terms`` table.
 
-    The index owns no state of its own: every read recomputes N, avgdl and
-    the document frequencies from SQLite, so two processes pointed at the
-    same database always agree.
+    Chunk statistics are read from SQLite. Source-level routing keeps only a
+    small derived ``source_id -> term_count`` cache, invalidated by every
+    write through this index; no term postings or text are duplicated.
     """
 
     def __init__(self, db: Database, k1: float = BM25_K1, b: float = BM25_B) -> None:
         self._db = db
         self._k1 = k1
         self._b = b
+        self._source_length_cache: dict[str, int] | None = None
 
     # -- writing ------------------------------------------------------------
 
@@ -128,6 +129,7 @@ class LexicalIndex:
         """
         if not chunks:
             return
+        self._source_length_cache = None
 
         for chunk in chunks:
             tf = (
@@ -175,6 +177,7 @@ class LexicalIndex:
         the index is rebuilt from the text already stored in ``chunks`` — the
         transcript remains the single source of truth either way.
         """
+        self._source_length_cache = None
         self._db.execute("DELETE FROM chunk_terms")
         self._db.execute("UPDATE chunks SET term_count = NULL")
         self._db.commit()
@@ -205,6 +208,7 @@ class LexicalIndex:
 
     def delete_chunk(self, chunk_id: str) -> None:
         """Remove a chunk's postings and clear its document length."""
+        self._source_length_cache = None
         self._db.execute("DELETE FROM chunk_terms WHERE chunk_id = ?", (chunk_id,))
         self._db.execute(
             "UPDATE chunks SET term_count = NULL WHERE chunk_id = ?", (chunk_id,)
@@ -308,3 +312,176 @@ class LexicalIndex:
 
         ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
         return ranked[:limit]
+
+    def search_sources(
+        self,
+        query: str,
+        source_ids: Sequence[str],
+        *,
+        limit_per_source: int = 100,
+    ) -> dict[str, list[tuple[str, float]]]:
+        """Run globally calibrated BM25 inside selected provenance sources.
+
+        Unlike filtering :meth:`search`, this examines every lexical posting
+        in the activated sources. BM25 corpus statistics remain global so
+        scores from different partitions stay comparable; independently
+        normalizing every source would manufacture one top-scoring chunk per
+        partition and let weak sources crowd out real temporal evidence.
+        Returned rows are bounded per source and deterministic.
+        """
+
+        selected = list(dict.fromkeys(str(value) for value in source_ids if str(value)))
+        results: dict[str, list[tuple[str, float]]] = {
+            source_id: [] for source_id in selected
+        }
+        if not selected or limit_per_source <= 0:
+            return results
+
+        terms = sorted(set(tokenize(query)))
+        if not terms:
+            return results
+
+        source_placeholders = ",".join("?" for _ in selected)
+        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        n_docs, avgdl = self.corpus_stats()
+        if n_docs <= 0 or avgdl <= 0.0:
+            return results
+
+        term_placeholders = ",".join("?" for _ in terms)
+        params = (*terms, *selected)
+        document_frequency = self.document_frequencies(terms)
+
+        # Each buffer is trimmed whenever it reaches twice its final bound.
+        # This keeps lexical workspace independent of source length while
+        # preserving exact deterministic top-k results.
+        buffers: dict[str, list[tuple[str, float]]] = {
+            source_id: [] for source_id in selected
+        }
+        def admit(source_key: str, chunk_id: str, score: float) -> None:
+            if score <= 0.0:
+                return
+            buffer = buffers[source_key]
+            buffer.append((chunk_id, score))
+            if len(buffer) >= limit_per_source * 2:
+                buffer.sort(key=lambda item: (-item[1], item[0]))
+                del buffer[limit_per_source:]
+
+        postings = self._db.execute(
+            "SELECT " + source_expr + ", ct.chunk_id, c.term_count, "
+            "ct.term, ct.tf FROM chunk_terms AS ct "
+            "JOIN chunks AS c ON c.chunk_id = ct.chunk_id "
+            "JOIN turns AS t ON t.turn_id = c.turn_id "
+            f"WHERE ct.term IN ({term_placeholders}) "
+            f"AND {source_expr} IN ({source_placeholders}) "
+            "AND c.term_count IS NOT NULL "
+            "ORDER BY " + source_expr + ", ct.chunk_id, ct.term",
+            params,
+        )
+        current_key: tuple[str, str] | None = None
+        current_score = 0.0
+        for source_id, chunk_id, doc_len, term, tf in postings:
+            source_key = str(source_id)
+            chunk_key = str(chunk_id)
+            key = (source_key, chunk_key)
+            if current_key is not None and key != current_key:
+                admit(current_key[0], current_key[1], current_score)
+                current_score = 0.0
+            current_key = key
+            df = document_frequency.get(str(term), 0)
+            frequency = float(tf)
+            if df <= 0 or frequency <= 0.0:
+                continue
+            idf = log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+            denom = frequency + self._k1 * (
+                1.0 - self._b + self._b * (float(doc_len or 0) / avgdl)
+            )
+            if denom > 0.0:
+                current_score += idf * (
+                    frequency * (self._k1 + 1.0) / denom
+                )
+        if current_key is not None:
+            admit(current_key[0], current_key[1], current_score)
+
+        for source_id, buffer in buffers.items():
+            buffer.sort(key=lambda item: (-item[1], item[0]))
+            results[source_id] = buffer[:limit_per_source]
+        return results
+
+    def search_source_tfisf(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+    ) -> list[tuple[str, float]]:
+        """Rank provenance sources with BM25-style TF–ISF.
+
+        Chunk BM25 answers "which excerpt uses these terms?" This companion
+        view answers "which conversation or document owns these terms?" by
+        treating every durable source as one aggregate lexical document.
+        Statistics are derived from the live index on each call, so appended
+        turns immediately affect source frequency without another stored
+        summary or rebuild.
+        """
+
+        if limit <= 0:
+            return []
+        terms = sorted(set(tokenize(query)))
+        if not terms:
+            return []
+
+        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        if self._source_length_cache is None:
+            source_rows = self._db.execute(
+                "SELECT " + source_expr + ", SUM(c.term_count) "
+                "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
+                "WHERE c.term_count IS NOT NULL "
+                "GROUP BY " + source_expr
+            ).fetchall()
+            self._source_length_cache = {
+                str(source_id): int(length or 0)
+                for source_id, length in source_rows
+            }
+        source_lengths = self._source_length_cache
+        if not source_lengths:
+            return []
+        n_sources = len(source_lengths)
+        avg_length = sum(source_lengths.values()) / n_sources
+        if avg_length <= 0.0:
+            return []
+
+        term_placeholders = ",".join("?" for _ in terms)
+        rows = self._db.execute(
+            "SELECT " + source_expr + ", ct.term, SUM(ct.tf) "
+            "FROM chunk_terms AS ct "
+            "JOIN chunks AS c ON c.chunk_id = ct.chunk_id "
+            "JOIN turns AS t ON t.turn_id = c.turn_id "
+            f"WHERE ct.term IN ({term_placeholders}) "
+            "GROUP BY " + source_expr + ", ct.term "
+            "ORDER BY " + source_expr + ", ct.term",
+            tuple(terms),
+        ).fetchall()
+        if not rows:
+            return []
+
+        source_frequency = Counter(str(term) for _source, term, _tf in rows)
+        scores: dict[str, float] = {}
+        for source_id, term, raw_tf in rows:
+            source_key = str(source_id)
+            term_key = str(term)
+            df = source_frequency[term_key]
+            tf = float(raw_tf)
+            source_length = float(source_lengths[source_key])
+            isf = log(
+                1.0 + (n_sources - df + 0.5) / (df + 0.5)
+            )
+            denominator = tf + self._k1 * (
+                1.0 - self._b + self._b * source_length / avg_length
+            )
+            if denominator > 0.0:
+                scores[source_key] = scores.get(source_key, 0.0) + isf * (
+                    tf * (self._k1 + 1.0) / denominator
+                )
+
+        return sorted(scores.items(), key=lambda item: (-item[1], item[0]))[
+            :limit
+        ]

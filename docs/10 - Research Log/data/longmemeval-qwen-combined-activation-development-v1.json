@@ -1,0 +1,56 @@
+{
+  "format": "memory-condense-qwen-combined-activation-development-v1",
+  "status": "mechanism_validated_neutral_smoke_not_admitted",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_manifest": "longmemeval-95-target-split-v2.json",
+  "split": "development",
+  "ordered_prefix_samples": 5,
+  "base_policy": "longmemeval-official-partition-local-development-v1.json",
+  "pipeline": {
+    "first_activation": "original question",
+    "first_candidate_sampling": "stratified anchors, transition neighbors, and source-local candidates",
+    "first_candidate_pool": 32,
+    "evidence_seeds": 6,
+    "combined_activation": "original question plus selected evidence",
+    "combined_activation_token_cap": 384,
+    "fresh_pool_source_gate": "sources of attended evidence seeds",
+    "fresh_pool_retrieval_query": "unchanged original question",
+    "fresh_pool_candidate_cap": 32,
+    "combined_activation_search": "QK + log1p(OV transport)",
+    "second_hop_slots": 12,
+    "protected_first_round_source_slots": 36,
+    "max_workspace_candidates": 8,
+    "max_workspace_tokens": 1024,
+    "retained_transformer_state_bytes": 0
+  },
+  "checkpoint_identity": {
+    "model": "Qwen3-8B",
+    "prefix_layers": 2,
+    "attention_layer": 1,
+    "model_index_sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc",
+    "config_sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+    "loaded_shard": "model-00001-of-00005.safetensors",
+    "loaded_shard_sha256": "31d6a825ae35f11fb85b195b4c42c146c051e446433125a215336abdf95cbf5f"
+  },
+  "matched_metrics": {
+    "baseline_literal_hits": 3,
+    "treatment_literal_hits": 3,
+    "baseline_mean_context_tokens": 6669.8,
+    "treatment_mean_context_tokens": 6672.2,
+    "baseline_evidence_source_coverage": 1.0,
+    "treatment_evidence_source_coverage": 1.0,
+    "row_level_hit_changes": 0,
+    "combined_activation_candidates_selected": 30,
+    "total_second_hop_candidates_admitted": 60,
+    "qwen_forward_passes": 45,
+    "qwen_candidate_inspections": 343,
+    "observed_max_workspace_candidates": 8,
+    "observed_max_workspace_tokens": 936,
+    "wall_seconds_including_model_load_and_cached_retrieval": 36.4
+  },
+  "artifact": {
+    "file": "eval_results/longmemeval-qwen-combined-activation-development-5.csv",
+    "sha256": "b276bd96ce44582ee3dcd189c0b49e7e90483ff4e935b8b618cdcb4d4ce6cc6e"
+  },
+  "decision": "Keep opt-in. The recursive activation mechanism is real and bounded, but literal and source-level metrics are neutral; semantic sufficiency is required before admission."
+}

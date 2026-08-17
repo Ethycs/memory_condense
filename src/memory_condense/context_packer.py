@@ -20,7 +20,10 @@ import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
+import pysbd
+
 from memory_condense._tokenizer import count_tokens, truncate_to_tokens
+from memory_condense.lexical import tokenize
 from memory_condense.schemas import (
     MemoryItem,
     MemoryResult,
@@ -46,6 +49,19 @@ class ContextBudget:
     max_consolidation_expansions: int = 3
     max_expansion_tokens: int = 250
     budget_aware_expansions: bool = False
+    # Opt-in: apply diminishing returns to repeated excerpts from the same
+    # durable source while performing budget-aware selection.
+    source_diverse_expansions: bool = False
+    # Opt-in lexical sentence extraction after chunk retrieval. This spends
+    # prompt tokens on the sentences most directly tied to the live query
+    # while retaining the durable chunk ID for provenance.
+    query_aware_sentence_expansions: bool = False
+    max_sentences_per_expansion: int = 2
+    # Opt-in rate-distortion filter. Candidate-set IDF supplies information
+    # weights; relevance and marginal concept/source novelty are divided by
+    # rendered token cost without disturbing the retriever's evidence order.
+    information_gain_expansions: bool = False
+    min_information_gain_per_token: float = 0.0
     # Opt-in: use diffused source heat as weighted-fair prompt exposure. The
     # default preserves the established retrieval ordering exactly.
     heat_weighted_expansions: bool = False
@@ -54,6 +70,10 @@ class ContextBudget:
     def __post_init__(self) -> None:
         if self.max_consolidation_expansions < 0:
             raise ValueError("max_consolidation_expansions must be non-negative")
+        if self.max_sentences_per_expansion < 1:
+            raise ValueError("max_sentences_per_expansion must be positive")
+        if self.min_information_gain_per_token < 0.0:
+            raise ValueError("min_information_gain_per_token must be non-negative")
         if not 0.0 < self.max_source_expansion_fraction <= 1.0:
             raise ValueError("max_source_expansion_fraction must lie in (0, 1]")
 
@@ -74,6 +94,11 @@ class ContextPacker:
 
     def __init__(self, budget: ContextBudget | None = None) -> None:
         self.budget = budget or ContextBudget()
+        self._sentence_segmenter = (
+            pysbd.Segmenter(language="en", clean=False)
+            if self.budget.query_aware_sentence_expansions
+            else None
+        )
 
     # -- public API ---------------------------------------------------------
 
@@ -100,7 +125,7 @@ class ContextPacker:
             exp_tokens,
             exp_dropped,
             source_tokens,
-        ) = self._build_expansions(expansions)
+        ) = self._build_expansions(expansions, query=user_text or "")
 
         messages: list[dict[str, str]] = []
         if system_prompt:
@@ -199,7 +224,10 @@ class ContextPacker:
         return kept, used, len(recent_turns) - len(kept)
 
     def _build_expansions(
-        self, expansions: list[RetrievalResult]
+        self,
+        expansions: list[RetrievalResult],
+        *,
+        query: str = "",
     ) -> tuple[list[str], list[str], int, int, dict[str, int]]:
         """Verbatim excerpts, each capped, and capped again in aggregate.
 
@@ -213,8 +241,10 @@ class ContextPacker:
             if self.budget.heat_weighted_expansions
             else expansions
         )
-        if self.budget.budget_aware_expansions:
-            ranked = self._budget_aware_order(ranked)
+        if self.budget.information_gain_expansions:
+            ranked = self._information_gain_order(ranked, query=query)
+        elif self.budget.budget_aware_expansions:
+            ranked = self._budget_aware_order(ranked, query=query)
         texts: list[str] = []
         chunk_ids: list[str] = []
         used = count_tokens(EXPANSION_PREFIX)
@@ -238,9 +268,8 @@ class ContextPacker:
             )
             if content_budget <= 0:
                 break
-            snippet = truncate_to_tokens(
-                result.chunk.text.strip(), content_budget
-            )
+            prepared = self._prepare_expansion_text(result.chunk.text, query)
+            snippet = truncate_to_tokens(prepared, content_budget)
             if not snippet:
                 continue
             entry = label + snippet
@@ -277,7 +306,10 @@ class ContextPacker:
         )
 
     def _budget_aware_order(
-        self, expansions: list[RetrievalResult]
+        self,
+        expansions: list[RetrievalResult],
+        *,
+        query: str = "",
     ) -> list[RetrievalResult]:
         """Choose high-utility evidence under the hard token ceiling.
 
@@ -292,8 +324,9 @@ class ContextPacker:
         available = max(0, self.budget.expansion_tokens - prefix_cost)
         ranked: list[tuple[float, int, int, bool, RetrievalResult]] = []
         for index, result in enumerate(expansions):
+            prepared = self._prepare_expansion_text(result.chunk.text, query)
             snippet = truncate_to_tokens(
-                result.chunk.text.strip(), self.budget.max_expansion_tokens
+                prepared, self.budget.max_expansion_tokens
             )
             if not snippet:
                 continue
@@ -315,7 +348,23 @@ class ContextPacker:
         used = 0
         direct = 0
         consolidation = 0
-        for _utility, index, cost, is_consolidation, result in ranked:
+        source_counts: dict[str, int] = defaultdict(int)
+        remaining = list(ranked)
+        while remaining:
+            if self.budget.source_diverse_expansions:
+                remaining.sort(
+                    key=lambda item: (
+                        -item[0]
+                        / (
+                            1
+                            + source_counts[
+                                self._result_source_id(item[4])
+                            ]
+                        ),
+                        item[1],
+                    )
+                )
+            _utility, index, cost, is_consolidation, result = remaining.pop(0)
             if is_consolidation:
                 if consolidation >= self.budget.max_consolidation_expansions:
                     continue
@@ -329,8 +378,208 @@ class ContextPacker:
                 consolidation += 1
             else:
                 direct += 1
+            source_counts[self._result_source_id(result)] += 1
         selected.sort(key=lambda item: item[0])
         return [result for _index, result in selected]
+
+    def _prepare_expansion_text(self, text: str, query: str) -> str:
+        """Return a deterministic query-focused excerpt when enabled.
+
+        The retriever still chooses and scores durable chunks. This method is
+        deliberately only a packing transform: it keeps the best lexical
+        sentence matches in their original order and stores no model state.
+        If neither the query nor any sentence has a usable lexical match, the
+        original text is retained so dense-only semantic hits are not erased.
+        """
+
+        stripped = text.strip()
+        if not self.budget.query_aware_sentence_expansions or not query.strip():
+            return stripped
+        if self._sentence_segmenter is None:
+            return stripped
+
+        sentences = [
+            segment.strip()
+            for segment in self._sentence_segmenter.segment(stripped)
+            if segment.strip()
+        ]
+        if len(sentences) <= self.budget.max_sentences_per_expansion:
+            return stripped
+
+        query_terms = set(tokenize(query))
+        if not query_terms:
+            return stripped
+
+        scored: list[tuple[float, int]] = []
+        for index, sentence in enumerate(sentences):
+            sentence_terms = set(tokenize(sentence))
+            overlap = query_terms.intersection(sentence_terms)
+            if not overlap:
+                continue
+            # Exact numbers and long identifiers are unusually discriminative
+            # in long-chat recall. Length normalization prevents a long
+            # sentence from winning merely by containing more words.
+            overlap_weight = sum(
+                3.0 if term.isdigit() or len(term) >= 8 else 1.0
+                for term in overlap
+            )
+            score = overlap_weight / math.sqrt(max(1, len(sentence_terms)))
+            scored.append((score, index))
+
+        if not scored:
+            return stripped
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        selected = sorted(
+            index
+            for _score, index in scored[
+                : self.budget.max_sentences_per_expansion
+            ]
+        )
+        return " ".join(sentences[index] for index in selected)
+
+    def _information_gain_order(
+        self,
+        expansions: list[RetrievalResult],
+        *,
+        query: str,
+    ) -> list[RetrievalResult]:
+        """Filter low-yield evidence using estimated information per token.
+
+        This is a deterministic rate-distortion proxy rather than a claim to
+        know true answer mutual information. Candidate-set IDF estimates term
+        surprise, normalized retrieval score estimates semantic relevance,
+        and accepted evidence discounts repeated concepts, sources, and numeric
+        facts. Crucially, this is a monotone filter over retrieval order: it can
+        remove a low-yield item but cannot promote a weaker candidate over a
+        required higher-ranked item.
+        """
+
+        if not expansions:
+            return []
+
+        prepared: list[dict[str, object]] = []
+        document_frequency: dict[str, int] = defaultdict(int)
+        raw_scores = [max(0.0, float(result.score)) for result in expansions]
+        low_score = min(raw_scores, default=0.0)
+        high_score = max(raw_scores, default=0.0)
+        for index, result in enumerate(expansions):
+            text = self._prepare_expansion_text(result.chunk.text, query)
+            snippet = truncate_to_tokens(text, self.budget.max_expansion_tokens)
+            terms = set(tokenize(snippet))
+            for term in terms:
+                document_frequency[term] += 1
+            cost = count_tokens(snippet) + 2 if snippet else 0
+            relative_score = (
+                (raw_scores[index] - low_score) / (high_score - low_score)
+                if high_score > low_score
+                else 0.0
+            )
+            normalized_score = max(
+                min(1.0, raw_scores[index]),
+                0.5 * relative_score,
+            )
+            prepared.append(
+                {
+                    "index": index,
+                    "result": result,
+                    "terms": terms,
+                    "cost": cost,
+                    "score": normalized_score,
+                    "source": self._result_source_id(result),
+                    "consolidation": result.route == "live_consolidation",
+                }
+            )
+
+        count = len(expansions)
+        idf = {
+            term: math.log2((count + 1.0) / (frequency + 1.0)) + 1.0
+            for term, frequency in document_frequency.items()
+        }
+        query_terms = set(tokenize(query))
+        # A set/sequence answer has a higher distortion cost than a singleton:
+        # superficially repetitive excerpts may each carry a different required
+        # member. Retain more evidence for these queries instead of teaching the
+        # redundancy filter that "another concert" or "another change" is noise.
+        multi_fact_markers = {
+            "all",
+            "each",
+            "order",
+            "ordered",
+            "earliest",
+            "latest",
+            "sequence",
+            "chronological",
+            "compare",
+            "differences",
+            "between",
+        }
+        effective_threshold = self.budget.min_information_gain_per_token
+        if query_terms.intersection(multi_fact_markers):
+            effective_threshold *= 0.70
+        query_weight = sum(idf.get(term, math.log2(count + 1.0)) for term in query_terms)
+        selected: list[RetrievalResult] = []
+        selected_terms: set[str] = set()
+        selected_numbers: set[str] = set()
+        selected_sources: set[str] = set()
+        for item in prepared:
+            cost = int(item["cost"])
+            if cost <= 0:
+                continue
+            terms = set(item["terms"])
+            total_information = sum(idf.get(term, 1.0) for term in terms)
+            new_information = sum(
+                idf.get(term, 1.0) for term in terms - selected_terms
+            )
+            lexical_relevance = (
+                sum(
+                    idf.get(term, 1.0)
+                    for term in terms.intersection(query_terms)
+                )
+                / query_weight
+                if query_weight > 0.0
+                else 0.0
+            )
+            semantic_relevance = float(item["score"])
+            relevance = max(lexical_relevance, semantic_relevance)
+            concept_novelty = (
+                new_information / total_information
+                if total_information > 0.0
+                else 0.0
+            )
+            source_novelty = float(str(item["source"]) not in selected_sources)
+            numbers = {term for term in terms if term.isdigit()}
+            temporal_novelty = (
+                len(numbers - selected_numbers) / len(numbers)
+                if numbers
+                else 0.0
+            )
+            novelty = (
+                0.65 * concept_novelty
+                + 0.25 * source_novelty
+                + 0.10 * temporal_novelty
+            )
+            marginal_information = relevance * (0.60 + 0.40 * novelty)
+            gain_rate = marginal_information / max(1, cost)
+            if gain_rate < effective_threshold:
+                continue
+            result = item["result"]
+            if not isinstance(result, RetrievalResult):
+                continue
+            selected.append(result)
+            selected_terms.update(terms)
+            selected_numbers.update(term for term in terms if term.isdigit())
+            selected_sources.add(str(item["source"]))
+
+        return selected
+
+    @staticmethod
+    def _result_source_id(result: RetrievalResult) -> str:
+        if result.memory_source_id:
+            return result.memory_source_id
+        if result.turn is not None:
+            return str(result.turn.source_id or result.turn.turn_id)
+        return result.chunk.turn_id
 
     def _heat_weighted_order(
         self, expansions: list[RetrievalResult]

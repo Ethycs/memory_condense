@@ -123,6 +123,8 @@ RetrievalMode = Literal[
     "hybrid_source",
     "hybrid_graph",
     "hybrid_neighbor",
+    "causal_consolidation",
+    "causal_graph",
 ]
 
 
@@ -156,6 +158,49 @@ class RetrievalConfig(BaseModel):
     source_candidate_pool: int = Field(default=200, ge=1)
     #: Pool prefix whose source identities may admit second-stage candidates.
     source_activation_k: int | None = Field(default=None, ge=1)
+    #: Add a bounded source-level TF-ISF activation channel derived from the
+    #: live chunk-term index. Raw chunks remain the authoritative payload.
+    source_tfisf_activation: bool = False
+    source_tfisf_slots: int = Field(default=8, ge=1)
+    #: Expand activated source leaves through bounded pairwise-contraction
+    #: parents, then reserve a few source slots for their original chunks.
+    source_hsc_activation: bool = False
+    source_hsc_slots: int = Field(default=8, ge=1)
+    source_hsc_hops: int = Field(default=2, ge=1)
+    source_hsc_chunk_slots: int = Field(default=8, ge=1)
+    #: Scan and rerank candidates inside activated sources instead of merely
+    #: filtering the global candidate pool. False preserves historical arms.
+    source_local_search: bool = False
+    #: Route through hierarchical ``partition::source`` provenance before
+    #: chunk competition. Off by default for historical-arm reproducibility.
+    source_partition_routing: bool = False
+    source_partition_slots: int = Field(default=3, ge=1)
+    source_partition_separator: str = Field(default="::", min_length=1)
+    #: Use a transient Qwen prefix to choose a bounded reserve of candidates
+    #: from the source-local pool. The CLI enables this only when it can load
+    #: an explicit local checkpoint; no transformer state enters the store.
+    qwen_rerank: bool = False
+    qwen_rerank_candidate_pool: int = Field(default=64, ge=1)
+    qwen_rerank_slots: int = Field(default=6, ge=1)
+    qwen_rerank_group_size: int = Field(default=8, ge=2)
+    qwen_rerank_beam_per_group: int = Field(default=2, ge=1)
+    qwen_rerank_candidate_tokens: int = Field(default=64, ge=1)
+    qwen_rerank_query_tokens: int = Field(default=96, ge=1)
+    qwen_rerank_score_weight: float = Field(default=0.35, ge=0.0, le=1.0)
+    qwen_rerank_model: str = ""
+    qwen_rerank_prefix_layers: int = Field(default=2, ge=1)
+    qwen_rerank_attention_layer: int = Field(default=1, ge=0)
+    qwen_rerank_use_cav: bool = False
+    qwen_rerank_cav_layer: int = Field(default=5, ge=0)
+    qwen_rerank_max_workspace_tokens: int = Field(default=1024, ge=1)
+    #: Two-hop treatment: attend over first-round evidence, then spend a fixed
+    #: reserve on another source-local retrieval instead of directly reranking.
+    qwen_feedback: bool = False
+    qwen_feedback_candidate_pool: int = Field(default=32, ge=1)
+    qwen_feedback_seed_slots: int = Field(default=6, ge=1)
+    qwen_feedback_slots: int = Field(default=12, ge=0)
+    qwen_feedback_evidence_tokens: int = Field(default=48, ge=1)
+    qwen_feedback_query_tokens: int = Field(default=384, ge=1)
     #: Source-local chunk shells exposed around hybrid anchors.
     neighbor_radius: int = Field(default=1, ge=0)
     #: Hard count of additional neighbor chunks; direct anchors never compete.
@@ -164,8 +209,107 @@ class RetrievalConfig(BaseModel):
     neighbor_replacement_slots: int = Field(default=0, ge=0)
     #: Restrict transition expansion to the useful temporal direction.
     neighbor_direction: Literal["both", "previous", "next"] = "both"
+    #: Live Hebbian/QK graph candidates appended to the direct hybrid result.
+    consolidation_chunk_slots: int = Field(default=3, ge=0)
+    #: Degree-two diffusion was the first policy to recover a unique held-out
+    #: build-session probe; one hop remains available as an ablation.
+    consolidation_hops: int = Field(default=2, ge=1)
+    consolidation_candidates: int = Field(default=128, ge=1)
+    consolidation_diffusion_width: int = Field(default=32, ge=1)
+    consolidation_min_count: int = Field(default=2, ge=1)
+    #: Independent evidence budget used by ContextPacker before the benchmark's
+    #: complete 8k responder-prompt cap is applied.
+    consolidation_expansion_tokens: int = Field(default=1600, ge=1)
+    consolidation_training_expansion_tokens: int = Field(default=1600, ge=1)
+    consolidation_budget_aware_packing: bool = True
+    consolidation_source_diverse_packing: bool = False
+    consolidation_query_aware_sentence_packing: bool = False
+    consolidation_max_sentences_per_expansion: int = Field(default=2, ge=1)
+    consolidation_information_gain_packing: bool = False
+    consolidation_min_information_gain_per_token: float = Field(
+        default=0.0,
+        ge=0.0,
+    )
+    #: Write-side causal replay bounds. They limit compute/workspace, not the
+    #: amount of durable conversation evidence stored in SQLite/HNSW.
+    consolidation_training_k: int = Field(default=10, ge=1)
+    consolidation_max_event_nodes: int = Field(default=9, ge=2)
+    consolidation_new_event_nodes: int = Field(default=5, ge=1)
+    consolidation_max_training_prompt_tokens: int = Field(default=128, ge=1)
 
     model_config = {"frozen": True}
+
+    def model_post_init(self, __context) -> None:
+        if self.consolidation_new_event_nodes >= self.consolidation_max_event_nodes:
+            raise ValueError(
+                "consolidation_new_event_nodes must be smaller than "
+                "consolidation_max_event_nodes"
+            )
+        if self.qwen_rerank and self.qwen_feedback:
+            raise ValueError("qwen_rerank and qwen_feedback are separate arms")
+        if self.qwen_rerank or self.qwen_feedback:
+            if not self.source_local_search:
+                raise ValueError("Qwen attention requires source_local_search")
+            if self.qwen_rerank_beam_per_group >= 8:
+                raise ValueError(
+                    "qwen_rerank_beam_per_group must be smaller than the "
+                    "eight-candidate Qwen workspace"
+                )
+            if self.qwen_rerank_group_size > 8:
+                raise ValueError(
+                    "qwen_rerank_group_size cannot exceed the eight-candidate "
+                    "Qwen workspace"
+                )
+            if self.qwen_rerank_attention_layer >= self.qwen_rerank_prefix_layers:
+                raise ValueError(
+                    "qwen_rerank_attention_layer must be inside the loaded prefix"
+                )
+            if (
+                self.qwen_rerank_use_cav
+                and self.qwen_rerank_cav_layer >= self.qwen_rerank_prefix_layers
+            ):
+                raise ValueError(
+                    "qwen_rerank_cav_layer must be inside the loaded prefix"
+                )
+        if self.source_partition_routing and self.mode not in {
+            "hybrid_graph",
+            "causal_graph",
+        }:
+            raise ValueError(
+                "source_partition_routing requires hybrid_graph or causal_graph"
+            )
+        if self.source_hsc_activation:
+            if self.mode not in {"hybrid_graph", "causal_graph"}:
+                raise ValueError("source_hsc_activation requires a graph mode")
+            if self.source_hsc_chunk_slots > self.source_slots:
+                raise ValueError("source_hsc_chunk_slots cannot exceed source_slots")
+        if self.qwen_rerank:
+            if self.mode not in {
+                "hybrid_source",
+                "hybrid_graph",
+                "causal_graph",
+            }:
+                raise ValueError(
+                    "qwen_rerank requires hybrid_source, hybrid_graph, or "
+                    "causal_graph mode"
+                )
+            if self.qwen_rerank_slots > self.source_slots:
+                raise ValueError("qwen_rerank_slots cannot exceed source_slots")
+            if self.qwen_rerank_candidate_pool < self.source_slots:
+                raise ValueError(
+                    "qwen_rerank_candidate_pool cannot be smaller than source_slots"
+                )
+        if self.qwen_feedback:
+            if self.mode not in {"hybrid_graph", "causal_graph"}:
+                raise ValueError(
+                    "qwen_feedback requires hybrid_graph or causal_graph mode"
+                )
+            if self.qwen_feedback_slots > self.source_slots:
+                raise ValueError("qwen_feedback_slots cannot exceed source_slots")
+            if self.qwen_feedback_seed_slots > self.qwen_feedback_candidate_pool:
+                raise ValueError(
+                    "qwen_feedback_seed_slots cannot exceed its candidate pool"
+                )
 
     @property
     def effective_hybrid(self) -> bool:
@@ -183,17 +327,32 @@ class RetrievalConfig(BaseModel):
             return f"anchored-source-k{self.k}"
         if self.mode == "hybrid_source":
             activation = self.source_activation_k or self.k
+            local = "-local" if self.source_local_search else ""
+            qwen = f"-qwen{self.qwen_rerank_slots}" if self.qwen_rerank else ""
             return (
                 f"hybrid-source-k{self.k}-s{self.source_slots}"
-                f"-a{activation}-p{self.source_candidate_pool}"
+                f"-a{activation}-p{self.source_candidate_pool}{local}{qwen}"
             )
         if self.mode == "hybrid_graph":
             activation = self.source_activation_k or self.k
+            local = "-local" if self.source_local_search else ""
+            qwen = (
+                f"-qwenfb{self.qwen_feedback_slots}"
+                if self.qwen_feedback
+                else f"-qwen{self.qwen_rerank_slots}"
+                if self.qwen_rerank
+                else ""
+            )
+            partitions = (
+                f"-part{self.source_partition_slots}"
+                if self.source_partition_routing
+                else ""
+            )
             return (
                 f"hybrid-graph-k{self.k}-r{self.neighbor_radius}"
                 f"-n{self.neighbor_slots}-{self.neighbor_direction}"
                 f"-s{self.source_slots}-a{activation}"
-                f"-p{self.source_candidate_pool}"
+                f"-p{self.source_candidate_pool}{partitions}{local}{qwen}"
             )
         if self.mode == "hybrid_neighbor":
             replacement = (
@@ -207,6 +366,25 @@ class RetrievalConfig(BaseModel):
             )
         if self.mode == "memory":
             return f"memory{self.k_memories}"
+        if self.mode in {"causal_consolidation", "causal_graph"}:
+            base = "causal-graph" if self.mode == "causal_graph" else "causal"
+            local = "-local" if self.source_local_search else ""
+            qwen = (
+                f"-qwenfb{self.qwen_feedback_slots}"
+                if self.qwen_feedback
+                else f"-qwen{self.qwen_rerank_slots}"
+                if self.qwen_rerank
+                else ""
+            )
+            partitions = (
+                f"-part{self.source_partition_slots}"
+                if self.source_partition_routing
+                else ""
+            )
+            return (
+                f"{base}-k{self.k}-s{self.consolidation_chunk_slots}"
+                f"-h{self.consolidation_hops}{partitions}{local}{qwen}"
+            )
         if self.effective_hybrid:
             return f"hybrid{self.alpha:g}"
         return "dense"

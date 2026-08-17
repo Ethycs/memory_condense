@@ -1,0 +1,54 @@
+{
+  "format": "memory-condense-qwen-rerank-development-v1",
+  "status": "neutral_smoke_not_admitted",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_manifest": "longmemeval-95-target-split-v2.json",
+  "split": "development",
+  "ordered_prefix_samples": 5,
+  "base_policy": "longmemeval-official-causal-graph-development-v1.json",
+  "read_policy_delta": {
+    "source_local_search": true,
+    "qwen_rerank": true,
+    "qwen_rerank_model": "Qwen3-8B",
+    "qwen_rerank_prefix_layers": 2,
+    "qwen_rerank_attention_layer": 1,
+    "qwen_rerank_use_cav": false,
+    "qwen_rerank_candidate_pool": 64,
+    "qwen_rerank_slots": 6,
+    "qwen_rerank_group_size": 8,
+    "qwen_rerank_beam_per_group": 2,
+    "qwen_rerank_candidate_tokens": 64,
+    "qwen_rerank_query_tokens": 96,
+    "qwen_rerank_score_weight": 0.35,
+    "qwen_rerank_max_workspace_tokens": 1024,
+    "tournament_utility": "max(0,qk)+log1p(max(0,ov_transport))"
+  },
+  "checkpoint_identity": {
+    "model_index_sha256": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc",
+    "config_sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+    "loaded_shard": "model-00001-of-00005.safetensors",
+    "loaded_shard_sha256": "31d6a825ae35f11fb85b195b4c42c146c051e446433125a215336abdf95cbf5f"
+  },
+  "matched_metrics": {
+    "baseline_literal_hits": 3,
+    "treatment_literal_hits": 3,
+    "baseline_mean_context_tokens": 6669.8,
+    "treatment_mean_context_tokens": 6667.2,
+    "baseline_evidence_source_coverage": 1.0,
+    "treatment_evidence_source_coverage": 1.0,
+    "row_level_hit_changes": 0,
+    "qwen_candidates_added_per_question": 6,
+    "qwen_forward_passes": 20,
+    "qwen_candidate_inspections": 140,
+    "max_workspace_candidates": 8,
+    "max_workspace_tokens": 612,
+    "mean_max_workspace_tokens": 562.4,
+    "retained_transformer_state_bytes": 0,
+    "wall_seconds_including_model_load_and_cached_retrieval": 116.8
+  },
+  "artifact": {
+    "file": "eval_results/longmemeval-qwen-rerank-qkov-development-5.csv",
+    "sha256": "67bd6d583ed912ed971db7e103fc8707570a3921ace8479a13c5d6fbab7b3c14"
+  },
+  "decision": "Keep opt-in. The bounded live-attention treatment made real substitutions but showed no evidence or literal-recall gain on this smoke."
+}

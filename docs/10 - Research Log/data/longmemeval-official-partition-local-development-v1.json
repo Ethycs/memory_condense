@@ -1,0 +1,50 @@
+{
+  "format": "memory-condense-development-arm-result-v1",
+  "status": "rejected_no_pareto_gain",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_manifest": "longmemeval-95-target-split-v2.json",
+  "split": "development",
+  "ordered_prefix_samples": 40,
+  "base_policy": "longmemeval-official-causal-graph-development-v1.json",
+  "read_policy_delta": {
+    "source_local_search": true,
+    "source_local_candidates_per_source": 200,
+    "score_calibration": "global_across_activated_source_union",
+    "source_activation_role": "eligibility_gate"
+  },
+  "workspace": {
+    "dense_candidate_bound_per_source": 200,
+    "lexical_candidate_bound_per_source": 200,
+    "text_hydration": "final_rank_only",
+    "persisted_transformer_state_bytes": 0
+  },
+  "development_metrics": {
+    "questions": 40,
+    "haystack_literal_ceiling": 0.6,
+    "literal_recall": 0.575,
+    "recoverable_literal_recall": 0.9583333333333334,
+    "mean_context_tokens": 6666.85,
+    "max_context_tokens": 6687,
+    "evidence_source_recall": 0.995,
+    "evidence_any_source_recall": 1.0,
+    "evidence_all_source_recall": 0.975,
+    "mean_direct_chunks": 49.475,
+    "mean_learned_chunks": 28.575
+  },
+  "comparison_to_frozen_policy": {
+    "literal_hit_delta": 0,
+    "row_level_hit_changes": 0,
+    "mean_context_token_delta": 29.025,
+    "decision": "retain_as_ablation_do_not_select"
+  },
+  "artifact": {
+    "file": "longmemeval-official-causal-graph-local-calibrated-b6750-40.csv",
+    "sha256": "f5134b16cc1ab679d5dc44a1e5952f986e736a7b89a52b1c25cf2fd3085fd465"
+  },
+  "failure_audit": {
+    "question_id": "e4e14d04",
+    "gold_answer": "Two weeks",
+    "gold_evidence_retrieved": true,
+    "interpretation": "Temporal subtraction is required; the normalized literal elsewhere in the haystack is coincidental, not gold evidence."
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "format": "memory-condense-context-stress-result-v1",
+  "status": "failed_scaling_gate",
+  "date": "2026-08-16",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_manifest": "longmemeval-95-target-split-v2.json",
+  "split": "development",
+  "construction": {
+    "target_content_tokens": 1000000,
+    "actual_content_tokens": 1039203,
+    "turns": 5400,
+    "source_histories": 10,
+    "questions": 10,
+    "method": "concatenate complete locked-split LongMemEval histories into one memory until the target is met",
+    "source_identity": "each source ID is namespaced by its original sample ID",
+    "tokenizer": "cl100k proxy",
+    "provider_calls": 0
+  },
+  "retrieval_policy": {
+    "manifest": "longmemeval-official-causal-graph-development-v1.json",
+    "manifest_sha256": "c80772cc225206a77a5a58ce2cc169faf3a52f7884284e52f7b3db4eb0d0133f",
+    "mode": "causal_graph",
+    "evidence_token_budget": 6750,
+    "responder_prompt_cap": 8000
+  },
+  "million_token_metrics": {
+    "haystack_literal_ceiling": 0.7,
+    "literal_recall": 0.4,
+    "mean_context_tokens": 5924,
+    "mean_context_fraction": 0.0057005,
+    "mean_evidence_source_recall": 0.8133,
+    "evidence_any_source_recall": 0.9,
+    "evidence_all_source_recall": 0.7,
+    "cold_end_to_end_wall_seconds": 609.3,
+    "warm_cached_end_to_end_wall_seconds": 35.6
+  },
+  "matched_100k_baseline": {
+    "questions": 10,
+    "literal_recall": 0.5,
+    "mean_evidence_source_recall": 1.0,
+    "evidence_any_source_recall": 1.0,
+    "evidence_all_source_recall": 1.0
+  },
+  "coverage_failures": [
+    {
+      "question_id": "gpt4_d6585ce8",
+      "evidence_source_recall": 0.8
+    },
+    {
+      "question_id": "e01b8e2f",
+      "evidence_source_recall": 0.0
+    },
+    {
+      "question_id": "gpt4_7abb270c",
+      "evidence_source_recall": 0.3333
+    }
+  ],
+  "artifact": {
+    "file": "longmemeval-million-context-selected-b6750-10.csv",
+    "sha256": "7733de0f1d85d6697b82f6189c0bfdb6ed732a10026b97196c844ea4564b32e1"
+  },
+  "interpretation": "The selected 100k policy does not preserve its source-retrieval coverage at 1M. Candidate competition across partitions is now a demonstrated scaling bottleneck; this run is not evidence of 1M-context parity."
+}

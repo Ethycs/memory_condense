@@ -8,6 +8,7 @@ from memory_condense.eval.schemas import (
     TurnResult,
     UsageStats,
 )
+import pytest
 
 
 def test_chunker_config_defaults():
@@ -55,6 +56,96 @@ def test_hybrid_graph_label_captures_both_link_budgets():
     )
 
     assert config.label == "hybrid-graph-k10-r5-n24-next-s24-a20-p200"
+
+
+def test_source_tfisf_defaults_off_and_has_a_positive_bound():
+    config = RetrievalConfig()
+
+    assert config.source_tfisf_activation is False
+    assert config.source_tfisf_slots == 8
+    with pytest.raises(ValueError):
+        RetrievalConfig(source_tfisf_slots=0)
+
+
+def test_source_hsc_requires_graph_mode_and_fits_source_budget():
+    with pytest.raises(ValueError, match="requires a graph mode"):
+        RetrievalConfig(mode="dense", source_hsc_activation=True)
+    with pytest.raises(ValueError, match="cannot exceed source_slots"):
+        RetrievalConfig(
+            mode="causal_graph",
+            source_slots=3,
+            source_hsc_activation=True,
+            source_hsc_chunk_slots=4,
+        )
+
+
+def test_partition_local_label_is_distinct_from_historical_pool_arm():
+    config = RetrievalConfig(
+        mode="hybrid_graph",
+        k=10,
+        source_local_search=True,
+    )
+
+    assert config.label.endswith("-local")
+
+
+def test_hierarchical_partition_routing_is_explicit_and_graph_only():
+    config = RetrievalConfig(
+        mode="causal_graph",
+        source_partition_routing=True,
+        source_partition_slots=2,
+    )
+
+    assert "-part2" in config.label
+    with pytest.raises(ValueError, match="requires hybrid_graph or causal_graph"):
+        RetrievalConfig(mode="dense", source_partition_routing=True)
+
+
+def test_qwen_rerank_label_and_bounds_are_explicit():
+    config = RetrievalConfig(
+        mode="causal_graph",
+        source_local_search=True,
+        qwen_rerank=True,
+        qwen_rerank_slots=6,
+    )
+
+    assert config.label.endswith("-local-qwen6")
+    with pytest.raises(ValueError, match="source_local_search"):
+        RetrievalConfig(mode="causal_graph", qwen_rerank=True)
+    with pytest.raises(ValueError, match="cannot exceed source_slots"):
+        RetrievalConfig(
+            mode="causal_graph",
+            source_local_search=True,
+            source_slots=2,
+            qwen_rerank=True,
+            qwen_rerank_slots=3,
+        )
+
+
+def test_qwen_feedback_is_a_distinct_bounded_graph_arm():
+    config = RetrievalConfig(
+        mode="causal_graph",
+        source_local_search=True,
+        qwen_feedback=True,
+        qwen_feedback_slots=12,
+    )
+
+    assert config.label.endswith("-local-qwenfb12")
+    with pytest.raises(ValueError, match="separate arms"):
+        RetrievalConfig(
+            mode="causal_graph",
+            source_local_search=True,
+            qwen_rerank=True,
+            qwen_feedback=True,
+        )
+    with pytest.raises(ValueError, match="cannot exceed source_slots"):
+        RetrievalConfig(
+            mode="causal_graph",
+            source_local_search=True,
+            source_slots=4,
+            qwen_feedback=True,
+            qwen_feedback_slots=5,
+        )
 
 
 def test_eval_config_defaults():

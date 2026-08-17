@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import zlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -82,6 +83,27 @@ class FakeQwenTurnLinker:
             workspace_candidates=len(bounded),
             workspace_tokens=32,
         )
+
+
+class FakeAttentionFeedback:
+    candidate_pool = 8
+
+    def __init__(self) -> None:
+        self.last_report = None
+        self.seen_routes = []
+
+    def select(self, query, candidates, *, top_k):
+        self.seen_routes = [candidate.route for candidate in candidates]
+        self.last_report = SimpleNamespace(
+            model_dump=lambda: {
+                "passes": 1,
+                "max_workspace_candidates": len(candidates),
+                "max_workspace_tokens": 64,
+                "total_candidate_inspections": len(candidates),
+                "qwen_candidates_added": min(top_k, len(candidates)),
+            }
+        )
+        return list(candidates[:top_k])
 
 
 CONVERSATION = [
@@ -166,6 +188,7 @@ class TestIngest:
         )
 
         assert results[0].chunk.text == "Alpha uses SQLite."
+        assert results[1].chunk.text == "Alpha keeps WAL enabled."
         assert {result.turn.source_id for result in results} == {"session-alpha"}
         assert results[1].route == "hybrid_source"
         assert results[1].anchor_chunk_id == results[0].chunk.chunk_id
@@ -200,6 +223,55 @@ class TestIngest:
 
         assert calls == [(1, 17), (31, 31)]
 
+    def test_partition_local_search_recovers_chunk_absent_from_global_pool(self, mc):
+        _, anchor_chunks = mc.ingest(
+            "user",
+            "Alpha project overview.",
+            source_id="session-alpha",
+        )
+        _, target_chunks = mc.ingest(
+            "assistant",
+            "The launch code is cerulean.",
+            source_id="session-alpha",
+        )
+        anchor = mc.retriever.hydrate_chunk(
+            anchor_chunks[0].chunk_id,
+            score=1.0,
+            route="hybrid",
+        )
+        assert anchor is not None
+
+        def truncated_global_pool(*args, **kwargs):
+            return [anchor]
+
+        mc.search_hybrid_from_embedding = truncated_global_pool
+        legacy = mc.search_hybrid_sources(
+            "What is the launch code?",
+            k=1,
+            source_slots=1,
+            source_candidate_pool=1,
+            source_activation_k=1,
+            source_local_search=False,
+        )
+        local = mc.search_hybrid_sources(
+            "What is the launch code?",
+            k=1,
+            source_slots=1,
+            source_candidate_pool=1,
+            source_activation_k=1,
+            source_local_search=True,
+        )
+
+        assert [result.chunk.chunk_id for result in legacy] == [
+            anchor_chunks[0].chunk_id
+        ]
+        assert [result.chunk.chunk_id for result in local] == [
+            anchor_chunks[0].chunk_id,
+            target_chunks[0].chunk_id,
+        ]
+        assert local[1].route == "hybrid_source_local"
+        assert local[1].anchor_chunk_id == anchor_chunks[0].chunk_id
+
     def test_hybrid_graph_unions_directional_neighbors_and_source_rerank(self, mc):
         mc.ingest("user", "Alpha begins here.", source_id="session-alpha")
         mc.ingest("assistant", "Alpha uses SQLite.", source_id="session-alpha")
@@ -221,6 +293,160 @@ class TestIngest:
         assert results[0].chunk.text == "Alpha uses SQLite."
         assert results[1].chunk.text == "Alpha keeps WAL enabled."
         assert results[1].transition_direction == "next"
+        assert len({result.chunk.chunk_id for result in results}) == len(results)
+        assert {result.turn.source_id for result in results} == {"session-alpha"}
+
+    def test_hybrid_graph_tfisf_can_activate_a_source_below_chunk_prefix(self, mc):
+        _, alpha_chunks = mc.ingest(
+            "user", "Alpha overview.", source_id="session-alpha"
+        )
+        _, beta_chunks = mc.ingest(
+            "user", "The cerulean launch code.", source_id="session-beta"
+        )
+        alpha = mc.retriever.hydrate_chunk(
+            alpha_chunks[0].chunk_id, score=1.0, route="hybrid"
+        )
+        beta = mc.retriever.hydrate_chunk(
+            beta_chunks[0].chunk_id, score=0.5, route="hybrid"
+        )
+        assert alpha is not None and beta is not None
+
+        def fixed_pool(*args, **kwargs):
+            return [alpha] if kwargs["k"] == 1 else [alpha, beta]
+
+        mc.search_hybrid_from_embedding = fixed_pool
+        mc.retriever.source_tfisf_query = lambda *args, **kwargs: [
+            ("session-beta", 2.0)
+        ]
+
+        results = mc.search_hybrid_graph(
+            "What is the launch code?",
+            k=1,
+            neighbor_radius=0,
+            neighbor_slots=0,
+            source_slots=1,
+            source_candidate_pool=2,
+            source_activation_k=1,
+            source_tfisf_activation=True,
+            source_tfisf_slots=1,
+        )
+
+        assert [result.chunk.chunk_id for result in results] == [
+            alpha_chunks[0].chunk_id,
+            beta_chunks[0].chunk_id,
+        ]
+        assert mc.last_source_tfisf_report["admitted_sources"] == [
+            "session-beta"
+        ]
+
+    def test_hybrid_graph_hsc_reserve_hydrates_original_sibling_source(self, mc):
+        _, alpha_chunks = mc.ingest(
+            "user", "Alpha project overview.", source_id="project::alpha"
+        )
+        _, beta_chunks = mc.ingest(
+            "user", "The cerulean launch code.", source_id="project::beta"
+        )
+        alpha = mc.retriever.hydrate_chunk(
+            alpha_chunks[0].chunk_id, score=1.0, route="hybrid"
+        )
+        assert alpha is not None
+
+        mc.search_hybrid_from_embedding = lambda *args, **kwargs: [alpha]
+        mc.retriever.source_hsc_expand = lambda *args, **kwargs: [
+            ("project::beta", 0.9)
+        ]
+
+        results = mc.search_hybrid_graph(
+            "What is the launch code?",
+            k=1,
+            neighbor_radius=0,
+            neighbor_slots=0,
+            source_slots=1,
+            source_candidate_pool=1,
+            source_activation_k=1,
+            source_hsc_activation=True,
+            source_hsc_slots=1,
+            source_hsc_hops=1,
+            source_hsc_chunk_slots=1,
+        )
+
+        assert [result.chunk.chunk_id for result in results] == [
+            alpha_chunks[0].chunk_id,
+            beta_chunks[0].chunk_id,
+        ]
+        assert results[1].route == "hsc_contraction"
+        assert results[1].memory_source_id == "project::beta"
+
+    def test_hybrid_graph_routes_inside_selected_hierarchical_partition(self, mc):
+        for text in [
+            "Alpha project overview.",
+            "Alpha uses SQLite.",
+            "Alpha keeps WAL enabled.",
+        ]:
+            mc.ingest("user", text, source_id="project-alpha::session-main")
+        mc.ingest(
+            "user",
+            "Unrelated garden notes.",
+            source_id="project-beta::session-main",
+        )
+
+        results = mc.search_hybrid_graph(
+            "How does Alpha store data?",
+            k=1,
+            neighbor_radius=0,
+            neighbor_slots=0,
+            source_slots=2,
+            source_candidate_pool=4,
+            source_activation_k=2,
+            source_partition_routing=True,
+            source_partition_slots=1,
+        )
+
+        assert results
+        assert {
+            result.turn.source_id.split("::", 1)[0] for result in results
+        } == {"project-alpha"}
+        assert mc.last_partition_routing_report["selected_partitions"] == [
+            "project-alpha"
+        ]
+        assert mc.last_partition_routing_report["routed_sources"] == 1
+
+    def test_attention_feedback_runs_a_bounded_second_source_retrieval(self, mc):
+        for text in [
+            "Alpha project overview.",
+            "Alpha joined three weeks ago.",
+            "Alpha discussed another book.",
+            "Alpha attended the meetup last week.",
+            "Alpha planned a future event.",
+        ]:
+            mc.ingest("user", text, source_id="session-alpha")
+        controller = FakeAttentionFeedback()
+        mc.set_source_candidate_reranker(controller)
+
+        results = mc.search_hybrid_graph(
+            "How long before the meetup?",
+            k=1,
+            neighbor_radius=0,
+            neighbor_slots=0,
+            source_slots=2,
+            source_candidate_pool=5,
+            source_activation_k=1,
+            source_local_search=True,
+            use_attention_feedback=True,
+            feedback_slots=1,
+            feedback_seed_slots=1,
+            feedback_evidence_tokens=12,
+            feedback_query_tokens=64,
+        )
+
+        assert len(results) == 3
+        assert sum(
+            result.route == "qwen_activation_feedback" for result in results
+        ) == 1
+        assert mc.last_source_rerank_report["feedback_rounds"] == 1
+        assert mc.last_source_rerank_report["feedback_candidates_added"] == 1
+        assert mc.last_source_rerank_report["feedback_activation_candidates"] == 1
+        assert mc.last_source_rerank_report["feedback_query_tokens"] <= 64
         assert len({result.chunk.chunk_id for result in results}) == len(results)
         assert {result.turn.source_id for result in results} == {"session-alpha"}
 

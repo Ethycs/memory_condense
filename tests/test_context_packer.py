@@ -171,6 +171,151 @@ class TestExpansions:
         assert short_b.chunk.chunk_id in packed.expansion_chunk_ids
         assert long.chunk.chunk_id not in packed.expansion_chunk_ids
 
+    def test_source_diverse_budget_aware_order_penalizes_repeated_source(self):
+        source_a_first = _result("alpha first").model_copy(
+            update={"score": 1.0, "memory_source_id": "source-a"}
+        )
+        source_a_second = _result("alpha second").model_copy(
+            update={"score": 0.9, "memory_source_id": "source-a"}
+        )
+        source_b = _result("beta evidence").model_copy(
+            update={"score": 0.6, "memory_source_id": "source-b"}
+        )
+        budget = ContextBudget(
+            expansion_tokens=30,
+            max_expansions=2,
+            budget_aware_expansions=True,
+            source_diverse_expansions=True,
+        )
+
+        packed = ContextPacker(budget).pack(
+            expansions=[source_a_first, source_a_second, source_b]
+        )
+
+        assert packed.expansion_chunk_ids == [
+            source_a_first.chunk.chunk_id,
+            source_b.chunk.chunk_id,
+        ]
+
+    def test_query_aware_sentence_packing_keeps_best_matches_in_source_order(self):
+        result = _result(
+            "The garden is quiet today. "
+            "My deployment region is westus3. "
+            "The build uses twelve workers. "
+            "Nothing else changed."
+        )
+        budget = ContextBudget(
+            expansion_tokens=100,
+            query_aware_sentence_expansions=True,
+            max_sentences_per_expansion=2,
+        )
+
+        packed = ContextPacker(budget).pack(
+            expansions=[result],
+            user_text="Which deployment region and how many workers did I use?",
+        )
+
+        excerpt = packed.expansions[0]
+        assert "westus3" in excerpt
+        assert "twelve workers" in excerpt
+        assert "garden" not in excerpt
+        assert "Nothing else" not in excerpt
+        assert packed.expansion_chunk_ids == [result.chunk.chunk_id]
+
+    def test_query_aware_sentence_packing_preserves_dense_only_hit(self):
+        original = "A semantically relevant sentence. Another supporting sentence. Third."
+        budget = ContextBudget(query_aware_sentence_expansions=True)
+
+        packed = ContextPacker(budget).pack(
+            expansions=[_result(original)],
+            user_text="unmatched vocabulary",
+        )
+
+        assert original in packed.expansions[0]
+
+    def test_information_gain_packing_stops_before_low_signal_noise(self):
+        relevant = _result("The cerulean launch code is seven.").model_copy(
+            update={"score": 0.2, "memory_source_id": "source-relevant"}
+        )
+        noise = _result("Garden furniture and ordinary weather.").model_copy(
+            update={"score": 0.001, "memory_source_id": "source-noise"}
+        )
+        budget = ContextBudget(
+            expansion_tokens=100,
+            information_gain_expansions=True,
+            min_information_gain_per_token=0.005,
+        )
+
+        packed = ContextPacker(budget).pack(
+            expansions=[noise, relevant],
+            user_text="What is the cerulean launch code?",
+        )
+
+        assert packed.expansion_chunk_ids == [relevant.chunk.chunk_id]
+        assert packed.token_counts["expansions"] < budget.expansion_tokens
+
+    def test_information_gain_packing_retains_semantic_only_signal(self):
+        semantic = _result("A paraphrased but useful passage.").model_copy(
+            update={"score": 0.9}
+        )
+        budget = ContextBudget(
+            information_gain_expansions=True,
+            min_information_gain_per_token=0.005,
+        )
+
+        packed = ContextPacker(budget).pack(
+            expansions=[semantic],
+            user_text="unmatched query vocabulary",
+        )
+
+        assert packed.expansion_chunk_ids == [semantic.chunk.chunk_id]
+
+    def test_information_gain_zero_threshold_preserves_retrieval_order(self):
+        first = _result("First ranked evidence.").model_copy(
+            update={"score": 0.1, "memory_source_id": "source-a"}
+        )
+        second = _result("Second ranked evidence.").model_copy(
+            update={"score": 0.9, "memory_source_id": "source-b"}
+        )
+        budget = ContextBudget(
+            expansion_tokens=100,
+            information_gain_expansions=True,
+            min_information_gain_per_token=0.0,
+        )
+
+        packed = ContextPacker(budget).pack(
+            expansions=[first, second],
+            user_text="evidence",
+        )
+
+        assert packed.expansion_chunk_ids == [
+            first.chunk.chunk_id,
+            second.chunk.chunk_id,
+        ]
+
+    def test_information_gain_retains_more_for_multi_fact_query(self):
+        marginal = _result("A distinct supporting detail appears here.").model_copy(
+            update={"score": 0.05, "memory_source_id": "source-a"}
+        )
+        budget = ContextBudget(
+            expansion_tokens=100,
+            information_gain_expansions=True,
+            min_information_gain_per_token=0.0075,
+        )
+        packer = ContextPacker(budget)
+
+        singleton = packer.pack(
+            expansions=[marginal],
+            user_text="What happened?",
+        )
+        multi_fact = packer.pack(
+            expansions=[marginal],
+            user_text="List all items in order.",
+        )
+
+        assert singleton.expansion_chunk_ids == []
+        assert multi_fact.expansion_chunk_ids == [marginal.chunk.chunk_id]
+
     def test_each_expansion_truncated(self):
         budget = ContextBudget(max_expansion_tokens=10)
         packed = ContextPacker(budget).pack(expansions=[_result("word " * 200)])

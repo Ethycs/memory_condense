@@ -119,6 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Ingests and retrieves locally; makes no API calls"
         ),
     )
+    parser.add_argument(
+        "--sufficiency-audit",
+        metavar="BENCHMARK_FILE",
+        help=(
+            "Compare retrieved context with the benchmark's gold-source "
+            "oracle; deterministic by default, optional semantic judge"
+        ),
+    )
 
     # Models — import the defaults so the CLI can never drift from the schema.
     parser.add_argument(
@@ -144,6 +152,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--causal-store-cache",
+        type=Path,
+        help=(
+            "Content-addressed cache for learned sample-local causal graphs; "
+            "write-policy keyed and hash-verified on every hit"
+        ),
+    )
+    parser.add_argument(
         "--policy-manifest",
         type=Path,
         help="Frozen retrieval selection manifest; hash and config are verified",
@@ -161,6 +177,55 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--local-qwen-gpu-memory", default="4GiB")
     parser.add_argument("--local-qwen-cpu-memory", default="24GiB")
+    parser.add_argument(
+        "--qwen-rerank-model-dir",
+        type=Path,
+        help=(
+            "Use a bounded local Qwen prefix as a QK/OV candidate reranker; "
+            "requires --source-local-search and a compatible retrieval mode"
+        ),
+    )
+    parser.add_argument(
+        "--qwen-rerank-cav-report",
+        type=Path,
+        default=Path("eval_results/qwen3_prefix_cav_probe.json"),
+    )
+    parser.add_argument(
+        "--qwen-rerank-cav-vectors",
+        type=Path,
+        default=Path("eval_results/qwen3_prefix_cav_probe.safetensors"),
+    )
+    parser.add_argument("--qwen-rerank-prefix-layers", type=int, default=2)
+    parser.add_argument("--qwen-rerank-attention-layer", type=int, default=1)
+    parser.add_argument("--qwen-rerank-cav-layer", type=int, default=5)
+    parser.add_argument(
+        "--qwen-rerank-use-cav",
+        action="store_true",
+        help="Also capture the configured source CAV signature (off by default)",
+    )
+    parser.add_argument("--qwen-rerank-device", default="cuda")
+    parser.add_argument("--qwen-rerank-dtype", default="bfloat16")
+    parser.add_argument("--qwen-rerank-candidate-pool", type=int, default=64)
+    parser.add_argument("--qwen-rerank-slots", type=int, default=6)
+    parser.add_argument("--qwen-rerank-group-size", type=int, default=8)
+    parser.add_argument("--qwen-rerank-beam-per-group", type=int, default=2)
+    parser.add_argument("--qwen-rerank-candidate-tokens", type=int, default=64)
+    parser.add_argument("--qwen-rerank-query-tokens", type=int, default=96)
+    parser.add_argument("--qwen-rerank-score-weight", type=float, default=0.35)
+    parser.add_argument("--qwen-rerank-max-workspace-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--qwen-feedback",
+        action="store_true",
+        help=(
+            "Attend over first-round evidence and use it for one bounded "
+            "second retrieval round instead of direct Qwen reranking"
+        ),
+    )
+    parser.add_argument("--qwen-feedback-candidate-pool", type=int, default=32)
+    parser.add_argument("--qwen-feedback-seed-slots", type=int, default=6)
+    parser.add_argument("--qwen-feedback-slots", type=int, default=12)
+    parser.add_argument("--qwen-feedback-evidence-tokens", type=int, default=48)
+    parser.add_argument("--qwen-feedback-query-tokens", type=int, default=384)
 
     parser.add_argument(
         "--results-dir", default="./eval_results", help="Output directory"
@@ -176,6 +241,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Limit number of benchmark samples evaluated",
+    )
+    parser.add_argument(
+        "--stress-context-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Combine complete benchmark histories into one memory containing "
+            "at least this many content tokens before answer-recall"
+        ),
+    )
+    parser.add_argument(
+        "--stress-questions",
+        type=int,
+        default=10,
+        help="Questions issued against a combined context-stress memory",
+    )
+    parser.add_argument(
+        "--sample-offset",
+        type=int,
+        default=0,
+        help=(
+            "Skip this many samples after locked-split selection; enables "
+            "non-overlapping resumable/parallel benchmark shards"
+        ),
     )
     parser.add_argument(
         "--recent-window",
@@ -244,6 +333,8 @@ def build_parser() -> argparse.ArgumentParser:
             "hybrid_source",
             "hybrid_graph",
             "hybrid_neighbor",
+            "causal_consolidation",
+            "causal_graph",
         ],
         default="dense",
         help=(
@@ -254,7 +345,9 @@ def build_parser() -> argparse.ArgumentParser:
             "provenance sources/sessions, hybrid-anchored source expansion, "
             "bounded reranking inside hybrid-activated sources, their "
             "transition/source graph union, "
-            "or bounded source-local expansion around hybrid anchors"
+            "bounded source-local expansion around hybrid anchors, or a "
+            "sample-local causal consolidation graph, or its bounded "
+            "transition/source-union candidate front end"
         ),
     )
     parser.add_argument(
@@ -292,6 +385,42 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Pool prefix allowed to activate source links (default: --k)",
     )
+    parser.add_argument(
+        "--source-tfisf-activation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add bounded live TF-ISF source activation (default false)",
+    )
+    parser.add_argument("--source-tfisf-slots", type=int, default=8)
+    parser.add_argument(
+        "--source-hsc-activation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Expand source seeds through bounded pairwise contraction",
+    )
+    parser.add_argument("--source-hsc-slots", type=int, default=8)
+    parser.add_argument("--source-hsc-hops", type=int, default=2)
+    parser.add_argument("--source-hsc-chunk-slots", type=int, default=8)
+    parser.add_argument(
+        "--source-local-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Search inside activated sources instead of filtering the global "
+            "candidate pool (default false for historical-arm reproducibility)"
+        ),
+    )
+    parser.add_argument(
+        "--source-partition-routing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Route through hierarchical partition::source IDs before chunk "
+            "competition (default false)"
+        ),
+    )
+    parser.add_argument("--source-partition-slots", type=int, default=3)
+    parser.add_argument("--source-partition-separator", default="::")
     parser.add_argument(
         "--neighbor-radius",
         type=int,
@@ -336,6 +465,55 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Memory items requested for the header in --mode memory",
     )
+    parser.add_argument("--consolidation-chunk-slots", type=int, default=3)
+    parser.add_argument("--consolidation-hops", type=int, default=2)
+    parser.add_argument("--consolidation-candidates", type=int, default=128)
+    parser.add_argument("--consolidation-diffusion-width", type=int, default=32)
+    parser.add_argument("--consolidation-min-count", type=int, default=2)
+    parser.add_argument("--consolidation-expansion-tokens", type=int, default=1600)
+    parser.add_argument(
+        "--consolidation-training-expansion-tokens",
+        type=int,
+        default=1600,
+    )
+    parser.add_argument("--consolidation-training-k", type=int, default=10)
+    parser.add_argument("--consolidation-max-event-nodes", type=int, default=9)
+    parser.add_argument("--consolidation-new-event-nodes", type=int, default=5)
+    parser.add_argument(
+        "--consolidation-max-training-prompt-tokens",
+        type=int,
+        default=128,
+    )
+    parser.add_argument(
+        "--consolidation-budget-aware-packing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--consolidation-source-diverse-packing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--consolidation-query-aware-sentence-packing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--consolidation-max-sentences-per-expansion",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--consolidation-information-gain-packing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--consolidation-min-information-gain-per-token",
+        type=float,
+        default=0.0,
+    )
 
     return parser
 
@@ -343,6 +521,8 @@ def build_parser() -> argparse.ArgumentParser:
 def config_from_args(args: argparse.Namespace) -> EvalConfig:
     # --hybrid predates --mode and is kept so the commands in
     # `docs/02 - Implementation/01` keep working.
+    if args.qwen_feedback and not args.qwen_rerank_model_dir:
+        raise ValueError("--qwen-feedback requires --qwen-rerank-model-dir")
     mode = "hybrid" if args.hybrid and args.mode == "dense" else args.mode
     return EvalConfig(
         chunker=ChunkerConfig(min_tokens=args.min_tokens, max_tokens=args.max_tokens),
@@ -361,15 +541,92 @@ def config_from_args(args: argparse.Namespace) -> EvalConfig:
             source_slots=args.source_slots,
             source_candidate_pool=args.source_candidate_pool,
             source_activation_k=args.source_activation_k,
+            source_tfisf_activation=args.source_tfisf_activation,
+            source_tfisf_slots=args.source_tfisf_slots,
+            source_hsc_activation=args.source_hsc_activation,
+            source_hsc_slots=args.source_hsc_slots,
+            source_hsc_hops=args.source_hsc_hops,
+            source_hsc_chunk_slots=args.source_hsc_chunk_slots,
+            source_local_search=args.source_local_search,
+            source_partition_routing=args.source_partition_routing,
+            source_partition_slots=args.source_partition_slots,
+            source_partition_separator=args.source_partition_separator,
+            qwen_rerank=(
+                bool(args.qwen_rerank_model_dir) and not args.qwen_feedback
+            ),
+            qwen_rerank_candidate_pool=args.qwen_rerank_candidate_pool,
+            qwen_rerank_slots=args.qwen_rerank_slots,
+            qwen_rerank_group_size=args.qwen_rerank_group_size,
+            qwen_rerank_beam_per_group=args.qwen_rerank_beam_per_group,
+            qwen_rerank_candidate_tokens=args.qwen_rerank_candidate_tokens,
+            qwen_rerank_query_tokens=args.qwen_rerank_query_tokens,
+            qwen_rerank_score_weight=args.qwen_rerank_score_weight,
+            qwen_rerank_model=(
+                args.qwen_rerank_model_dir.name
+                if args.qwen_rerank_model_dir
+                else ""
+            ),
+            qwen_rerank_prefix_layers=args.qwen_rerank_prefix_layers,
+            qwen_rerank_attention_layer=args.qwen_rerank_attention_layer,
+            qwen_rerank_use_cav=args.qwen_rerank_use_cav,
+            qwen_rerank_cav_layer=args.qwen_rerank_cav_layer,
+            qwen_rerank_max_workspace_tokens=(
+                args.qwen_rerank_max_workspace_tokens
+            ),
+            qwen_feedback=args.qwen_feedback,
+            qwen_feedback_candidate_pool=args.qwen_feedback_candidate_pool,
+            qwen_feedback_seed_slots=args.qwen_feedback_seed_slots,
+            qwen_feedback_slots=args.qwen_feedback_slots,
+            qwen_feedback_evidence_tokens=args.qwen_feedback_evidence_tokens,
+            qwen_feedback_query_tokens=args.qwen_feedback_query_tokens,
             neighbor_radius=args.neighbor_radius,
             neighbor_slots=args.neighbor_slots,
             neighbor_replacement_slots=args.neighbor_replacement_slots,
             neighbor_direction=args.neighbor_direction,
+            consolidation_chunk_slots=args.consolidation_chunk_slots,
+            consolidation_hops=args.consolidation_hops,
+            consolidation_candidates=args.consolidation_candidates,
+            consolidation_diffusion_width=args.consolidation_diffusion_width,
+            consolidation_min_count=args.consolidation_min_count,
+            consolidation_expansion_tokens=args.consolidation_expansion_tokens,
+            consolidation_training_expansion_tokens=(
+                args.consolidation_training_expansion_tokens
+            ),
+            consolidation_budget_aware_packing=(
+                args.consolidation_budget_aware_packing
+            ),
+            consolidation_source_diverse_packing=(
+                args.consolidation_source_diverse_packing
+            ),
+            consolidation_query_aware_sentence_packing=(
+                args.consolidation_query_aware_sentence_packing
+            ),
+            consolidation_max_sentences_per_expansion=(
+                args.consolidation_max_sentences_per_expansion
+            ),
+            consolidation_information_gain_packing=(
+                args.consolidation_information_gain_packing
+            ),
+            consolidation_min_information_gain_per_token=(
+                args.consolidation_min_information_gain_per_token
+            ),
+            consolidation_training_k=args.consolidation_training_k,
+            consolidation_max_event_nodes=args.consolidation_max_event_nodes,
+            consolidation_new_event_nodes=args.consolidation_new_event_nodes,
+            consolidation_max_training_prompt_tokens=(
+                args.consolidation_max_training_prompt_tokens
+            ),
         ),
         judge_model=args.judge_model,
         responder_model=args.responder_model,
         embedding_device=args.embedding_device,
-        conversation_dir=args.conversation_dir or args.benchmark_file or "",
+        conversation_dir=(
+            args.conversation_dir
+            or args.benchmark_file
+            or args.answer_recall
+            or args.sufficiency_audit
+            or ""
+        ),
         results_dir=args.results_dir,
         max_conversations=args.max_conversations,
         recent_window=args.recent_window,
@@ -450,6 +707,35 @@ def _make_judge_fn(model: str, *, retries: int = 0):
     return judge_fn
 
 
+def _make_sufficiency_fn(model: str, *, retries: int = 0):
+    """Judge whether excerpts can derive the gold answer, not an answer string."""
+
+    import litellm
+
+    from memory_condense.eval.sufficiency import build_sufficiency_prompt
+
+    def sufficiency_fn(
+        question: str,
+        gold: str,
+        context: list[str],
+    ) -> tuple[bool, str, UsageStats]:
+        started = time.perf_counter()
+        response = litellm.completion(
+            model=model,
+            messages=build_sufficiency_prompt(question, gold, context),
+            max_tokens=JUDGE_MAX_TOKENS,
+            num_retries=retries,
+        )
+        verdict = _content(response)
+        return (
+            verdict.upper().startswith("SUFFICIENT"),
+            verdict,
+            UsageStats.from_litellm(response, time.perf_counter() - started),
+        )
+
+    return sufficiency_fn
+
+
 def _apply_locked_split(args: argparse.Namespace, samples):
     manifest_path = args.benchmark_split_manifest
     split = args.benchmark_split
@@ -459,7 +745,9 @@ def _apply_locked_split(args: argparse.Namespace, samples):
         )
     if not manifest_path:
         return samples
-    dataset_path = args.answer_recall or args.benchmark_file
+    dataset_path = (
+        args.answer_recall or args.sufficiency_audit or args.benchmark_file
+    )
     manifest = load_split_manifest(manifest_path)
     selected = select_locked_split(
         samples,
@@ -472,6 +760,20 @@ def _apply_locked_split(args: argparse.Namespace, samples):
         f"(dataset sha256 {manifest.dataset_sha256[:12]}...)"
     )
     return selected
+
+
+def _apply_sample_offset(args: argparse.Namespace, samples):
+    offset = int(args.sample_offset)
+    if offset < 0:
+        raise ValueError("--sample-offset must be non-negative")
+    if offset >= len(samples) and offset:
+        raise ValueError(
+            f"--sample-offset {offset} is outside the {len(samples)} samples"
+        )
+    if offset:
+        print(f"Sample shard starts at locked-split offset {offset}")
+        return samples[offset:]
+    return samples
 
 
 def _planned_provider_calls(
@@ -523,7 +825,11 @@ def _verified_policy_sha256(
         "chunker_min_tokens": config.chunker.min_tokens,
         "chunker_max_tokens": config.chunker.max_tokens,
     }
-    if config.retrieval.mode in {"hybrid_source", "hybrid_graph"}:
+    if config.retrieval.mode in {
+        "hybrid_source",
+        "hybrid_graph",
+        "causal_graph",
+    }:
         expected.update(
             {
                 "source_slots": config.retrieval.source_slots,
@@ -533,14 +839,265 @@ def _verified_policy_sha256(
                 "source_candidate_pool": config.retrieval.source_candidate_pool,
             }
         )
-    if config.retrieval.mode == "hybrid_graph":
+        if config.retrieval.source_local_search:
+            expected["source_local_search"] = True
+        if config.retrieval.source_tfisf_activation:
+            expected["source_tfisf_activation"] = True
+            expected["source_tfisf_slots"] = config.retrieval.source_tfisf_slots
+        if config.retrieval.source_hsc_activation:
+            expected.update(
+                {
+                    "source_hsc_activation": True,
+                    "source_hsc_slots": config.retrieval.source_hsc_slots,
+                    "source_hsc_hops": config.retrieval.source_hsc_hops,
+                    "source_hsc_chunk_slots": (
+                        config.retrieval.source_hsc_chunk_slots
+                    ),
+                }
+            )
+        if config.retrieval.source_partition_routing:
+            expected.update(
+                {
+                    "source_partition_routing": True,
+                    "source_partition_slots": (
+                        config.retrieval.source_partition_slots
+                    ),
+                    "source_partition_separator": (
+                        config.retrieval.source_partition_separator
+                    ),
+                }
+            )
+        if config.retrieval.qwen_rerank:
+            expected.update(
+                {
+                    "qwen_rerank": True,
+                    "qwen_rerank_candidate_pool": (
+                        config.retrieval.qwen_rerank_candidate_pool
+                    ),
+                    "qwen_rerank_slots": config.retrieval.qwen_rerank_slots,
+                    "qwen_rerank_group_size": (
+                        config.retrieval.qwen_rerank_group_size
+                    ),
+                    "qwen_rerank_beam_per_group": (
+                        config.retrieval.qwen_rerank_beam_per_group
+                    ),
+                    "qwen_rerank_candidate_tokens": (
+                        config.retrieval.qwen_rerank_candidate_tokens
+                    ),
+                    "qwen_rerank_query_tokens": (
+                        config.retrieval.qwen_rerank_query_tokens
+                    ),
+                    "qwen_rerank_score_weight": (
+                        config.retrieval.qwen_rerank_score_weight
+                    ),
+                    "qwen_rerank_model": config.retrieval.qwen_rerank_model,
+                    "qwen_rerank_prefix_layers": (
+                        config.retrieval.qwen_rerank_prefix_layers
+                    ),
+                    "qwen_rerank_attention_layer": (
+                        config.retrieval.qwen_rerank_attention_layer
+                    ),
+                    "qwen_rerank_use_cav": config.retrieval.qwen_rerank_use_cav,
+                    "qwen_rerank_cav_layer": (
+                        config.retrieval.qwen_rerank_cav_layer
+                    ),
+                    "qwen_rerank_max_workspace_tokens": (
+                        config.retrieval.qwen_rerank_max_workspace_tokens
+                    ),
+                }
+            )
+        if config.retrieval.qwen_feedback:
+            expected.update(
+                {
+                    "qwen_feedback": True,
+                    "qwen_feedback_candidate_pool": (
+                        config.retrieval.qwen_feedback_candidate_pool
+                    ),
+                    "qwen_feedback_seed_slots": (
+                        config.retrieval.qwen_feedback_seed_slots
+                    ),
+                    "qwen_feedback_slots": config.retrieval.qwen_feedback_slots,
+                    "qwen_feedback_evidence_tokens": (
+                        config.retrieval.qwen_feedback_evidence_tokens
+                    ),
+                    "qwen_feedback_query_tokens": (
+                        config.retrieval.qwen_feedback_query_tokens
+                    ),
+                    "qwen_rerank_group_size": (
+                        config.retrieval.qwen_rerank_group_size
+                    ),
+                    "qwen_rerank_beam_per_group": (
+                        config.retrieval.qwen_rerank_beam_per_group
+                    ),
+                    "qwen_rerank_candidate_tokens": (
+                        config.retrieval.qwen_rerank_candidate_tokens
+                    ),
+                    "qwen_rerank_query_tokens": (
+                        config.retrieval.qwen_rerank_query_tokens
+                    ),
+                    "qwen_rerank_model": config.retrieval.qwen_rerank_model,
+                    "qwen_rerank_prefix_layers": (
+                        config.retrieval.qwen_rerank_prefix_layers
+                    ),
+                    "qwen_rerank_attention_layer": (
+                        config.retrieval.qwen_rerank_attention_layer
+                    ),
+                    "qwen_rerank_use_cav": config.retrieval.qwen_rerank_use_cav,
+                    "qwen_rerank_cav_layer": (
+                        config.retrieval.qwen_rerank_cav_layer
+                    ),
+                    "qwen_rerank_max_workspace_tokens": (
+                        config.retrieval.qwen_rerank_max_workspace_tokens
+                    ),
+                }
+            )
+    if config.retrieval.mode in {"hybrid_graph", "causal_graph"}:
         expected["neighbor_direction"] = config.retrieval.neighbor_direction
+    if config.retrieval.mode in {"causal_consolidation", "causal_graph"}:
+        expected.update(
+            {
+                "consolidation_chunk_slots": (
+                    config.retrieval.consolidation_chunk_slots
+                ),
+                "consolidation_hops": config.retrieval.consolidation_hops,
+                "consolidation_candidates": (
+                    config.retrieval.consolidation_candidates
+                ),
+                "consolidation_diffusion_width": (
+                    config.retrieval.consolidation_diffusion_width
+                ),
+                "consolidation_min_count": (
+                    config.retrieval.consolidation_min_count
+                ),
+                "consolidation_expansion_tokens": (
+                    config.retrieval.consolidation_expansion_tokens
+                ),
+                "consolidation_training_expansion_tokens": (
+                    config.retrieval.consolidation_training_expansion_tokens
+                ),
+                "consolidation_budget_aware_packing": (
+                    config.retrieval.consolidation_budget_aware_packing
+                ),
+                "consolidation_training_k": (
+                    config.retrieval.consolidation_training_k
+                ),
+                "consolidation_max_event_nodes": (
+                    config.retrieval.consolidation_max_event_nodes
+                ),
+                "consolidation_new_event_nodes": (
+                    config.retrieval.consolidation_new_event_nodes
+                ),
+                "consolidation_max_training_prompt_tokens": (
+                    config.retrieval.consolidation_max_training_prompt_tokens
+                ),
+            }
+        )
+        if config.retrieval.consolidation_source_diverse_packing:
+            expected["consolidation_source_diverse_packing"] = True
+        if config.retrieval.consolidation_query_aware_sentence_packing:
+            expected["consolidation_query_aware_sentence_packing"] = True
+            expected["consolidation_max_sentences_per_expansion"] = (
+                config.retrieval.consolidation_max_sentences_per_expansion
+            )
+        if config.retrieval.consolidation_information_gain_packing:
+            expected["consolidation_information_gain_packing"] = True
+            expected["consolidation_min_information_gain_per_token"] = (
+                config.retrieval.consolidation_min_information_gain_per_token
+            )
     if retrieval != expected:
         raise ValueError(
             f"policy manifest retrieval config mismatch: expected {retrieval}, "
             f"got {expected}"
         )
     return file_sha256(path)
+
+
+def _benchmark_ingest_fn(args: argparse.Namespace, config: EvalConfig):
+    """Select an isolated benchmark writer without mutating compiled stores."""
+
+    if config.retrieval.mode in {"causal_consolidation", "causal_graph"}:
+        from memory_condense.eval.causal_benchmark import (
+            causal_consolidation_ingest_fn,
+        )
+
+        return causal_consolidation_ingest_fn(
+            args.compiled_store_cache,
+            causal_cache_root=args.causal_store_cache,
+            device=config.embedding_device,
+        )
+    if args.compiled_store_cache:
+        return compiled_store_ingest_fn(
+            args.compiled_store_cache,
+            device=config.embedding_device,
+        )
+    return ingest_sample
+
+
+def _load_candidate_reranker(args: argparse.Namespace, config: EvalConfig):
+    """Load one shared, bounded Qwen control plane for a benchmark run."""
+
+    if not (config.retrieval.qwen_rerank or config.retrieval.qwen_feedback):
+        return None
+    if args.qwen_rerank_model_dir is None:
+        raise ValueError("Qwen attention requires --qwen-rerank-model-dir")
+    from memory_condense.qwen_consolidation import load_qwen_linker
+    from memory_condense.qwen_rerank import QwenCandidateReranker
+
+    print(f"Loading bounded Qwen reranker from {args.qwen_rerank_model_dir}...")
+    linker = load_qwen_linker(
+        args.qwen_rerank_model_dir,
+        prefix_layers=config.retrieval.qwen_rerank_prefix_layers,
+        attention_layer=config.retrieval.qwen_rerank_attention_layer,
+        cav_report=(
+            args.qwen_rerank_cav_report
+            if config.retrieval.qwen_rerank_use_cav
+            else None
+        ),
+        cav_vectors=(
+            args.qwen_rerank_cav_vectors
+            if config.retrieval.qwen_rerank_use_cav
+            else None
+        ),
+        cav_layer=config.retrieval.qwen_rerank_cav_layer,
+        device=args.qwen_rerank_device,
+        dtype=args.qwen_rerank_dtype,
+        max_candidates=8,
+        max_workspace_tokens=config.retrieval.qwen_rerank_max_workspace_tokens,
+    )
+    return QwenCandidateReranker(
+        linker,
+        candidate_pool=(
+            config.retrieval.qwen_feedback_candidate_pool
+            if config.retrieval.qwen_feedback
+            else config.retrieval.qwen_rerank_candidate_pool
+        ),
+        qwen_slots=(
+            config.retrieval.qwen_feedback_seed_slots
+            if config.retrieval.qwen_feedback
+            else config.retrieval.qwen_rerank_slots
+        ),
+        group_size=config.retrieval.qwen_rerank_group_size,
+        beam_per_group=config.retrieval.qwen_rerank_beam_per_group,
+        candidate_tokens=config.retrieval.qwen_rerank_candidate_tokens,
+        query_tokens=(
+            config.retrieval.qwen_feedback_query_tokens
+            if config.retrieval.qwen_feedback
+            else config.retrieval.qwen_rerank_query_tokens
+        ),
+        score_weight=config.retrieval.qwen_rerank_score_weight,
+    )
+
+
+def _attach_candidate_reranker(ingest_fn, reranker):
+    if reranker is None:
+        return ingest_fn
+
+    def attached(sample, config, data_dir):
+        condenser = ingest_fn(sample, config, data_dir)
+        condenser.set_source_candidate_reranker(reranker)
+        return condenser
+
+    return attached
 
 
 def run_compare(args: argparse.Namespace) -> None:
@@ -568,27 +1125,51 @@ def run_answer_recall(args: argparse.Namespace) -> None:
         print("No samples parsed. Check --benchmark-format.")
         return
 
-    samples = _apply_locked_split(args, samples)
+    samples = _apply_sample_offset(args, _apply_locked_split(args, samples))
+    stress_tokens = getattr(args, "stress_context_tokens", None)
+    if stress_tokens is not None:
+        from memory_condense.eval.context_stress import (
+            compose_context_stress_sample,
+            transcript_tokens,
+        )
+
+        samples = [
+            compose_context_stress_sample(
+                samples,
+                target_tokens=stress_tokens,
+                max_questions=getattr(args, "stress_questions", 10),
+            )
+        ]
+        actual_tokens = transcript_tokens(samples[0])
+        print(
+            f"Context stress memory: {actual_tokens:,} tokens, "
+            f"{len(samples[0].turns):,} turns, "
+            f"{len(samples[0].questions)} questions"
+        )
+    if args.qwen_rerank_model_dir and args.embedding_device is None:
+        # Keep the GPU for the attention slice; BGE remains functional on CPU.
+        args.embedding_device = "cpu"
     config = config_from_args(args)
     print(
         f"{len(samples)} sample(s); measuring "
         f"{args.max_samples or len(samples)} in {config.retrieval.mode} mode. "
         "No API calls will be made."
     )
-    report = run_recall(
-        samples,
-        config,
-        benchmark=Path(args.answer_recall).stem,
-        max_samples=args.max_samples,
-        ingest_fn=(
-            compiled_store_ingest_fn(
-                args.compiled_store_cache,
-                device=config.embedding_device,
-            )
-            if args.compiled_store_cache
-            else ingest_sample
-        ),
-    )
+    reranker = _load_candidate_reranker(args, config)
+    try:
+        report = run_recall(
+            samples,
+            config,
+            benchmark=Path(args.answer_recall).stem,
+            max_samples=1 if stress_tokens is not None else args.max_samples,
+            ingest_fn=_attach_candidate_reranker(
+                _benchmark_ingest_fn(args, config),
+                reranker,
+            ),
+        )
+    finally:
+        if reranker is not None:
+            reranker.close()
     print_recall_report(report)
 
     if args.csv:
@@ -598,6 +1179,7 @@ def run_answer_recall(args: argparse.Namespace) -> None:
             [
                 "question_id",
                 "category",
+                "in_haystack",
                 "in_context",
                 "best_f1",
                 "in_header",
@@ -606,6 +1188,21 @@ def run_answer_recall(args: argparse.Namespace) -> None:
                 "evidence_source_recall",
                 "all_evidence_sources",
                 "retrieved_source_ids",
+                "direct_chunks",
+                "consolidation_chunks",
+                "causal_events",
+                "causal_graph_edges",
+                "causal_write_s",
+                "qwen_rerank_passes",
+                "qwen_candidate_inspections",
+                "qwen_max_workspace_candidates",
+                "qwen_max_workspace_tokens",
+                "qwen_candidates_added",
+                "qwen_feedback_rounds",
+                "qwen_feedback_seed_sources",
+                "qwen_feedback_candidates_added",
+                "qwen_feedback_activation_candidates",
+                "qwen_feedback_query_tokens",
             ]
         )
         for question in report.questions:
@@ -613,6 +1210,7 @@ def run_answer_recall(args: argparse.Namespace) -> None:
                 [
                     question.question_id,
                     question.category,
+                    int(question.in_haystack),
                     int(question.in_context),
                     f"{question.best_f1:.4f}",
                     int(question.in_memory_header),
@@ -625,10 +1223,138 @@ def run_answer_recall(args: argparse.Namespace) -> None:
                         int(question.all_evidence_sources)
                     ),
                     "|".join(question.retrieved_source_ids),
+                    question.direct_chunks,
+                    question.consolidation_chunks,
+                    question.causal_events,
+                    question.causal_graph_edges,
+                    f"{question.causal_write_s:.4f}",
+                    question.qwen_rerank_passes,
+                    question.qwen_candidate_inspections,
+                    question.qwen_max_workspace_candidates,
+                    question.qwen_max_workspace_tokens,
+                    question.qwen_candidates_added,
+                    question.qwen_feedback_rounds,
+                    question.qwen_feedback_seed_sources,
+                    question.qwen_feedback_candidates_added,
+                    question.qwen_feedback_activation_candidates,
+                    question.qwen_feedback_query_tokens,
                 ]
             )
         Path(args.csv).write_text(output.getvalue(), encoding="utf-8")
         print(f"Per-question CSV written to {args.csv}")
+
+
+def run_sufficiency_mode(args: argparse.Namespace) -> None:
+    """Audit retrieval separately from whether labelled evidence is answerable."""
+
+    from memory_condense.eval.sufficiency import (
+        print_sufficiency_report,
+        run_sufficiency_audit,
+    )
+
+    print(f"Loading benchmark from {args.sufficiency_audit}...")
+    samples = load_benchmark(args.sufficiency_audit, args.benchmark_format)
+    if not samples:
+        print("No samples parsed. Check --benchmark-format.")
+        return
+    samples = _apply_sample_offset(args, _apply_locked_split(args, samples))
+    selected = samples[: args.max_samples] if args.max_samples is not None else samples
+    labeled_questions = sum(
+        bool(question.evidence_sources)
+        for sample in selected
+        for question in sample.questions
+    )
+    planned_calls = 2 * labeled_questions if args.use_judge else 0
+    remote_calls = 0 if args.local_qwen_model_dir else planned_calls
+    if remote_calls > args.max_provider_calls:
+        raise ValueError(
+            f"planned remote provider calls ({remote_calls}) exceed "
+            f"--max-provider-calls ({args.max_provider_calls}); explicit "
+            "authorization is required"
+        )
+    if args.qwen_rerank_model_dir and args.local_qwen_model_dir and args.use_judge:
+        raise ValueError(
+            "the full local judge and prefix reranker cannot share this GPU in "
+            "one process; run the deterministic retrieval audit first"
+        )
+    if args.qwen_rerank_model_dir and args.embedding_device is None:
+        args.embedding_device = "cpu"
+    config = config_from_args(args)
+    policy_hash = _verified_policy_sha256(
+        args.policy_manifest,
+        config=config,
+        dataset_sha256=file_sha256(args.sufficiency_audit),
+        split_manifest=args.benchmark_split_manifest,
+    )
+    if policy_hash:
+        print(f"Verified retrieval policy sha256 {policy_hash[:12]}...")
+
+    local_judge = None
+    sufficiency_fn = None
+    if args.use_judge and args.local_qwen_model_dir:
+        from memory_condense.eval.local_qwen import LocalQwenAnswerer
+
+        local_judge = LocalQwenAnswerer(
+            args.local_qwen_model_dir,
+            max_new_tokens=args.local_qwen_max_new_tokens,
+            gpu_memory=args.local_qwen_gpu_memory,
+            cpu_memory=args.local_qwen_cpu_memory,
+        )
+
+        from memory_condense.eval.sufficiency import build_sufficiency_prompt
+
+        def local_sufficiency(question, gold, context):
+            started = time.perf_counter()
+            verdict = local_judge(
+                build_sufficiency_prompt(question, gold, context)
+            )
+            return (
+                verdict.upper().startswith("SUFFICIENT"),
+                verdict,
+                UsageStats(calls=1, elapsed_s=time.perf_counter() - started),
+            )
+
+        sufficiency_fn = local_sufficiency
+    elif args.use_judge:
+        sufficiency_fn = _make_sufficiency_fn(
+            args.judge_model,
+            retries=args.provider_retries,
+        )
+
+    reranker = None
+    try:
+        reranker = _load_candidate_reranker(args, config)
+        report = run_sufficiency_audit(
+            samples,
+            config,
+            benchmark=Path(args.sufficiency_audit).stem,
+            max_samples=args.max_samples,
+            ingest_fn=_attach_candidate_reranker(
+                _benchmark_ingest_fn(args, config),
+                reranker,
+            ),
+            sufficiency_fn=sufficiency_fn,
+        )
+    finally:
+        if reranker is not None:
+            reranker.close()
+        if local_judge is not None:
+            local_judge.close()
+
+    print_sufficiency_report(report)
+    if args.csv:
+        rows = [row.model_dump(mode="json") for row in report.questions]
+        output = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+            writer.writeheader()
+            for row in rows:
+                row["expected_source_ids"] = "|".join(row["expected_source_ids"])
+                row["retrieved_source_ids"] = "|".join(row["retrieved_source_ids"])
+                row["judge_usage"] = json.dumps(row["judge_usage"], sort_keys=True)
+                writer.writerow(row)
+        Path(args.csv).write_text(output.getvalue(), encoding="utf-8")
+        print(f"Per-question sufficiency CSV written to {args.csv}")
 
 
 def run_benchmark_mode(args: argparse.Namespace) -> None:
@@ -638,7 +1364,7 @@ def run_benchmark_mode(args: argparse.Namespace) -> None:
         print("No benchmark samples found.")
         sys.exit(1)
 
-    samples = _apply_locked_split(args, samples)
+    samples = _apply_sample_offset(args, _apply_locked_split(args, samples))
     questions = sum(len(s.questions) for s in samples)
     print(f"Loaded {len(samples)} samples / {questions} questions")
 
@@ -664,6 +1390,8 @@ def run_benchmark_mode(args: argparse.Namespace) -> None:
         )
 
     local_answerer = None
+    if args.qwen_rerank_model_dir and args.embedding_device is None:
+        args.embedding_device = "cpu"
     if args.local_qwen_model_dir:
         from memory_condense.eval.local_qwen import LocalQwenAnswerer
 
@@ -693,7 +1421,9 @@ def run_benchmark_mode(args: argparse.Namespace) -> None:
         dataset_sha256=dataset_hash,
         split_manifest=args.benchmark_split_manifest,
     )
+    reranker = None
     try:
+        reranker = _load_candidate_reranker(args, config)
         result = run_benchmark(
             samples,
             config,
@@ -716,13 +1446,9 @@ def run_benchmark_mode(args: argparse.Namespace) -> None:
             # Label the run with the dataset, not the --benchmark-format flag, which
             # defaults to "auto" and would name every report benchmark_auto_*.json.
             benchmark=Path(args.benchmark_file).stem,
-            ingest_fn=(
-                compiled_store_ingest_fn(
-                    args.compiled_store_cache,
-                    device=config.embedding_device,
-                )
-                if args.compiled_store_cache
-                else ingest_sample
+            ingest_fn=_attach_candidate_reranker(
+                _benchmark_ingest_fn(args, config),
+                reranker,
             ),
             verbose=True,
             dataset_sha256=dataset_hash,
@@ -733,6 +1459,8 @@ def run_benchmark_mode(args: argparse.Namespace) -> None:
             policy_manifest_sha256=policy_hash,
         )
     finally:
+        if reranker is not None:
+            reranker.close()
         if local_answerer is not None:
             print(
                 f"Local responder: {local_answerer.calls} calls in "
@@ -779,27 +1507,30 @@ def main() -> None:
     modes = [
         bool(args.compare),
         bool(args.answer_recall),
+        bool(args.sufficiency_audit),
         bool(args.benchmark_file),
         bool(args.conversation_dir),
     ]
     if sum(modes) > 1:
         parser.error(
-            "--compare, --answer-recall, --benchmark-file, and --conversation-dir "
-            "are mutually exclusive"
+            "--compare, --answer-recall, --sufficiency-audit, --benchmark-file, "
+            "and --conversation-dir are mutually exclusive"
         )
 
     if args.compare:
         run_compare(args)
     elif args.answer_recall:
         run_answer_recall(args)
+    elif args.sufficiency_audit:
+        run_sufficiency_mode(args)
     elif args.benchmark_file:
         run_benchmark_mode(args)
     elif args.conversation_dir:
         run_replay_mode(args)
     else:
         parser.error(
-            "one of --conversation-dir, --benchmark-file, --compare, or "
-            "--answer-recall is required"
+            "one of --conversation-dir, --benchmark-file, --compare, "
+            "--answer-recall, or --sufficiency-audit is required"
         )
 
 

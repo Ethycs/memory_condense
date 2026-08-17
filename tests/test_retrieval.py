@@ -130,6 +130,18 @@ def test_source_query_empty_or_zero(retriever):
     assert retriever.source_query(_vector_query({0: 1.0}), k_sources=0) == []
 
 
+def test_source_ids_in_partitions_preserves_provenance_order(db, retriever):
+    store = TranscriptStore(db)
+    store.append("user", "one", source_id="alpha::session-2")
+    store.append("user", "two", source_id="beta::session-1")
+    store.append("user", "three", source_id="alpha::session-1")
+
+    assert retriever.source_ids_in_partitions(["alpha"]) == [
+        "alpha::session-2",
+        "alpha::session-1",
+    ]
+
+
 def test_hydrate_sources_round_robins_selected_source_chunks(db, retriever):
     store = TranscriptStore(db)
     a1 = store.append("user", "alpha first", source_id="session-a")

@@ -110,6 +110,25 @@ provider-agnostic, while public common-benchmark validation remains open.
   while a separately bounded ranked prefix activates source IDs. Lower-ranked
   chunks may enter only through those source IDs. This separates evidence
   discovery from the number of chunks immediately returned.
+- **Partition-local source search** — the opt-in `source_local_search` strategy
+  streams every durable embedding in each activated source instead of filtering
+  the global ANN pool. Dense and BM25 candidate buffers are bounded per source;
+  text is hydrated only for the final rank. Scores are normalized once across
+  the activated-source union. Per-source normalization is intentionally
+  forbidden here because it makes every weak partition manufacture a
+  top-scoring chunk and was measured to displace temporal evidence.
+- **TF-ISF source activation** — an opt-in lexical route treats each durable
+  source/session as an aggregate document. BM25-style term frequency and
+  inverse source frequency select a bounded set of source IDs; only candidates
+  already inside the bounded retrieval pool can be admitted. The live index
+  caches aggregate source lengths, not text or postings outside the existing
+  chunk index.
+- **Lazy source contraction** — `SourceContractionIndex` builds a transient,
+  partition-local HSC-style hierarchy from source-centroid embeddings. Internal
+  nodes contain child pointers, a derived centroid, level, and member count—no
+  transcript text or transformer state. Query-seeded reads ascend from active
+  source leaves and inspect bounded siblings; writes invalidate the hierarchy
+  and the next read reconstructs it from authoritative chunk embeddings.
 - **`add_chunks`** writes the dense index, persists the embedding, **populates `chunks.lexical_weights`** with the chunk's term-frequency map, and feeds the same chunks to the BM25 index. The column that was always NULL is now real.
 - **`delete_chunk(chunk_id)`** — clears embedding + `hnsw_label` in SQLite (authoritative), marks the label deleted in the live hnswlib graph best-effort, and drops the BM25 postings. The chunk **row** survives so memory provenance pointing at it cannot dangle.
 - **Structure**: hnswlib `space="cosine"`, `M=16`, `ef_construction=200`, `max_elements=100_000`; chunk↔label mapping lives in `chunks.hnsw_label` (single source of truth); `rebuild_index()` reconstructs the `.bin` from SQLite blobs.
@@ -182,6 +201,26 @@ provider-agnostic, while public common-benchmark validation remains open.
   candidates from a bounded source-conditioned rerank. Only chunk/source IDs
   and scalar scores exist during the walk; the final evaluator prompt cap is
   still authoritative.
+- **Partition-local read**: `source_local_search=True` uses the global hybrid
+  prefix only to activate source IDs, then streams dense and lexical candidates
+  inside that eligible union. Scores are calibrated once across the union;
+  independent per-source normalization is forbidden because it manufactures a
+  score-1 candidate in every partition.
+- **Transient Qwen candidate arm**: an optional `QwenCandidateReranker` protects
+  the strong scalar prefix and reserves a fixed number of source-local slots
+  for a recursive QK+OV tournament. Each forward sees at most eight candidates
+  and a hard token cap. Candidate text and Q/K/V/residual tensors die after the
+  pass; only normal `RetrievalResult` rows and scalar workspace diagnostics
+  cross the boundary. This is a measured experimental read arm, not a durable
+  transformer cache or a production default.
+- **Recursive combined-activation arm**: `qwen_feedback` first lets the
+  original-question activation select a stratified subset of recalled
+  evidence. It then re-encodes `question + selected evidence` as one bounded
+  activation window and uses that combined QK/OV state to search a fresh pool
+  of lower-ranked candidates from the selected source partitions. BGE supplies
+  only the broad second-stage pool; it never receives a fabricated projection
+  of the Qwen activation. The original anchors and most source candidates are
+  protected, while the recursive hop competes for a fixed reserve.
 
 ### MemoryStore — `memory_store.py`
 - **Domain**: the typed long-term memory state machine. **Inputs**: validated `MemoryOps`. **Outputs**: `MemoryItem` / `MemoryResult`.
@@ -219,6 +258,14 @@ provider-agnostic, while public common-benchmark validation remains open.
   per token with a per-source expansion fraction. The packer reports actual
   expansion tokens by source in `expansion_source_token_counts`, making "heat
   equals amount of source text seen" observable rather than metaphorical.
+- **Information-rate option**: after query-aware sentence extraction, a
+  deterministic conditional information-bottleneck proxy estimates candidate
+  IDF surprise, lexical/dense relevance, concept/source novelty, and temporal
+  novelty per rendered token. It is a monotone filter over retrieval order,
+  never a global softmax or reranker, so weak candidates cannot displace strong
+  anchors. Enumeration, ordering, comparison, and all/each queries lower the
+  rejection threshold because superficially repetitive excerpts may encode
+  distinct required members. The filter stores no learned state.
 - **Hard constraint**: every section has an independent ceiling, and **anything that does not fit is dropped and counted** in `PackedContext.dropped` (`memories` / `recent_turns` / `expansions`) — never silently truncated without a record. Token accounting per section lands in `token_counts`.
 
 ### MemoryCondenser — `condenser.py`
@@ -247,6 +294,12 @@ provider-agnostic, while public common-benchmark validation remains open.
 - **Self-replay** (`runner.py`) — teacher-forced: after scoring, ingest the *actual* recorded turns, never the generated ones. Metrics: mean judge score, Recall@4.
 - **Benchmark QA probes** (`benchmark.py`) — ingest a sample's whole haystack, enforce a hard full-prompt ceiling, answer each question from dense/hybrid/span/source/memory context, and grade with SQuAD-normalized token F1 + exact match plus an optional LLM `judge_fn` for semantic equivalence. `answer_fn` / `judge_fn` are **injected**; the module imports no litellm.
 - **Free retrieval diagnostics** (`recall.py`) — report gold-string reachability and tokens together, plus any/all/fractional gold evidence-source coverage when the benchmark supplies source labels.
+- **Evidence sufficiency** (`sufficiency.py`) — compares the retrieved prompt
+  with a same-budget gold-source/session oracle. LongMemEval does not provide
+  exact evidence-turn labels, so the report states its granularity explicitly.
+  Literal, inference-required, and source-coverage diagnostics are local; an
+  injected semantic judge can separately label oracle and retrieved
+  sufficiency when calls are explicitly authorized.
 - **Compiled benchmark cache** (`compiled_cache.py`) — content-addressed,
   per-sample SQLite/HNSW artifacts keyed by all write-time inputs. Manifests
   hold exact file hashes and are published last; verified reads cannot rewrite

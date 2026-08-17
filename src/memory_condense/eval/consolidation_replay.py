@@ -128,10 +128,32 @@ def _source_rows(
     ]
 
 
+def _source_user_queries(source_db: str | Path) -> list[str]:
+    """Read only user text, avoiding a second materialization of embeddings."""
+
+    connection = sqlite3.connect(Path(source_db))
+    try:
+        turn_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(turns)").fetchall()
+        }
+        ordinal_expression = "ordinal" if "ordinal" in turn_columns else "rowid"
+        return [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT text FROM turns WHERE role = 'user' "
+                f"ORDER BY {ordinal_expression}"
+            ).fetchall()
+            if str(row[0]).strip()
+        ]
+    finally:
+        connection.close()
+
+
 def stage_causal_store(
     source_db: str | Path,
     target_dir: str | Path,
-    embedder: FrozenQueryEmbedder,
+    embedder: object,
     *,
     expansion_tokens: int = 1600,
     retrieval_k: int = 10,
@@ -159,6 +181,7 @@ def stage_causal_store(
     if target.exists():
         raise FileExistsError(f"refusing to replace replay store: {target}")
     rows = _source_rows(source)
+    source_chunk_count = sum(len(row[4]) for row in rows)
     budget = ContextBudget(
         recent_window_tokens=0,
         memory_header_tokens=0,
@@ -222,9 +245,18 @@ def stage_causal_store(
         embedder=embedder,
         auto_extract=False,
         budget=budget,
+        retriever_max_elements=max(1, source_chunk_count),
     ) as condenser:
         for ordinal, role, text, source_id, source_chunks in rows:
-            if role == "user":
+            # LongMemEval inserts a dated system turn at the start of each
+            # source session. Close the previous episode before that turn is
+            # visible; otherwise its timestamp is incorrectly treated as an
+            # outcome of the previous conversation.
+            source_changed = (
+                pending is not None
+                and source_id != pending.get("source_id")
+            )
+            if role == "user" or source_changed:
                 finalize_pending(condenser.transcript.current_turn())
 
             if role == "user" and chunks_seen > 0:
@@ -245,6 +277,7 @@ def stage_causal_store(
                     pending = {
                         "event_id": f"causal-user:{ordinal}",
                         "user_text": text,
+                        "source_id": source_id,
                         "anchor_ids": tuple(packed.direct_expansion_chunk_ids),
                         "prompt_ids": [],
                         "outcome_ids": [],
@@ -272,6 +305,39 @@ def stage_causal_store(
         "outcome_chunks_bound": outcome_chunks_bound,
         "skipped_large_prompt": skipped_large,
         "skipped_insufficient_candidates": skipped_empty,
+    }
+
+
+def apply_rank_learning(
+    store_dir: str | Path,
+    embedder: object,
+    events: Sequence[ReplayEvent],
+) -> dict[str, object]:
+    """Persist provider-free causal/co-access scalars for a staged store."""
+
+    applied = 0
+    started = time.perf_counter()
+    with MemoryCondenser(
+        data_dir=store_dir,
+        embedder=embedder,
+        auto_extract=False,
+        persist_index_on_close=False,
+    ) as condenser:
+        for event in events:
+            update = condenser.observe_context_access(
+                [],
+                event.chunk_ids,
+                access_event_id=event.event_id,
+                now_turn=event.now_turn,
+                causal_chunk_ids=event.causal_chunk_ids,
+            )
+            applied += int(update.created)
+        graph = condenser.consolidation.stats()
+    return {
+        "events_offered": len(events),
+        "events_applied": applied,
+        "elapsed_s": time.perf_counter() - started,
+        "graph": graph,
     }
 
 

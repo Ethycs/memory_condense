@@ -448,15 +448,66 @@ def answer_question(
     Returns answer text, context, prompt-content tokens, and provider usage.
     """
     query_text = question.dated_question
-    if config.retrieval.mode == "memory":
+    if config.retrieval.mode in {
+        "memory",
+        "causal_consolidation",
+        "causal_graph",
+    }:
+        causal = config.retrieval.mode in {
+            "causal_consolidation",
+            "causal_graph",
+        }
+        graph_results = (
+            mc.search_hybrid_graph(
+                query_text,
+                k=config.retrieval.k,
+                neighbor_radius=config.retrieval.neighbor_radius,
+                neighbor_slots=config.retrieval.neighbor_slots,
+                neighbor_direction=config.retrieval.neighbor_direction,
+                source_slots=config.retrieval.source_slots,
+                source_candidate_pool=config.retrieval.source_candidate_pool,
+                source_activation_k=config.retrieval.source_activation_k,
+                source_tfisf_activation=(
+                    config.retrieval.source_tfisf_activation
+                ),
+                source_tfisf_slots=config.retrieval.source_tfisf_slots,
+                source_hsc_activation=config.retrieval.source_hsc_activation,
+                source_hsc_slots=config.retrieval.source_hsc_slots,
+                source_hsc_hops=config.retrieval.source_hsc_hops,
+                source_hsc_chunk_slots=(
+                    config.retrieval.source_hsc_chunk_slots
+                ),
+                source_partition_routing=(
+                    config.retrieval.source_partition_routing
+                ),
+                source_partition_slots=config.retrieval.source_partition_slots,
+                source_partition_separator=(
+                    config.retrieval.source_partition_separator
+                ),
+                source_local_search=config.retrieval.source_local_search,
+                use_source_reranker=config.retrieval.qwen_rerank,
+                use_attention_feedback=config.retrieval.qwen_feedback,
+                feedback_slots=config.retrieval.qwen_feedback_slots,
+                feedback_seed_slots=config.retrieval.qwen_feedback_seed_slots,
+                feedback_evidence_tokens=(
+                    config.retrieval.qwen_feedback_evidence_tokens
+                ),
+                feedback_query_tokens=config.retrieval.qwen_feedback_query_tokens,
+                ef_search=config.retrieval.ef_search,
+                candidates=config.retrieval.candidates,
+                alpha=config.retrieval.alpha,
+            )
+            if config.retrieval.mode == "causal_graph"
+            else None
+        )
         packed = mc.build_context(
             query_text,
             # A haystack is not a live conversation: its "last 8 turns" are an
             # arbitrary slice of someone else's dialogue and would be noise in
             # the prompt. The QA protocol wants retrieved context only.
             recent_turns=0,
-            k_memories=config.retrieval.k_memories,
-            k_expansions=config.retrieval.k,
+            k_memories=0 if causal else config.retrieval.k_memories,
+            k_expansions=(0 if graph_results is not None else config.retrieval.k),
             hybrid=True,
             # Benchmark questions are independent probes.  Letting one probe
             # reheat its hits changes later rankings and makes accuracy depend
@@ -464,7 +515,19 @@ def answer_question(
             reheat_memories=False,
             # Independent benchmark probes must not teach one another a live
             # co-activation graph either.
+            use_consolidation=causal,
             learn_consolidation=False,
+            consolidation_memory_slots=0 if causal else 1,
+            consolidation_chunk_slots=(
+                config.retrieval.consolidation_chunk_slots if causal else 1
+            ),
+            consolidation_min_count=config.retrieval.consolidation_min_count,
+            consolidation_hops=config.retrieval.consolidation_hops,
+            consolidation_candidates=config.retrieval.consolidation_candidates,
+            consolidation_diffusion_width=(
+                config.retrieval.consolidation_diffusion_width
+            ),
+            expansion_results=graph_results,
         )
         # `expansions` is already rendered text, unlike the chunk arms'
         # RetrievalResult objects.
@@ -507,6 +570,15 @@ def answer_question(
                 source_slots=config.retrieval.source_slots,
                 source_candidate_pool=config.retrieval.source_candidate_pool,
                 source_activation_k=config.retrieval.source_activation_k,
+                source_partition_routing=(
+                    config.retrieval.source_partition_routing
+                ),
+                source_partition_slots=config.retrieval.source_partition_slots,
+                source_partition_separator=(
+                    config.retrieval.source_partition_separator
+                ),
+                source_local_search=config.retrieval.source_local_search,
+                use_source_reranker=config.retrieval.qwen_rerank,
                 ef_search=config.retrieval.ef_search,
                 candidates=config.retrieval.candidates,
                 alpha=config.retrieval.alpha,
@@ -524,6 +596,25 @@ def answer_question(
                 source_slots=config.retrieval.source_slots,
                 source_candidate_pool=config.retrieval.source_candidate_pool,
                 source_activation_k=config.retrieval.source_activation_k,
+                source_tfisf_activation=(
+                    config.retrieval.source_tfisf_activation
+                ),
+                source_tfisf_slots=config.retrieval.source_tfisf_slots,
+                source_hsc_activation=config.retrieval.source_hsc_activation,
+                source_hsc_slots=config.retrieval.source_hsc_slots,
+                source_hsc_hops=config.retrieval.source_hsc_hops,
+                source_hsc_chunk_slots=(
+                    config.retrieval.source_hsc_chunk_slots
+                ),
+                source_local_search=config.retrieval.source_local_search,
+                use_source_reranker=config.retrieval.qwen_rerank,
+                use_attention_feedback=config.retrieval.qwen_feedback,
+                feedback_slots=config.retrieval.qwen_feedback_slots,
+                feedback_seed_slots=config.retrieval.qwen_feedback_seed_slots,
+                feedback_evidence_tokens=(
+                    config.retrieval.qwen_feedback_evidence_tokens
+                ),
+                feedback_query_tokens=config.retrieval.qwen_feedback_query_tokens,
                 ef_search=config.retrieval.ef_search,
                 candidates=config.retrieval.candidates,
                 alpha=config.retrieval.alpha,

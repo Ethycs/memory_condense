@@ -9,7 +9,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from memory_condense.decay import decay_factor
 from memory_condense.qwen_prefix import Qwen3PrefixEncoder
@@ -477,6 +477,7 @@ class QwenMemoryLinker:
         *,
         beam_per_group: int = 2,
         top_k: int = 4,
+        score_mode: Literal["qk", "qk_ov"] = "qk",
     ) -> NestedMemoryInspection:
         """Recursively inspect candidate groups without carrying transformer state.
 
@@ -489,6 +490,8 @@ class QwenMemoryLinker:
             raise ValueError("beam_per_group must be smaller than max_candidates")
         if top_k < 1:
             raise ValueError("top_k must be positive")
+        if score_mode not in {"qk", "qk_ov"}:
+            raise ValueError("score_mode must be 'qk' or 'qk_ov'")
         groups = [list(group) for group in candidate_groups if group]
         if not groups:
             raise ValueError("at least one non-empty candidate group is required")
@@ -500,6 +503,19 @@ class QwenMemoryLinker:
         max_tokens = 0
         total_inspections = 0
 
+        def hit_score(hit: MemoryLinkHit) -> float:
+            qk = max(0.0, float(hit.qk_score))
+            if score_mode == "qk":
+                return qk
+            return qk + math.log1p(max(0.0, float(hit.ov_transport)))
+
+        def ranked_hits(result: MemoryLinkResult) -> list[MemoryLinkHit]:
+            return sorted(
+                result.hits,
+                key=lambda hit: (hit_score(hit), hit.episode_id),
+                reverse=True,
+            )
+
         def inspect_groups(
             current_groups: Sequence[Sequence[AssociativeMemoryCandidate]],
         ) -> list[AssociativeMemoryCandidate]:
@@ -510,14 +526,14 @@ class QwenMemoryLinker:
                 result = self.link(
                     source_text,
                     group,
-                    top_k=min(beam_per_group, len(group)),
+                    top_k=None,
                 )
                 passes += 1
                 max_candidates = max(max_candidates, result.workspace_candidates)
                 max_tokens = max(max_tokens, result.workspace_tokens)
                 total_inspections += result.workspace_candidates
                 by_id = {candidate.episode_id: candidate for candidate in group}
-                for hit in result.hits:
+                for hit in ranked_hits(result)[:beam_per_group]:
                     if hit.episode_id in seen_finalists:
                         continue
                     seen_finalists.add(hit.episode_id)
@@ -526,7 +542,7 @@ class QwenMemoryLinker:
                         AssociativeMemoryCandidate(
                             episode_id=original.episode_id,
                             text=original.text,
-                            score=hit.qk_score,
+                            score=hit_score(hit),
                             route=original.route,
                             metadata=dict(original.metadata),
                         )
@@ -545,7 +561,7 @@ class QwenMemoryLinker:
                 final = self.link(
                     source_text,
                     finalists,
-                    top_k=min(top_k, len(finalists)),
+                    top_k=None,
                 )
                 break
             except MemoryError:
@@ -554,14 +570,14 @@ class QwenMemoryLinker:
                 reduced: list[AssociativeMemoryCandidate] = []
                 for start in range(0, len(finalists), 2):
                     group = finalists[start : start + 2]
-                    result = self.link(source_text, group, top_k=1)
+                    result = self.link(source_text, group, top_k=None)
                     passes += 1
                     max_candidates = max(
                         max_candidates, result.workspace_candidates
                     )
                     max_tokens = max(max_tokens, result.workspace_tokens)
                     total_inspections += result.workspace_candidates
-                    winner = result.hits[0]
+                    winner = ranked_hits(result)[0]
                     original = next(
                         candidate
                         for candidate in group
@@ -571,7 +587,7 @@ class QwenMemoryLinker:
                         AssociativeMemoryCandidate(
                             episode_id=original.episode_id,
                             text=original.text,
-                            score=winner.qk_score,
+                            score=hit_score(winner),
                             route=original.route,
                             metadata=dict(original.metadata),
                         )
@@ -582,7 +598,7 @@ class QwenMemoryLinker:
         max_tokens = max(max_tokens, final.workspace_tokens)
         total_inspections += final.workspace_candidates
         return NestedMemoryInspection(
-            hits=final.hits,
+            hits=tuple(ranked_hits(final)[:top_k]),
             passes=passes,
             max_workspace_candidates=max_candidates,
             max_workspace_tokens=max_tokens,

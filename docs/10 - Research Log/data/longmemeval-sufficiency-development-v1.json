@@ -1,0 +1,41 @@
+{
+  "format": "memory-condense-gold-source-sufficiency-v1",
+  "status": "deterministic_audit_complete_semantic_judging_pending",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_manifest": "longmemeval-95-target-split-v2.json",
+  "split": "development",
+  "ordered_prefix_samples": 40,
+  "retrieval_policy": "longmemeval-official-causal-graph-development-v1.json",
+  "retrieval_policy_sha256": "c80772cc225206a77a5a58ce2cc169faf3a52f7884284e52f7b3db4eb0d0133f",
+  "oracle": {
+    "granularity": "source",
+    "definition": "all chronological turns in answer_session_ids, capped by the same 8000-token responder prompt budget",
+    "exact_evidence_turn_labels_available": false
+  },
+  "deterministic_metrics": {
+    "questions": 40,
+    "haystack_literal_recall": 0.6,
+    "gold_source_literal_recall": 0.5,
+    "retrieved_literal_recall": 0.575,
+    "retrieved_gold_source_literal_recall": 0.525,
+    "gold_source_literal_questions": 20,
+    "gold_source_literal_questions_retrieved_from_gold_source": 20,
+    "literal_within_partition_misses": 0,
+    "gold_sources_without_literal_answer_rate": 0.5,
+    "mean_evidence_source_recall": 0.995,
+    "all_evidence_sources_rate": 0.975,
+    "mean_gold_source_context_tokens": 5069,
+    "mean_retrieved_context_tokens": 6638
+  },
+  "semantic_metrics": {
+    "oracle_sufficiency": null,
+    "retrieved_sufficiency": null,
+    "sufficiency_retention": null,
+    "provider_calls": 0
+  },
+  "artifact": {
+    "file": "eval_results/longmemeval-selected-sufficiency-development-40.csv",
+    "sha256": "b11d30ed803ecb96973f25fa54b960db55c7988fb19ce1d33c6337c2b872fb21"
+  },
+  "interpretation": "Source coverage is a routing metric. It is not evidence-span coverage, context sufficiency, or answer accuracy."
+}

@@ -13,6 +13,7 @@ from memory_condense.association_store import AssociationStore
 from memory_condense.db import Database
 from memory_condense.lexical import LexicalIndex
 from memory_condense.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.source_hierarchy import SourceContractionIndex
 
 #: `meta` key holding the next free hnswlib label. Labels are shared state
 #: across every process open on a store, so they are allocated through the
@@ -152,6 +153,7 @@ class SimilarityRetriever:
         self._span_cached_through_rowid: dict[int, int] = {}
 
         self._lexical = LexicalIndex(db)
+        self._source_hierarchy = SourceContractionIndex(db, dim=dim)
 
         self._index: hnswlib.Index | None = None
         self._load_or_create_index()
@@ -171,6 +173,23 @@ class SimilarityRetriever:
             )
             # Load mapping from DB if available
             self._load_label_mapping()
+
+    def release(self) -> None:
+        """Release native ANN buffers without mutating the persisted index.
+
+        ``hnswlib.Index`` owns capacity-sized native allocations. Closing only
+        SQLite leaves those buffers live as long as the facade remains in a
+        Python frame, which is especially costly for sequential benchmark
+        samples. Dropping the final reference is deterministic and idempotent.
+        """
+
+        self._index = None
+        self._span_cache.clear()
+        self._span_vector_buffers.clear()
+        self._span_tail_sums.clear()
+        self._span_tail_tokens.clear()
+        self._span_cached_through_rowid.clear()
+        self._source_hierarchy.invalidate()
 
     def _load_label_mapping(self) -> None:
         """Load label<->chunk_id mapping from the chunks table."""
@@ -350,6 +369,7 @@ class SimilarityRetriever:
         self._index.add_items(data, np.array(labels, dtype=np.int64))
 
         self._lexical.add_chunks(indexed)
+        self._source_hierarchy.invalidate()
 
     def _live_count(self) -> int:
         """Elements hnswlib will actually return (excludes deleted labels)."""
@@ -725,6 +745,66 @@ class SimilarityRetriever:
                 results.append(hydrated)
         return results
 
+    def source_tfisf_query(
+        self,
+        query_text: str,
+        *,
+        k_sources: int = 8,
+    ) -> list[tuple[str, float]]:
+        """Return live source-level lexical activations without hydration."""
+
+        return self._lexical.search_source_tfisf(query_text, limit=k_sources)
+
+    def source_hsc_expand(
+        self,
+        query_embedding: np.ndarray,
+        seed_source_ids: Sequence[str],
+        *,
+        slots: int = 8,
+        hops: int = 2,
+    ) -> list[tuple[str, float]]:
+        """Expand source seeds through the transient contraction hierarchy."""
+
+        return self._source_hierarchy.expand(
+            query_embedding,
+            seed_source_ids,
+            slots=slots,
+            hops=hops,
+        )
+
+    def source_ids_in_partitions(
+        self,
+        partition_ids: Sequence[str],
+        *,
+        separator: str = "::",
+    ) -> list[str]:
+        """Return source IDs belonging to hierarchical top-level partitions.
+
+        Partition identity is encoded in the durable source ID as
+        ``partition::source``.  Keeping it in the existing provenance field
+        avoids a second copy of transcript or embedding state.  Sources that
+        do not contain the separator are their own top-level partition.
+        """
+
+        selected = {str(value) for value in partition_ids if str(value)}
+        if not selected:
+            return []
+        if not separator:
+            raise ValueError("partition separator must be non-empty")
+
+        rows = self._db.execute(
+            "SELECT source_id, MIN(ordinal) FROM turns "
+            "WHERE source_id IS NOT NULL GROUP BY source_id "
+            "ORDER BY MIN(ordinal), source_id"
+        ).fetchall()
+        results: list[str] = []
+        for source_id, _ordinal in rows:
+            source = str(source_id)
+            partition = source.split(separator, 1)[0]
+            if partition in selected:
+                results.append(source)
+        return results
+
     def hydrate_source_neighbors(
         self,
         anchors: Sequence[RetrievalResult],
@@ -894,6 +974,171 @@ class SimilarityRetriever:
                 results.append(hydrated)
         return results
 
+    def hybrid_query_sources(
+        self,
+        query_text: str,
+        query_embedding: np.ndarray,
+        source_ids: Sequence[str],
+        *,
+        k: int = 24,
+        candidates_per_source: int = 200,
+        alpha: float = 0.65,
+        source_scores: dict[str, float] | None = None,
+        anchor_chunk_ids: dict[str, str] | None = None,
+        exclude_chunk_ids: Sequence[str] = (),
+    ) -> list[RetrievalResult]:
+        """Search every chunk in activated sources, then return a bounded rank.
+
+        This is deliberately different from filtering a global ANN pool. Dense
+        vectors are streamed from SQLite and only bounded per-source buffers are
+        retained. BM25 is also computed in each source's local corpus. Text is
+        hydrated only for the final ``k`` rows, keeping workspace proportional
+        to ``sources * candidates_per_source`` rather than source length.
+
+        Source activation is an eligibility gate, not a second relevance
+        multiplier. Dense and lexical scores are normalized once across the
+        complete activated-source union so scores remain comparable between
+        partitions while chunks absent from the global pool can still enter.
+        """
+
+        selected = list(dict.fromkeys(str(value) for value in source_ids if str(value)))
+        if k <= 0 or not selected:
+            return []
+        if candidates_per_source <= 0:
+            raise ValueError("candidates_per_source must be positive")
+
+        query = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+        query_norm = float(np.linalg.norm(query))
+        if query.shape != (self._dim,) or query_norm <= 0.0:
+            raise ValueError("query_embedding must be a non-zero vector of index dimension")
+        query /= query_norm
+
+        source_placeholders = ",".join("?" for _ in selected)
+        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        dense_buffers: dict[str, list[tuple[float, str]]] = {
+            source_id: [] for source_id in selected
+        }
+        rows = self._db.execute(
+            "SELECT c.chunk_id, c.embedding, " + source_expr + " "
+            "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
+            f"WHERE {source_expr} IN ({source_placeholders}) "
+            "AND c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            "ORDER BY c.chunk_id",
+            tuple(selected),
+        )
+        for chunk_id, blob, source_id in rows:
+            source_key = str(source_id)
+            vector = np.frombuffer(blob, dtype=np.float32)
+            denominator = float(np.linalg.norm(vector))
+            if vector.shape != query.shape or denominator <= 0.0:
+                continue
+            score = float(np.dot(query, vector) / denominator)
+            buffer = dense_buffers[source_key]
+            buffer.append((score, str(chunk_id)))
+            if len(buffer) >= candidates_per_source * 2:
+                buffer.sort(key=lambda item: (-item[0], item[1]))
+                del buffer[candidates_per_source:]
+
+        dense_by_source = {
+            source_id: sorted(buffer, key=lambda item: (-item[0], item[1]))[
+                :candidates_per_source
+            ]
+            for source_id, buffer in dense_buffers.items()
+        }
+        lexical_by_source = self._lexical.search_sources(
+            query_text,
+            selected,
+            limit_per_source=candidates_per_source,
+        )
+        priors = source_scores or {}
+        anchors = anchor_chunk_ids or {}
+        excluded = {str(value) for value in exclude_chunk_ids}
+
+        dense_flat = [
+            (source_id, chunk_id, score)
+            for source_id in selected
+            for score, chunk_id in dense_by_source.get(source_id, [])
+        ]
+        lexical_flat = [
+            (source_id, chunk_id, score)
+            for source_id in selected
+            for chunk_id, score in lexical_by_source.get(source_id, [])
+        ]
+        dense_normalized = ranking.min_max_normalize(
+            [score for _source_id, _chunk_id, score in dense_flat]
+        )
+        lexical_normalized = ranking.min_max_normalize(
+            [score for _source_id, _chunk_id, score in lexical_flat]
+        )
+        dense_scores = {
+            (source_id, chunk_id): score
+            for (source_id, chunk_id, _raw), score in zip(
+                dense_flat, dense_normalized
+            )
+        }
+        lexical_scores = {
+            (source_id, chunk_id): score
+            for (source_id, chunk_id, _raw), score in zip(
+                lexical_flat, lexical_normalized
+            )
+        }
+
+        scored: list[tuple[float, int, str, float, float, str]] = []
+        for source_order, source_id in enumerate(selected):
+            dense_hits = dense_by_source.get(source_id, [])
+            lexical_hits = lexical_by_source.get(source_id, [])
+            ordered_ids = [chunk_id for _score, chunk_id in dense_hits]
+            seen = set(ordered_ids)
+            for chunk_id, _score in lexical_hits:
+                if chunk_id not in seen:
+                    seen.add(chunk_id)
+                    ordered_ids.append(chunk_id)
+
+            for chunk_id in ordered_ids:
+                if chunk_id in excluded:
+                    continue
+                dense_score = dense_scores.get((source_id, chunk_id), 0.0)
+                lexical_score = lexical_scores.get((source_id, chunk_id), 0.0)
+                local_score = ranking.blend_hybrid(
+                    dense_score, lexical_score, alpha
+                )
+                scored.append(
+                    (
+                        local_score,
+                        source_order,
+                        chunk_id,
+                        dense_score,
+                        lexical_score,
+                        source_id,
+                    )
+                )
+
+        scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+        results: list[RetrievalResult] = []
+        for score, _source_order, chunk_id, dense, lexical_score, source_id in scored:
+            hydrated = self._hydrate(
+                chunk_id,
+                score=score,
+                dense_score=dense,
+                lexical_score=lexical_score,
+                route="hybrid_source_local",
+                anchor_chunk_id=anchors.get(source_id),
+            )
+            if hydrated is not None:
+                results.append(
+                    hydrated.model_copy(
+                        update={
+                            "memory_source_id": source_id,
+                            "source_heat": max(
+                                0.0, float(priors.get(source_id, 1.0))
+                            ),
+                        }
+                    )
+                )
+            if len(results) >= k:
+                break
+        return results
+
     def delete_chunk(self, chunk_id: str) -> bool:
         """Remove a chunk from both indexes. Returns False if it was unknown.
 
@@ -922,6 +1167,7 @@ class SimilarityRetriever:
         self._db.commit()
         self._clear_span_cache()
         self._lexical.delete_chunk(chunk_id)
+        self._source_hierarchy.invalidate()
         artifacts_removed = 0
         if self._associations is not None:
             artifacts_removed = self._associations.remove_chunk_artifacts(chunk_id)

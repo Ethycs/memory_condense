@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Mapping, Sequence
 
 import numpy as np
 
@@ -15,6 +16,14 @@ from memory_condense.hebbian_retrieval import (
 )
 from memory_condense.chunker import Chunker
 from memory_condense.context_packer import ContextBudget, ContextPacker
+from memory_condense.consolidation import (
+    ConsolidationNode,
+    ConsolidationUpdate,
+    LiveConsolidationStore,
+    context_activations,
+    expand_context_associations,
+    inspect_qwen_context_hyperplane,
+)
 from memory_condense.db import Database
 from memory_condense.embedding import EmbeddingService
 from memory_condense.extractor import Extractor, RuleBasedExtractor
@@ -91,6 +100,7 @@ class MemoryCondenser:
             association_store=self._associations,
         )
         self._memory = MemoryStore(self._db, embedder=self._embedder)
+        self._consolidation = LiveConsolidationStore(self._db)
         self._validator = Validator(self._db)
         self._extractor = extractor if extractor is not None else RuleBasedExtractor()
         self._packer = ContextPacker(budget)
@@ -919,12 +929,25 @@ class MemoryCondenser:
         k_expansions: int = 10,
         hybrid: bool = True,
         reheat_memories: bool = True,
+        use_consolidation: bool = True,
+        learn_consolidation: bool = True,
+        consolidation_memory_slots: int = 1,
+        consolidation_chunk_slots: int = 1,
+        consolidation_min_count: int = 2,
+        consolidation_hops: int = 1,
+        consolidation_candidates: int = 32,
+        consolidation_diffusion_width: int = 32,
+        access_event_id: str | None = None,
     ) -> PackedContext:
         """Assemble a token-budgeted prompt for ``user_text``.
 
         Memory header + recent window + verbatim expansions, each capped
         independently so context cost stays predictable as the conversation
-        grows.
+        grows. Established live-consolidation edges may propose bounded
+        additive candidates before packing; they never evict a direct result
+        merely to reserve a graph slot. Only direct results that actually
+        survive packing train the graph afterward, preventing a graph-selected
+        result from reinforcing itself merely because the graph selected it.
         """
         # Ranking is a read; only memories that survive the header budget are
         # genuine accesses.  Reheating all top-k candidates here kept dropped
@@ -936,9 +959,44 @@ class MemoryCondenser:
         )
 
         expansions: list[RetrievalResult] = []
+        query_embedding: np.ndarray | None = None
         if k_expansions:
-            search = self.search_hybrid if hybrid else self.search
-            expansions = search(user_text, k=k_expansions)
+            query_embedding = self._embedder.embed_query(user_text)
+            if hybrid:
+                expansions = self.search_hybrid_from_embedding(
+                    user_text,
+                    query_embedding,
+                    k=k_expansions,
+                )
+            else:
+                expansions = self._retriever.query(
+                    query_embedding,
+                    k=k_expansions,
+                )
+
+        if use_consolidation and (memories or expansions):
+            memories, expansions = expand_context_associations(
+                memories,
+                expansions,
+                store=self._consolidation,
+                get_memory=self._memory.get,
+                hydrate_chunk=self._retriever.hydrate_chunk,
+                now_turn=self._transcript.current_turn(),
+                memory_slots=consolidation_memory_slots,
+                chunk_slots=consolidation_chunk_slots,
+                max_candidates=consolidation_candidates,
+                min_coactivation_count=consolidation_min_count,
+                diffusion_hops=consolidation_hops,
+                diffusion_width=consolidation_diffusion_width,
+                chunk_relevance=(
+                    lambda chunk_ids: self._retriever.cosine_scores(
+                        query_embedding,
+                        chunk_ids,
+                    )
+                    if query_embedding is not None
+                    else {}
+                ),
+            )
 
         turns = self._transcript.get_recent(recent_turns) if recent_turns else []
         recent = [(t.role, t.text) for t in turns]
@@ -950,6 +1008,33 @@ class MemoryCondenser:
             expansions=expansions,
             user_text=user_text,
         )
+        memory_by_id = {result.item.mem_id: result for result in memories}
+        chunk_by_id = {result.chunk.chunk_id: result for result in expansions}
+        # Keep the independently retrieved subset explicit for delayed Qwen
+        # inspection. The text-free IDs are already part of the packed result;
+        # no activation or prompt buffer is retained.
+        direct_memory_ids = [
+            mem_id
+            for mem_id in packed.memory_ids
+            if memory_by_id[mem_id].route != "live_consolidation"
+        ]
+        direct_chunk_ids = [
+            chunk_id
+            for chunk_id in packed.expansion_chunk_ids
+            if chunk_by_id[chunk_id].route != "live_consolidation"
+        ]
+        event_id = access_event_id or self._context_event_id(
+            user_text,
+            direct_memory_ids,
+            direct_chunk_ids,
+        )
+        packed = packed.model_copy(
+            update={
+                "direct_memory_ids": direct_memory_ids,
+                "direct_expansion_chunk_ids": direct_chunk_ids,
+                "consolidation_event_id": event_id,
+            }
+        )
         if reheat_memories:
             now_turn = self._transcript.current_turn()
             ranked_by_id = {result.item.mem_id: result.item for result in memories}
@@ -957,7 +1042,154 @@ class MemoryCondenser:
                 [ranked_by_id[mem_id] for mem_id in packed.memory_ids],
                 now_turn=now_turn,
             )
+        if learn_consolidation:
+            # Learn from independent retrieval evidence only.  A candidate
+            # admitted by this graph must later be found directly before it can
+            # strengthen the assembly, avoiding a self-confirming feedback loop.
+            activations = context_activations(
+                direct_memory_ids,
+                direct_chunk_ids,
+            )
+            if activations:
+                self._consolidation.observe(event_id, activations)
+                packed = packed.model_copy(update={"consolidation_learned": True})
         return packed
+
+    def observe_context_access(
+        self,
+        memory_ids: Sequence[str],
+        chunk_ids: Sequence[str],
+        *,
+        access_event_id: str,
+        now_turn: int | None = None,
+        node_activations: Mapping[ConsolidationNode, float] | None = None,
+        pair_affinities: Mapping[
+            tuple[ConsolidationNode, ConsolidationNode], float
+        ]
+        | None = None,
+        causal_chunk_ids: Sequence[str] = (),
+    ) -> ConsolidationUpdate:
+        """Explicitly reinforce one externally assembled, bounded context.
+
+        Rank-discounted activity is the provider-free default.  A transient
+        Qwen prefix inspection may instead pass CAV-derived node activity and
+        bounded QK/OV ``pair_affinities``. ``causal_chunk_ids`` marks newly
+        produced response/tool evidence in a completed interaction. Only the
+        resulting scalar update is durable; the caller remains responsible for
+        discarding the workspace.
+        """
+
+        allowed = set(context_activations(memory_ids, chunk_ids))
+        if node_activations is None:
+            activations = context_activations(memory_ids, chunk_ids)
+        else:
+            activations = {
+                node: float(value)
+                for node, value in node_activations.items()
+                if node in allowed
+            }
+        filtered_pairs = {
+            pair: float(value)
+            for pair, value in (pair_affinities or {}).items()
+            if pair[0] in allowed and pair[1] in allowed
+        }
+        causal_targets = tuple(
+            node
+            for chunk_id in dict.fromkeys(str(value) for value in causal_chunk_ids)
+            if (node := ConsolidationNode.chunk(chunk_id)) in allowed
+        )
+        return self._consolidation.observe(
+            access_event_id,
+            activations,
+            pair_affinities=filtered_pairs,
+            causal_targets=causal_targets,
+            now_turn=now_turn,
+        )
+
+    def consolidate_context_with_qwen(
+        self,
+        user_text: str,
+        packed: PackedContext,
+        linker: object,
+        *,
+        access_event_id: str | None = None,
+        now_turn: int | None = None,
+        causal_chunk_ids: Sequence[str] = (),
+    ) -> tuple[object, ConsolidationUpdate]:
+        """Inspect a completed turn with Qwen and apply one scalar update.
+
+        This is intentionally separate from :meth:`build_context` so callers
+        may run the bounded prefix pass after the response or on a background
+        queue instead of adding it to answer latency. Build with
+        ``learn_consolidation=False`` first; mixing the rank fallback and Qwen
+        learning for one context would count that prompt twice.
+        """
+
+        if packed.consolidation_learned:
+            raise ValueError(
+                "context already used rank-based consolidation; build with "
+                "learn_consolidation=False before Qwen consolidation"
+            )
+        memories = [
+            item
+            for mem_id in packed.direct_memory_ids
+            if (item := self._memory.get(mem_id)) is not None
+        ]
+        chunks = [
+            result
+            for chunk_id in packed.direct_expansion_chunk_ids
+            if (
+                result := self._retriever.hydrate_chunk(
+                    chunk_id,
+                    score=0.0,
+                    route="direct_for_consolidation",
+                )
+            )
+            is not None
+        ]
+        result, activations = inspect_qwen_context_hyperplane(
+            linker,
+            user_text,
+            memories,
+            chunks,
+        )
+        event_id = (
+            access_event_id
+            or packed.consolidation_event_id
+            or self._context_event_id(
+                user_text,
+                packed.direct_memory_ids,
+                packed.direct_expansion_chunk_ids,
+            )
+        )
+        update = self.observe_context_access(
+            packed.direct_memory_ids,
+            packed.direct_expansion_chunk_ids,
+            access_event_id=event_id,
+            now_turn=now_turn,
+            node_activations=activations,
+            causal_chunk_ids=causal_chunk_ids,
+        )
+        return result, update
+
+    def _context_event_id(
+        self,
+        user_text: str,
+        memory_ids: Sequence[str],
+        chunk_ids: Sequence[str],
+    ) -> str:
+        """Stable retry identity without retaining the prompt or context text."""
+
+        payload = "\x1f".join(
+            [
+                str(self._transcript.current_turn()),
+                user_text,
+                *memory_ids,
+                *chunk_ids,
+            ]
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+        return f"context:{self._transcript.current_turn()}:{digest}"
 
     # -- accessors ----------------------------------------------------------
 
@@ -980,6 +1212,12 @@ class MemoryCondenser:
     def associations(self) -> AssociationStore:
         """Compact external CAV/QK/OV artifacts; never transformer token state."""
         return self._associations
+
+    @property
+    def consolidation(self) -> LiveConsolidationStore:
+        """Prompt-driven associations spanning semantic memory and evidence."""
+
+        return self._consolidation
 
     @property
     def database_path(self) -> Path:

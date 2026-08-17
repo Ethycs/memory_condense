@@ -103,6 +103,8 @@ class MemoryLinkResult:
     source_cav_signature: tuple[float, ...]
     workspace_candidates: int
     workspace_tokens: int
+    passes: int = 1
+    total_candidate_inspections: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +444,8 @@ class QwenMemoryLinker:
             source_cav_signature=signature,
             workspace_candidates=len(bounded),
             workspace_tokens=workspace_tokens,
+            passes=1,
+            total_candidate_inspections=len(bounded),
         )
 
     def link_into_graph(

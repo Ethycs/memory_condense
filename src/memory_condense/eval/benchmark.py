@@ -462,6 +462,9 @@ def answer_question(
             # reheat its hits changes later rankings and makes accuracy depend
             # on question order rather than the stored conversation.
             reheat_memories=False,
+            # Independent benchmark probes must not teach one another a live
+            # co-activation graph either.
+            learn_consolidation=False,
         )
         # `expansions` is already rendered text, unlike the chunk arms'
         # RetrievalResult objects.

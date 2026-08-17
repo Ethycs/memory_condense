@@ -7,13 +7,13 @@
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
 
-> **Built and locally measured; external competitiveness remains open.** Retrieval, extraction, decay, CAV quality, bounded QK/CAV association, and source-heat allocation now have local measurements. The locked fresh association split confirms prompt-token savings without a recall regression; the later dual QK/heat result is posthoc development evidence and does not establish a new recall gain or performance on a public common benchmark. `git log --oneline` and the machine-readable artifacts remain the authority over prose.
+> **Built and locally measured; external competitiveness remains open.** Retrieval, extraction, decay, CAV quality, bounded QK/CAV association, source-heat allocation, and prompt-driven consolidation now have local measurements. The locked chronological build-session replay reached 38/39 literal evidence probes with Qwen-weighted consolidation, but this is not answer-stage judged accuracy or a public/common benchmark. `git log --oneline` and the machine-readable artifacts remain the authority over prose.
 
 ## Reconciliation state (2026-08-16)
 
 | Doc | Reconciled? | Substance of the change |
 | --- | --- | --- |
-| `01 - Design/00 - Original Architecture Plan.md` | ✅ | Phases 0,1,2,3,5 built; Phase 4 (cold summaries) is the only unbuilt phase |
+| `01 - Design/00 - Original Architecture Plan.md` | ✅ | Phases 0,1,2,3,5 and live relational consolidation (4A) built; materialized cold summaries (4B) remain unbuilt |
 | `01 - Design/01 - Eval Design…` | ✅ | Retired-model BUG documented; judge≠responder and token instrumentation both **resolved**, not open |
 | `02 - Implementation/00 - Setup…` | ✅ | 48-test baseline → **366**; hardcoded `dim=1024` bug marked fixed; schema-v2 migration gotcha added |
 | `02 - Implementation/01 - Running the Eval Harness.md` | ✅ | Rewritten for four CLI modes; benchmark data sources + cost warning; sweep is 54 configs, not 48 |
@@ -26,6 +26,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `06 - Roadmaps/01 - Delivering the Specified System.md` | **new** | Decay was specified in wall-clock seconds; the design intent is per-turn. The energy term therefore contributed a constant, and **every memory-arm number is void** — including the Phase 4 verdict. Carries the git evidence that the spec was wrong from commit one, and the five-stage delivery sequence |
 | `00 - Theory/00 …` | — | Not touched; stable by policy (corrections only) |
 | `00 - Theory/01 …` | **new draft** | Extracted-head associative memory with CAV/J-Space concepts, QK routing, OV transport, live-head pruning, and a falsification sequence; the prefix prototype now has a locked local token-saving result but no fresh recall gain |
+| `00 - Theory/03 …` | **implemented / locally measured** | Schema-v9 prompt/response binding across typed memories and evidence; repeated activation, turn decay, bounded two-hop reads, and transient CAV/QK/OV weighting |
 | `04 - Reference/00 - Competitive Landscape 2026.md` | — | Not touched this pass |
 | `08 - Analysis/00 - Retrieval Ablation…` | ✅ | Sweep corrected to 54 configs; a position-bin analysis was added and then **retracted the same day** — it does not replicate on the second run pair, and every bin-to-bin difference is inside noise. The aggregate ablation result stands |
 | `08 - Analysis/01 - Extraction and Decay Audit` | **new** | 70.6% of memory items never reach the prompt; COLD is unreachable by construction; the default extractor is 65% spurious `Constraint`s. All free, all previously unmeasured |
@@ -34,6 +35,8 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `10 - Research Log/04 - 2026-08-16 - Safe associative memory confirmation.md` | **new confirmation** | On a locked fresh six-family split, safe CAV/QK arms preserved 83.3% hybrid recall while reducing prompt tokens by 1.3–2.7%; degree-two pruning removed 392/1,204 edges without a recall loss; no fresh recall gain was observed |
 | `10 - Research Log/05 - 2026-08-16 - Source heat diffusion development.md` | **new development replay** | Two-hop dual allocation reserves one ranked-QK slot and one heat slot; degree-two replay preserved local recall while reducing selected text by 5.1–16.3%; pure heat lost the one development recovery, and no fresh recall gain is claimed |
 | `10 - Research Log/06 - 2026-08-16 - 95 percent long-chat target.md` | **active target** | Locks 500 cleaned LongMemEval questions into 200/100/200 partitions and defines ≥95% judge accuracy under an 8k prompt ceiling as the hard gate |
+| `10 - Research Log/08 - 2026-08-16 - Real Qwen consolidation path.md` | **operational smoke** | The real seven-layer BF16 prefix updated six schema-v8 edges from four packed pointers in 0.75 s after a 12.92 s startup load, retaining zero prompt/activation bytes; recall effect remains unmeasured |
+| `10 - Research Log/09 - 2026-08-16 - Causal binding reaches 97.4 percent evidence recall.md` | **new development replay** | Four-arm chronological replay: original 35/39, packing-only 36/39, rank graph 37/39, Qwen graph 38/39 with no losses and zero retained transformer-state bytes; answer-stage evaluation remains open |
 | `07 - Status Reports/…` | ✅ | Three dated handoffs; **2026-08-15 is the current one** and supersedes the earlier test counts (48 → 366 → 523) |
 
 ## The tree
@@ -79,11 +82,14 @@ docs/
 - "How do I actually *use* it day to day?" → `02 - Implementation/02 - MCP Integration.md` — the memory system is exposed to Claude Code as an MCP server.
 - "Is this competitive?" → **on common benchmarks, still unanswerable** (`04 - Reference/00` + `08 - Analysis/`; zero common-benchmark runs exist). **In-regime, a baseline of record now exists**: `10 - Research Log/00` — B0, 92.3% recall at 0.5% of transcript tokens on this project's own build session, with its caveats stated.
 - "What is the large-model attention-head memory idea?" → `00 - Theory/01 - Extracted Attention Heads as Recursive Associative Memory.md` — a **DRAFT** whose first CAV/live-head prototype is implemented, including the full-teacher J-Space implication.
+- "How do later prompts consolidate connected memory partitions?" → `00 - Theory/03 - Prompt-Driven Systems Consolidation.md` — schema-v9 causal binding plus repeated co-activation across semantic memories and evidence, including bounded iterative reads, the transient Qwen hyperplane seam, and anti-self-reinforcement rules.
 - "Did the downloaded Qwen prefix produce usable CAVs?" → `10 - Research Log/02 - 2026-08-16 - Qwen3 prefix CAV gate.md` — yes on the first controlled local probe; this is not yet a retrieval result.
 - "Did extracted heads improve live-memory retrieval?" → `10 - Research Log/03 - 2026-08-16 - Live Qwen head memory smokes.md` — calibrated layer-1 heads and temporal direction reached 1.000 R@1/R@3 on four development links; direct QK/OV failed and blind replication remains open.
 - "Did persistent CAV/QK memory save tokens on unseen source families?" → `10 - Research Log/04 - 2026-08-16 - Safe associative memory confirmation.md` — yes locally, without lowering baseline recall; a fresh recall gain and public-benchmark result remain unconfirmed.
 - "Can attention heat control how much memory each source contributes?" → `10 - Research Log/05 - 2026-08-16 - Source heat diffusion development.md` — implemented as a bounded external scalar walk plus source-aware packing; the selected dual QK/heat policy is posthoc development evidence awaiting a new locked split.
 - "What exactly does 95% long-chat accuracy mean?" → `10 - Research Log/06 - 2026-08-16 - 95 percent long-chat target.md` — answer-stage judge accuracy, minimum sample size, 8k hard prompt cap, locked LongMemEval partitions, and the experiment ladder.
+- "Has live schema-v8 consolidation run through the real Qwen checkpoint?" → `10 - Research Log/08 - 2026-08-16 - Real Qwen consolidation path.md` — yes on a temporary store copy; it validates execution and memory bounds, not a recall gain.
+- "Did causal Qwen consolidation improve the operational long-chat probe?" → `10 - Research Log/09 - 2026-08-16 - Causal binding reaches 97.4 percent evidence recall.md` — yes on the locked local literal-evidence test (38/39, no regressions); answer-stage judged LongMemEval remains the primary gate.
 
 ## The one distinction this tree tries hardest to keep
 

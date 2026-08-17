@@ -976,6 +976,39 @@ class SimilarityRetriever:
             anchor_chunk_id=anchor_chunk_id,
         )
 
+    def cosine_scores(
+        self,
+        query_embedding: np.ndarray,
+        chunk_ids: Sequence[str],
+    ) -> dict[str, float]:
+        """Score known chunk IDs without widening ANN retrieval.
+
+        This is used to rerank a small graph frontier against the live query.
+        It reads only durable chunk embeddings and returns scalar cosines; no
+        transformer activation or query state is retained.
+        """
+
+        ids = list(dict.fromkeys(str(value) for value in chunk_ids if str(value)))
+        if not ids:
+            return {}
+        query = np.asarray(query_embedding, dtype=np.float32)
+        query_norm = float(np.linalg.norm(query))
+        if query.ndim != 1 or query_norm <= 0.0:
+            raise ValueError("query_embedding must be a non-zero vector")
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._db.execute(
+            "SELECT chunk_id, embedding FROM chunks "
+            f"WHERE embedding IS NOT NULL AND chunk_id IN ({placeholders})",
+            tuple(ids),
+        ).fetchall()
+        scores: dict[str, float] = {}
+        for chunk_id, blob in rows:
+            vector = np.frombuffer(blob, dtype=np.float32)
+            denominator = query_norm * float(np.linalg.norm(vector))
+            if vector.shape == query.shape and denominator > 0.0:
+                scores[str(chunk_id)] = float(np.dot(query, vector) / denominator)
+        return scores
+
     def rebuild_index(self) -> None:
         """Rebuild the hnswlib index from all embeddings in SQLite."""
         self._clear_span_cache()

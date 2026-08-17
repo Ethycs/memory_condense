@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
@@ -96,6 +97,29 @@ class EmbeddingService:
             ),
             dtype=np.float32,
         )
+
+    def close(self) -> None:
+        """Release lazily loaded model weights before another GPU stage.
+
+        The memory pipeline normally keeps one embedder resident.  Staged
+        experiments are different: they batch all retrieval queries first,
+        then give the same GPU to a Qwen prefix teacher.  Explicit release
+        prevents the two models from competing for accelerator memory.
+        """
+
+        model = self._model
+        self._model = None
+        if model is None:
+            return
+        del model
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:  # pragma: no cover - torch is an optional import here
+            pass
 
     @property
     def model_name(self) -> str:

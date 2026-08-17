@@ -1,6 +1,6 @@
 # Original Architecture Plan — LLM API + local bge-m3 memory manager
 
-**Status**: 🟡 LARGELY REALIZED — Phases 0, 1, 2, 3 and 5 are built and merged to `main`; Phase 4 (cold summaries) is not. See `03 - Architecture/00` for the as-built map and `06 - Roadmaps/00` for what is open.
+**Status**: 🟡 LARGELY REALIZED — Phases 0, 1, 2, 3 and 5 are built. Phase 4A, use-dependent relational consolidation across memory partitions, is implemented in schema v9; Phase 4B, materialized cold era summaries, remains unbuilt. See `03 - Architecture/00` for the as-built map and `06 - Roadmaps/00` for what is open.
 **Date**: 2026-08-14
 **Date filed**: 2026-08-14 (content predates repo's first commit)
 **Supersedes**: the "Phases 1–4 unbuilt and under re-evaluation" status of this document; also the canonical copy of the root-level `arch_instructions.md` (original retained in place for now; see `09 - Archived/ARCHIVE-INDEX.md`)
@@ -71,7 +71,8 @@ SQLite for transcript + memory items; FAISS or hnswlib for ANN; embeddings as SQ
 | 1 | MemoryItem + pins + ContextPacker + HOT/WARM retrieval | ✅ Built | `schemas.py`, `memory_store.py`, `context_packer.py`, `ranking.py` |
 | 2 | LLM memory_ops (strict JSON) + Validator + supersede | ✅ Built — **rule-based extractor is the default**; the LLM path exists and is exercised by tests, but is opt-in via `extractor=LLMExtractor(complete=…)` | `extractor.py`, `validator.py`, `memory_store.supersede` |
 | 3 | Decay + tiering + access reheating | ✅ Built | `decay.py`, `memory_store.touch` / `heat_counts` |
-| 4 | Cold summaries (cluster "era summaries") | 🔲 **Unbuilt** — the one design phase with no code | — |
+| 4A | Live relational consolidation driven by later packed prompts | ✅ Built — causal prompt/response binding, decayed repeated co-activation, bounded iterative reads, optional CAV/QK/OV weighting | `consolidation.py`, schema v9, `MemoryCondenser.build_context` |
+| 4B | Materialized cold summaries (cluster "era summaries") | 🔲 **Unbuilt** — now gated on stable assemblies learned by 4A | — |
 | 5 | Eval harness (scripted conversations + QA probes; token cost, recall, correction robustness) | ✅ Built — self-replay **and** QA-probe benchmark modes; token cost + latency now instrumented via `UsageStats` | `eval/runner.py`, `eval/benchmark.py`, `eval/analysis.py` |
 
 All of the above is committed and merged to `main` as of 2026-08-14 (merge `f3edc91`). "Built" here means "exists and passes tests" (407 passing), not "measured" — see the Decision Point in `06 - Roadmaps/00`. Merging changed the first half of that sentence and nothing about the second.

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 9
 
 #: DDL introduced by v3, written once and reused by both the fresh-database
 #: path and the migration path.
@@ -118,6 +118,84 @@ CREATE INDEX IF NOT EXISTS idx_hebbian_edges_high
 ON hebbian_chunk_edges(artifact_id, chunk_high);
 """
 
+#: Model-independent live consolidation introduced by v8.  Nodes are durable
+#: references into the semantic-memory and evidence partitions; edges contain
+#: only decayed scalar co-activation statistics.  In particular there is no
+#: column capable of retaining a prompt, token stream, activation, or K/V
+#: cache.  Repeated later contexts strengthen useful assemblies while the
+#: ordinary turn clock weakens associations that stop recurring.
+_V8_CONSOLIDATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS consolidation_access_events (
+    event_id          TEXT PRIMARY KEY,
+    observed_turn     INTEGER NOT NULL CHECK(observed_turn >= 0),
+    event_fingerprint TEXT NOT NULL,
+    member_count      INTEGER NOT NULL CHECK(member_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_events_turn
+ON consolidation_access_events(observed_turn);
+
+CREATE TABLE IF NOT EXISTS consolidation_nodes (
+    node_key         TEXT PRIMARY KEY,
+    node_kind        TEXT NOT NULL CHECK(node_kind IN ('memory', 'chunk')),
+    memory_id        TEXT UNIQUE REFERENCES memory_items(mem_id) ON DELETE CASCADE,
+    chunk_id         TEXT UNIQUE REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+    access_mass      REAL NOT NULL DEFAULT 0.0 CHECK(access_mass >= 0.0),
+    access_count     INTEGER NOT NULL DEFAULT 0 CHECK(access_count >= 0),
+    last_access_turn INTEGER NOT NULL DEFAULT 0 CHECK(last_access_turn >= 0),
+    CHECK(
+        (node_kind = 'memory' AND memory_id IS NOT NULL AND chunk_id IS NULL)
+        OR
+        (node_kind = 'chunk' AND chunk_id IS NOT NULL AND memory_id IS NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_nodes_kind
+ON consolidation_nodes(node_kind, node_key);
+
+CREATE TABLE IF NOT EXISTS consolidation_edges (
+    node_low             TEXT NOT NULL REFERENCES consolidation_nodes(node_key)
+                         ON DELETE CASCADE,
+    node_high            TEXT NOT NULL REFERENCES consolidation_nodes(node_key)
+                         ON DELETE CASCADE,
+    coactivation_mass    REAL NOT NULL DEFAULT 0.0
+                         CHECK(coactivation_mass >= 0.0),
+    coactivation_count   INTEGER NOT NULL DEFAULT 0
+                         CHECK(coactivation_count >= 0),
+    last_reinforced_turn INTEGER NOT NULL DEFAULT 0
+                         CHECK(last_reinforced_turn >= 0),
+    PRIMARY KEY (node_low, node_high),
+    CHECK(node_low < node_high)
+);
+
+CREATE INDEX IF NOT EXISTS idx_consolidation_edges_high
+ON consolidation_edges(node_high);
+
+-- A retired semantic memory must not remain reachable through learned state.
+-- The underlying memory row and provenance remain intact; only reconstructible
+-- consolidation state is removed.
+CREATE TRIGGER IF NOT EXISTS trg_consolidation_retire_memory
+AFTER UPDATE OF status ON memory_items
+WHEN NEW.status <> 'active'
+BEGIN
+    DELETE FROM consolidation_nodes WHERE memory_id = NEW.mem_id;
+END;
+
+-- Chunk deletion is represented by clearing its retrieval payload while the
+-- provenance row survives.  Remove only the learned node and incident edges.
+CREATE TRIGGER IF NOT EXISTS trg_consolidation_retire_chunk
+AFTER UPDATE OF embedding ON chunks
+WHEN NEW.embedding IS NULL
+BEGIN
+    DELETE FROM consolidation_nodes WHERE chunk_id = NEW.chunk_id;
+END;
+"""
+
+_V9_CAUSAL_BINDING_SCHEMA = """
+ALTER TABLE consolidation_edges
+ADD COLUMN causal_count INTEGER NOT NULL DEFAULT 0 CHECK(causal_count >= 0);
+"""
+
 #: Full schema for a freshly created database (already at CURRENT_SCHEMA_VERSION).
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS turns (
@@ -204,6 +282,8 @@ _SCHEMA_SQL = (
     + _V3_INDEXES
     + _V5_ASSOCIATION_SCHEMA
     + _V7_HEBBIAN_SCHEMA
+    + _V8_CONSOLIDATION_SCHEMA
+    + _V9_CAUSAL_BINDING_SCHEMA
     + f"\nINSERT OR REPLACE INTO meta (key, value)"
     f" VALUES ('schema_version', '{CURRENT_SCHEMA_VERSION}');\n"
 )
@@ -291,6 +371,18 @@ UPDATE meta SET value = '6' WHERE key = 'schema_version';
     7: _V7_HEBBIAN_SCHEMA
     + """
 UPDATE meta SET value = '7' WHERE key = 'schema_version';
+""",
+    8: _V8_CONSOLIDATION_SCHEMA
+    + """
+UPDATE meta SET value = '8' WHERE key = 'schema_version';
+""",
+    # A completed prompt/response episode is stronger evidence than an
+    # incidental retrieved-together event. Keep that provenance as one scalar
+    # counter so unique outcomes can be recalled without lowering the repeated
+    # co-access guard for every edge in the graph.
+    9: _V9_CAUSAL_BINDING_SCHEMA
+    + """
+UPDATE meta SET value = '9' WHERE key = 'schema_version';
 """,
 }
 

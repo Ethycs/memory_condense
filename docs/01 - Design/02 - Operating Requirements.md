@@ -25,7 +25,11 @@ The system's claim is **dual benefit**: equal recall for fewer tokens, or more r
 
 The deliverable is the **assembled, budgeted context**: recent window + memory header + verbatim expansions (+ era summaries when built), packed by `ContextPacker` under hard per-section ceilings. Retrieval modes (dense / hybrid / span) are **components inside layers**, not alternatives to the system. Benchmarking a component and reporting it as the system is a category error — it happened twice (the original harness bypassed `build_context`; the 2026-08-15/16 arm comparisons bypassed it again).
 
-- **State**: **Built, mis-wired, under-measured.** The expansion layer can only draw from dense or hybrid ([`condenser.py:220`](../../src/memory_condense/condenser.py#L220)) — span, the best-measured retriever, is unreachable from the assembly. No whole-system number exists with all layers live.
+- **State**: **Built, expanded, under-measured.** Schema v8 now lets later
+  packed prompts consolidate recurring assemblies across typed memories and
+  source chunks, and normal `build_context` performs its bounded read-before-write
+  lifecycle. The expansion layer still cannot draw from span, and no
+  whole-system answer-stage number exists with every layer live.
 
 ## R4 — Operating envelope: 1 to 1,000,000 tokens
 

@@ -114,7 +114,7 @@ provider-agnostic, while public common-benchmark validation remains open.
 - **`delete_chunk(chunk_id)`** — clears embedding + `hnsw_label` in SQLite (authoritative), marks the label deleted in the live hnswlib graph best-effort, and drops the BM25 postings. The chunk **row** survives so memory provenance pointing at it cannot dangle.
 - **Structure**: hnswlib `space="cosine"`, `M=16`, `ef_construction=200`, `max_elements=100_000`; chunk↔label mapping lives in `chunks.hnsw_label` (single source of truth); `rebuild_index()` reconstructs the `.bin` from SQLite blobs.
 
-### Compiled and live association plane — `association_store.py`, `associative_retrieval.py`, `heat_diffusion.py`, `hebbian_retrieval.py`
+### Compiled and live association plane — `association_store.py`, `associative_retrieval.py`, `heat_diffusion.py`, `hebbian_retrieval.py`, `consolidation.py`
 
 - **Write-time domain**: a bounded Qwen3 prefix inspects small candidate sets
   and compiles fixed-width CAV signatures plus per-head QK/OV edge evidence.
@@ -141,6 +141,21 @@ provider-agnostic, while public common-benchmark validation remains open.
   retain only an event ID plus membership hash. Query text and transformer token
   state are never persisted. See
   [`02 - Live Hebbian Co-Retrieval Memory.md`](../00%20-%20Theory/02%20-%20Live%20Hebbian%20Co-Retrieval%20Memory.md).
+- **Prompt-driven systems consolidation**: schema v9 adds a separate,
+  model-independent graph whose typed nodes point into both `memory_items` and
+  `chunks`. Completed interactions bind the stored prompt/prior anchors to every
+  new response/tool chunk through fixed-size slices; `causal_count` distinguishes
+  that evidence from ordinary repeated co-access. Reads add candidates without
+  evicting direct evidence, may diffuse through two bounded scalar hops, and
+  rerank the frontier against the live query before the unchanged hard token
+  cap. Associations decay in turn-space and are degree-pruned. Graph-admitted
+  results cannot reinforce themselves.
+- **Qwen-weighted consolidation**: `observe_context_access` accepts transient
+  CAV-derived node activity plus bounded QK/OV pair affinities. The prefix
+  workspace is discarded; schema v9 persists only IDs, scalar masses/counts,
+  turn coordinates, and idempotency hashes. Rank-discounted activity remains
+  the provider-free fallback. See
+  [`03 - Prompt-Driven Systems Consolidation.md`](../00%20-%20Theory/03%20-%20Prompt-Driven%20Systems%20Consolidation.md).
 
 ### Causal transition policy — `transition_policy.py`
 
@@ -216,8 +231,10 @@ provider-agnostic, while public common-benchmark validation remains open.
   (ranked compiled links) · `search_heat_associative` (dual QK/heat allocation)
   · `search_hebbian` / `observe_retrieval_access` (bounded live co-access)
   · `recall_memories` (ranked `MemoryResult`, reheats) · `build_context`
-  (packed prompt; `hybrid=True` by default) · `heat_counts` · properties
-  `transcript` / `memory` / `retriever` / `validator`.
+  (packed prompt; `hybrid=True` by default; live consolidation read/write) ·
+  `observe_context_access` (optional CAV/QK/OV-weighted update) · `heat_counts`
+  · properties `transcript` / `memory` / `retriever` / `associations` /
+  `consolidation` / `validator`.
 - Constructor params of note: `extractor`, `budget`, `auto_extract`, and **`embedder`** — injectable so tests substitute a fake and never download bge-m3.
 
 ### Loader — `loader.py`

@@ -28,7 +28,8 @@ Everything marked ✅ below is **built and unit-tested but not committed**. `git
 | Eval harness (self-replay + judge + ablation) | ✅ ~95% — instrumented and model-fixed; sweep still never run |
 | **Benchmark numbers on LongMemEval / LoCoMo** | 🔲 **Open — harness exists, has never been run. No competitiveness claim is possible yet.** |
 | **The parameter sweep** | 🔲 Open — `sweep.py` exists, 54 configs, never executed |
-| **Cold-tier era summaries** (design Phase 4) | 🔲 Open — unimplemented |
+| **Live relational consolidation** (design Phase 4A) | ✅ Implemented in schema v9 — completed prompt/response episodes create typed causal bindings; later prompts strengthen decayed cross-partition associations; Qwen weighting reached 38/39 local evidence probes, while answer-stage/public benchmarking remains open |
+| **Materialized cold-tier era summaries** (design Phase 4B) | 🔲 Open — now gated on stable assemblies learned by Phase 4A rather than arbitrary clustering |
 | ~~Hybrid retrieval reachable from the self-replay eval~~ | ✅ Complete — `RetrievalConfig.hybrid/alpha/candidates`, `--hybrid`/`--alpha`, distinct result filename. 🔲 **the delta vs dense is still unmeasured** |
 
 ## Decision Point (now UNBLOCKED, still OPEN)

@@ -134,6 +134,43 @@ class TestExpansions:
         assert len(packed.expansions) == 2
         assert packed.dropped["expansions"] == 3
 
+    def test_consolidation_candidates_are_additive_to_direct_slots(self):
+        direct = [_result("direct alpha"), _result("direct beta")]
+        learned = _result("learned gamma").model_copy(
+            update={"route": "live_consolidation"}
+        )
+        budget = ContextBudget(
+            expansion_tokens=100,
+            max_expansions=2,
+            max_consolidation_expansions=1,
+        )
+
+        packed = ContextPacker(budget).pack(expansions=[*direct, learned])
+
+        assert packed.expansion_chunk_ids == [
+            direct[0].chunk.chunk_id,
+            direct[1].chunk.chunk_id,
+            learned.chunk.chunk_id,
+        ]
+
+    def test_budget_aware_order_keeps_short_high_utility_evidence(self):
+        long = _result("long " * 20).model_copy(update={"score": 0.9})
+        short_a = _result("short alpha").model_copy(update={"score": 0.8})
+        short_b = _result("short beta").model_copy(update={"score": 0.7})
+        budget = ContextBudget(
+            expansion_tokens=18,
+            max_expansions=3,
+            budget_aware_expansions=True,
+        )
+
+        packed = ContextPacker(budget).pack(
+            expansions=[long, short_a, short_b]
+        )
+
+        assert short_a.chunk.chunk_id in packed.expansion_chunk_ids
+        assert short_b.chunk.chunk_id in packed.expansion_chunk_ids
+        assert long.chunk.chunk_id not in packed.expansion_chunk_ids
+
     def test_each_expansion_truncated(self):
         budget = ContextBudget(max_expansion_tokens=10)
         packed = ContextPacker(budget).pack(expansions=[_result("word " * 200)])
@@ -159,6 +196,16 @@ class TestExpansions:
         packed = ContextPacker().pack(expansions=[_result("alpha"), _result("beta")])
         assert packed.expansions[0].startswith("[1]")
         assert packed.expansions[1].startswith("[2]")
+
+    def test_records_ids_only_for_expansions_that_reach_the_prompt(self):
+        results = [_result(f"excerpt {index}") for index in range(3)]
+        packed = ContextPacker(ContextBudget(max_expansions=2)).pack(
+            expansions=results
+        )
+        assert packed.expansion_chunk_ids == [
+            results[0].chunk.chunk_id,
+            results[1].chunk.chunk_id,
+        ]
 
 
 class TestMessageAssembly:

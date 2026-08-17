@@ -71,6 +71,9 @@ class TestFreshDatabase:
             "hebbian_access_events",
             "hebbian_chunk_nodes",
             "hebbian_chunk_edges",
+            "consolidation_access_events",
+            "consolidation_nodes",
+            "consolidation_edges",
             "meta",
         } <= tables
 
@@ -84,6 +87,10 @@ class TestFreshDatabase:
             assert "idx_turns_source" in {
                 row[1] for row in db.execute("PRAGMA index_list(turns)").fetchall()
             }
+
+    def test_consolidation_edges_distinguish_causal_binding(self, tmp_path):
+        with Database(tmp_path / "causal.db") as db:
+            assert "causal_count" in _column_names(db, "consolidation_edges")
 
     def test_reopening_is_idempotent(self, tmp_path):
         path = tmp_path / "reopen.db"

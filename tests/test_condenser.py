@@ -15,7 +15,9 @@ import pytest
 
 from memory_condense.association_store import AssociationArtifact
 from memory_condense.condenser import MemoryCondenser
+from memory_condense.consolidation import ConsolidationNode
 from memory_condense.context_packer import ContextBudget
+from memory_condense.head_memory import MemoryLinkHit, MemoryLinkResult
 from memory_condense.schemas import (
     Chunk,
     MemoryOps,
@@ -54,6 +56,32 @@ class FakeEmbedder:
             c.model_copy(update={"embedding": self._vec(c.text).tolist()})
             for c in chunks
         ]
+
+
+class FakeQwenTurnLinker:
+    """Records the bounded workspace and emits deterministic QK/OV hits."""
+
+    def __init__(self) -> None:
+        self.candidate_ids: tuple[str, ...] = ()
+
+    def link(self, source_text, candidates, *, top_k=None):
+        assert source_text
+        bounded = list(candidates[:top_k])
+        self.candidate_ids = tuple(candidate.episode_id for candidate in bounded)
+        return MemoryLinkResult(
+            hits=tuple(
+                MemoryLinkHit(
+                    episode_id=candidate.episode_id,
+                    qk_score=float(len(bounded) - index),
+                    ov_transport=1.0,
+                    head_weights=(1.0,),
+                )
+                for index, candidate in enumerate(bounded)
+            ),
+            source_cav_signature=(0.25, 0.75),
+            workspace_candidates=len(bounded),
+            workspace_tokens=32,
+        )
 
 
 CONVERSATION = [
@@ -695,6 +723,104 @@ class TestContextAssembly:
             for i in populated.memory.list_items()
         }
         assert after == before
+
+    def test_context_build_learns_only_the_items_that_reach_the_prompt(
+        self, populated
+    ):
+        packed = populated.build_context(
+            "What storage constraints and decisions matter?",
+            recent_turns=0,
+        )
+        stats = populated.consolidation.stats()
+        assert stats["nodes"] == len(packed.memory_ids) + len(
+            packed.expansion_chunk_ids
+        )
+        assert stats["edges"] > 0
+        assert stats["retained_prompt_state_bytes"] == 0
+
+    def test_repeating_same_context_build_is_idempotent(self, populated):
+        kwargs = dict(recent_turns=0, use_consolidation=False)
+        populated.build_context("What did we decide?", **kwargs)
+        before = populated.consolidation.stats()
+        populated.build_context("What did we decide?", **kwargs)
+        assert populated.consolidation.stats() == before
+
+    def test_measurement_can_disable_consolidation_learning(self, populated):
+        populated.build_context(
+            "What did we decide?",
+            recent_turns=0,
+            learn_consolidation=False,
+        )
+        assert populated.consolidation.stats() == {
+            "nodes": 0,
+            "edges": 0,
+            "event_receipts": 0,
+            "retained_prompt_state_bytes": 0,
+        }
+
+    def test_explicit_qwen_weighted_context_observation(self, populated):
+        packed = populated.build_context(
+            "What did we decide?",
+            recent_turns=0,
+            use_consolidation=False,
+            learn_consolidation=False,
+        )
+        left = ConsolidationNode.memory(packed.memory_ids[0])
+        right = ConsolidationNode.chunk(packed.expansion_chunk_ids[0])
+        update = populated.observe_context_access(
+            packed.memory_ids,
+            packed.expansion_chunk_ids,
+            access_event_id="qwen-turn-1",
+            node_activations={left: 1.0, right: 0.8},
+            pair_affinities={(left, right): 0.4},
+        )
+        assert update.nodes_observed == 2
+        neighbor = populated.consolidation.neighbors(
+            {left: 1.0},
+            top_k=1,
+            min_coactivation_count=1,
+        )[0]
+        assert neighbor.node == right
+        assert neighbor.score == pytest.approx(0.4)
+
+    def test_qwen_consolidates_packed_direct_members_without_retaining_workspace(
+        self, populated
+    ):
+        packed = populated.build_context(
+            "What storage constraints and decisions matter?",
+            recent_turns=0,
+            use_consolidation=False,
+            learn_consolidation=False,
+        )
+        linker = FakeQwenTurnLinker()
+
+        result, update = populated.consolidate_context_with_qwen(
+            "What storage constraints and decisions matter?",
+            packed,
+            linker,
+        )
+
+        expected_ids = {
+            *(f"m:{mem_id}" for mem_id in packed.direct_memory_ids),
+            *(f"c:{chunk_id}" for chunk_id in packed.direct_expansion_chunk_ids),
+        }
+        assert set(linker.candidate_ids) == expected_ids
+        assert result.workspace_candidates == len(expected_ids)
+        assert update.created is True
+        assert update.nodes_observed == len(expected_ids)
+        assert populated.consolidation.stats()["retained_prompt_state_bytes"] == 0
+
+    def test_qwen_consolidation_rejects_double_learning(self, populated):
+        packed = populated.build_context(
+            "What did we decide?",
+            recent_turns=0,
+        )
+        with pytest.raises(ValueError, match="already used rank-based"):
+            populated.consolidate_context_with_qwen(
+                "What did we decide?",
+                packed,
+                FakeQwenTurnLinker(),
+            )
 
 
 class TestLifecycle:

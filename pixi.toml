@@ -40,6 +40,8 @@ qwen-smoke = "python -m memory_condense.qwen_prefix --model-dir .cache/models/Qw
 qwen-cav-probe = "python -m memory_condense.cav_probe --model-dir .cache/models/Qwen3-8B --dataset examples/cav/live_memory_concepts.json --layers all --prefix-layers 7 --batch-size 8 --output eval_results/qwen3_prefix_cav_probe.json"
 qwen-head-memory-smoke = "python -m memory_condense.head_memory --model-dir .cache/models/Qwen3-8B --cav-report eval_results/qwen3_prefix_cav_probe.json --cav-vectors eval_results/qwen3_prefix_cav_probe.safetensors --dataset examples/cav/live_head_memory_smoke.json --layer 5 --output eval_results/qwen3_live_head_memory_smoke.json"
 qwen-head-association-smoke = "python -m memory_condense.head_memory --model-dir .cache/models/Qwen3-8B --cav-report eval_results/qwen3_prefix_cav_probe.json --cav-vectors eval_results/qwen3_prefix_cav_probe.safetensors --dataset examples/cav/live_head_association_smoke.json --layer 5 --association-layer 1 --output eval_results/qwen3_live_head_association_layer_5_1.json"
+qwen-consolidate = "python -m memory_condense.qwen_consolidation"
+qwen-consolidation-replay = "python -m memory_condense.eval.consolidation_replay"
 
 [feature.dev.dependencies]
 pytest = ">=8.0"

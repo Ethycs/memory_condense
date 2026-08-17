@@ -41,13 +41,19 @@ class ContextBudget:
     # reach the prompt.  This raised assembled recall in the B0 investigation
     # without increasing the 800-token expansion budget.
     max_expansions: int = 10
+    # Learned candidates are additive and may use otherwise-idle token budget;
+    # they never consume one of the direct-retrieval slots.
+    max_consolidation_expansions: int = 3
     max_expansion_tokens: int = 250
+    budget_aware_expansions: bool = False
     # Opt-in: use diffused source heat as weighted-fair prompt exposure. The
     # default preserves the established retrieval ordering exactly.
     heat_weighted_expansions: bool = False
     max_source_expansion_fraction: float = 1.0
 
     def __post_init__(self) -> None:
+        if self.max_consolidation_expansions < 0:
+            raise ValueError("max_consolidation_expansions must be non-negative")
         if not 0.0 < self.max_source_expansion_fraction <= 1.0:
             raise ValueError("max_source_expansion_fraction must lie in (0, 1]")
 
@@ -88,9 +94,13 @@ class ContextPacker:
             self._build_memory_header(memories)
         )
         kept_turns, turn_tokens, turns_dropped = self._fit_recent_turns(recent_turns)
-        exp_texts, exp_tokens, exp_dropped, source_tokens = self._build_expansions(
-            expansions
-        )
+        (
+            exp_texts,
+            expansion_chunk_ids,
+            exp_tokens,
+            exp_dropped,
+            source_tokens,
+        ) = self._build_expansions(expansions)
 
         messages: list[dict[str, str]] = []
         if system_prompt:
@@ -123,6 +133,7 @@ class ContextPacker:
             memory_header=header,
             memory_ids=memory_ids,
             expansions=exp_texts,
+            expansion_chunk_ids=expansion_chunk_ids,
             recent_turns=kept_turns,
             token_counts=token_counts,
             expansion_source_token_counts=source_tokens,
@@ -189,7 +200,7 @@ class ContextPacker:
 
     def _build_expansions(
         self, expansions: list[RetrievalResult]
-    ) -> tuple[list[str], int, int, dict[str, int]]:
+    ) -> tuple[list[str], list[str], int, int, dict[str, int]]:
         """Verbatim excerpts, each capped, and capped again in aggregate.
 
         The final excerpt is shortened to the remaining aggregate budget.  The
@@ -202,13 +213,22 @@ class ContextPacker:
             if self.budget.heat_weighted_expansions
             else expansions
         )
+        if self.budget.budget_aware_expansions:
+            ranked = self._budget_aware_order(ranked)
         texts: list[str] = []
+        chunk_ids: list[str] = []
         used = count_tokens(EXPANSION_PREFIX)
         source_tokens: dict[str, int] = defaultdict(int)
+        direct_kept = 0
+        consolidation_kept = 0
 
         for result in ranked:
-            if len(texts) >= self.budget.max_expansions:
-                break
+            is_consolidation = result.route == "live_consolidation"
+            if is_consolidation:
+                if consolidation_kept >= self.budget.max_consolidation_expansions:
+                    continue
+            elif direct_kept >= self.budget.max_expansions:
+                continue
             remaining = self.budget.expansion_tokens - used
             label = f"[{len(texts) + 1}] "
             # Reserve the label and the newline accounted for by this packer.
@@ -236,14 +256,81 @@ class ContextPacker:
             if not snippet or used + cost > self.budget.expansion_tokens:
                 break
             texts.append(entry)
+            chunk_ids.append(result.chunk.chunk_id)
+            if is_consolidation:
+                consolidation_kept += 1
+            else:
+                direct_kept += 1
             used += cost
             source_id = result.memory_source_id or result.chunk.turn_id
             source_tokens[source_id] += count_tokens(snippet)
 
         if not texts:
-            return [], 0, len(expansions), {}
+            return [], [], 0, len(expansions), {}
 
-        return texts, used, len(expansions) - len(texts), dict(source_tokens)
+        return (
+            texts,
+            chunk_ids,
+            used,
+            len(expansions) - len(texts),
+            dict(source_tokens),
+        )
+
+    def _budget_aware_order(
+        self, expansions: list[RetrievalResult]
+    ) -> list[RetrievalResult]:
+        """Choose high-utility evidence under the hard token ceiling.
+
+        Retrieval score divided by square-root token cost is a conservative
+        length correction: it stops a few long, marginal candidates from
+        hiding short precise evidence without collapsing into a pure
+        score-per-token policy that over-favors tiny fragments. Selected rows
+        return in original rank order for deterministic prompt rendering.
+        """
+
+        prefix_cost = count_tokens(EXPANSION_PREFIX)
+        available = max(0, self.budget.expansion_tokens - prefix_cost)
+        ranked: list[tuple[float, int, int, bool, RetrievalResult]] = []
+        for index, result in enumerate(expansions):
+            snippet = truncate_to_tokens(
+                result.chunk.text.strip(), self.budget.max_expansion_tokens
+            )
+            if not snippet:
+                continue
+            # Two tokens safely approximate the rendered label and newline;
+            # the exact pack below remains the authoritative hard cap.
+            cost = count_tokens(snippet) + 2
+            utility = max(0.0, float(result.score)) / math.sqrt(max(1, cost))
+            ranked.append(
+                (
+                    utility,
+                    index,
+                    cost,
+                    result.route == "live_consolidation",
+                    result,
+                )
+            )
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        selected: list[tuple[int, RetrievalResult]] = []
+        used = 0
+        direct = 0
+        consolidation = 0
+        for _utility, index, cost, is_consolidation, result in ranked:
+            if is_consolidation:
+                if consolidation >= self.budget.max_consolidation_expansions:
+                    continue
+            elif direct >= self.budget.max_expansions:
+                continue
+            if used + cost > available:
+                continue
+            selected.append((index, result))
+            used += cost
+            if is_consolidation:
+                consolidation += 1
+            else:
+                direct += 1
+        selected.sort(key=lambda item: item[0])
+        return [result for _index, result in selected]
 
     def _heat_weighted_order(
         self, expansions: list[RetrievalResult]

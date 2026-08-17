@@ -161,6 +161,7 @@ def _assemble(
             # silently override it back to dense.
             hybrid=True,
             reheat_memories=False,
+            learn_consolidation=False,
         )
         header = [packed.memory_header] if packed.memory_header else []
         return header, list(packed.expansions), []

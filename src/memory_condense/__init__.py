@@ -7,6 +7,17 @@ from memory_condense.association_store import (
     StoredHebbianNeighbor,
 )
 from memory_condense.condenser import MemoryCondenser
+from memory_condense.consolidation import (
+    ConsolidationNeighbor,
+    ConsolidationNode,
+    ConsolidationNodeKind,
+    ConsolidationUpdate,
+    LiveConsolidationStore,
+    context_activations,
+    expand_context_associations,
+    inspect_qwen_context_hyperplane,
+    qwen_head_activations,
+)
 from memory_condense.context_packer import ContextBudget, ContextPacker
 from memory_condense.decay import effective_energy, heat_for, item_energy, item_heat
 from memory_condense.heat_diffusion import (
@@ -47,6 +58,15 @@ from memory_condense.transition_policy import (
 __all__ = [
     # facade
     "MemoryCondenser",
+    "ConsolidationNodeKind",
+    "ConsolidationNode",
+    "ConsolidationUpdate",
+    "ConsolidationNeighbor",
+    "LiveConsolidationStore",
+    "context_activations",
+    "expand_context_associations",
+    "inspect_qwen_context_hyperplane",
+    "qwen_head_activations",
     "AssociationArtifact",
     "AssociationStore",
     "HebbianUpdate",

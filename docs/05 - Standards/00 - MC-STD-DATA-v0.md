@@ -6,11 +6,11 @@
 **Applies to:** `src/memory_condense/` and `eval_results/` JSON
 **Depends on:** • `03 - Architecture/00 - System Overview.md` (as-built map)
 
-> **Current worktree**: `schema_version` 6. v4 moves lifecycle decay to conversation-turn coordinates; v5 adds versioned, compact CAV signatures and sparse QK/OV association edges; v6 adds durable source/session identity to turns. Stores at any earlier version migrate in place on open — see clause 10.
+> **Current worktree**: `schema_version` 8. v4 moves lifecycle decay to conversation-turn coordinates; v5 adds versioned compact CAV/QK/OV artifacts; v6 adds durable source/session identity; v7 adds artifact-scoped chunk Hebbian co-access; v8 adds model-independent live consolidation across typed memories and chunks. Stores at any earlier version migrate in place on open — see clause 10.
 
 ## 0. Scope
 
-Covers: the SQLite schema and migrations through v6, the embedding contract, chunk sizing, the lexical/BM25 index, the memory-item and provenance contract, compact association artifacts, loader input formats (Claude exports + LongMemEval/LoCoMo), and eval result JSON.
+Covers: the SQLite schema and migrations through v8, the embedding contract, chunk sizing, the lexical/BM25 index, the memory-item and provenance contract, compact association and consolidation artifacts, loader input formats (Claude exports + LongMemEval/LoCoMo), and eval result JSON.
 
 Does NOT cover: prompt formats (implementation detail), rank weights or `alpha` (tuning parameters, not contract), or the `MemoryOps` **wire** contract for external producers — that gets its own standard (MC-STD-MEMOPS) if and when a non-local producer exists.
 
@@ -31,12 +31,22 @@ Does NOT cover: prompt formats (implementation detail), rank weights or `alpha` 
     Note the normalization here differs from clause 8's on purpose. Clause 8 decides whether a quote is genuine *evidence*, where a change of case changes the evidence, so it MUST NOT case-fold. This clause decides whether two memories are the *same memory*. The two MUST NOT be unified.
 12. **Transformer token state MUST NOT be durable memory.** A head-inspection pass MAY materialize token IDs, Q/K/V, attention maps, head outputs, or residual streams inside a hard-bounded workspace. None may cross a pass boundary or be written to the durable store. The only durable head-derived records are fixed-width `float32` CAV coordinates, fixed-width per-head edge weights, scalar QK/OV evidence, chunk IDs, artifact identity, and lifecycle counters. Every retrieval call MUST separately cap hydrated chunks; graph traversal is not permission to grow model context.
 13. **Source identity MUST survive chunking.** When an ingest caller supplies a session/document `source_id`, every chunk derived from that turn MUST remain traceable to it through `chunks.turn_id -> turns.source_id`. Source-aware retrieval and packing MUST fall back to `turn_id` only for legacy turns whose source is NULL. A source ID groups provenance; it does not authorize source-wide prompt expansion beyond the hard token budget.
+14. **Live consolidation MUST learn only from bounded durable references that
+    actually reached a model context.** Its graph MAY connect active
+    `memory_items` and retrievable `chunks`, but MUST store no source text,
+    prompt, token state, embedding, attention matrix, residual, or K/V cache.
+    Graph-selected candidates MUST NOT reinforce the edge that selected them;
+    they must later recur through independent retrieval. Reads MUST have a
+    recurrence threshold and fixed result slots. Node/edge statistics MUST
+    decay in conversation-turn space and graph degree plus receipt history MUST
+    be bounded. CAV/QK/OV signals MAY weight a scalar update but MUST NOT bypass
+    these constraints or become factual authority.
 
 ## 2. Core concept
 
-One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 6) holds everything durable: the source-identified transcript, chunks, BM25 inverted index, memory items with provenance, and compact association artifacts. Two derived caches sit beside it — the hnswlib index file (`hnsw_index.bin`, cosine, `M=16`, `ef_construction=200`, `max_elements=100 000`, rebuildable via `rebuild_index()`) and the `chunk_terms` postings (rebuildable via `LexicalIndex.rebuild()`). Qwen is never part of this durable state; it is a bounded compiler/inspector that emits association records and unloads.
+One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 8) holds everything durable: the source-identified transcript, chunks, BM25 inverted index, memory items with provenance, compact association artifacts, and scalar live-consolidation state. Two derived caches sit beside it — the hnswlib index file (`hnsw_index.bin`, cosine, `M=16`, `ef_construction=200`, `max_elements=100 000`, rebuildable via `rebuild_index()`) and the `chunk_terms` postings (rebuildable via `LexicalIndex.rebuild()`). Qwen is never part of this durable state; it is a bounded compiler/inspector that emits association records and unloads.
 
-## 3. Storage schema (v6)
+## 3. Storage schema (v8)
 
 | Table | Columns (contract-relevant) | Notes |
 | --- | --- | --- |
@@ -48,18 +58,24 @@ One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 6) holds everythin
 | `association_artifacts` | `artifact_id` PK, model/checkpoint identity, prefix/head/CAV layers, JSON concept names, head count, creation time, JSON metadata | defines how every compact vector must be interpreted; reusing an ID with a different interpretation is rejected |
 | `chunk_cav_signatures` | `(chunk_id, artifact_id)` PK/FKs, fixed-width f32 `signature` BLOB, created/access turns, access count | concept coordinates only; width is exactly the artifact's concept count |
 | `chunk_head_edges` | `(source_chunk_id, destination_chunk_id, artifact_id)` PK/FKs, fixed-width f32 `head_weights`, scalar `qk_score`, scalar `ov_transport`, evidence/traversal counters, last-access turn, optional temporal direction | sparse directed graph; self-edges forbidden; width is exactly the artifact's query-head count |
+| `hebbian_access_events`, `hebbian_chunk_nodes`, `hebbian_chunk_edges` | artifact-scoped event fingerprints, chunk IDs, scalar node/edge masses, counts, and turn coordinates | v7 bounded live co-access projection over conceptual chunks; no prompt or token state |
+| `consolidation_access_events` | `event_id` PK, observed turn, SHA-256 membership fingerprint, member count | v8 bounded idempotency receipts; no rendered context |
+| `consolidation_nodes` | typed `node_key` pointing to exactly one active `memory_item` or retrievable `chunk`, scalar access mass/count and last-access turn | cross-partition address only; retired source state removes this derived node through triggers |
+| `consolidation_edges` | ordered node pair PK/FKs, scalar co-activation mass/count, causal count, last-reinforced turn | model-independent live assembly; distinguishes completed-interaction binding from incidental co-access; hard degree pruning and turn decay |
 | `meta` | `key` PK, `value` | holds `schema_version` |
 
 ### 3.1 Migration path
 
 | From | To | Applied changes |
 | --- | --- | --- |
-| (no file / no `meta` table) | 6 | full schema created directly at v6 |
+| (no file / no `meta` table) | 8 | full schema created directly at v8 |
 | 1 | 2 | `ALTER TABLE chunks ADD COLUMN term_count`; create `chunk_terms`, `memory_items`, `memory_provenance` and their indexes; `UPDATE meta SET value = '2'` |
 | 2 | 3 | `ALTER TABLE memory_items ADD COLUMN content_hash`; `idx_memory_content_hash`; **post-migration backfill** of `content_hash` for existing rows; `UPDATE meta SET value = '3'` |
 | 3 | 4 | add `turns.ordinal`, `memory_items.half_life_turns`, and `memory_items.last_access_turn`; backfill turn ordinals and enter existing memories at the latest turn |
 | 4 | 5 | create `association_artifacts`, `chunk_cav_signatures`, and `chunk_head_edges` plus artifact/destination indexes; no transcript or memory row is rewritten |
 | 5 | 6 | add nullable `turns.source_id` plus `(source_id, ordinal)` index; legacy turns remain valid and use `turn_id` as the source fallback |
+| 6 | 7 | add artifact-scoped bounded Hebbian access-event, chunk-node, and chunk-edge tables |
+| 7 | 8 | add model-independent cross-partition consolidation events, typed nodes, scalar edges, indexes, and retirement triggers |
 
 `Database.schema_version` reports the on-disk version (`0` when unreadable). Migrations run inside `Database.__init__`, so opening a v1 file upgrades it — no separate migration command exists, and none should be added without also making the upgrade opt-in.
 
@@ -130,6 +146,6 @@ pixi run -e dev pytest -q -m "not slow" tests/test_db.py tests/test_memory_store
 pixi run python -c "import sqlite3, tempfile, pathlib; from memory_condense.db import Database; p=pathlib.Path(tempfile.mkdtemp())/'v.db'; d=Database(p); print(d.schema_version); print(sorted(r[0] for r in d.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")))"
 ```
 
-Expect `6` and the table list `['association_artifacts', 'chunk_cav_signatures', 'chunk_head_edges', 'chunk_terms', 'chunks', 'memory_items', 'memory_provenance', 'meta', 'turns']`.
+Expect `9` and a table list containing the transcript, chunk/BM25, memory/provenance, CAV/QK/OV, v7 Hebbian, and v8 consolidation tables; schema v9 adds `consolidation_edges.causal_count`.
 
 Drift between `_SCHEMA_SQL` and `_MIGRATIONS` is no longer something to catch by hand: `tests/test_db.py::TestSchemaParity` builds a fresh database and a migrated one from both v1 and v2, then asserts they converge on the same tables, columns, and indexes. It compares shape rather than DDL text, because `ALTER TABLE ADD COLUMN` and `CREATE TABLE` render the same logical column differently and a text comparison would fail on every additive migration until everyone learned to ignore it.

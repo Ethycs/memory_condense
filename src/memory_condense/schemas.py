@@ -323,6 +323,11 @@ class RetrievalResult(BaseModel):
     # not retained activations or evidence text.
     transition_distance: Optional[int] = Field(default=None, ge=1)
     transition_direction: Optional[Literal["previous", "next"]] = None
+    # Model-independent, prompt-driven consolidation diagnostics.  These are
+    # scalar graph metadata only; prompt text and model state are never stored.
+    consolidation_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    consolidation_anchor: Optional[str] = None
+    consolidation_support: Optional[int] = Field(default=None, ge=0)
 
 
 class MemoryResult(BaseModel):
@@ -342,6 +347,10 @@ class MemoryResult(BaseModel):
     energy: float = 0.0
     recency: float = 0.0
     pin_boost: float = 0.0
+    route: Optional[str] = None
+    consolidation_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    consolidation_anchor: Optional[str] = None
+    consolidation_support: Optional[int] = Field(default=None, ge=0)
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +369,17 @@ class PackedContext(BaseModel):
     #: the model and must continue to cool.
     memory_ids: list[str] = Field(default_factory=list)
     expansions: list[str] = Field(default_factory=list)
+    #: Durable chunk IDs corresponding one-for-one with ``expansions``.  This
+    #: lets the live consolidation layer learn only from evidence that
+    #: actually survived packing, without retaining the prompt text itself.
+    expansion_chunk_ids: list[str] = Field(default_factory=list)
+    #: Independently retrieved members among the packed IDs.  Learned
+    #: candidates are intentionally excluded so a background Qwen
+    #: consolidation pass cannot reinforce the graph that selected them.
+    direct_memory_ids: list[str] = Field(default_factory=list)
+    direct_expansion_chunk_ids: list[str] = Field(default_factory=list)
+    consolidation_event_id: Optional[str] = None
+    consolidation_learned: bool = False
     recent_turns: list[tuple[str, str]] = Field(default_factory=list)
     token_counts: dict[str, int] = Field(default_factory=dict)
     # Actual excerpt content tokens exposed from each heat source. Labels and

@@ -1,10 +1,11 @@
 # V3 retrieval freeze and validation campaign
 
 **Status:** the final no-provider LongMemEval-S development replay passed the
-retrieval/context-sufficiency gate and is frozen as the v3 treatment. The
-minimum-100-question held-out campaign is fully specified but has not made any
-provider calls. This is still development selection evidence, not held-out
-accuracy or a complete-context-replacement certification.
+retrieval/context-sufficiency gate and is frozen as the v3 treatment. All ten
+blind validation cache shards are now prepared and independently verified, but
+the minimum-100-question held-out campaign has made no provider calls. This is
+still development selection evidence and validation infrastructure, not
+held-out accuracy or a complete-context-replacement certification.
 
 ## Final development replay
 
@@ -94,6 +95,31 @@ judge accuracy, a hard 8,000-token local prompt-proxy cap plus provider-usage
 postcheck, and `recent_window=4`. The plan was dry-verified end to end without
 calling a model.
 
+### Blind validation cache preparation completed
+
+The ten validation shards were prepared after the v3 freeze with
+`--prepare-cache-only`, using isolated roots in the Downloads evaluation rig:
+
+- `longmemeval-million-context-validation-compiled-v3`; and
+- `longmemeval-million-context-validation-causal-v3`.
+
+Offsets `0, 10, …, 90` all completed without a retry or provider call. Across
+the ten independent shards, preparation covered 10,441,617 transcript-token
+proxies, 54,246 turns, 79,915 chunks, and 23,917 learned episodes. Wall time
+summed across the sequential runs was 5,810.5 seconds (1:36:50.5), with a
+per-shard range of 568.3–608.9 seconds.
+
+The post-prepare audit independently reconstructed the frozen validation plan
+and rehashed every manifest, SQLite database, and HNSW index. It found ten
+unique sample hashes, ten unique compiled keys, ten unique causal keys, exact
+compiled-to-causal linkage, and no `.building-*`, WAL, or SHM remnants. Every
+receipt binds policy `5263d5afd15298ec4088db9d6381ae243ddb685e9a3cf4d9892fc84e14fb9883`,
+implementation `452be3bfa7524bb81676c7abcb032529a32a480311d24d1e17f8513c783ecd83`,
+environment `058083871240979257ada7ca4c71dd816fee64792b275ef11e4857c9f5ebba33`,
+and BGE execution `330aaff04f917de64e7b21c7decf82556b8fb9b1163c00d8a1e672a93ce78f38`.
+All ten shards are therefore eligible for the validation-only
+`require_cache_hit=true` read-only path.
+
 ## Mem0 comparison boundary
 
 The provider-free Mem0 adapter now matches the official raw LongMemEval
@@ -119,10 +145,13 @@ pixi run -e dev python -m pytest -q
 1247 passed, 1 unrelated pydantic-settings warning
 ```
 
-The next safe step is blind preparation of the ten validation cache shards.
-That step makes no provider calls. Scored validation would then require exactly
-200 authorized logical calls: one responder and one independent judge per
-question. Until those calls are explicitly authorized and the campaign merger
-certifies the ten reports, the correct claim is: **the v3 treatment achieves
+The next safe step is a scored offset-0 canary, which requires explicit
+authorization for exactly 20 central-dev calls: ten responder calls and ten
+independent judge calls, with zero retries. The remaining nine shards require a
+further 180 calls, or the complete campaign can be authorized as 200 calls up
+front. Until those calls are explicitly authorized and the campaign merger
+certifies all ten reports, the correct claim is: **the v3 treatment achieves
 100% source and scored answer-value coverage on the locked 1M-token
-development replay while returning an average 1,986-token context packet.**
+development replay while returning an average 1,986-token context packet; all
+100 held-out questions have blind, verified, read-only caches ready for scored
+evaluation.**

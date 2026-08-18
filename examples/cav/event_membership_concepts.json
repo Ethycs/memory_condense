@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "purpose": "Probe whether a shallow Qwen3-8B prefix exposes a stable direction for completed autobiographical events, distinct from plans, recommendations, negations, and general discussion.",
+  "concepts": [
+    {
+      "name": "autobiographical_completed_event",
+      "description": "The speaker states that they personally completed or experienced a concrete event, rather than planning, denying, recommending, or discussing it abstractly.",
+      "train": {
+        "positive": [
+          "I visited the Science Museum yesterday and loved the astronomy exhibit.",
+          "I attended the Queen concert at the Prudential Center last night.",
+          "I went to a jazz night at a local bar on Friday.",
+          "I just got back from an outdoor concert in the park.",
+          "I toured the art museum with my sister last weekend.",
+          "I finished the marathon in four hours this morning.",
+          "I ordered the blue phone case after the baby shower.",
+          "I prepared the nursery before our guests arrived.",
+          "I flew to Hawaii for my vacation in June.",
+          "I ate dinner at Miss Bee Providore on Saturday.",
+          "I completed nine weeks of sculpting classes.",
+          "I watched the music festival in Brooklyn two weeks ago.",
+          "I bought the tickets and saw the performance downtown.",
+          "I met the author during the bookstore event yesterday.",
+          "I took the train to Seattle for the conference.",
+          "I celebrated my birthday at the botanical garden last month."
+        ],
+        "negative": [
+          "I plan to visit the Science Museum next weekend.",
+          "I might attend the Queen concert if tickets are available.",
+          "You should try the jazz night at the local bar.",
+          "The park hosts a free outdoor concert every summer.",
+          "I did not visit the art museum during that trip.",
+          "Would you recommend a marathon training schedule?",
+          "The blue phone case is available to order online.",
+          "I am thinking about preparing the nursery tomorrow.",
+          "Hawaii is a popular destination for summer vacations.",
+          "Miss Bee Providore receives many positive restaurant reviews.",
+          "Sculpting classes generally run for several weeks.",
+          "The Brooklyn music festival was listed on the events page.",
+          "I want to buy tickets for a downtown performance.",
+          "The author will appear at the bookstore next month.",
+          "The train to Seattle leaves every weekday morning.",
+          "I have never celebrated my birthday at a botanical garden."
+        ]
+      },
+      "test": {
+        "positive": [
+          "I spent Saturday exploring the Natural History Museum.",
+          "I saw Billie Eilish perform in Philadelphia with my sister.",
+          "I returned yesterday from the food festival by the river.",
+          "I took a pottery workshop at the community studio last month.",
+          "I stayed at the beach house for four days in May.",
+          "I picked out baby-shower gifts before lunch.",
+          "I joined Serenity Yoga after trying their evening class.",
+          "I read all 190 pages of Nightingale during the flight."
+        ],
+        "negative": [
+          "I hope to explore the Natural History Museum on Saturday.",
+          "Billie Eilish performs in Philadelphia during the tour.",
+          "The food festival by the river is recommended for visitors.",
+          "I cancelled the pottery workshop before it started.",
+          "The beach house can be rented for four days in May.",
+          "Which baby-shower gifts should I pick out?",
+          "Serenity Yoga offers an evening class for new members.",
+          "Nightingale contains 190 pages in this edition."
+        ]
+      }
+    }
+  ]
+}

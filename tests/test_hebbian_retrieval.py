@@ -93,6 +93,7 @@ def test_same_event_is_idempotent_and_persists_across_restart(tmp_path):
             "nodes": 2,
             "edges": 1,
             "event_receipts": 1,
+            "retained_request_token_state_bytes": 0,
             "retained_token_state_bytes": 0,
         }
 

@@ -14,12 +14,28 @@ from dataclasses import asdict, dataclass
 from typing import Any, Sequence
 
 from memory_condense._tokenizer import truncate_to_tokens
+from memory_condense.association_store import AssociationArtifact
 from memory_condense.head_memory import (
     AssociativeMemoryCandidate,
     NestedMemoryInspection,
 )
 from memory_condense.ranking import min_max_normalize
 from memory_condense.schemas import RetrievalResult
+
+
+def _qk_ov_cav_utility(hit: Any) -> float:
+    """Transient attention utility with an optional positive CAV margin."""
+
+    utility = max(0.0, float(hit.qk_score)) + math.log1p(
+        max(0.0, float(hit.ov_transport))
+    )
+    signature = hit.metadata.get("cav_signature", ())
+    if signature:
+        positive_margin = sum(max(0.0, float(value)) for value in signature) / len(
+            signature
+        )
+        utility += math.log1p(positive_margin)
+    return utility
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +71,7 @@ class QwenCandidateReranker:
         candidate_tokens: int = 64,
         query_tokens: int = 96,
         score_weight: float = 0.35,
+        association_artifact: AssociationArtifact | None = None,
     ) -> None:
         if candidate_pool < 1:
             raise ValueError("candidate_pool must be positive")
@@ -76,6 +93,7 @@ class QwenCandidateReranker:
         self.candidate_tokens = int(candidate_tokens)
         self.query_tokens = int(query_tokens)
         self.score_weight = float(score_weight)
+        self.association_artifact = association_artifact
         self.last_report: QwenRerankReport | None = None
 
     def select(
@@ -134,11 +152,7 @@ class QwenCandidateReranker:
             top_k=min(top_k, int(self.linker.max_candidates)),
             score_mode="qk_ov",
         )
-        utilities = [
-            max(0.0, float(hit.qk_score))
-            + math.log1p(max(0.0, float(hit.ov_transport)))
-            for hit in inspection.hits
-        ]
+        utilities = [_qk_ov_cav_utility(hit) for hit in inspection.hits]
         normalized = min_max_normalize(utilities)
         selected: list[RetrievalResult] = []
         for hit, score in zip(inspection.hits, normalized, strict=True):
@@ -174,19 +188,36 @@ class QwenCandidateReranker:
         candidates: Sequence[RetrievalResult],
         *,
         top_k: int,
+        unique_sources: bool = False,
     ) -> list[RetrievalResult]:
-        """Keep strong scalar candidates and fill reserved slots with Qwen winners."""
+        """Keep scalar candidates and fill reserved slots with Qwen winners.
+
+        ``unique_sources`` turns the candidate tournament into a set-retrieval
+        operator: only the strongest chunk from each durable source/session is
+        inspected. This prevents repeated chunks from one event from consuming
+        the attention reserve when a query asks for an exhaustive list.
+        """
 
         if top_k <= 0:
             self.last_report = QwenRerankReport(0, 0, 0, 0, 0, 0, 0, 0, 0)
             return []
         bounded: list[RetrievalResult] = []
         seen: set[str] = set()
+        seen_sources: set[str] = set()
         for result in candidates:
             chunk_id = result.chunk.chunk_id
             if chunk_id in seen:
                 continue
+            source_id = str(
+                result.memory_source_id
+                or getattr(result.turn, "source_id", None)
+                or getattr(result.turn, "turn_id", None)
+                or result.chunk.turn_id
+            )
+            if unique_sources and source_id in seen_sources:
+                continue
             seen.add(chunk_id)
+            seen_sources.add(source_id)
             bounded.append(result)
             if len(bounded) >= self.candidate_pool:
                 break
@@ -245,11 +276,7 @@ class QwenCandidateReranker:
             top_k=min(reserved, int(self.linker.max_candidates)),
             score_mode="qk_ov",
         )
-        utilities = [
-            max(0.0, float(hit.qk_score))
-            + math.log1p(max(0.0, float(hit.ov_transport)))
-            for hit in inspection.hits
-        ]
+        utilities = [_qk_ov_cav_utility(hit) for hit in inspection.hits]
         normalized = min_max_normalize(utilities)
         floor = min((float(result.score) for result in protected), default=0.0)
 

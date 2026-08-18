@@ -95,6 +95,7 @@ class TestCompactSignatures:
             "edges": 0,
             "cav_payload_bytes": 8,
             "head_payload_bytes": 0,
+            "retained_request_token_state_bytes": 0,
             "retained_token_state_bytes": 0,
         }
 
@@ -111,6 +112,31 @@ class TestCompactSignatures:
         )
         assert [hit.chunk_id for hit in hits] == [chunks[1], chunks[3]]
         assert all("context_dependency" in hit.shared_concepts for hit in hits)
+
+    def test_batch_write_and_source_filtered_concept_members(self, db):
+        chunks = _insert_chunks(db, 4)
+        db.execute("UPDATE turns SET source_id = 'source-a' WHERE ordinal <= 2")
+        db.execute("UPDATE turns SET source_id = 'source-b' WHERE ordinal > 2")
+        db.commit()
+        store = AssociationStore(db)
+        artifact = store.register_artifact(
+            _artifact(concept_names=("completed_event",))
+        )
+
+        assert store.put_signatures(
+            artifact.artifact_id,
+            list(zip(chunks, ([0.2], [0.9], [1.2], [-0.1]), strict=True)),
+        ) == 4
+
+        hits = store.concept_members(
+            artifact.artifact_id,
+            "completed_event",
+            top_k=4,
+            source_ids=("source-a",),
+        )
+        assert [hit.chunk_id for hit in hits] == [chunks[1], chunks[0]]
+        assert [hit.score for hit in hits] == pytest.approx([0.9, 0.2])
+        assert store.stats(artifact.artifact_id)["cav_payload_bytes"] == 16
 
 
 class TestSparseEdges:
@@ -148,7 +174,9 @@ class TestSparseEdges:
             assert edge.qk_score == pytest.approx(0.5)
             assert edge.ov_transport == pytest.approx(2.5)
             assert edge.head_weights == pytest.approx((0.625,) * 32)
-            assert store.stats(artifact.artifact_id)["retained_token_state_bytes"] == 0
+            stats = store.stats(artifact.artifact_id)
+            assert stats["retained_request_token_state_bytes"] == 0
+            assert stats["retained_token_state_bytes"] == 0
 
     def test_pruning_enforces_degree_and_uses_live_traversal_evidence(self, db):
         chunks = _insert_chunks(db, 4)

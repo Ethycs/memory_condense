@@ -71,7 +71,8 @@ The focused tests cover:
 - hard degree and event-history caps;
 - facade-level learned recall;
 - fixed result count and token-growth rollback;
-- deletion cleanup and zero retained transformer token state.
+- deletion cleanup and zero retained request-derived transformer token state;
+  reusable static weights/tokenizers are outside this metric.
 
 Ruff is not installed in the frozen dev environment, so no lint result is
 claimed.

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 from memory_condense.head_memory import MemoryLinkHit, NestedMemoryInspection
-from memory_condense.qwen_rerank import QwenCandidateReranker
+from memory_condense.qwen_rerank import QwenCandidateReranker, _qk_ov_cav_utility
 from memory_condense.schemas import Chunk, RetrievalResult, Turn
 
 
-def _result(index: int) -> RetrievalResult:
+def _result(index: int, *, source_id: str = "source-a") -> RetrievalResult:
     turn = Turn(
         turn_id=f"turn-{index}",
         role="user",
         text=f"candidate {index}",
-        source_id="source-a",
+        source_id=source_id,
     )
     chunk = Chunk(
         chunk_id=f"chunk-{index}",
@@ -97,6 +97,55 @@ def test_qwen_reranker_empty_input_does_not_invoke_linker():
     assert linker.groups == []
     assert reranker.last_report is not None
     assert reranker.last_report.output_candidates == 0
+
+
+def test_qwen_utility_rewards_positive_event_concept_margin():
+    plain = MemoryLinkHit(
+        episode_id="plain",
+        qk_score=0.2,
+        ov_transport=0.3,
+        head_weights=(1.0,),
+    )
+    event = MemoryLinkHit(
+        episode_id="event",
+        qk_score=0.2,
+        ov_transport=0.3,
+        head_weights=(1.0,),
+        metadata={"cav_signature": (0.8,)},
+    )
+
+    assert _qk_ov_cav_utility(event) > _qk_ov_cav_utility(plain)
+
+
+def test_qwen_reranker_can_limit_enumeration_candidates_to_unique_sources():
+    linker = FakeNestedLinker()
+    reranker = QwenCandidateReranker(
+        linker,
+        candidate_pool=6,
+        qwen_slots=2,
+        group_size=2,
+        beam_per_group=2,
+    )
+    candidates = [
+        _result(0, source_id="event-a"),
+        _result(1, source_id="event-a"),
+        _result(2, source_id="event-b"),
+        _result(3, source_id="event-c"),
+        _result(4, source_id="event-d"),
+        _result(5, source_id="event-e"),
+    ]
+
+    selected = reranker.rerank(
+        "Which events happened?",
+        candidates,
+        top_k=4,
+        unique_sources=True,
+    )
+
+    sources = [result.turn.source_id for result in selected]
+    assert len(sources) == len(set(sources)) == 4
+    assert reranker.last_report is not None
+    assert reranker.last_report.input_candidates == 5
 
 
 def test_qwen_attention_selects_seeds_without_replacing_context():

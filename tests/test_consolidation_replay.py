@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import shutil
 import sqlite3
 import zlib
 
@@ -14,7 +17,13 @@ from memory_condense.eval.consolidation_replay import (
     _comparison,
     stage_causal_store,
 )
-from memory_condense.eval.causal_benchmark import causal_consolidation_ingest_fn
+from memory_condense.eval.causal_benchmark import (
+    CAUSAL_BUILD_PROTOCOL,
+    CAUSAL_CACHE_REVISION,
+    CAUSAL_MANIFEST_NAME,
+    _held_out_query_batch,
+    causal_consolidation_ingest_fn,
+)
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
 from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
 from memory_condense.schemas import Chunk
@@ -52,6 +61,37 @@ def test_frozen_query_embedder_refuses_unbatched_queries():
     assert embedder.embed_query("known").tolist() == [1.0, 0.0]
     with pytest.raises(KeyError, match="frozen batch"):
         embedder.embed_query("unknown")
+
+
+def test_causal_query_batch_includes_enabled_retrieval_facets():
+    sample = BenchmarkSample(
+        sample_id="facets",
+        questions=[
+            BenchmarkQuestion(
+                question_id="q",
+                question=(
+                    "Which happened first: I prepared the nursery, "
+                    "I picked baby shower gifts, and I ordered a phone case?"
+                ),
+                answer="nursery",
+            )
+        ],
+    )
+    config = EvalConfig(
+        retrieval=RetrievalConfig(
+            mode="causal_graph",
+            source_slots=6,
+            query_facet_retrieval=True,
+            query_facet_slots=6,
+        )
+    )
+
+    assert _held_out_query_batch(sample, config) == [
+        sample.questions[0].dated_question,
+        "I prepared the nursery",
+        "I picked baby shower gifts",
+        "I ordered a phone case",
+    ]
 
 
 def test_source_reader_accepts_pre_source_id_historical_store(tmp_path):
@@ -263,8 +303,12 @@ def test_causal_benchmark_ingest_learns_only_in_scratch_store(tmp_path):
             consolidation_diffusion_width=32,
         )
         assert any("amber" in excerpt for excerpt in packed.expansions)
+        with pytest.raises(sqlite3.OperationalError):
+            store.ingest("user", "This cache must reject writes.")
     finally:
         store.close()
+
+    cached_database_bytes = cached_database.read_bytes()
 
     read_variant = config.model_copy(
         update={
@@ -280,8 +324,27 @@ def test_causal_benchmark_ingest_learns_only_in_scratch_store(tmp_path):
             "events_applied"
         ] == 1
         assert len(list(causal_cache.glob("*/causal-store.json"))) == 1
+        packed = reopened.build_context(
+            sample.questions[0].dated_question,
+            recent_turns=0,
+            k_memories=0,
+            k_expansions=2,
+            reheat_memories=False,
+            learn_consolidation=False,
+            consolidation_chunk_slots=3,
+            consolidation_hops=2,
+            consolidation_candidates=128,
+            consolidation_diffusion_width=32,
+        )
+        assert any("amber" in excerpt for excerpt in packed.expansions)
+        with pytest.raises(sqlite3.OperationalError):
+            reopened.ingest("user", "A cache hit must reject writes too.")
     finally:
         reopened.close()
+
+    assert cached_database.read_bytes() == cached_database_bytes
+    assert not cached_database.with_name(f"{cached_database.name}-wal").exists()
+    assert not cached_database.with_name(f"{cached_database.name}-shm").exists()
 
 
 def test_causal_benchmark_does_not_embed_prompts_rejected_by_write_bound(tmp_path):
@@ -326,11 +389,441 @@ def test_causal_benchmark_does_not_embed_prompts_rejected_by_write_bound(tmp_pat
         tmp_path / "bounded",
     )
     try:
-        assert oversized not in embedder.query_batches[-1]
-        assert "Recall the compact fact?" in embedder.query_batches[-1]
-        assert sample.questions[0].dated_question in embedder.query_batches[-1]
+        assert len(embedder.query_batches) == 2
+        training_batch, held_out_batch = embedder.query_batches
+        assert oversized not in training_batch
+        assert training_batch == ["Recall the compact fact?"]
+        assert held_out_batch == [sample.questions[0].dated_question]
+        assert sample.questions[0].dated_question not in training_batch
         assert store.causal_consolidation_stats["staging"][
             "skipped_large_prompt"
         ] == 1
     finally:
         store.close()
+
+
+def test_blind_causal_cache_prepare_never_embeds_held_out_questions(
+    tmp_path,
+    monkeypatch,
+):
+    class CapturingEmbedder(ReplayEmbedder):
+        model_name = "test/blind-prepare"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_batches: list[list[str]] = []
+
+        def embed_queries(self, texts):
+            self.query_batches.append(list(texts))
+            return super().embed_queries(texts)
+
+    held_out = "What is the secret held-out answer?"
+    sample = BenchmarkSample(
+        sample_id="blind-sample",
+        turns=[
+            ("assistant", "The durable marker is amber."),
+            ("user", "Which durable marker was used?"),
+            ("assistant", "The amber marker was used."),
+        ],
+        turn_source_ids=["s1"] * 3,
+        questions=[
+            BenchmarkQuestion(
+                question_id="blind-q",
+                question=held_out,
+                answer="secret gold value",
+            )
+        ],
+    )
+    config = EvalConfig(
+        retrieval=RetrievalConfig(mode="causal_graph", source_slots=2)
+    )
+    embedder = CapturingEmbedder()
+
+    def held_out_forbidden(*_args, **_kwargs):
+        raise AssertionError("blind preparation must not inspect QA probes")
+
+    monkeypatch.setattr(
+        "memory_condense.eval.causal_benchmark._held_out_query_batch",
+        held_out_forbidden,
+    )
+    ingest = causal_consolidation_ingest_fn(
+        embedder=embedder,
+        causal_cache_root=tmp_path / "causal-cache",
+        prepare_only=True,
+    )
+
+    first = ingest(sample, config, tmp_path / "first")
+    first.close()
+    batches_after_build = len(embedder.query_batches)
+    second = ingest(sample, config, tmp_path / "second")
+    second.close()
+
+    assert ingest.prepare_only is True
+    assert batches_after_build == 1
+    assert len(embedder.query_batches) == batches_after_build
+    assert "Which durable marker was used?" in embedder.query_batches[0]
+    assert held_out not in embedder.query_batches[0]
+    assert "secret gold value" not in embedder.query_batches[0]
+
+
+def test_normal_and_blind_cold_builds_share_the_exact_training_batch(tmp_path):
+    class CapturingEmbedder(ReplayEmbedder):
+        model_name = "test/training-batch-parity"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_batches: list[list[str]] = []
+
+        def embed_queries(self, texts):
+            self.query_batches.append(list(texts))
+            return super().embed_queries(texts)
+
+    sample = BenchmarkSample(
+        sample_id="training-parity",
+        turns=[
+            ("assistant", "The first durable marker is amber."),
+            ("user", "Which first marker was used?"),
+            ("assistant", "The amber marker was used."),
+            ("user", "Which marker should I remember now?"),
+            ("assistant", "Remember amber."),
+        ],
+        turn_source_ids=["s1"] * 5,
+        questions=[
+            BenchmarkQuestion(
+                question_id="training-parity-q",
+                question="What was the durable marker?",
+                answer="amber",
+            )
+        ],
+    )
+    config = EvalConfig(retrieval=RetrievalConfig(mode="causal_consolidation"))
+    blind_embedder = CapturingEmbedder()
+    normal_embedder = CapturingEmbedder()
+
+    blind = causal_consolidation_ingest_fn(
+        embedder=blind_embedder,
+        causal_cache_root=tmp_path / "blind-cache",
+        prepare_only=True,
+    )(sample, config, tmp_path / "blind")
+    normal = causal_consolidation_ingest_fn(
+        embedder=normal_embedder,
+        causal_cache_root=tmp_path / "normal-cache",
+    )(sample, config, tmp_path / "normal")
+    try:
+        assert blind_embedder.query_batches == [
+            [
+                "Which first marker was used?",
+                "Which marker should I remember now?",
+            ]
+        ]
+        assert normal_embedder.query_batches[0] == blind_embedder.query_batches[0]
+        assert normal_embedder.query_batches[1] == [
+            sample.questions[0].dated_question
+        ]
+        for section in ("staging", "learning"):
+            for field in (
+                set(blind.causal_consolidation_stats[section])
+                & set(normal.causal_consolidation_stats[section])
+                - {"elapsed_s"}
+            ):
+                assert (
+                    blind.causal_consolidation_stats[section][field]
+                    == normal.causal_consolidation_stats[section][field]
+                )
+    finally:
+        blind.close()
+        normal.close()
+
+
+def test_blind_causal_hit_still_materializes_and_attests_compiled_cache(
+    tmp_path,
+):
+    class CapturingEmbedder(ReplayEmbedder):
+        model_name = "test/blind-hit"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_batches: list[list[str]] = []
+
+        def embed_queries(self, texts):
+            self.query_batches.append(list(texts))
+            return super().embed_queries(texts)
+
+    held_out = "What held-out marker was used?"
+    sample = BenchmarkSample(
+        sample_id="blind-hit",
+        turns=[
+            ("assistant", "The durable marker is amber."),
+            ("user", "Which marker was used?"),
+            ("assistant", "The amber marker was used."),
+        ],
+        turn_source_ids=["s1"] * 3,
+        questions=[
+            BenchmarkQuestion(
+                question_id="blind-hit-q",
+                question=held_out,
+                answer="amber",
+            )
+        ],
+    )
+    config = EvalConfig(
+        retrieval=RetrievalConfig(mode="causal_graph", source_slots=2)
+    )
+    causal_cache = tmp_path / "causal-cache"
+
+    # Seed both linked layers, then remove the compiled root to reproduce an
+    # otherwise valid causal hit whose source cache was lost.
+    compiled_cache = tmp_path / "compiled-cache"
+    seed_embedder = CapturingEmbedder()
+    seed_ingest = causal_consolidation_ingest_fn(
+        compiled_cache,
+        embedder=seed_embedder,
+        causal_cache_root=causal_cache,
+        prepare_only=True,
+    )
+    seed_ingest(sample, config, tmp_path / "seed").close()
+    shutil.rmtree(compiled_cache)
+
+    hit_embedder = CapturingEmbedder()
+    hit_ingest = causal_consolidation_ingest_fn(
+        compiled_cache,
+        embedder=hit_embedder,
+        causal_cache_root=causal_cache,
+        prepare_only=True,
+    )
+    store = hit_ingest(sample, config, tmp_path / "hit")
+    try:
+        receipts = store.blind_cache_receipts
+        assert len(receipts["compiled"]) == 1
+        assert len(receipts["causal"]) == 1
+        assert list(compiled_cache.glob("*/compiled-store.json"))
+        assert held_out not in {
+            text for batch in hit_embedder.query_batches for text in batch
+        }
+    finally:
+        store.close()
+
+
+def test_required_causal_cache_hit_is_read_only_and_reports_exact_pair(tmp_path):
+    class CapturingEmbedder(ReplayEmbedder):
+        model_name = "test/strict-causal-hit"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_batches: list[list[str]] = []
+
+        def embed_queries(self, texts):
+            self.query_batches.append(list(texts))
+            return super().embed_queries(texts)
+
+    sample = BenchmarkSample(
+        sample_id="strict-causal-hit",
+        turns=[
+            ("assistant", "The durable marker is amber."),
+            ("user", "Which marker was used?"),
+            ("assistant", "The amber marker was used."),
+        ],
+        turn_source_ids=["s1"] * 3,
+        questions=[
+            BenchmarkQuestion(
+                question_id="strict-q",
+                question="What marker was used?",
+                answer="amber",
+            )
+        ],
+    )
+    config = EvalConfig(retrieval=RetrievalConfig(mode="causal_graph"))
+    compiled_root = tmp_path / "compiled"
+    causal_root = tmp_path / "causal"
+    seed = CapturingEmbedder()
+    causal_consolidation_ingest_fn(
+        compiled_root,
+        causal_cache_root=causal_root,
+        embedder=seed,
+        prepare_only=True,
+    )(sample, config, tmp_path / "prepare").close()
+    before = {
+        path.relative_to(tmp_path).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for root in (compiled_root, causal_root)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    scored = CapturingEmbedder()
+    ingest = causal_consolidation_ingest_fn(
+        compiled_root,
+        causal_cache_root=causal_root,
+        embedder=scored,
+        require_cache_hit=True,
+    )
+    store = ingest(sample, config, tmp_path / "must-remain-unused")
+    try:
+        receipts = store.blind_cache_receipts
+        assert len(receipts["compiled"]) == 1
+        assert len(receipts["causal"]) == 1
+        assert receipts["causal"][0]["compiled_cache_key"] == receipts["compiled"][0][
+            "cache_key"
+        ]
+        assert scored.query_batches == [[sample.questions[0].dated_question]]
+    finally:
+        store.close()
+
+    after = {
+        path.relative_to(tmp_path).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for root in (compiled_root, causal_root)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not (tmp_path / "must-remain-unused").exists()
+
+
+def test_required_causal_cache_miss_fails_before_query_or_write(tmp_path):
+    class CapturingEmbedder(ReplayEmbedder):
+        model_name = "test/strict-causal-miss"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.query_batches: list[list[str]] = []
+
+        def embed_queries(self, texts):
+            self.query_batches.append(list(texts))
+            return super().embed_queries(texts)
+
+    compiled_root = tmp_path / "compiled"
+    causal_root = tmp_path / "causal"
+    compiled_root.mkdir()
+    causal_root.mkdir()
+    embedder = CapturingEmbedder()
+    ingest = causal_consolidation_ingest_fn(
+        compiled_root,
+        causal_cache_root=causal_root,
+        embedder=embedder,
+        require_cache_hit=True,
+    )
+    sample = BenchmarkSample(
+        sample_id="strict-causal-miss",
+        turns=[("user", "Historical text")],
+        questions=[
+            BenchmarkQuestion(
+                question_id="strict-miss-q",
+                question="Held-out question?",
+                answer="answer",
+            )
+        ],
+    )
+    config = EvalConfig(retrieval=RetrievalConfig(mode="causal_graph"))
+
+    with pytest.raises(RuntimeError, match="required causal-store cache entry"):
+        ingest(sample, config, tmp_path / "unused")
+    assert embedder.query_batches == []
+    assert list(compiled_root.iterdir()) == []
+    assert list(causal_root.iterdir()) == []
+    assert not (tmp_path / "unused").exists()
+
+
+def test_causal_manifest_attests_training_only_build_protocol(tmp_path):
+    sample = BenchmarkSample(
+        sample_id="protocol",
+        turns=[
+            ("assistant", "The durable marker is amber."),
+            ("user", "Which marker was used?"),
+            ("assistant", "The amber marker was used."),
+        ],
+        turn_source_ids=["s1"] * 3,
+        questions=[
+            BenchmarkQuestion(
+                question_id="protocol-q",
+                question="What marker was used?",
+                answer="amber",
+            )
+        ],
+    )
+    config = EvalConfig(retrieval=RetrievalConfig(mode="causal_consolidation"))
+    causal_cache = tmp_path / "causal-cache"
+    ingest = causal_consolidation_ingest_fn(
+        embedder=ReplayEmbedder(),
+        causal_cache_root=causal_cache,
+        prepare_only=True,
+    )
+
+    store = ingest(sample, config, tmp_path / "build")
+    store.close()
+    manifest_path = next(causal_cache.glob(f"*/{CAUSAL_MANIFEST_NAME}"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["cache_revision"] == CAUSAL_CACHE_REVISION
+    assert manifest["build_protocol"] == CAUSAL_BUILD_PROTOCOL
+
+    manifest["build_protocol"] = "legacy-held-out-cobatched"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="build protocol mismatch"):
+        ingest(sample, config, tmp_path / "must-not-open")
+
+
+def test_blind_prepare_rejects_causal_to_compiled_identity_mismatch(tmp_path):
+    sample = BenchmarkSample(
+        sample_id="compiled-link",
+        turns=[
+            ("assistant", "The durable marker is amber."),
+            ("user", "Which marker was used?"),
+            ("assistant", "The amber marker was used."),
+        ],
+        turn_source_ids=["s1"] * 3,
+        questions=[
+            BenchmarkQuestion(
+                question_id="compiled-link-q",
+                question="What marker was used?",
+                answer="amber",
+            )
+        ],
+    )
+    config = EvalConfig(retrieval=RetrievalConfig(mode="causal_consolidation"))
+    causal_cache = tmp_path / "causal-cache"
+    ingest = causal_consolidation_ingest_fn(
+        tmp_path / "compiled-cache",
+        embedder=ReplayEmbedder(),
+        causal_cache_root=causal_cache,
+        prepare_only=True,
+    )
+    ingest(sample, config, tmp_path / "build").close()
+    manifest_path = next(causal_cache.glob(f"*/{CAUSAL_MANIFEST_NAME}"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["compiled_cache_key"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="compiled cache identity mismatch"):
+        ingest(sample, config, tmp_path / "must-not-open")
+
+
+def test_causal_factory_closes_owned_embedder_on_setup_error(
+    tmp_path,
+    monkeypatch,
+):
+    events: list[str] = []
+
+    class TrackingEmbedder(ReplayEmbedder):
+        model_name = "test/factory-close"
+
+        def close(self):
+            events.append("close")
+
+    def fail_compiled_factory(*_args, **_kwargs):
+        raise OSError("simulated cache-root failure")
+
+    monkeypatch.setattr(
+        "memory_condense.eval.causal_benchmark.EmbeddingService",
+        lambda **_kwargs: TrackingEmbedder(),
+    )
+    monkeypatch.setattr(
+        "memory_condense.eval.causal_benchmark.compiled_store_ingest_fn",
+        fail_compiled_factory,
+    )
+
+    with pytest.raises(OSError, match="cache-root failure"):
+        causal_consolidation_ingest_fn(
+            tmp_path / "compiled",
+            causal_cache_root=tmp_path / "causal",
+        )
+
+    assert events == ["close"]

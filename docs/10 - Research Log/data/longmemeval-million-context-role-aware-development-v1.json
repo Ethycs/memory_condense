@@ -1,0 +1,101 @@
+{
+  "format": "memory-condense-operational-context-stress-result-v1",
+  "status": "selected_development_policy_not_validated",
+  "date": "2026-08-17",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_manifest": "longmemeval-95-target-split-v2.json",
+  "split": "development",
+  "construction": {
+    "content_tokens": 1039203,
+    "turns": 5400,
+    "source_histories": 10,
+    "questions": 10
+  },
+  "models": {
+    "responder": "openai/codex_sdk/gpt-5.6-terra",
+    "judge": "openai/codex_sdk/gpt-5.6-sol",
+    "gateway": "central-dev v1",
+    "answer_calls": 10,
+    "judge_calls": 10
+  },
+  "retrieval_treatment": {
+    "role_aware_retrieval": true,
+    "role_user_weight": 1.25,
+    "role_assistant_weight": 0.75,
+    "role_system_weight": 0.5,
+    "activation_condition": "first-person pronoun in live query",
+    "persistent_model_state": false,
+    "persistent_duplicate_transcript": false
+  },
+  "selected_metrics": {
+    "haystack_literal_ceiling": 0.7,
+    "literal_recall": 0.5,
+    "mean_best_token_f1_offline": 0.154,
+    "mean_evidence_source_recall": 0.93,
+    "evidence_any_source_recall": 1.0,
+    "evidence_all_source_recall": 0.8,
+    "judge_accuracy": 0.7,
+    "mean_f1": 0.6342857142857142,
+    "exact_match": 0.5,
+    "mean_context_tokens": 1907.7,
+    "mean_prompt_tokens": 2215.9,
+    "p95_prompt_tokens": 2554,
+    "mean_transcript_token_savings": 0.9981642662694392,
+    "approximate_context_compression_ratio": 544.7,
+    "prompt_budget": 8000,
+    "prompt_budget_compliance": true
+  },
+  "comparison": {
+    "prior_best_judge_accuracy": 0.3,
+    "absolute_accuracy_gain": 0.4,
+    "relative_accuracy_gain": 1.3333,
+    "prior_efficient_context_tokens": 1377.4,
+    "additional_context_tokens": 530.3
+  },
+  "rejected_offline_arms": {
+    "facet_v9": {
+      "literal_recall": 0.4,
+      "mean_evidence_source_recall": 0.78,
+      "mean_best_token_f1": 0.149,
+      "mean_context_tokens": 1392,
+      "artifact_sha256": "2c11fd9d364e7ddf2f08db2b1136a7666c5e91a7f5dfd8bafff00a4f2b6080f9"
+    },
+    "pure_lexical_v10": {
+      "literal_recall": 0.4,
+      "mean_evidence_source_recall": 0.757,
+      "mean_best_token_f1": 0.125,
+      "mean_context_tokens": 1411,
+      "artifact_sha256": "8abcf5b616f5bcf481d9205be50cdadce3bc939eb848f2b1f2fbcf8c53b0c7fb"
+    },
+    "wide_workspace_v11": {
+      "literal_recall": 0.4,
+      "mean_evidence_source_recall": 0.78,
+      "mean_best_token_f1": 0.149,
+      "mean_context_tokens": 1278,
+      "artifact_sha256": "e1700d412c79e616cba189f72d184805b5f7140665f8906fbfc47d6fdd66ff34"
+    },
+    "wide_role_v13": {
+      "literal_recall": 0.5,
+      "mean_evidence_source_recall": 0.913,
+      "mean_best_token_f1": 0.155,
+      "mean_context_tokens": 1934,
+      "artifact_sha256": "8860feea0974f85e087af8f687516f37b15515a816913ce05e41678991f554e9"
+    },
+    "role_diverse_v14": {
+      "literal_recall": 0.5,
+      "mean_evidence_source_recall": 0.897,
+      "mean_best_token_f1": 0.154,
+      "mean_context_tokens": 1849,
+      "artifact_sha256": "e29034be39651512bb526c27adb76f04cfbd824c8e95adb1204c107d18081d00"
+    }
+  },
+  "artifacts": {
+    "operational_report": "operational-role-v12/benchmark_longmemeval_s_cleaned_120-250_k10_ef50_causal-graph-k10-s24-h2-local-role_20260817_233121.json",
+    "operational_report_sha256": "9aefaeb29954be9cbd094c6491146066d49c4b0e732fbff8460120cdf375bf5e",
+    "offline_csv": "longmemeval-million-context-role-v12-10.csv",
+    "offline_csv_sha256": "1b585a14c3393df097338fb1f2b61898fa246e1433ebdab60dcd0ef5fde0c858",
+    "implementation_sha256": "169e743717e0305b38df2ff9ceda56835de4c78cb054f3bfc1c9c99d9638e23b",
+    "environment_lock_sha256": "058083871240979257ada7ca4c71dd816fee64792b275ef11e4857c9f5ebba33"
+  },
+  "interpretation": "Locked ten-question development stress test only. Role-aware retrieval raised judged operational accuracy from 30% to 70% while returning 1907.7 tokens from a 1,039,203-token transcript. The 95% target is not met and validation remains untouched."
+}

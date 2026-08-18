@@ -27,7 +27,8 @@ locked long-chat evaluation while respecting all of these constraints:
 - at most 8,000 cl100k proxy tokens in each responder prompt;
 - identical responder and judge models across baseline/treatment comparisons;
 - exact source provenance retained;
-- zero persisted transformer token K/V or residual sequences; and
+- zero persisted request-derived transformer token K/V or residual sequences
+  (reusable static model/tokenizer assets are outside this metric); and
 - report accuracy, mean/p95 prompt tokens, write cost, read latency, and storage
   rather than optimizing a single headline number.
 
@@ -81,16 +82,20 @@ cannot move a sample between partitions.
 
 ## Implemented measurement gate
 
-The benchmark report now records per-question context and full prompt-content
-tokens, aggregate mean/p95 prompt tokens, the configured accuracy target,
-minimum question count, and an explicit target status:
+The benchmark report now records per-question context and a full local
+prompt-token proxy: exact cl100k message content plus a fixed reported chat
+framing reserve. It binds the vocabulary identity, records the responder
+output reserve separately, and checks nonzero provider-reported input usage.
+The report also records aggregate mean/p95 proxy values, the configured
+accuracy target, minimum question count, and an explicit target status:
 
 - `ungraded` — no semantic judge;
 - `insufficient_questions` — judged but below the minimum population;
 - `failed` — sufficiently sized but below 95%; or
 - `passed` — sufficiently sized and at or above 95%.
 
-Before an answer call, ranked excerpts are fitted under the 8,000-token cap.
+Before an answer call, ranked excerpts are fitted under the 8,000-token local
+proxy cap. This deterministic ceiling is not an exact provider-token promise.
 The final excerpt is token-boundary truncated if needed; the fully assembled
 prompt is re-counted, so the ceiling is enforced rather than estimated.
 
@@ -250,7 +255,7 @@ the causal sequential path.
 `hybrid_neighbor` preserves the hybrid top-10 anchors, then walks source-local
 chunk shells in distance order. It has independent hard caps for radius and
 extra neighbor slots. A fixed-budget variant lets transition candidates replace
-the weakest anchors. No transformer is loaded and no token state is retained.
+the weakest anchors. No transformer is loaded and no request-token state is retained.
 
 | Development arm | Literal reachability | Mean context tokens | Reachability / 1k | Row changes vs hybrid |
 | --- | ---: | ---: | ---: | --- |

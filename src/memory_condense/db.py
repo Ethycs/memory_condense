@@ -20,10 +20,11 @@ CREATE INDEX IF NOT EXISTS idx_memory_content_hash ON memory_items(content_hash)
 """
 
 #: Compact, external association state introduced by v5.  These tables are
-#: intentionally incapable of storing the transformer's growing token state:
+#: intentionally incapable of storing growing request-derived token state:
 #: a row contains one fixed-width CAV signature or one sparse episode edge.
 #: Source text remains in ``chunks`` and every attention workspace is
-#: disposable after it emits these records.
+#: disposable after it emits these records. Static model/tokenizer assets are
+#: reusable machinery and are not represented by this request-state invariant.
 _V5_ASSOCIATION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS association_artifacts (
     artifact_id      TEXT PRIMARY KEY,
@@ -454,18 +455,42 @@ class Database:
     existing file is migrated forward one version at a time. The transcript is
     append-only and all derived state (chunks, terms, memory) is reconstructible
     from it — see ``docs/05 - Standards/00 - MC-STD-DATA-v0.md``.
+
+    ``read_only=True`` opens an existing database through SQLite's ``mode=ro``
+    URI and enables ``query_only`` as a second guard. The URI also marks the
+    closed cache snapshot immutable so SQLite does not create WAL/SHM sidecars
+    merely to read it. Read-only connections do not create parent directories,
+    initialize an empty schema, or run migrations. This makes immutable
+    evaluation caches enforce their contract at the storage boundary while
+    preserving the writable default for live memory.
     """
 
-    def __init__(self, db_path: str | Path = "memory.db") -> None:
+    def __init__(
+        self,
+        db_path: str | Path = "memory.db",
+        *,
+        read_only: bool = False,
+    ) -> None:
         self._path = Path(db_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = bool(read_only)
+        if self._read_only:
+            connection_target = (
+                f"{self._path.resolve().as_uri()}?mode=ro&immutable=1"
+            )
+        else:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            connection_target = str(self._path)
         self._conn = sqlite3.connect(
-            str(self._path),
+            connection_target,
             check_same_thread=False,
+            uri=self._read_only,
         )
-        self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._init_schema()
+        if self._read_only:
+            self._conn.execute("PRAGMA query_only=ON")
+        else:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._init_schema()
 
     def _init_schema(self) -> None:
         version = self._read_version()
@@ -507,6 +532,11 @@ class Database:
     def path(self) -> Path:
         """Absolute/relative database path used by independent read workers."""
         return self._path
+
+    @property
+    def read_only(self) -> bool:
+        """Whether SQLite enforces an immutable connection."""
+        return self._read_only
 
     def current_turn(self) -> int:
         """The conversation's position — **the decay coordinate**.

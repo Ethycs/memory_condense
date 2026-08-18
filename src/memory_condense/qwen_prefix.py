@@ -13,17 +13,217 @@ This is an experimental component.  It does not participate in the existing
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-8B"
+DEFAULT_MODEL_REVISION = "b968826d9c46dd6066d109eabc6255188de91218"
 DEFAULT_PREFIX_LAYERS = 7
 FIRST_SHARD = "model-00001-of-00005.safetensors"
 
+# Content hashes for the exact pinned Hugging Face revision above.  The
+# prefix loader verifies the small architecture/tokenizer files and only the
+# safetensors shards needed by the requested layer prefix.  A two-layer
+# coverage run therefore does not depend on the unused full-model shards.
+QWEN3_8B_FILE_SHA256: dict[str, str] = {
+    "config.json": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+    "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+    "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+    "merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+    "model.safetensors.index.json": "f9fdbcb91c23971c13ec5d5f2573d2349e8f61f2f049371ec699281748fdb1bc",
+    FIRST_SHARD: "31d6a825ae35f11fb85b195b4c42c146c051e446433125a215336abdf95cbf5f",
+    "model-00002-of-00005.safetensors": "5991236cea6fe21f3d43cab0f0e84448734fbbe0789816202989f2ddc9d18282",
+    "model-00003-of-00005.safetensors": "c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836",
+    "model-00004-of-00005.safetensors": "b5ee7de71fbf17db3d5704e0c8f2bc7d005ca9e1d7ca2aeb19827b0cfcaa917a",
+}
+_PREFIX_METADATA_FILES = (
+    "config.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "vocab.json",
+    "merges.txt",
+    "model.safetensors.index.json",
+)
+_PREFIX_MANIFEST_FORMAT = "memory-condense-qwen3-prefix-checkpoint-v1"
+
 _LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.")
+
+
+@dataclass(frozen=True, slots=True)
+class QwenPrefixCheckpointIdentity:
+    """Verified, content-addressed identity for one usable layer prefix."""
+
+    model_id: str
+    model_revision: str
+    checkpoint_sha256: str
+    verified_files: tuple[str, ...]
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb", buffering=0) as source:
+        buffer = bytearray(8 * 1024 * 1024)
+        view = memoryview(buffer)
+        while size := source.readinto(buffer):
+            digest.update(view[:size])
+    return digest.hexdigest()
+
+
+def _prefix_manifest_sha256(
+    file_hashes: Mapping[str, str],
+    *,
+    model_id: str,
+    model_revision: str,
+) -> str:
+    payload = {
+        "format": _PREFIX_MANIFEST_FORMAT,
+        "model_id": str(model_id),
+        "model_revision": str(model_revision),
+        "files": {
+            str(name): str(digest).casefold()
+            for name, digest in sorted(file_hashes.items())
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _known_required_shards(layers: int) -> tuple[str, ...]:
+    """Return shards needed by a prefix of the pinned 36-layer checkpoint."""
+
+    count = int(layers)
+    if not 1 <= count <= 36:
+        raise ValueError("Qwen3-8B prefix layers must lie in [1, 36]")
+    if count <= 7:
+        return (FIRST_SHARD,)
+    if count <= 17:
+        return (FIRST_SHARD, "model-00002-of-00005.safetensors")
+    if count <= 27:
+        return (
+            FIRST_SHARD,
+            "model-00002-of-00005.safetensors",
+            "model-00003-of-00005.safetensors",
+        )
+    return (
+        FIRST_SHARD,
+        "model-00002-of-00005.safetensors",
+        "model-00003-of-00005.safetensors",
+        "model-00004-of-00005.safetensors",
+    )
+
+
+def expected_prefix_checkpoint_sha256(
+    layers: int,
+    *,
+    model_id: str = DEFAULT_MODEL_ID,
+    model_revision: str = DEFAULT_MODEL_REVISION,
+) -> str:
+    """Return the pinned manifest digest without reading the local checkpoint."""
+
+    names = (*_PREFIX_METADATA_FILES, *_known_required_shards(layers))
+    return _prefix_manifest_sha256(
+        {name: QWEN3_8B_FILE_SHA256[name] for name in names},
+        model_id=model_id,
+        model_revision=model_revision,
+    )
+
+
+def verify_prefix_checkpoint(
+    model_dir: str | Path,
+    *,
+    layers: int,
+    model_id: str = DEFAULT_MODEL_ID,
+    model_revision: str = DEFAULT_MODEL_REVISION,
+    expected_checkpoint_sha256: str | None = None,
+    expected_file_sha256: Mapping[str, str] = QWEN3_8B_FILE_SHA256,
+) -> QwenPrefixCheckpointIdentity:
+    """Hash-verify the exact metadata and shards consumed by a prefix load."""
+
+    root = Path(model_dir)
+    index_path = root / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise FileNotFoundError(f"required checkpoint metadata is missing: {index_path}")
+
+    expected_index = expected_file_sha256.get(index_path.name)
+    if not expected_index:
+        raise ValueError(f"no pinned SHA-256 for {index_path.name}")
+    actual_index = _file_sha256(index_path)
+    if not hmac.compare_digest(actual_index, expected_index.casefold()):
+        raise ValueError(
+            f"checkpoint SHA-256 mismatch for {index_path.name}: "
+            f"expected {expected_index}, got {actual_index}"
+        )
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    required_shards = tuple(
+        sorted(
+            {
+                shard
+                for key, shard in index["weight_map"].items()
+                if checkpoint_key_is_needed(key, int(layers))
+            }
+        )
+    )
+    known_shards = _known_required_shards(layers)
+    if required_shards != known_shards:
+        raise ValueError(
+            "pinned Qwen3-8B shard layout mismatch: "
+            f"expected {known_shards}, got {required_shards}"
+        )
+
+    names = (*_PREFIX_METADATA_FILES, *required_shards)
+    actual_hashes: dict[str, str] = {index_path.name: actual_index}
+    for name in names:
+        if name in actual_hashes:
+            continue
+        expected = expected_file_sha256.get(name)
+        if not expected:
+            raise ValueError(f"no pinned SHA-256 for {name}")
+        path = root / name
+        if not path.is_file():
+            raise FileNotFoundError(f"required prefix checkpoint file is missing: {path}")
+        actual = _file_sha256(path)
+        if not hmac.compare_digest(actual, expected.casefold()):
+            raise ValueError(
+                f"checkpoint SHA-256 mismatch for {name}: "
+                f"expected {expected}, got {actual}"
+            )
+        actual_hashes[name] = actual
+
+    checkpoint_sha256 = _prefix_manifest_sha256(
+        actual_hashes,
+        model_id=model_id,
+        model_revision=model_revision,
+    )
+    expected_manifest = (
+        expected_checkpoint_sha256
+        or _prefix_manifest_sha256(
+            {name: expected_file_sha256[name] for name in names},
+            model_id=model_id,
+            model_revision=model_revision,
+        )
+    ).casefold()
+    if not hmac.compare_digest(checkpoint_sha256, expected_manifest):
+        raise ValueError(
+            "prefix checkpoint manifest SHA-256 mismatch: "
+            f"expected {expected_manifest}, got {checkpoint_sha256}"
+        )
+    return QwenPrefixCheckpointIdentity(
+        model_id=str(model_id),
+        model_revision=str(model_revision),
+        checkpoint_sha256=checkpoint_sha256,
+        verified_files=tuple(names),
+    )
 
 
 def _require_torch_stack() -> tuple[Any, ...]:
@@ -167,7 +367,22 @@ class Qwen3PrefixEncoder:
         layers: int = DEFAULT_PREFIX_LAYERS,
         device: str = "cuda",
         dtype: str = "bfloat16",
+        model_id: str = DEFAULT_MODEL_ID,
+        model_revision: str = DEFAULT_MODEL_REVISION,
+        expected_checkpoint_sha256: str | None = None,
     ) -> None:
+        self.model_dir = Path(model_dir)
+        self.layers = int(layers)
+        self.model_id = str(model_id)
+        self.model_revision = str(model_revision)
+        self.checkpoint_identity = verify_prefix_checkpoint(
+            self.model_dir,
+            layers=self.layers,
+            model_id=self.model_id,
+            model_revision=self.model_revision,
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
+        )
+        self.checkpoint_sha256 = self.checkpoint_identity.checkpoint_sha256
         (
             self._torch,
             _,
@@ -180,10 +395,9 @@ class Qwen3PrefixEncoder:
             self._apply_rotary_pos_emb,
         ) = _require_torch_stack()
 
-        self.model_dir = Path(model_dir)
-        self.layers = int(layers)
         self.device = self._torch.device(device)
         self.dtype = _torch_dtype(self._torch, dtype)
+        self.dtype_name = _canonical_dtype_name(dtype)
 
         inventory = inspect_prefix_checkpoint(self.model_dir)
         available = int(inventory["complete_prefix_layers"])
@@ -547,6 +761,21 @@ def _torch_dtype(torch: Any, name: str) -> Any:
     }
     try:
         return aliases[name.lower()]
+    except KeyError as exc:
+        raise ValueError(f"unsupported dtype {name!r}; choose {sorted(aliases)}") from exc
+
+
+def _canonical_dtype_name(name: str) -> str:
+    aliases = {
+        "float16": "float16",
+        "fp16": "float16",
+        "bfloat16": "bfloat16",
+        "bf16": "bfloat16",
+        "float32": "float32",
+        "fp32": "float32",
+    }
+    try:
+        return aliases[str(name).casefold()]
     except KeyError as exc:
         raise ValueError(f"unsupported dtype {name!r}; choose {sorted(aliases)}") from exc
 

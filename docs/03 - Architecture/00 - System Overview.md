@@ -187,7 +187,9 @@ provider-agnostic, while public common-benchmark validation remains open.
   sparse recurrent edge utility can provide a second bounded score.
 - **Durable state**: only scalar reward sums, decayed mass, counts, role/head
   IDs, and source/destination IDs. The one-turn decision may carry compact CAV
-  deltas in memory, but snapshots exclude them and all transformer token state.
+  deltas in memory, but snapshots exclude them and all request-derived
+  transformer token state. Reusable static weights/tokenizers are linker
+  assets, not request state, and are outside that metric.
 - **Admission rule**: this policy is implemented but not yet admitted to QA
   retrieval or pruning. Exact-target and 2-D CAV/velocity chronological replays
   failed to transfer to a separate compiled store, so they remain diagnostics.

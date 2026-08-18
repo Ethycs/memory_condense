@@ -1,6 +1,12 @@
 import pytest
 
-from memory_condense._tokenizer import count_tokens
+from memory_condense._tokenizer import (
+    CHAT_FRAMING_TOKENS_FIXED,
+    CHAT_FRAMING_TOKENS_PER_MESSAGE,
+    count_chat_prompt_token_proxy,
+    count_tokens,
+    tokenizer_proxy_identity,
+)
 from memory_condense.chunker import Chunker
 
 
@@ -50,6 +56,38 @@ def test_token_count_populated():
     chunks = chunker.chunk_turn("t1", text)
     assert len(chunks) == 1
     assert chunks[0].token_count == count_tokens(chunks[0].text)
+
+
+def test_chat_prompt_proxy_adds_explicit_framing_and_binds_vocabulary():
+    messages = [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Where?"},
+    ]
+    expected = (
+        sum(count_tokens(message["content"]) for message in messages)
+        + CHAT_FRAMING_TOKENS_PER_MESSAGE * len(messages)
+        + CHAT_FRAMING_TOKENS_FIXED
+    )
+
+    assert count_chat_prompt_token_proxy(messages) == expected
+    identity = tokenizer_proxy_identity()
+    assert identity["schema"] == "memory-condense-prompt-token-proxy-v1"
+    assert identity["encoding"] == "cl100k_base"
+    assert len(str(identity["vocabulary_sha256"])) == 64
+    assert identity["chat_framing_tokens_per_message"] == 8
+    assert identity["chat_framing_tokens_fixed"] == 8
+
+
+def test_conceptual_spans_separate_plan_from_completed_event(chunker):
+    text = (
+        "I'm planning to buy concert merchandise. By the way, I just got "
+        "back from an amazing Billie Eilish concert today."
+    )
+
+    assert chunker.conceptual_spans(text) == [
+        "I'm planning to buy concert merchandise.",
+        "I just got back from an amazing Billie Eilish concert today.",
+    ]
 
 
 def test_long_text_splits():

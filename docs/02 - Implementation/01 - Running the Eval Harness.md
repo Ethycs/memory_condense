@@ -75,7 +75,7 @@ Point `--conversation-dir` at a directory of such files; `load_directory` return
 | `--use-judge` | off | benchmark | Also grade answers with a semantic-equivalence judge; **doubles API cost** |
 | `--accuracy-target` | `0.95` | benchmark | Judge-accuracy target recorded in the report |
 | `--min-target-questions` | `100` | benchmark | A smaller judged smoke is reported as insufficient even if perfect |
-| `--max-prompt-tokens` | `8000` | benchmark | Hard cl100k content-token ceiling applied before every responder call |
+| `--max-prompt-tokens` | `8000` | benchmark | Hard local prompt-token-proxy ceiling: cl100k message content plus an explicit conservative chat-framing reserve. This is not an exact provider-token cap. |
 | `--recent-window` | 4 | replay, sweep | Recent turns always in the responder prompt |
 | `--min-tokens` / `--max-tokens` | 120 / 250 | all but compare | Chunker bounds (cl100k tokens) |
 | `--k` | 10 | all but compare | Chunks retrieved per query; **`--k 0` = no-memory baseline** |
@@ -133,8 +133,11 @@ pixi run python -m memory_condense.eval --benchmark-file data/locomo10.json `
 
 Remote benchmark execution is fail-closed: `--max-provider-calls` defaults to
 zero and must cover every planned answer plus judge call. Provider retries also
-default to zero. Each saved question and aggregate report records actual answer
-and judge input/output tokens, latency, and call count. Increasing retries is an
+default to zero. Each saved question and aggregate report records the local
+prompt-token proxy and actual answer/judge input/output usage when the provider
+returns it, plus latency and call count. A nonzero provider input count is
+checked against the same cap; unavailable usage remains explicitly unknown,
+not zero-token proof. Increasing retries is an
 explicit cost decision via `--provider-retries`; it is never silently enabled.
 Paid reports also record the dataset, locked-split manifest, complete Python
 source tree, Pixi lock, and optional frozen-policy SHA-256 values. Saving a
@@ -146,9 +149,13 @@ Protocol (`eval/benchmark.py`), deliberately different from replay: ingest a sam
 The operational headline is semantic answer accuracy after the conversation is
 complete, with the responder receiving only the bounded retrieved context. A
 saved report includes completed-transcript tokens, retrieved-context tokens,
-the context fraction, transcript-token savings, maximum prompt size, and prompt
-budget compliance. The treatment never sends the completed transcript. A run
-cannot pass the accuracy target if it exceeds the configured prompt boundary.
+the context fraction, transcript-token savings, maximum prompt-token proxy,
+and both local-proxy and available provider-usage budget compliance. The
+proxy identity binds the exact cl100k vocabulary and fixed chat-framing rule;
+the responder's 256-token output reserve is recorded separately. The treatment
+never sends the completed transcript. A run cannot pass the accuracy target if
+either an observed provider input or its local proxy exceeds the configured
+prompt boundary.
 Source coverage and literal answer containment are diagnostics for explaining
 failures, not substitutes for answer accuracy.
 
@@ -176,7 +183,7 @@ retrieval-only settings intentionally reuse the same compiled bytes. Extracting
 `memory` mode is rejected because its write state is policy-dependent.
 
 The summary prints aggregate F1 / EM / judge accuracy, mean and p95 responder
-prompt tokens, the 95% target status, and a per-category breakdown
+prompt-token proxy, available provider input usage, the 95% target status, and a per-category breakdown
 (LongMemEval's `question_type`, LoCoMo's `category`). A run can pass only when
 judge accuracy reaches the configured target over at least the configured
 minimum number of questions; unjudged and undersized runs are explicit.

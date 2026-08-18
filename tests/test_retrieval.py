@@ -140,6 +140,70 @@ def test_source_ids_in_partitions_preserves_provenance_order(db, retriever):
         "alpha::session-2",
         "alpha::session-1",
     ]
+    assert retriever.source_partition_ids() == ["alpha", "beta"]
+
+
+def test_source_partition_inventory_treats_unpartitioned_sources_as_ids(
+    db, retriever
+):
+    store = TranscriptStore(db)
+    store.append("user", "one", source_id="plain-source")
+    store.append("user", "two", source_id="alpha::session")
+    store.append("user", "three", source_id="plain-source")
+
+    assert retriever.source_partition_ids() == ["plain-source", "alpha"]
+    with pytest.raises(ValueError, match="separator"):
+        retriever.source_partition_ids(separator="")
+
+
+def test_partition_content_scan_is_exact_and_excludes_only_source_metadata(
+    db, retriever
+):
+    store = TranscriptStore(db)
+    metadata = store.append(
+        "system",
+        "[alpha::session-1 took place at 2024/03/02]",
+        source_id="alpha::session-1",
+    )
+    alpha = store.append(
+        "user",
+        "I visited the Science Museum today.",
+        source_id="alpha::session-1",
+    )
+    exact = store.append(
+        "assistant",
+        "Ordinary system-looking content remains evidence.",
+        source_id="alpha",
+    )
+    collision = store.append(
+        "user",
+        "I visited the Wrong Museum.",
+        source_id="alpha-extra::session-1",
+    )
+    retriever.add_chunks(
+        [
+            _chunk_with(metadata.turn_id, metadata.text, _vector({0: 1.0})),
+            _chunk_with(alpha.turn_id, alpha.text, _vector({0: 1.0})),
+            _chunk_with(exact.turn_id, exact.text, _vector({0: 1.0})),
+            _chunk_with(collision.turn_id, collision.text, _vector({0: 1.0})),
+        ]
+    )
+
+    rows = list(retriever.iter_partition_content_rows(["alpha"]))
+
+    assert [(row.source_id, row.role, row.text) for row in rows] == [
+        ("alpha::session-1", "user", alpha.text),
+        ("alpha", "assistant", exact.text),
+    ]
+    assert collision.text not in {row.text for row in rows}
+    assert [row.ordinal for row in rows] == sorted(row.ordinal for row in rows)
+
+    # A caller that already captured the routed source set gets the identical
+    # rows without resolving mutable partition membership a second time.
+    source_rows = list(
+        retriever.iter_source_content_rows(["alpha::session-1", "alpha"])
+    )
+    assert source_rows == rows
 
 
 def test_hydrate_sources_round_robins_selected_source_chunks(db, retriever):
@@ -167,6 +231,81 @@ def test_hydrate_sources_round_robins_selected_source_chunks(db, retriever):
     ]
     assert [result.score for result in results] == [0.9, 0.8, 0.9]
     assert all(result.route == "anchored_source" for result in results)
+
+
+def test_source_companions_exclude_only_supplied_metadata_and_bound_sources(
+    db, retriever
+):
+    store = TranscriptStore(db)
+    meta_a = store.append(
+        "system",
+        "[session-a took place at 2024/01/02]",
+        source_id="session-a",
+    )
+    system_fact = store.append(
+        "system",
+        "The official launch code is cerulean.",
+        source_id="session-a",
+    )
+    user_fact = store.append(
+        "user",
+        "I used the backup amber launch code.",
+        source_id="session-a",
+    )
+    meta_b = store.append(
+        "system",
+        "[session-b took place at 2024/02/03]",
+        source_id="session-b",
+    )
+    beta_fact = store.append(
+        "user",
+        "The beta launch code is violet.",
+        source_id="session-b",
+    )
+    chunks = [
+        _chunk_with(meta_a.turn_id, meta_a.text, _vector({1: 1.0})),
+        _chunk_with(system_fact.turn_id, system_fact.text, _vector({0: 1.0})),
+        _chunk_with(user_fact.turn_id, user_fact.text, _vector({2: 1.0})),
+        _chunk_with(meta_b.turn_id, meta_b.text, _vector({1: 1.0})),
+        _chunk_with(beta_fact.turn_id, beta_fact.text, _vector({0: 1.0})),
+    ]
+    retriever.add_chunks(chunks)
+
+    results = retriever.hybrid_query_source_companions(
+        "official launch code",
+        _vector_query({0: 1.0}),
+        ["session-a", "session-b"],
+        metadata_chunk_ids=[chunks[0].chunk_id, chunks[3].chunk_id],
+        max_sources=1,
+        max_per_source=2,
+        candidates_per_source=4,
+    )
+
+    assert [result.chunk.chunk_id for result in results] == [
+        chunks[1].chunk_id,
+        chunks[2].chunk_id,
+    ]
+    assert results[0].turn.role == "system"
+    assert all(result.route == "source_metadata_companion" for result in results)
+
+
+def test_source_companions_return_no_row_for_missing_content(db, retriever):
+    store = TranscriptStore(db)
+    metadata = store.append(
+        "system",
+        "[orphan took place at 2024/01/02]",
+        source_id="orphan",
+    )
+    chunk = _chunk_with(metadata.turn_id, metadata.text, _vector({0: 1.0}))
+    retriever.add_chunks([chunk])
+
+    assert retriever.hybrid_query_source_companions(
+        "when",
+        _vector_query({0: 1.0}),
+        ["orphan", "missing"],
+        metadata_chunk_ids=[chunk.chunk_id],
+        max_sources=2,
+    ) == []
 
 
 def test_hydrate_source_neighbors_walks_ranked_shells_and_deduplicates(

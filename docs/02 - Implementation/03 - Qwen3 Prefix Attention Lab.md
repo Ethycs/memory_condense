@@ -243,7 +243,7 @@ top-10 and compiled-link top-10 both achieved 8/8 containment. Hybrid top-3
 alone retained 8/8 at 636 mean tokens versus 2,141 at top-10 (70.3% fewer),
 while reserving one of those three slots for a compiled QK/OV link retained
 8/8 but increased the mean to 672 tokens. The links did not earn their cost on
-these easy probes. Cold compilation of 113 chunks retained zero token K/V,
+these easy probes. Cold compilation of 113 chunks retained zero request-derived token K/V,
 904 bytes of float32 CAV payload, and about 43 KB of per-head edge payload.
 Pruning 337 directed edges to 225 preserved 8/8. These notes results are now
 development data.
@@ -275,7 +275,9 @@ one result slot for ranked QK and one for heat. With degree-two pruning it
 replayed at 91.7% recall / 828.7 mean tokens on development, 100% / 927.0 on
 v2, and 83.3% / 924.1 on the prior locked-confirmation split. Those are
 posthoc replays, not a fresh confirmation. Ordinary reads still load no Qwen
-weights and retain zero token-state bytes. Full protocol and caveats are in
+weights and retain zero request-token-state bytes. Static checkpoint and
+tokenizer assets are reusable linker machinery, not memory, and are outside
+that metric. Full protocol and caveats are in
 [`10 - Research Log/05 - 2026-08-16 - Source heat diffusion development.md`](../10%20-%20Research%20Log/05%20-%202026-08-16%20-%20Source%20heat%20diffusion%20development.md).
 
 The delayed turn learner has now received its first transfer test. Exact

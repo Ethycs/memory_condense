@@ -90,7 +90,10 @@ The defaults are deliberately conservative:
 Degree pruning bounds edge storage by the number of durable conceptual chunks,
 not conversation length squared. Receipt pruning bounds per-turn bookkeeping.
 The schema has no columns for query text, token IDs, attention, K/V, residuals,
-or hidden states, and reports `retained_token_state_bytes = 0`.
+or hidden states, and reports `retained_request_token_state_bytes = 0`.
+That metric covers state derived from a request (token IDs, Q/K/V, attention,
+residuals, and generation K/V), not reusable static model weights or tokenizer
+assets. `retained_token_state_bytes` remains only as a compatibility alias.
 
 The explicit event boundary also limits positive-feedback loops. Merely
 inspecting an edge does not reinforce it. The caller records only the set that

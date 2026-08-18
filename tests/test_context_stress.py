@@ -52,3 +52,17 @@ def test_compose_context_stress_sample_rejects_insufficient_history():
         compose_context_stress_sample(
             [sample], target_tokens=transcript_tokens(sample) + 1
         )
+
+
+def test_compose_context_stress_sample_can_target_later_question():
+    samples = [_sample("a", "alpha"), _sample("b", "beta")]
+
+    combined = compose_context_stress_sample(
+        samples,
+        target_tokens=2,
+        max_questions=1,
+        question_offset=1,
+    )
+
+    assert [question.question_id for question in combined.questions] == ["q-b"]
+    assert combined.questions[0].evidence_sources == ["b::shared-source"]

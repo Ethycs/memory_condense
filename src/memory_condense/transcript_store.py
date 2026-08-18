@@ -1,7 +1,28 @@
 from __future__ import annotations
 
+import re
+
 from memory_condense.db import Database
 from memory_condense.schemas import Turn
+
+
+_SOURCE_METADATA_RE = re.compile(
+    r"^\[(?P<source>.+?) took place at (?P<timestamp>.+?)\]\s*$"
+)
+
+
+def parse_source_metadata(text: str) -> tuple[str, str] | None:
+    """Parse the synthetic timestamp turn emitted at a source boundary.
+
+    This intentionally recognizes only the ingest format, not arbitrary
+    system evidence containing a date. Callers may therefore exclude these
+    provenance rows while leaving ordinary system-authored facts eligible.
+    """
+
+    match = _SOURCE_METADATA_RE.fullmatch(text.strip())
+    if match is None:
+        return None
+    return match.group("source").strip(), match.group("timestamp").strip()
 
 
 class TranscriptStore:
@@ -71,6 +92,24 @@ class TranscriptStore:
             "SELECT turn_id, role, text, source_id, created_at FROM turns ORDER BY ordinal"
         )
         return [self._row_to_turn(r) for r in cur.fetchall()]
+
+    def source_metadata(self, source_ids: list[str]) -> dict[str, str]:
+        """Return the first system metadata turn for each requested source."""
+
+        selected = list(dict.fromkeys(source_id for source_id in source_ids if source_id))
+        if not selected:
+            return {}
+        placeholders = ",".join("?" for _ in selected)
+        cur = self._db.execute(
+            "SELECT source_id, text FROM turns "
+            f"WHERE role = 'system' AND source_id IN ({placeholders}) "
+            "ORDER BY ordinal",
+            tuple(selected),
+        )
+        metadata: dict[str, str] = {}
+        for source_id, text in cur.fetchall():
+            metadata.setdefault(str(source_id), str(text))
+        return metadata
 
     def find_containing(self, text: str) -> Turn | None:
         """The most recent turn containing ``text`` verbatim, if any.

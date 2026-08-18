@@ -7,6 +7,7 @@ that exercises a real MemoryCondenser (and therefore bge-m3) is marked slow.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,8 @@ from memory_condense.eval.benchmark import (
     run_benchmark,
     save_benchmark_report,
 )
+from memory_condense.eval.cache_receipts import cache_receipts_sha256
+from memory_condense.eval.sample_identity import sample_sha256
 from memory_condense.eval.schemas import (
     ChunkerConfig,
     EvalConfig,
@@ -94,6 +97,44 @@ def make_config(k: int = 3) -> EvalConfig:
         chunker=ChunkerConfig(min_tokens=20, max_tokens=60),
         retrieval=RetrievalConfig(k=k, ef_search=20),
     )
+
+
+def _blind_cache_receipts(sample: BenchmarkSample):
+    digest = sample_sha256(sample)
+    compiled_key = hashlib.sha256(b"compiled-cache").hexdigest()
+    execution = hashlib.sha256(b"embedding-execution").hexdigest()
+    implementation = hashlib.sha256(b"implementation").hexdigest()
+    environment = hashlib.sha256(b"environment").hexdigest()
+    return {
+        "compiled": [
+            {
+                "manifest_sha256": hashlib.sha256(b"compiled-manifest").hexdigest(),
+                "cache_key": compiled_key,
+                "sample_sha256": digest,
+                "database_sha256": hashlib.sha256(b"compiled-db").hexdigest(),
+                "index_sha256": hashlib.sha256(b"compiled-index").hexdigest(),
+                "embedding_execution_sha256": execution,
+                "implementation_sha256": implementation,
+                "environment_lock_sha256": environment,
+                "turn_count": len(sample.turns),
+                "chunk_count": len(sample.turns),
+            }
+        ],
+        "causal": [
+            {
+                "manifest_sha256": hashlib.sha256(b"causal-manifest").hexdigest(),
+                "cache_key": hashlib.sha256(b"causal-cache").hexdigest(),
+                "sample_sha256": digest,
+                "compiled_cache_key": compiled_key,
+                "database_sha256": hashlib.sha256(b"causal-db").hexdigest(),
+                "index_sha256": hashlib.sha256(b"causal-index").hexdigest(),
+                "build_protocol_sha256": hashlib.sha256(b"protocol").hexdigest(),
+                "embedding_execution_sha256": execution,
+                "implementation_sha256": implementation,
+                "environment_lock_sha256": environment,
+            }
+        ],
+    }
 
 
 SAMPLE = BenchmarkSample(
@@ -167,6 +208,9 @@ def test_exact_match_uses_normalization():
 def test_build_qa_prompt_includes_context_and_question():
     messages = build_qa_prompt("Where?", ["chunk one", "chunk two"])
     assert messages[0]["role"] == "system"
+    assert "newest relevant user update" in messages[0]["content"]
+    assert "difference, duration, or amount remaining" in messages[0]["content"]
+    assert "explicit start or end boundary" in messages[0]["content"]
     assert "chunk one" in messages[1]["content"]
     assert "chunk two" in messages[1]["content"]
     assert "Where?" in messages[1]["content"]
@@ -209,15 +253,17 @@ def test_source_mode_reaches_the_benchmark_prompt():
 
 
 def test_prompt_budget_caps_and_truncates_context():
-    from memory_condense._tokenizer import count_tokens
+    from memory_condense._tokenizer import count_chat_prompt_token_proxy
 
     uncapped = ["Boston " * 200, "Pepper " * 200]
-    capped = cap_context_to_prompt_budget("Where?", uncapped, 120)
+    # Leave room for the fixed provenance/update instructions while still
+    # forcing the long retrieved chunks through the truncation path.
+    capped = cap_context_to_prompt_budget("Where?", uncapped, 300)
     prompt = build_qa_prompt("Where?", capped)
 
     assert capped
     assert len(capped) == 1
-    assert sum(count_tokens(message["content"]) for message in prompt) <= 120
+    assert count_chat_prompt_token_proxy(prompt) <= 300
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +300,69 @@ def test_run_benchmark_end_to_end_with_stub_answer_fn():
     )
     assert result.prompt_budget_compliance is True
     assert result.max_prompt_tokens_observed > 0
+    assert result.mean_prompt_token_proxy == result.mean_prompt_tokens
+    assert result.p95_prompt_token_proxy == result.p95_prompt_tokens
+    assert (
+        result.max_prompt_token_proxy_observed
+        == result.max_prompt_tokens_observed
+    )
+    assert result.prompt_token_proxy_budget_compliance is True
+    assert result.provider_prompt_budget_compliance is None
+    assert result.provider_input_usage_status == "unavailable"
+    assert result.responder_output_token_reserve == 256
+    assert result.mean_request_token_proxy == pytest.approx(
+        result.mean_prompt_token_proxy + 256
+    )
+    assert result.prompt_token_proxy_identity["encoding"] == "cl100k_base"
+    question = result.samples[0].question_results[0]
+    assert question.prompt_token_proxy == question.prompt_tokens
+    assert question.request_token_proxy == question.prompt_token_proxy + 256
     assert result.benchmark == "fixture"
     assert result.run_timestamp
+
+
+def test_run_benchmark_carries_exact_linked_cache_receipts():
+    receipts = _blind_cache_receipts(SAMPLE)
+
+    def receipt_ingest(sample, config, data_dir):
+        store = fake_ingest_fn(sample, config, data_dir)
+        store.blind_cache_receipts = receipts
+        return store
+
+    result = run_benchmark(
+        samples=[SAMPLE],
+        config=make_config(),
+        answer_fn=lambda messages: "Boston",
+        ingest_fn=receipt_ingest,
+    )
+
+    sample_result = result.samples[0]
+    assert sample_result.cache_receipts == receipts
+    assert sample_result.cache_receipts_sha256 == cache_receipts_sha256(receipts)
+
+
+def test_run_benchmark_rejects_unlinked_receipts_before_answering_and_closes():
+    receipts = _blind_cache_receipts(SAMPLE)
+    receipts["causal"][0]["compiled_cache_key"] = "f" * 64
+    created: list[FakeCondenser] = []
+    answer_calls: list[object] = []
+
+    def receipt_ingest(sample, config, data_dir):
+        store = fake_ingest_fn(sample, config, data_dir)
+        store.blind_cache_receipts = receipts
+        created.append(store)
+        return store
+
+    with pytest.raises(ValueError, match="compiled cache key"):
+        run_benchmark(
+            samples=[SAMPLE],
+            config=make_config(),
+            answer_fn=lambda messages: answer_calls.append(messages) or "Boston",
+            ingest_fn=receipt_ingest,
+        )
+
+    assert answer_calls == []
+    assert created and all(store.closed for store in created)
 
 
 def test_run_benchmark_category_breakdown():
@@ -372,6 +479,55 @@ def test_accuracy_target_fails_when_operational_prompt_budget_is_exceeded(
     assert result.prompt_budget_compliance is False
     assert result.accuracy_target_met is False
     assert result.target_status == "prompt_budget_exceeded"
+
+
+def test_nonzero_provider_input_usage_is_checked_against_same_cap():
+    sample = SAMPLE.model_copy(update={"questions": [SAMPLE.questions[0]]})
+    config = make_config().model_copy(
+        update={
+            "accuracy_target": 0.95,
+            "min_target_questions": 1,
+            "max_prompt_tokens": 800,
+        }
+    )
+    result = run_benchmark(
+        samples=[sample],
+        config=config,
+        answer_fn=lambda messages: (
+            "Boston",
+            UsageStats(input_tokens=801, output_tokens=1, calls=1),
+        ),
+        judge_fn=lambda question, gold, prediction: (True, "correct"),
+        ingest_fn=fake_ingest_fn,
+    )
+
+    question = result.samples[0].question_results[0]
+    assert question.prompt_token_proxy <= 800
+    assert question.provider_prompt_budget_compliant is False
+    assert result.prompt_token_proxy_budget_compliance is True
+    assert result.provider_prompt_budget_compliance is False
+    assert result.provider_input_usage_status == "complete"
+    assert result.prompt_budget_compliance is False
+    assert result.target_status == "prompt_budget_exceeded"
+
+
+def test_partial_provider_usage_is_labeled_without_treating_zero_as_empty():
+    sample = SAMPLE.model_copy(update={"questions": SAMPLE.questions[:2]})
+    usages = iter(
+        [
+            UsageStats(input_tokens=400, output_tokens=1, calls=1),
+            UsageStats(input_tokens=0, output_tokens=1, calls=1),
+        ]
+    )
+    result = run_benchmark(
+        samples=[sample],
+        config=make_config().model_copy(update={"max_prompt_tokens": 800}),
+        answer_fn=lambda messages: ("Boston", next(usages)),
+        ingest_fn=fake_ingest_fn,
+    )
+
+    assert result.provider_prompt_budget_compliance is True
+    assert result.provider_input_usage_status == "partial"
 
 
 def test_run_benchmark_max_samples():

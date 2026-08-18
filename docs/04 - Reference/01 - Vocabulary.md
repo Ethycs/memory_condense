@@ -68,7 +68,10 @@ One-line scope: canonical terms as used in this repo's code, docs, and eval resu
 | k0 baseline | no-memory baseline | Run with `--k 0`: recent window only, identical code path |
 | ablation pair | — | Matched k=0 / k=N runs on the same corpus; the delta isolates retrieval |
 | UsageStats | usage | Token + latency accounting for one or more LLM calls: `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `elapsed_s`, `calls`. Adds associatively, so run totals are exact sums of turn totals |
-| context tokens | `context_tokens` | cl100k count of the assembled responder prompt for one turn — measures what the prompt actually costs, independent of what the provider reports |
+| context tokens | `context_tokens` | cl100k count of retrieved evidence text; it is a stable local quantity, not provider billing usage |
+| prompt-token proxy | `prompt_token_proxy` | Exact local cl100k count of message content plus the reported fixed chat-framing reserve. It enforces deterministic packing, but is not an exact count under a provider-specific tokenizer/template. Historical `prompt_tokens` fields are compatibility aliases. |
+| provider input tokens | `responder_usage.input_tokens` | Provider-reported responder input usage. When nonzero it is verified against the prompt cap; zero means the gateway did not report usage, not that the request contained no tokens. |
+| request-token state | `retained_request_token_state_bytes` | Request-derived token IDs, Q/K/V, attention maps, residuals, or generation K/V retained across requests. Static model weights and tokenizer assets are explicitly outside this metric. Historical `retained_token_state_bytes` is a compatibility alias. |
 | benchmark sample | `BenchmarkSample` | One public-benchmark record: a haystack of turns plus the questions asked about it |
 | QA probe | benchmark question | One `(question, gold answer, category, evidence)` asked against an ingested haystack |
 | F1 | token F1 | SQuAD-style token-level F1 between predicted and gold answer after normalization (lowercase, strip punctuation, drop articles, collapse whitespace). The standard LongMemEval/LoCoMo string metric |

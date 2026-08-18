@@ -23,6 +23,7 @@ def compose_context_stress_sample(
     *,
     target_tokens: int,
     max_questions: int = 10,
+    question_offset: int = 0,
 ) -> BenchmarkSample:
     """Combine histories until one sample meets ``target_tokens``.
 
@@ -36,6 +37,8 @@ def compose_context_stress_sample(
         raise ValueError("target_tokens must be positive")
     if max_questions < 1:
         raise ValueError("max_questions must be positive")
+    if question_offset < 0:
+        raise ValueError("question_offset must be non-negative")
 
     turns: list[tuple[str, str]] = []
     turn_source_ids: list[str | None] = []
@@ -56,9 +59,10 @@ def compose_context_stress_sample(
             return f"{sample.sample_id}::{source_id}"
 
         turn_source_ids.extend(namespace(source_id) for source_id in source_ids)
-        if len(questions) < max_questions:
+        question_stop = question_offset + max_questions
+        if len(questions) < question_stop:
             for question in sample.questions:
-                if len(questions) >= max_questions:
+                if len(questions) >= question_stop:
                     break
                 questions.append(
                     question.model_copy(
@@ -82,6 +86,9 @@ def compose_context_stress_sample(
         )
     if not questions:
         raise ValueError("context stress sample has no questions")
+    questions = questions[question_offset : question_offset + max_questions]
+    if not questions:
+        raise ValueError("question_offset is outside the available stress questions")
 
     return BenchmarkSample(
         sample_id=f"context-stress-{target_tokens}",

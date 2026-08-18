@@ -158,6 +158,20 @@ class RetrievalConfig(BaseModel):
     source_candidate_pool: int = Field(default=200, ge=1)
     #: Pool prefix whose source identities may admit second-stage candidates.
     source_activation_k: int | None = Field(default=None, ge=1)
+    #: Split explicit colon-delimited lists into bounded retrieval queries and
+    #: reserve source slots round-robin so every stated facet can contribute.
+    query_facet_retrieval: bool = False
+    query_facet_slots: int = Field(default=6, ge=0)
+    query_facet_max: int = Field(default=4, ge=1)
+    #: For explicitly first-person questions, apply a transient role prior so
+    #: user statements outrank assistant suggestions with similar wording.
+    role_aware_retrieval: bool = False
+    role_user_weight: float = Field(default=1.25, ge=0.0)
+    role_assistant_weight: float = Field(default=0.75, ge=0.0)
+    role_system_weight: float = Field(default=0.50, ge=0.0)
+    #: For explicit order/set questions, round-robin chunks by source so one
+    #: session cannot monopolize anchors or the source-local candidate reserve.
+    multi_fact_source_diversity: bool = False
     #: Add a bounded source-level TF-ISF activation channel derived from the
     #: live chunk-term index. Raw chunks remain the authoritative payload.
     source_tfisf_activation: bool = False
@@ -201,6 +215,86 @@ class RetrievalConfig(BaseModel):
     qwen_feedback_slots: int = Field(default=12, ge=0)
     qwen_feedback_evidence_tokens: int = Field(default=48, ge=1)
     qwen_feedback_query_tokens: int = Field(default=384, ge=1)
+    #: Run a transient query-conditioned event selector over the complete
+    #: bounded expansion set, then place one representative before duplicate
+    #: support. Raw chunks remain the payload and all model state is shed.
+    coverage_selection: bool = False
+    coverage_selector_backend: Literal[
+        "local_ini",
+        "qwen_prefix",
+        "qwen_prefix_choice",
+        "cross_encoder",
+        "cross_encoder_qwen_prefix",
+    ] = "local_ini"
+    coverage_selector_model: str = ""
+    coverage_selector_dtype: Literal[
+        "auto", "bfloat16", "float16", "float32"
+    ] = "auto"
+    coverage_selector_prefix_model_id: str = ""
+    coverage_selector_prefix_revision: str = ""
+    coverage_selector_prefix_checkpoint_sha256: str = ""
+    coverage_selector_prefix_device: str = ""
+    coverage_selector_prefix_dtype: str = ""
+    coverage_selector_candidate_pool: int = Field(default=64, ge=1)
+    coverage_selector_candidate_tokens: int = Field(default=96, ge=1)
+    coverage_selector_query_tokens: int = Field(default=192, ge=1)
+    coverage_selector_max_workspace_tokens: int = Field(default=8192, ge=1)
+    coverage_selector_max_new_tokens: int = Field(default=4096, ge=1)
+    coverage_selector_cross_encoder_model_id: str = ""
+    coverage_selector_cross_encoder_revision: str = ""
+    coverage_selector_cross_encoder_checkpoint_sha256: str = ""
+    coverage_selector_cross_encoder_device: str = "cuda"
+    #: Semantic reranking has its own frontier.  In the composite arm this is
+    #: deliberately wider than the bounded Qwen duplicate-grouping prefix.
+    coverage_selector_cross_encoder_candidate_pool: int = Field(
+        default=128,
+        ge=1,
+    )
+    coverage_selector_cross_encoder_semantic_rerank: bool = True
+    coverage_selector_cross_encoder_score_only: bool = False
+    coverage_selector_cross_encoder_batch_size: int = Field(default=32, ge=1)
+    coverage_selector_cross_encoder_max_length: int = Field(default=256, ge=1)
+    coverage_selector_choice_model_id: str = ""
+    coverage_selector_choice_revision: str = ""
+    coverage_selector_choice_checkpoint_sha256: str = ""
+    coverage_selector_choice_device: str = "cuda"
+    coverage_selector_choice_dtype: Literal[
+        "auto", "bfloat16", "float16", "float32"
+    ] = "auto"
+    coverage_selector_choice_batch_size: int = Field(default=8, ge=1)
+    coverage_selector_choice_max_candidates: int = Field(default=128, ge=1)
+    coverage_selector_choice_query_tokens: int = Field(default=192, ge=1)
+    coverage_selector_choice_candidate_tokens: int = Field(default=128, ge=1)
+    coverage_selector_choice_max_prompt_tokens: int = Field(default=512, ge=1)
+    coverage_selector_choice_max_workspace_tokens: int = Field(default=8192, ge=1)
+    coverage_selector_null_threshold: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+    )
+    coverage_selector_uncertainty_entropy: float = Field(
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+    )
+    coverage_selector_prefix_layers: int = Field(default=6, ge=1)
+    coverage_selector_attention_layer: int = Field(default=5, ge=0)
+    coverage_selector_merge_similarity: float = Field(
+        default=0.985,
+        ge=0.0,
+        le=1.0,
+    )
+    coverage_selector_same_source_merge_similarity: float = Field(
+        default=0.90,
+        ge=0.0,
+        le=1.0,
+    )
+    #: Frozen policy exception: permit a fully audited FIXED-K set from the
+    #: selected partition scope to close the prompt tail even though global
+    #: recall is not proven. Off by default; reports must label the weaker
+    #: closure scope explicitly.
+    allow_selected_scope_fixed_k_closure: bool = False
+    coverage_selector_strict: bool = False
     #: Source-local chunk shells exposed around hybrid anchors.
     neighbor_radius: int = Field(default=1, ge=0)
     #: Hard count of additional neighbor chunks; direct anchors never compete.
@@ -230,6 +324,7 @@ class RetrievalConfig(BaseModel):
         default=0.0,
         ge=0.0,
     )
+    consolidation_source_metadata_packing: bool = False
     #: Write-side causal replay bounds. They limit compute/workspace, not the
     #: amount of durable conversation evidence stored in SQLite/HNSW.
     consolidation_training_k: int = Field(default=10, ge=1)
@@ -247,6 +342,108 @@ class RetrievalConfig(BaseModel):
             )
         if self.qwen_rerank and self.qwen_feedback:
             raise ValueError("qwen_rerank and qwen_feedback are separate arms")
+        if self.coverage_selection and self.mode not in {
+            "memory",
+            "causal_consolidation",
+            "causal_graph",
+        }:
+            raise ValueError(
+                "coverage_selection requires a packed memory or causal mode"
+            )
+        if self.allow_selected_scope_fixed_k_closure:
+            if not self.coverage_selection:
+                raise ValueError(
+                    "selected-scope closure requires coverage_selection"
+                )
+            if not self.source_partition_routing:
+                raise ValueError(
+                    "selected-scope closure requires source_partition_routing"
+                )
+            if self.coverage_selector_backend not in {
+                "qwen_prefix",
+                "qwen_prefix_choice",
+            }:
+                raise ValueError(
+                    "selected-scope closure currently requires a Qwen prefix "
+                    "coverage backend"
+                )
+        if self.coverage_selection and self.coverage_selector_backend in {
+            "qwen_prefix",
+            "qwen_prefix_choice",
+            "cross_encoder_qwen_prefix",
+        }:
+            if self.coverage_selector_attention_layer < 1:
+                raise ValueError(
+                    "coverage selector attention layer must be at least 1 so "
+                    "the readout state is query-conditioned"
+                )
+            if self.coverage_selector_attention_layer >= self.coverage_selector_prefix_layers:
+                raise ValueError(
+                    "coverage selector attention layer must be inside its prefix"
+                )
+            if (
+                self.coverage_selector_same_source_merge_similarity
+                > self.coverage_selector_merge_similarity
+            ):
+                raise ValueError(
+                    "same-source merge threshold cannot exceed cross-source threshold"
+                )
+        if (
+            self.coverage_selection
+            and self.coverage_selector_backend
+            in {"cross_encoder", "cross_encoder_qwen_prefix"}
+            and self.coverage_selector_cross_encoder_max_length
+            > self.coverage_selector_max_workspace_tokens
+        ):
+            raise ValueError(
+                "cross-encoder max length cannot exceed selector workspace"
+            )
+        if (
+            self.coverage_selector_cross_encoder_semantic_rerank
+            and self.coverage_selector_cross_encoder_score_only
+        ):
+            raise ValueError(
+                "cross-encoder semantic rerank and score-only modes are "
+                "mutually exclusive"
+            )
+        if (
+            self.coverage_selection
+            and self.coverage_selector_backend == "qwen_prefix_choice"
+        ):
+            if not all(
+                (
+                    self.coverage_selector_choice_model_id,
+                    self.coverage_selector_choice_revision,
+                    self.coverage_selector_choice_checkpoint_sha256,
+                )
+            ):
+                raise ValueError(
+                    "choice coverage requires exact model identity, revision, "
+                    "and checkpoint SHA-256"
+                )
+            digest = self.coverage_selector_choice_checkpoint_sha256.casefold()
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("choice checkpoint SHA-256 must be 64 hex digits")
+            # The CLI loader requires single-token A/B labels. Both logits
+            # come from one shared final prompt state, so no paired prompt or
+            # appended label occupies the token workspace.
+            if (
+                self.coverage_selector_choice_max_prompt_tokens
+                > self.coverage_selector_choice_max_workspace_tokens
+            ):
+                raise ValueError(
+                    "choice workspace cannot hold one candidate prompt"
+                )
+        if self.coverage_selector_prefix_checkpoint_sha256:
+            digest = self.coverage_selector_prefix_checkpoint_sha256.casefold()
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(
+                    "prefix checkpoint SHA-256 must be 64 hex digits"
+                )
         if self.qwen_rerank or self.qwen_feedback:
             if not self.source_local_search:
                 raise ValueError("Qwen attention requires source_local_search")
@@ -283,6 +480,29 @@ class RetrievalConfig(BaseModel):
                 raise ValueError("source_hsc_activation requires a graph mode")
             if self.source_hsc_chunk_slots > self.source_slots:
                 raise ValueError("source_hsc_chunk_slots cannot exceed source_slots")
+        if self.query_facet_retrieval:
+            if self.mode not in {"hybrid_graph", "causal_graph"}:
+                raise ValueError("query_facet_retrieval requires a graph mode")
+            if self.query_facet_slots > self.source_slots:
+                raise ValueError("query_facet_slots cannot exceed source_slots")
+            if (
+                self.source_hsc_activation
+                and self.query_facet_slots + self.source_hsc_chunk_slots
+                > self.source_slots
+            ):
+                raise ValueError(
+                    "facet and HSC reserves cannot exceed source_slots"
+                )
+        if self.role_aware_retrieval and self.mode not in {
+            "hybrid_graph",
+            "causal_graph",
+        }:
+            raise ValueError("role_aware_retrieval requires a graph mode")
+        if self.multi_fact_source_diversity and self.mode not in {
+            "hybrid_graph",
+            "causal_graph",
+        }:
+            raise ValueError("multi_fact_source_diversity requires a graph mode")
         if self.qwen_rerank:
             if self.mode not in {
                 "hybrid_source",
@@ -316,6 +536,38 @@ class RetrievalConfig(BaseModel):
         return self.mode == "hybrid" or self.hybrid
 
     @property
+    def coverage_label(self) -> str:
+        if not self.coverage_selection:
+            return ""
+        backend = self.coverage_selector_backend.replace("_", "-")
+        if self.coverage_selector_backend == "qwen_prefix_choice":
+            model_name = self.coverage_selector_choice_model_id.rsplit("/", 1)[-1]
+            slug = "".join(
+                character.casefold() if character.isalnum() else "-"
+                for character in model_name
+            ).strip("-")
+            while "--" in slug:
+                slug = slug.replace("--", "-")
+            backend = f"qwen-prefix-choice-{slug}"
+        semantic_mode = (
+            "-score-only"
+            if self.coverage_selector_backend
+            in {"cross_encoder", "cross_encoder_qwen_prefix"}
+            and self.coverage_selector_cross_encoder_score_only
+            else "-companion-only"
+            if self.coverage_selector_backend
+            in {"cross_encoder", "cross_encoder_qwen_prefix"}
+            and not self.coverage_selector_cross_encoder_semantic_rerank
+            else ""
+        )
+        selected_closure = (
+            "-selected-scope-closure"
+            if self.allow_selected_scope_fixed_k_closure
+            else ""
+        )
+        return f"-coverage-{backend}{semantic_mode}{selected_closure}"
+
+    @property
     def label(self) -> str:
         """Short tag for filenames and run tables."""
         if self.mode == "span":
@@ -336,6 +588,13 @@ class RetrievalConfig(BaseModel):
         if self.mode == "hybrid_graph":
             activation = self.source_activation_k or self.k
             local = "-local" if self.source_local_search else ""
+            facets = (
+                f"-facet{self.query_facet_slots}"
+                if self.query_facet_retrieval
+                else ""
+            )
+            roles = "-role" if self.role_aware_retrieval else ""
+            diversity = "-diverse" if self.multi_fact_source_diversity else ""
             qwen = (
                 f"-qwenfb{self.qwen_feedback_slots}"
                 if self.qwen_feedback
@@ -352,7 +611,8 @@ class RetrievalConfig(BaseModel):
                 f"hybrid-graph-k{self.k}-r{self.neighbor_radius}"
                 f"-n{self.neighbor_slots}-{self.neighbor_direction}"
                 f"-s{self.source_slots}-a{activation}"
-                f"-p{self.source_candidate_pool}{partitions}{local}{qwen}"
+                f"-p{self.source_candidate_pool}{partitions}{local}"
+                f"{facets}{roles}{diversity}{qwen}"
             )
         if self.mode == "hybrid_neighbor":
             replacement = (
@@ -365,10 +625,17 @@ class RetrievalConfig(BaseModel):
                 f"-s{self.neighbor_slots}{replacement}"
             )
         if self.mode == "memory":
-            return f"memory{self.k_memories}"
+            return f"memory{self.k_memories}{self.coverage_label}"
         if self.mode in {"causal_consolidation", "causal_graph"}:
             base = "causal-graph" if self.mode == "causal_graph" else "causal"
             local = "-local" if self.source_local_search else ""
+            facets = (
+                f"-facet{self.query_facet_slots}"
+                if self.query_facet_retrieval
+                else ""
+            )
+            roles = "-role" if self.role_aware_retrieval else ""
+            diversity = "-diverse" if self.multi_fact_source_diversity else ""
             qwen = (
                 f"-qwenfb{self.qwen_feedback_slots}"
                 if self.qwen_feedback
@@ -383,7 +650,8 @@ class RetrievalConfig(BaseModel):
             )
             return (
                 f"{base}-k{self.k}-s{self.consolidation_chunk_slots}"
-                f"-h{self.consolidation_hops}{partitions}{local}{qwen}"
+                f"-h{self.consolidation_hops}{partitions}{local}"
+                f"{facets}{roles}{diversity}{qwen}{self.coverage_label}"
             )
         if self.effective_hybrid:
             return f"hybrid{self.alpha:g}"
@@ -408,7 +676,10 @@ class EvalConfig(BaseModel):
     #: A small smoke cannot certify a 95% target even if it happens to be
     #: perfect. Paid/public runs must grade at least this many questions.
     min_target_questions: int = Field(default=100, ge=1)
-    #: Hard cap over message-content tokens sent to the responder. ``None``
+    #: Hard cap over the deterministic local prompt-token proxy sent to the
+    #: responder. The proxy uses cl100k_base plus an explicit chat-framing
+    #: reserve; it is not an exact provider-token count. Provider input usage
+    #: is checked after the call whenever the provider reports it. ``None``
     #: preserves historical uncapped behavior; the CLI defaults to 8k.
     max_prompt_tokens: int | None = Field(default=None, ge=1)
 

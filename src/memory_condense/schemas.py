@@ -313,7 +313,7 @@ class RetrievalResult(BaseModel):
     # activations, or any other transformer-shaped state between hops.
     association_path: Optional[tuple[str, ...]] = None
     # Heat is a conserved, external scalar derived from compact association
-    # edges. It is not a transformer attention tensor or retained token state.
+    # edges. It is not an attention tensor or retained request-token state.
     diffusion_heat: Optional[float] = Field(default=None, ge=0.0)
     association_support: Optional[int] = Field(default=None, ge=0)
     memory_source_id: Optional[str] = None

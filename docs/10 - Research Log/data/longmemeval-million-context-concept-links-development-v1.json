@@ -1,0 +1,36 @@
+{
+  "status": "development-measured",
+  "date": "2026-08-17",
+  "benchmark": "LongMemEval-S cleaned locked development stress",
+  "context_tokens": 1039203,
+  "turns": 5400,
+  "questions": 10,
+  "concept": "autobiographical_completed_event",
+  "concept_probe": {
+    "layer": 0,
+    "heldout_balanced_accuracy": 0.9375,
+    "bootstrap_mean_cosine": 0.7716960310935974,
+    "random_label_mean_accuracy": 0.48828125
+  },
+  "index": {
+    "user_chunks": 2478,
+    "transient_concept_spans": 6450,
+    "signature_width": 1,
+    "retained_transformer_state_bytes": 0
+  },
+  "workspace": {
+    "max_candidates_per_forward": 8,
+    "max_tokens_per_forward": 1024
+  },
+  "results": [
+    {"variant": "protected-union-v25", "evidence_source_coverage": 0.947, "all_sources": 0.8, "mean_context_tokens": 1981},
+    {"variant": "candidate-cav-v26", "evidence_source_coverage": 0.947, "all_sources": 0.8, "mean_context_tokens": 1981},
+    {"variant": "qwen250-v29", "evidence_source_coverage": 0.947, "all_sources": 0.8, "mean_context_tokens": 2197},
+    {"variant": "whole-chunk-index-v30", "evidence_source_coverage": 0.947, "all_sources": 0.8, "mean_context_tokens": 1981},
+    {"variant": "concept-span-v31", "evidence_source_coverage": 0.947, "all_sources": 0.8, "mean_context_tokens": 1981},
+    {"variant": "concept-attention-v32", "evidence_source_coverage": 0.947, "all_sources": 0.8, "mean_context_tokens": 2065},
+    {"variant": "concept-set-cover-v33", "evidence_source_coverage": 0.947, "all_sources": 0.8, "mean_context_tokens": 2067},
+    {"variant": "concept-tfisf-v34", "evidence_source_coverage": 0.947, "all_sources": 0.8, "mean_context_tokens": 2063}
+  ],
+  "next_gate": "measure raw graph evidence coverage separately from packed prompt coverage"
+}

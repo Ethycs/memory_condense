@@ -206,6 +206,7 @@ def test_pruned_arm_uses_an_isolated_sqlite_snapshot(rig_fixture):
         "edges_after": 1,
         "head_payload_bytes_before": 32,
         "head_payload_bytes_after": 16,
+        "retained_request_token_state_bytes": 0,
         "retained_token_state_bytes": 0,
     }
     assert report["arms"]["pruned"]["linked_recall"] == 1.0

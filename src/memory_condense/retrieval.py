@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import struct
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import hnswlib
 import numpy as np
@@ -14,6 +15,7 @@ from memory_condense.db import Database
 from memory_condense.lexical import LexicalIndex
 from memory_condense.schemas import Chunk, RetrievalResult, Turn
 from memory_condense.source_hierarchy import SourceContractionIndex
+from memory_condense.transcript_store import parse_source_metadata
 
 #: `meta` key holding the next free hnswlib label. Labels are shared state
 #: across every process open on a store, so they are allocated through the
@@ -36,6 +38,24 @@ _LABEL_KEY = "next_hnsw_label"
 #: topics. Two levels beat one: stratified scored 22.1% at 660 tokens where the
 #: single coarse level gave 21.6% at 673.
 DEFAULT_SPAN_TOKENS: tuple[int, ...] = (110, 220)
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionContentRow:
+    """One exact raw chunk reached by a hierarchical partition scan.
+
+    The row deliberately contains no embedding or derived semantic label.  A
+    caller may inspect every row with cheap query-specific logic, retain only
+    bounded chunk IDs, and hydrate the winners through the ordinary provenance
+    path.  Synthetic source-timestamp rows are excluded; their timestamps are
+    provenance metadata rather than answer evidence.
+    """
+
+    chunk_id: str
+    source_id: str
+    role: str
+    ordinal: int
+    text: str
 
 
 def load_chunk_payload(db: Database, chunk_id: str) -> Chunk | None:
@@ -805,6 +825,96 @@ class SimilarityRetriever:
                 results.append(source)
         return results
 
+    def source_partition_ids(self, *, separator: str = "::") -> list[str]:
+        """Return the complete durable top-level source-partition inventory.
+
+        The order follows first transcript occurrence and is therefore stable
+        for one immutable store.  Coverage diagnostics use this inventory to
+        distinguish an exhaustive partition scope from approximate top-k
+        routing; it contains IDs only and materializes no transcript text.
+        """
+
+        if not separator:
+            raise ValueError("partition separator must be non-empty")
+        rows = self._db.execute(
+            "SELECT source_id, MIN(ordinal) FROM turns "
+            "WHERE source_id IS NOT NULL GROUP BY source_id "
+            "ORDER BY MIN(ordinal), source_id"
+        ).fetchall()
+        partitions: list[str] = []
+        seen: set[str] = set()
+        for source_id, _ordinal in rows:
+            partition = str(source_id).split(separator, 1)[0]
+            if partition and partition not in seen:
+                seen.add(partition)
+                partitions.append(partition)
+        return partitions
+
+    def iter_partition_content_rows(
+        self,
+        partition_ids: Sequence[str],
+        *,
+        separator: str = "::",
+        source_batch_size: int = 400,
+    ) -> Iterator[PartitionContentRow]:
+        """Stream every raw content chunk in the selected partitions.
+
+        Partition membership is resolved through :meth:`source_ids_in_partitions`
+        rather than a prefix ``LIKE`` expression, so ``alpha`` cannot silently
+        include ``alpha-extra`` and separators containing SQL wildcard
+        characters remain literal.  Source IDs are queried in bounded groups
+        to stay below SQLite's bind-variable limit.  Text is yielded one row at
+        a time and no embedding, activation, or query state is retained.
+        """
+
+        if source_batch_size < 1:
+            raise ValueError("source_batch_size must be positive")
+        yield from self.iter_source_content_rows(
+            self.source_ids_in_partitions(
+                partition_ids,
+                separator=separator,
+            ),
+            source_batch_size=source_batch_size,
+        )
+
+    def iter_source_content_rows(
+        self,
+        source_ids: Sequence[str],
+        *,
+        source_batch_size: int = 400,
+    ) -> Iterator[PartitionContentRow]:
+        """Stream raw chunks from one immutable caller-supplied source set."""
+
+        if source_batch_size < 1:
+            raise ValueError("source_batch_size must be positive")
+        selected_sources = list(
+            dict.fromkeys(str(source_id) for source_id in source_ids if source_id)
+        )
+        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        for start in range(0, len(selected_sources), source_batch_size):
+            batch = selected_sources[start : start + source_batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._db.execute(
+                "SELECT c.chunk_id, "
+                + source_expr
+                + ", t.role, t.ordinal, c.text "
+                "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
+                f"WHERE {source_expr} IN ({placeholders}) "
+                "ORDER BY t.ordinal, c.rowid",
+                tuple(batch),
+            )
+            for chunk_id, source_id, role, ordinal, text in rows:
+                raw_text = str(text)
+                if parse_source_metadata(raw_text) is not None:
+                    continue
+                yield PartitionContentRow(
+                    chunk_id=str(chunk_id),
+                    source_id=str(source_id),
+                    role=str(role),
+                    ordinal=int(ordinal),
+                    text=raw_text,
+                )
+
     def hydrate_source_neighbors(
         self,
         anchors: Sequence[RetrievalResult],
@@ -1138,6 +1248,71 @@ class SimilarityRetriever:
             if len(results) >= k:
                 break
         return results
+
+    def hybrid_query_source_companions(
+        self,
+        query_text: str,
+        query_embedding: np.ndarray,
+        source_ids: Sequence[str],
+        *,
+        metadata_chunk_ids: Sequence[str],
+        max_sources: int,
+        max_per_source: int = 1,
+        candidates_per_source: int = 64,
+        alpha: float = 0.65,
+        source_scores: dict[str, float] | None = None,
+        anchor_chunk_ids: dict[str, str] | None = None,
+    ) -> list[RetrievalResult]:
+        """Return a bounded real-content shortlist per routed source.
+
+        ``metadata_chunk_ids`` must contain only synthetic source-boundary
+        timestamp rows identified by the caller. They are excluded by exact
+        durable chunk ID; other system-authored evidence remains eligible.
+        Sources, per-source search, and hydrated rows are all hard bounded.
+        The default preserves the historical one-best behavior; callers with
+        an injected semantic chooser may request a small ``max_per_source``
+        shortlist and still select exactly one payload before packing. No gold
+        labels or model state enter this operation.
+        """
+
+        if max_sources < 0:
+            raise ValueError("max_sources must be non-negative")
+        if max_per_source < 1:
+            raise ValueError("max_per_source must be positive")
+        if candidates_per_source < 1:
+            raise ValueError("candidates_per_source must be positive")
+        selected = list(
+            dict.fromkeys(str(source_id) for source_id in source_ids if str(source_id))
+        )[:max_sources]
+        if not selected:
+            return []
+        excluded = tuple(dict.fromkeys(str(value) for value in metadata_chunk_ids))
+        scores = source_scores or {}
+        anchors = anchor_chunk_ids or {}
+        companions: list[RetrievalResult] = []
+        for source_id in selected:
+            hits = self.hybrid_query_sources(
+                query_text,
+                query_embedding,
+                [source_id],
+                k=max_per_source,
+                candidates_per_source=candidates_per_source,
+                alpha=alpha,
+                source_scores={source_id: float(scores.get(source_id, 0.0))},
+                anchor_chunk_ids=(
+                    {source_id: anchors[source_id]}
+                    if source_id in anchors
+                    else None
+                ),
+                exclude_chunk_ids=excluded,
+            )
+            if not hits:
+                continue
+            companions.extend(
+                hit.model_copy(update={"route": "source_metadata_companion"})
+                for hit in hits[:max_per_source]
+            )
+        return companions
 
     def delete_chunk(self, chunk_id: str) -> bool:
         """Remove a chunk from both indexes. Returns False if it was unknown.

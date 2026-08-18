@@ -404,6 +404,34 @@ chunks. Replacing five weak anchors with those five transition candidates
 recovered the same two but lost nine, falling to 40.0%. Turn adjacency is
 therefore useful evidence for a selective gate, not a default retrieval rule.
 
+### Concept membership must be span-local
+
+A durable retrieval chunk and a conceptual event are not necessarily the same
+unit. A user sentence may begin with a plan or request and contain a completed
+event after a discourse boundary such as "by the way." Mean-pooling the whole
+chunk can classify the event as a plan even when the event clause is clear.
+
+The live compiler therefore uses event-sized sentence/clause spans for the
+teacher pass and elementwise max-pools their CAV margins back to the durable
+chunk ID:
+
+$$
+c_i[j] = \max_{s \in spans(chunk_i)} CAV_j(s).
+$$
+
+Only $c_i$ persists. The transient spans and residuals do not. This recovered
+positive event membership for two hard LongMemEval sources that whole-chunk
+pooling classified negatively, without multiplying stored prompt text or
+transformer state.
+
+Membership alone is not object binding. A completed-event CAV answers whether
+an event occurred; it does not establish whether the event is a museum visit,
+concert, purchase, or correction. Retrieval therefore needs a conjunction of
+CAV membership, sparse/dense object relevance, provenance constraints, and a
+set-aware packetizer. QK/OV attention can rerank bounded members, but measured
+development runs show that ordinary top-k attention is not by itself a
+set-completion objective.
+
 ## 7. Expected failure modes
 
 1. **Activation-space mismatch:** the runtime query adapter fails to reproduce the teacher's head rankings.

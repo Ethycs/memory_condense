@@ -1,0 +1,73 @@
+{
+  "format": "memory-condense-operational-context-stress-result-v1",
+  "status": "development_candidate_not_validated",
+  "date": "2026-08-17",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_manifest": "longmemeval-95-target-split-v2.json",
+  "split": "development",
+  "construction": {
+    "content_tokens": 1039203,
+    "turns": 5400,
+    "source_histories": 10,
+    "questions": 10
+  },
+  "models": {
+    "responder": "openai/codex_sdk/gpt-5.6-terra",
+    "judge": "openai/codex_sdk/gpt-5.6-sol",
+    "gateway": "central-dev v1",
+    "answer_calls": 10,
+    "judge_calls": 10
+  },
+  "selected_treatment": {
+    "source_metadata_prefilter": true,
+    "source_timestamp_binding": true,
+    "speaker_role_binding": true,
+    "temporal_update_prompt_semantics": true,
+    "information_gain_threshold": 0.008,
+    "judge_accuracy": 0.3,
+    "mean_f1": 0.295404868355688,
+    "exact_match": 0.2,
+    "mean_context_tokens": 1377.4,
+    "mean_prompt_tokens": 1658.1,
+    "mean_transcript_token_savings": 0.9986745611781336,
+    "approximate_context_compression_ratio": 754.4,
+    "prompt_budget": 8000,
+    "prompt_budget_compliance": true
+  },
+  "comparisons": {
+    "prior_best_v3": {
+      "judge_accuracy": 0.3,
+      "mean_f1": 0.280952380952381,
+      "mean_context_tokens": 2108.2,
+      "context_token_reduction": 0.3466,
+      "report_sha256": "987f6842df4717797f4d8a22a88bf079fc548ba189f7da818f4b6ed2bdf7c603"
+    },
+    "store_metadata_v5_rejected": {
+      "judge_accuracy": 0.2,
+      "mean_f1": 0.245404868355688,
+      "mean_context_tokens": 2165.2,
+      "report_sha256": "d6bd194e8a95dd82391d18d9c29402925ef852563ac0272742b4b68fa92de889"
+    },
+    "cleaned_prefilter_v6": {
+      "judge_accuracy": 0.2,
+      "mean_f1": 0.252727272727273,
+      "mean_context_tokens": 1326.4
+    },
+    "cleaned_unfiltered_offline_v7": {
+      "literal_recall": 0.4,
+      "mean_best_token_f1": 0.139,
+      "mean_context_tokens": 2219
+    }
+  },
+  "artifacts": {
+    "selected_report": "operational-metadata-v8-role/benchmark_longmemeval_s_cleaned_120-250_k10_ef50_causal-graph-k10-s24-h2-local_20260817_222603.json",
+    "selected_report_sha256": "0084b4236117a4208e408ae65d1297aed400e6b4057f8a758313a72aafa17dd5",
+    "offline_prefilter_csv": "longmemeval-million-context-metadata-prefilter-v6-10.csv",
+    "offline_prefilter_csv_sha256": "2b5ddd06d2fe4c7d785c5c93f15d33b9f116419729e2bfd8346acafd75c6151b",
+    "offline_unfiltered_csv": "longmemeval-million-context-metadata-prefilter-v7-unfiltered-10.csv",
+    "offline_unfiltered_csv_sha256": "cdde3f2bc957073f6b85b02a5d0ebbc5575ad21681b63c3e4737cfd37665aa95",
+    "environment_lock_sha256": "058083871240979257ada7ca4c71dd816fee64792b275ef11e4857c9f5ebba33",
+    "implementation_sha256": "9d7d22580c87b2f5c82ffa97f1608c1ed31e52663a9e59d79c5aa4c12d6be059"
+  },
+  "interpretation": "Ten-question locked development stress test only. The selected arm matches the best observed 30% judged accuracy while reducing returned context by 34.7%. It does not pass the 95% target and is not a validation result."
+}

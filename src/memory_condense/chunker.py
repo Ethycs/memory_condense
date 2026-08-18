@@ -8,6 +8,12 @@ from memory_condense._tokenizer import count_tokens
 from memory_condense.schemas import Chunk
 
 
+_CONCEPTUAL_BOUNDARY_RE = re.compile(
+    r"\s*(?:;|\u2014|\b(?:by the way|however|anyway|but|although|though),?)\s+",
+    re.IGNORECASE,
+)
+
+
 class Chunker:
     """Splits turn text into chunks using sentence boundary detection + merge.
 
@@ -53,6 +59,24 @@ class Chunker:
                 else:
                     result.append(seg)
         return result
+
+    def conceptual_spans(self, text: str) -> list[str]:
+        """Return event-sized clauses for semantic membership probes.
+
+        Retrieval chunks intentionally carry broad context.  CAV membership
+        should not average a short completed event away merely because the
+        same sentence begins with a plan, question, correction, or aside.
+        """
+
+        spans: list[str] = []
+        for sentence in self._split_sentences(text):
+            pieces = [
+                piece.strip(" ,")
+                for piece in _CONCEPTUAL_BOUNDARY_RE.split(sentence)
+                if piece.strip(" ,")
+            ]
+            spans.extend(pieces or [sentence])
+        return spans
 
     def _subsplit(self, text: str) -> list[str]:
         """Split an oversized sentence at clause boundaries."""

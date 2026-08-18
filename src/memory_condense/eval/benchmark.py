@@ -31,12 +31,21 @@ from typing import Callable, Optional, Protocol
 
 from pydantic import BaseModel, Field
 
-from memory_condense._tokenizer import count_tokens, truncate_to_tokens
+from memory_condense._tokenizer import (
+    count_chat_prompt_token_proxy,
+    count_tokens,
+    tokenizer_proxy_identity,
+    truncate_to_tokens,
+)
 from memory_condense.condenser import MemoryCondenser
 from memory_condense.context_packer import ContextBudget
 from memory_condense.embedding import EmbeddingService
 from memory_condense.eval.reproducibility import file_sha256
 from memory_condense.eval.schemas import EvalConfig, UsageStats
+from memory_condense.eval.cache_receipts import (
+    cache_receipts_sha256,
+    validated_cache_receipts,
+)
 from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
 
 # ---------------------------------------------------------------------------
@@ -88,7 +97,17 @@ QA_SYSTEM_PROMPT = (
     "Answer the question using ONLY the retrieved excerpts. Be as short as "
     "possible: reply with just the fact, name, number, or date asked for — "
     "no preamble, no explanation, no full sentences unless the question "
-    "requires one. If the excerpts do not contain the answer, reply exactly: "
+    "requires one. Provenance labels may include an excerpt timestamp and "
+    "speaker role. Treat user statements as facts about the user; do not "
+    "mistake assistant suggestions for things the user did. For 'now', "
+    "'current', or 'latest' questions, use the newest relevant user update. "
+    "For ordering questions, compare the relevant timestamps. If the "
+    "question asks for a difference, duration, or amount remaining, identify "
+    "the relevant operands and calculate the result. Treat statements such "
+    "as 'started today' or 'got it today' as events at their excerpt "
+    "timestamps; if an approximate recap conflicts with an explicit start "
+    "or end boundary, use the explicit boundary. If the "
+    "excerpts do not contain the answer, reply exactly: "
     "I don't know."
 )
 
@@ -117,6 +136,12 @@ JUDGE_USER_TEMPLATE = (
     "one-sentence reason."
 )
 
+# The remote benchmark responder requests at most this many generated tokens.
+# It is reported as a separate output reserve instead of being mislabeled as
+# part of the provider input prompt. CLI-local responders override it through
+# ``evaluation_protocol`` with their configured ``max_new_tokens`` value.
+BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE = 256
+
 
 # ---------------------------------------------------------------------------
 # Result schemas
@@ -137,7 +162,15 @@ class BenchmarkQuestionResult(BaseModel):
     judge_correct: Optional[bool] = None
     judge_reasoning: Optional[str] = None
     context_tokens: int = 0
+    #: Deterministic cl100k message-content count plus the explicit fixed chat
+    #: framing reserve. This is not provider-token usage.
+    prompt_token_proxy: int = 0
+    #: Compatibility alias for ``prompt_token_proxy`` in historical reports.
     prompt_tokens: int = 0
+    responder_output_token_reserve: int = 0
+    request_token_proxy: int = 0
+    #: ``None`` means the provider did not report a nonzero input count.
+    provider_prompt_budget_compliant: Optional[bool] = None
     transcript_tokens: int = 0
     context_fraction: float = 0.0
     transcript_token_savings: float = 0.0
@@ -149,6 +182,16 @@ class BenchmarkSampleResult(BaseModel):
     """Aggregated results for all questions on one benchmark sample."""
 
     sample_id: str
+    #: Content address of the exact parsed/composed sample evaluated. Unlike
+    #: ``sample_id``, this distinguishes context-stress shards with the same
+    #: human-readable label but different source histories or questions.
+    sample_sha256: str = ""
+    #: Exact verified identities of the immutable compiled and causal artifacts
+    #: used by this sample. Locked validation requires the full pair.
+    cache_receipts: dict[str, list[dict[str, object]]] = Field(
+        default_factory=dict
+    )
+    cache_receipts_sha256: str = ""
     num_turns: int
     num_questions: int
     question_results: list[BenchmarkQuestionResult] = Field(default_factory=list)
@@ -156,6 +199,9 @@ class BenchmarkSampleResult(BaseModel):
     exact_match_rate: float = 0.0
     judge_accuracy: Optional[float] = None
     mean_context_tokens: float = 0.0
+    mean_prompt_token_proxy: float = 0.0
+    mean_request_token_proxy: float = 0.0
+    #: Compatibility alias for ``mean_prompt_token_proxy``.
     mean_prompt_tokens: float = 0.0
     transcript_tokens: int = 0
     mean_context_fraction: float = 0.0
@@ -184,6 +230,17 @@ class BenchmarkRunResult(BaseModel):
     exact_match_rate: float = 0.0
     judge_accuracy: Optional[float] = None
     mean_context_tokens: float = 0.0
+    mean_prompt_token_proxy: float = 0.0
+    p95_prompt_token_proxy: int = 0
+    max_prompt_token_proxy_observed: int = 0
+    mean_request_token_proxy: float = 0.0
+    responder_output_token_reserve: int = 0
+    prompt_token_proxy_identity: dict[str, object] = Field(default_factory=dict)
+    prompt_token_proxy_budget_compliance: bool = True
+    #: ``None`` means no responder call returned nonzero provider input usage.
+    provider_prompt_budget_compliance: Optional[bool] = None
+    provider_input_usage_status: str = "unavailable"
+    #: Compatibility aliases for the prompt-token-proxy fields.
     mean_prompt_tokens: float = 0.0
     p95_prompt_tokens: int = 0
     mean_transcript_tokens: float = 0.0
@@ -203,6 +260,10 @@ class BenchmarkRunResult(BaseModel):
     implementation_sha256: str = ""
     environment_lock_sha256: str = ""
     policy_manifest_sha256: str = ""
+    #: Immutable execution controls that are not part of ``EvalConfig`` (for
+    #: example the stress-memory target and shard offset). Locked campaigns
+    #: compare these against the frozen policy and reconstructed population.
+    evaluation_protocol: dict[str, object] = Field(default_factory=dict)
     by_category: dict[str, CategoryMetrics] = Field(default_factory=dict)
     run_timestamp: str = ""
 
@@ -359,9 +420,15 @@ def build_qa_prompt(question: str, chunk_texts: list[str]) -> list[dict[str, str
 
 
 def _message_content_tokens(messages: list[dict[str, str]]) -> int:
-    """Stable tokenizer-proxy count over content sent to a provider."""
+    """cl100k message-content count, excluding any chat framing."""
 
     return sum(count_tokens(message.get("content", "")) for message in messages)
+
+
+def _message_prompt_token_proxy(messages: list[dict[str, str]]) -> int:
+    """Stable local input proxy including the explicit framing reserve."""
+
+    return count_chat_prompt_token_proxy(messages)
 
 
 def cap_context_to_prompt_budget(
@@ -369,7 +436,7 @@ def cap_context_to_prompt_budget(
     chunk_texts: list[str],
     max_prompt_tokens: int | None,
 ) -> list[str]:
-    """Keep ranked excerpts in order under a hard prompt-content ceiling.
+    """Keep ranked excerpts under a hard local prompt-token-proxy ceiling.
 
     The final excerpt may be truncated on a token boundary. A binary search is
     used because numbered labels and the QA template also consume tokens; the
@@ -381,7 +448,7 @@ def cap_context_to_prompt_budget(
     if max_prompt_tokens < 1:
         raise ValueError("max_prompt_tokens must be positive")
 
-    if _message_content_tokens(build_qa_prompt(question, [])) > max_prompt_tokens:
+    if _message_prompt_token_proxy(build_qa_prompt(question, [])) > max_prompt_tokens:
         raise ValueError(
             "max_prompt_tokens is smaller than the QA prompt without context"
         )
@@ -390,7 +457,7 @@ def cap_context_to_prompt_budget(
     for excerpt in chunk_texts:
         proposal = [*selected, excerpt]
         if (
-            _message_content_tokens(build_qa_prompt(question, proposal))
+            _message_prompt_token_proxy(build_qa_prompt(question, proposal))
             <= max_prompt_tokens
         ):
             selected.append(excerpt)
@@ -401,7 +468,7 @@ def cap_context_to_prompt_budget(
         while low < high:
             midpoint = (low + high + 1) // 2
             prefix = truncate_to_tokens(excerpt, midpoint)
-            tokens = _message_content_tokens(
+            tokens = _message_prompt_token_proxy(
                 build_qa_prompt(question, [*selected, prefix])
             )
             if tokens <= max_prompt_tokens:
@@ -445,7 +512,7 @@ def answer_question(
     budgeted verbatim expansions — which is the only way this harness exercises
     ``ContextPacker``, ``MemoryStore.retrieve``, ``rank_score`` or ``decay``.
 
-    Returns answer text, context, prompt-content tokens, and provider usage.
+    Returns answer text, context, local prompt-token proxy, and provider usage.
     """
     query_text = question.dated_question
     if config.retrieval.mode in {
@@ -467,6 +534,16 @@ def answer_question(
                 source_slots=config.retrieval.source_slots,
                 source_candidate_pool=config.retrieval.source_candidate_pool,
                 source_activation_k=config.retrieval.source_activation_k,
+                query_facet_retrieval=config.retrieval.query_facet_retrieval,
+                query_facet_slots=config.retrieval.query_facet_slots,
+                query_facet_max=config.retrieval.query_facet_max,
+                role_aware_retrieval=config.retrieval.role_aware_retrieval,
+                role_user_weight=config.retrieval.role_user_weight,
+                role_assistant_weight=config.retrieval.role_assistant_weight,
+                role_system_weight=config.retrieval.role_system_weight,
+                multi_fact_source_diversity=(
+                    config.retrieval.multi_fact_source_diversity
+                ),
                 source_tfisf_activation=(
                     config.retrieval.source_tfisf_activation
                 ),
@@ -570,6 +647,16 @@ def answer_question(
                 source_slots=config.retrieval.source_slots,
                 source_candidate_pool=config.retrieval.source_candidate_pool,
                 source_activation_k=config.retrieval.source_activation_k,
+                query_facet_retrieval=config.retrieval.query_facet_retrieval,
+                query_facet_slots=config.retrieval.query_facet_slots,
+                query_facet_max=config.retrieval.query_facet_max,
+                role_aware_retrieval=config.retrieval.role_aware_retrieval,
+                role_user_weight=config.retrieval.role_user_weight,
+                role_assistant_weight=config.retrieval.role_assistant_weight,
+                role_system_weight=config.retrieval.role_system_weight,
+                multi_fact_source_diversity=(
+                    config.retrieval.multi_fact_source_diversity
+                ),
                 source_partition_routing=(
                     config.retrieval.source_partition_routing
                 ),
@@ -657,7 +744,7 @@ def answer_question(
         config.max_prompt_tokens,
     )
     messages = build_qa_prompt(query_text, context_texts)
-    prompt_tokens = _message_content_tokens(messages)
+    prompt_tokens = _message_prompt_token_proxy(messages)
     raw_answer = answer_fn(messages)
     if isinstance(raw_answer, tuple):
         answer, usage = raw_answer
@@ -683,6 +770,21 @@ def _context_fraction(context_tokens: int, transcript_tokens: int) -> float:
     return context_tokens / transcript_tokens
 
 
+def _provider_prompt_budget_compliance(
+    usage: UsageStats,
+    max_prompt_tokens: int | None,
+) -> bool | None:
+    """Check authoritative provider input usage when it is available.
+
+    Several gateways return zero for an otherwise completed call. Zero is
+    therefore treated as unavailable, never as evidence of an empty prompt.
+    """
+
+    if usage.input_tokens <= 0:
+        return None
+    return max_prompt_tokens is None or usage.input_tokens <= max_prompt_tokens
+
+
 def evaluate_sample(
     sample: BenchmarkSample,
     config: EvalConfig,
@@ -690,13 +792,34 @@ def evaluate_sample(
     data_dir: str | Path,
     judge_fn: JudgeFn | None = None,
     ingest_fn: IngestFn = ingest_sample,
+    responder_output_token_reserve: int = (
+        BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE
+    ),
 ) -> BenchmarkSampleResult:
     """Ingest one sample's haystack, then grade every question about it."""
+    from memory_condense.eval.sample_identity import sample_sha256
+
+    if (
+        isinstance(responder_output_token_reserve, bool)
+        or not isinstance(responder_output_token_reserve, int)
+        or responder_output_token_reserve < 0
+    ):
+        raise ValueError("responder_output_token_reserve must be non-negative")
     question_results: list[BenchmarkQuestionResult] = []
     transcript_tokens = sum(count_tokens(text) for _role, text in sample.turns)
+    sample_digest = sample_sha256(sample)
 
     mc = ingest_fn(sample, config, Path(data_dir))
     try:
+        raw_cache_receipts = getattr(mc, "blind_cache_receipts", None)
+        cache_receipts = (
+            validated_cache_receipts(
+                raw_cache_receipts,
+                expected_sample_sha256=sample_digest,
+            )
+            if raw_cache_receipts
+            else {}
+        )
         for question in sample.questions:
             prediction, chunk_texts, prompt_tokens, responder_usage = answer_question(
                 mc, question, config, answer_fn
@@ -716,6 +839,10 @@ def evaluate_sample(
 
             context_tokens = sum(count_tokens(text) for text in chunk_texts)
             context_fraction = _context_fraction(context_tokens, transcript_tokens)
+            provider_budget_compliant = _provider_prompt_budget_compliance(
+                responder_usage,
+                config.max_prompt_tokens,
+            )
             question_results.append(
                 BenchmarkQuestionResult(
                     question_id=question.question_id,
@@ -723,13 +850,26 @@ def evaluate_sample(
                     gold_answer=question.answer,
                     predicted_answer=prediction,
                     category=question.category,
-                    retrieved_chunks=[t[:200] for t in chunk_texts[:5]],
+                    # Preserve the exact provider-visible evidence packet for
+                    # failure analysis. These are references to already
+                    # persisted source text, not duplicated transformer state.
+                    retrieved_chunks=list(chunk_texts),
                     f1=f1_score(prediction, question.answer),
                     exact_match=exact_match(prediction, question.answer),
                     judge_correct=judge_correct,
                     judge_reasoning=judge_reasoning,
                     context_tokens=context_tokens,
+                    prompt_token_proxy=prompt_tokens,
                     prompt_tokens=prompt_tokens,
+                    responder_output_token_reserve=(
+                        responder_output_token_reserve
+                    ),
+                    request_token_proxy=(
+                        prompt_tokens + responder_output_token_reserve
+                    ),
+                    provider_prompt_budget_compliant=(
+                        provider_budget_compliant
+                    ),
                     transcript_tokens=transcript_tokens,
                     context_fraction=context_fraction,
                     transcript_token_savings=1.0 - context_fraction,
@@ -748,6 +888,11 @@ def evaluate_sample(
 
     return BenchmarkSampleResult(
         sample_id=sample.sample_id,
+        sample_sha256=sample_digest,
+        cache_receipts=cache_receipts,
+        cache_receipts_sha256=(
+            cache_receipts_sha256(cache_receipts) if cache_receipts else ""
+        ),
         num_turns=len(sample.turns),
         num_questions=len(question_results),
         question_results=question_results,
@@ -759,8 +904,14 @@ def evaluate_sample(
         mean_context_tokens=_mean(
             [float(qr.context_tokens) for qr in question_results]
         ),
+        mean_prompt_token_proxy=_mean(
+            [float(qr.prompt_token_proxy) for qr in question_results]
+        ),
+        mean_request_token_proxy=_mean(
+            [float(qr.request_token_proxy) for qr in question_results]
+        ),
         mean_prompt_tokens=_mean(
-            [float(qr.prompt_tokens) for qr in question_results]
+            [float(qr.prompt_token_proxy) for qr in question_results]
         ),
         transcript_tokens=transcript_tokens,
         mean_context_fraction=_mean(
@@ -810,6 +961,7 @@ def run_benchmark(
     implementation_sha256: str = "",
     environment_lock_sha256: str = "",
     policy_manifest_sha256: str = "",
+    evaluation_protocol: dict[str, object] | None = None,
 ) -> BenchmarkRunResult:
     """Run the QA-probe protocol over benchmark samples.
 
@@ -831,6 +983,21 @@ def run_benchmark(
             :func:`ingest_sample`; tests inject a fake to stay offline.
         verbose: Print per-sample progress.
     """
+    protocol = dict(evaluation_protocol or {})
+    raw_output_reserve = protocol.get(
+        "responder_output_token_reserve",
+        BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
+    )
+    if (
+        isinstance(raw_output_reserve, bool)
+        or not isinstance(raw_output_reserve, int)
+        or raw_output_reserve < 0
+    ):
+        raise ValueError(
+            "evaluation_protocol.responder_output_token_reserve must be "
+            "a non-negative integer"
+        )
+    output_reserve = raw_output_reserve
     sample_results: list[BenchmarkSampleResult] = []
     effective_ingest_fn = (
         shared_embedding_ingest_fn(config.embedding_device)
@@ -857,6 +1024,7 @@ def run_benchmark(
                 data_dir=Path(tmpdir) / f"sample_{i}",
                 judge_fn=judge_fn,
                 ingest_fn=effective_ingest_fn,
+                responder_output_token_reserve=output_reserve,
             )
             sample_results.append(result)
 
@@ -871,12 +1039,31 @@ def run_benchmark(
     ]
     judged = [qr.judge_correct for qr in all_questions if qr.judge_correct is not None]
     judge_accuracy = _mean([1.0 if c else 0.0 for c in judged]) if judged else None
-    prompt_budget_compliance = (
+    prompt_token_proxy_budget_compliance = (
         config.max_prompt_tokens is None
         or all(
-            qr.prompt_tokens <= config.max_prompt_tokens
+            qr.prompt_token_proxy <= config.max_prompt_tokens
             for qr in all_questions
         )
+    )
+    provider_budget_rows = [
+        qr.provider_prompt_budget_compliant
+        for qr in all_questions
+        if qr.provider_prompt_budget_compliant is not None
+    ]
+    provider_prompt_budget_compliance = (
+        all(provider_budget_rows) if provider_budget_rows else None
+    )
+    provider_input_usage_status = (
+        "unavailable"
+        if not provider_budget_rows
+        else "complete"
+        if len(provider_budget_rows) == len(all_questions)
+        else "partial"
+    )
+    prompt_budget_compliance = (
+        prompt_token_proxy_budget_compliance
+        and provider_prompt_budget_compliance is not False
     )
     if judge_accuracy is None:
         target_status = "ungraded"
@@ -893,7 +1080,7 @@ def run_benchmark(
     else:
         target_status = "failed"
         target_met = False
-    prompt_counts = sorted(qr.prompt_tokens for qr in all_questions)
+    prompt_counts = sorted(qr.prompt_token_proxy for qr in all_questions)
     p95_index = max(0, math.ceil(0.95 * len(prompt_counts)) - 1)
 
     return BenchmarkRunResult(
@@ -910,7 +1097,24 @@ def run_benchmark(
         mean_context_tokens=_mean(
             [float(qr.context_tokens) for qr in all_questions]
         ),
-        mean_prompt_tokens=_mean([float(qr.prompt_tokens) for qr in all_questions]),
+        mean_prompt_token_proxy=_mean(
+            [float(qr.prompt_token_proxy) for qr in all_questions]
+        ),
+        p95_prompt_token_proxy=(prompt_counts[p95_index] if prompt_counts else 0),
+        max_prompt_token_proxy_observed=max(prompt_counts, default=0),
+        mean_request_token_proxy=_mean(
+            [float(qr.request_token_proxy) for qr in all_questions]
+        ),
+        responder_output_token_reserve=output_reserve,
+        prompt_token_proxy_identity=tokenizer_proxy_identity(),
+        prompt_token_proxy_budget_compliance=(
+            prompt_token_proxy_budget_compliance
+        ),
+        provider_prompt_budget_compliance=provider_prompt_budget_compliance,
+        provider_input_usage_status=provider_input_usage_status,
+        mean_prompt_tokens=_mean(
+            [float(qr.prompt_token_proxy) for qr in all_questions]
+        ),
         p95_prompt_tokens=(prompt_counts[p95_index] if prompt_counts else 0),
         mean_transcript_tokens=_mean(
             [float(qr.transcript_tokens) for qr in all_questions]
@@ -941,6 +1145,7 @@ def run_benchmark(
         implementation_sha256=implementation_sha256,
         environment_lock_sha256=environment_lock_sha256,
         policy_manifest_sha256=policy_manifest_sha256,
+        evaluation_protocol=protocol,
         by_category=_category_breakdown(all_questions),
         run_timestamp=datetime.now(timezone.utc).isoformat(),
     )
@@ -1003,11 +1208,28 @@ def print_benchmark_summary(result: BenchmarkRunResult) -> None:
         f"{result.mean_context_tokens:.1f} mean tokens "
         f"({result.mean_transcript_token_savings:.1%} saved)"
     )
+    proxy_budget = (
+        "within budget"
+        if result.prompt_token_proxy_budget_compliance
+        else "OVER BUDGET"
+    )
     print(
-        f"Prompt tokens: mean {result.mean_prompt_tokens:.1f}, "
-        f"p95 {result.p95_prompt_tokens}, "
-        f"max {result.max_prompt_tokens_observed} "
-        f"({'within budget' if result.prompt_budget_compliance else 'OVER BUDGET'})"
+        f"Prompt-token proxy: mean {result.mean_prompt_token_proxy:.1f}, "
+        f"p95 {result.p95_prompt_token_proxy}, "
+        f"max {result.max_prompt_token_proxy_observed} "
+        f"({proxy_budget}); "
+        f"output reserve {result.responder_output_token_reserve}"
+    )
+    provider_budget = (
+        "unavailable"
+        if result.provider_prompt_budget_compliance is None
+        else "within budget"
+        if result.provider_prompt_budget_compliance
+        else "OVER BUDGET"
+    )
+    print(
+        "Provider input verification: "
+        f"{result.provider_input_usage_status} / {provider_budget}"
     )
     print(
         "Provider usage: "

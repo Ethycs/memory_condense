@@ -19,6 +19,15 @@ from memory_condense.consolidation import (
     qwen_head_activations,
 )
 from memory_condense.context_packer import ContextBudget, ContextPacker
+from memory_condense.coverage_selector import (
+    CandidateAssignment,
+    CoverageSelectionReport,
+    QueryConditionedCoverageSelector,
+    QwenPrefixCoverageSelector,
+    SetOperator,
+    SetProgram,
+    compile_set_program,
+)
 from memory_condense.decay import effective_energy, heat_for, item_energy, item_heat
 from memory_condense.heat_diffusion import (
     DiffusedHeatNode,
@@ -108,6 +117,13 @@ __all__ = [
     "ContextPacker",
     "ContextBudget",
     "PackedContext",
+    "SetOperator",
+    "SetProgram",
+    "CandidateAssignment",
+    "CoverageSelectionReport",
+    "QueryConditionedCoverageSelector",
+    "QwenPrefixCoverageSelector",
+    "compile_set_program",
     # loading
     "load_conversation",
     "load_directory",

@@ -1,13 +1,13 @@
 # memory_condense — documentation tree
 
 **Status**: Living Document
-**Date**: 2026-08-16 (reconciled against the as-built code and locked local confirmation)
+**Date**: 2026-08-18 (reconciled against the frozen v3 LongMemEval development treatment)
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
 
-> **Built and locally measured; external competitiveness remains open.** Retrieval, extraction, decay, CAV quality, bounded QK/CAV association, source-heat allocation, and prompt-driven consolidation now have local measurements. The locked chronological build-session replay reached 38/39 literal evidence probes with Qwen-weighted consolidation, but this is not answer-stage judged accuracy or a public/common benchmark. `git log --oneline` and the machine-readable artifacts remain the authority over prose.
+> **Built and locally measured; external competitiveness remains open.** A ten-question LongMemEval-S development pilot reached 10/10 judge accuracy. The final v3 no-provider replay then reached 100% raw/packed source coverage and 11/11 scored answer-value components with a mean 1,986-token context from a 1,039,203-token transcript proxy. Prompt accounting is now explicitly a frozen local proxy with provider-usage postchecks. This is development evidence, not the required held-out minimum-100-question validation or a completed Mem0 comparison. `git log --oneline` and the machine-readable artifacts remain the authority over prose.
 
 ## Reconciliation state (2026-08-16)
 
@@ -19,7 +19,8 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `02 - Implementation/01 - Running the Eval Harness.md` | ✅ | Rewritten for four CLI modes; benchmark data sources + cost warning; sweep is 54 configs, not 48 |
 | `02 - Implementation/03 - Qwen3 Prefix Attention Lab.md` | **experimental / integrated** | Seven-layer Qwen3-8B BF16 prefix, compact persistent CAV/QK/OV artifacts, bounded dual QK/heat reads, source-aware packing, safe admission, and physical pruning; public benchmarking remains open |
 | `03 - Architecture/00 - System Overview.md` | ✅ | Diagram and every subsystem rewritten; "there is no condensation yet" was false |
-| `03 - Architecture/01 - Native Hypergraph Memory Plane.md` | **new / proposed** | Event-centric hypergraph for live QK/OV/CAV observations, with the measured pairwise graph retained as a bounded serving projection; no durable transformer token state |
+| `03 - Architecture/01 - Native Hypergraph Memory Plane.md` | **new / proposed** | Event-centric hypergraph for live QK/OV/CAV observations, with the measured pairwise graph retained as a bounded serving projection; no durable request-derived transformer token state (static model/tokenizer assets excluded) |
+| `03 - Architecture/02 - Query-Conditioned Bayesian Coverage Loop.md` | **implemented / prefix measurement pending** | Primary full-width Qwen3-8B layers 0–5 with layer-5 QK/OV transport-affinity grouping; secondary compact-INI classifier; recall-safe coverage ordering and zero durable transformer state |
 | `04 - Reference/01 - Vocabulary.md` | ✅ | Lifecycle + retrieval terms moved out of *(planned)*; BM25/hybrid/α/`term_count`/`UsageStats`/F1/provenance added |
 | `05 - Standards/00 - MC-STD-DATA-v0.md` | ✅ | Schema v2 + migration path; new normative clauses 8–10 (provenance, no destruction, migrate-in-place). Still **DRAFT** |
 | `06 - Roadmaps/00 - Gap Analysis and Roadmap.md` | ✅ | Status table and tiers rewritten; Decision Point now *unblocked* but still *open*. **Partly superseded 2026-08-15** — see below |
@@ -37,6 +38,8 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `10 - Research Log/06 - 2026-08-16 - 95 percent long-chat target.md` | **active target** | Locks 500 cleaned LongMemEval questions into 200/100/200 partitions and defines ≥95% judge accuracy under an 8k prompt ceiling as the hard gate |
 | `10 - Research Log/08 - 2026-08-16 - Real Qwen consolidation path.md` | **operational smoke** | The real seven-layer BF16 prefix updated six schema-v8 edges from four packed pointers in 0.75 s after a 12.92 s startup load, retaining zero prompt/activation bytes; recall effect remains unmeasured |
 | `10 - Research Log/09 - 2026-08-16 - Causal binding reaches 97.4 percent evidence recall.md` | **new development replay** | Four-arm chronological replay: original 35/39, packing-only 36/39, rank graph 37/39, Qwen graph 38/39 with no losses and zero retained transformer-state bytes; answer-stage evaluation remains open |
+| `10 - Research Log/15 - 2026-08-18 - Policy-locked 1M-context answer pilot.md` | **development pilot** | Ten of ten LongMemEval-S answers passed the independent judge; mean responder prompt 2,342 tokens from 1,039,203 transcript tokens; selected-scope closure is non-global and ≥100 held-out validation remains open |
+| `10 - Research Log/16 - 2026-08-18 - V3 retrieval freeze and validation campaign.md` | **frozen development treatment** | Final no-provider replay reached 100% source and scored answer-value coverage at a mean 1,986 returned tokens; exact cache receipts, prompt-proxy identity, a 100-question campaign plan, and the corrected Mem0 protocol are frozen, but no held-out provider calls have run |
 | `07 - Status Reports/…` | ✅ | Three dated handoffs; **2026-08-15 is the current one** and supersedes the earlier test counts (48 → 366 → 523) |
 
 ## The tree
@@ -76,11 +79,12 @@ docs/
 - Resuming cold? → **`06 - Roadmaps/01 - Delivering the Specified System.md` first** — it explains why every memory-arm number on record is void and what order the remaining work has to happen in. Then `07 - Status Reports/2026-08-15_retrieval-measurement-session.md` for the retrieval half, which still stands.
 - "What does the system do?" → `03 - Architecture/00 - System Overview.md`.
 - "How would a native hypergraph interact with live memory?" → `03 - Architecture/01 - Native Hypergraph Memory Plane.md` — canonical higher-order observations, pairwise serving projections, bounded traversal, and event-aware pruning.
+- "How are complete sets deduplicated without losing distinct events?" → `03 - Architecture/02 - Query-Conditioned Bayesian Coverage Loop.md` — a primary six-layer Qwen3-8B QK/OV affinity arm plus a secondary compact-INI classifier, followed by recall-safe representative-first packing; the locked baseline isolates a 100%-raw versus 94.7%-packed gap and the prefix treatment is pending measurement.
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
 - "How do I run the Qwen attention-prefix experiment?" → `02 - Implementation/03 - Qwen3 Prefix Attention Lab.md`.
 - "How do I actually *use* it day to day?" → `02 - Implementation/02 - MCP Integration.md` — the memory system is exposed to Claude Code as an MCP server.
-- "Is this competitive?" → **on common benchmarks, still unanswerable** (`04 - Reference/00` + `08 - Analysis/`; zero common-benchmark runs exist). **In-regime, a baseline of record now exists**: `10 - Research Log/00` — B0, 92.3% recall at 0.5% of transcript tokens on this project's own build session, with its caveats stated.
+- "Is this competitive?" → **not established yet**. `10 - Research Log/16` records the frozen v3 development treatment at 100% source/value coverage and 99.81% transcript-token-proxy savings, but the required ≥100 held-out run and same-budget Mem0 arm remain open.
 - "What is the large-model attention-head memory idea?" → `00 - Theory/01 - Extracted Attention Heads as Recursive Associative Memory.md` — a **DRAFT** whose first CAV/live-head prototype is implemented, including the full-teacher J-Space implication.
 - "How do later prompts consolidate connected memory partitions?" → `00 - Theory/03 - Prompt-Driven Systems Consolidation.md` — schema-v9 causal binding plus repeated co-activation across semantic memories and evidence, including bounded iterative reads, the transient Qwen hyperplane seam, and anti-self-reinforcement rules.
 - "Did the downloaded Qwen prefix produce usable CAVs?" → `10 - Research Log/02 - 2026-08-16 - Qwen3 prefix CAV gate.md` — yes on the first controlled local probe; this is not yet a retrieval result.
@@ -90,6 +94,8 @@ docs/
 - "What exactly does 95% long-chat accuracy mean?" → `10 - Research Log/06 - 2026-08-16 - 95 percent long-chat target.md` — answer-stage judge accuracy, minimum sample size, 8k hard prompt cap, locked LongMemEval partitions, and the experiment ladder.
 - "Has live schema-v8 consolidation run through the real Qwen checkpoint?" → `10 - Research Log/08 - 2026-08-16 - Real Qwen consolidation path.md` — yes on a temporary store copy; it validates execution and memory bounds, not a recall gain.
 - "Did causal Qwen consolidation improve the operational long-chat probe?" → `10 - Research Log/09 - 2026-08-16 - Causal binding reaches 97.4 percent evidence recall.md` — yes on the locked local literal-evidence test (38/39, no regressions); answer-stage judged LongMemEval remains the primary gate.
+- "Did it answer LongMemEval questions from a 1M-token chat?" → `10 - Research Log/15 - 2026-08-18 - Policy-locked 1M-context answer pilot.md` — yes, 10/10 on the development pilot with a mean 2,342-token legacy local prompt proxy; provider input usage was unavailable, and held-out scale plus the Mem0 comparison remain open.
+- "What is the frozen v3 treatment and validation plan?" → `10 - Research Log/16 - 2026-08-18 - V3 retrieval freeze and validation campaign.md` — the final no-provider replay, exact artifact/cache identities, ten-shard held-out plan, prompt-proxy semantics, and corrected Mem0 comparison boundary.
 
 ## The one distinction this tree tries hardest to keep
 

@@ -476,6 +476,10 @@ class AssociativeSweepRig:
                 "edges_after": stats_after["edges"],
                 "head_payload_bytes_before": stats_before["head_payload_bytes"],
                 "head_payload_bytes_after": stats_after["head_payload_bytes"],
+                "retained_request_token_state_bytes": stats_after[
+                    "retained_request_token_state_bytes"
+                ],
+                # Compatibility alias for historical sweep artifacts.
                 "retained_token_state_bytes": stats_after[
                     "retained_token_state_bytes"
                 ],

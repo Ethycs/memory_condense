@@ -130,6 +130,7 @@ class StoredCAVNeighbor:
     chunk_id: str
     score: float
     shared_concepts: tuple[str, ...]
+    source_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +327,47 @@ class AssociationStore:
         self._db.commit()
         self._cav_neighbor_cache.clear()
 
+    def put_signatures(
+        self,
+        artifact_id: str,
+        signatures: Sequence[tuple[str, Sequence[float]]],
+        *,
+        created_turn: int | None = None,
+    ) -> int:
+        """Store a batch of fixed-width signatures in one transaction."""
+
+        artifact = self._require_artifact(artifact_id)
+        if artifact.cav_layer is None or not artifact.concept_names:
+            raise ValueError("artifact does not define a CAV coordinate system")
+        turn = self._db.current_turn() if created_turn is None else int(created_turn)
+        if turn < 0:
+            raise ValueError("created_turn must be non-negative")
+        rows = [
+            (
+                str(chunk_id),
+                artifact_id,
+                self._pack_f32(
+                    values,
+                    width=len(artifact.concept_names),
+                    field_name="CAV signature",
+                ),
+                turn,
+            )
+            for chunk_id, values in signatures
+        ]
+        if not rows:
+            return 0
+        self._db.executemany(
+            "INSERT INTO chunk_cav_signatures "
+            "(chunk_id, artifact_id, signature, created_turn) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chunk_id, artifact_id) DO UPDATE SET "
+            "signature = excluded.signature, created_turn = excluded.created_turn",
+            rows,
+        )
+        self._db.commit()
+        self._cav_neighbor_cache.clear()
+        return len(rows)
+
     def get_signature(
         self, chunk_id: str, artifact_id: str
     ) -> StoredCAVSignature | None:
@@ -445,6 +487,88 @@ class AssociationStore:
         result = tuple(ranked[:top_k])
         self._cache_put(self._cav_neighbor_cache, cache_key, result)
         return result
+
+    def concept_members(
+        self,
+        artifact_id: str,
+        concept_name: str,
+        *,
+        top_k: int,
+        min_margin: float = 0.0,
+        source_ids: Sequence[str] = (),
+        exclude: Sequence[str] = (),
+        unique_sources: bool = False,
+    ) -> tuple[StoredCAVNeighbor, ...]:
+        """Return strongest positive members of one named concept.
+
+        This is an inverted concept lookup over compact float coordinates.
+        Optional durable-source filtering makes it suitable after coarse
+        partition routing without scanning or hydrating source text.
+        """
+
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if top_k == 0:
+            return ()
+        artifact = self._require_artifact(artifact_id)
+        try:
+            concept_index = artifact.concept_names.index(concept_name)
+        except ValueError as exc:
+            raise KeyError(f"unknown CAV concept: {concept_name}") from exc
+        params: list[Any] = [artifact_id]
+        where = [
+            "s.artifact_id = ?",
+            "c.embedding IS NOT NULL",
+            "c.hnsw_label IS NOT NULL",
+        ]
+        filtered_source_ids = tuple(
+            dict.fromkeys(str(value) for value in source_ids)
+        )
+        if filtered_source_ids:
+            placeholders = ",".join("?" for _ in filtered_source_ids)
+            where.append(f"COALESCE(t.source_id, t.turn_id) IN ({placeholders})")
+            params.extend(filtered_source_ids)
+        rows = self._db.execute(
+            "SELECT s.chunk_id, s.signature, COALESCE(t.source_id, t.turn_id) "
+            "FROM chunk_cav_signatures AS s "
+            "JOIN chunks AS c ON c.chunk_id = s.chunk_id "
+            "JOIN turns AS t ON t.turn_id = c.turn_id WHERE "
+            + " AND ".join(where),
+            tuple(params),
+        ).fetchall()
+        excluded = set(exclude)
+        ranked: list[StoredCAVNeighbor] = []
+        for chunk_id, blob, source_id in rows:
+            if chunk_id in excluded:
+                continue
+            signature = self._unpack_f32(blob)
+            if len(signature) != len(artifact.concept_names):
+                raise ValueError(
+                    "stored CAV signature width does not match its artifact"
+                )
+            margin = float(signature[concept_index])
+            if margin <= min_margin:
+                continue
+            ranked.append(
+                StoredCAVNeighbor(
+                    chunk_id=chunk_id,
+                    score=margin,
+                    shared_concepts=(concept_name,),
+                    source_id=str(source_id),
+                )
+            )
+        ranked.sort(key=lambda hit: (hit.score, hit.chunk_id), reverse=True)
+        if unique_sources:
+            seen_sources: set[str] = set()
+            source_unique: list[StoredCAVNeighbor] = []
+            for hit in ranked:
+                source_id = str(hit.source_id)
+                if source_id in seen_sources:
+                    continue
+                seen_sources.add(source_id)
+                source_unique.append(hit)
+            ranked = source_unique
+        return tuple(ranked[:top_k])
 
     # -- sparse QK/OV edge graph ------------------------------------------
 
@@ -1226,7 +1350,13 @@ class AssociationStore:
         )
 
     def hebbian_stats(self, artifact_id: str) -> dict[str, int]:
-        """Compact live-graph counts, including the zero-token-state invariant."""
+        """Compact graph counts and the zero request-token-state invariant.
+
+        The metric covers request-derived token IDs, Q/K/V, attention maps,
+        residual streams, and generation K/V caches retained across requests.
+        It intentionally does not count reusable static model weights or a
+        tokenizer, neither of which is memory derived from a request.
+        """
         self._require_artifact(artifact_id)
         counts = {}
         for name, table in (
@@ -1240,6 +1370,10 @@ class AssociationStore:
                     (artifact_id,),
                 ).fetchone()[0]
             )
+        counts["retained_request_token_state_bytes"] = 0
+        # Backward-compatible spelling used by historical reports.  Its scope
+        # is identical to retained_request_token_state_bytes; it never meant
+        # static checkpoint weights or tokenizer assets.
         counts["retained_token_state_bytes"] = 0
         return counts
 
@@ -1398,6 +1532,10 @@ class AssociationStore:
             "edges": edges,
             "cav_payload_bytes": cav_payload_bytes,
             "head_payload_bytes": head_payload_bytes,
-            # An explicit invariant useful in reports and backend parity tests.
+            # Request-derived token IDs, Q/K/V, attention maps, residuals, and
+            # generation K/V are never retained between linker invocations.
+            # Static checkpoint/tokenizer assets are outside this metric.
+            "retained_request_token_state_bytes": 0,
+            # Compatibility alias for historical artifacts.
             "retained_token_state_bytes": 0,
         }

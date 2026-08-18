@@ -41,7 +41,7 @@ and [official graph documentation](https://docs.mem0.ai/platform/features/graph-
 | Durable memory | Extracted facts, vector records, entities/graph, temporal metadata, SQL history/audit | Append-only raw transcript plus chunks, typed lifecycle memory, exact provenance, CAV signatures, and sparse QK/OV edges |
 | Graph meaning | Entity/memory co-occurrence used to boost retrieval | Learned conceptual/attention associations; a richer native hypergraph is proposed but not yet validated |
 | Transformer role | LLMs participate in extraction and query-time memory pipeline | Qwen prefix is a staged write-time linker only; ordinary associative reads are model-free |
-| Token state | Conventional memory records, not advertised as a persistent K/V-memory design | Explicit invariant: persist zero transformer token K/V or residual sequences |
+| Request-token state | Conventional memory records, not advertised as a persistent K/V-memory design | Explicit invariant: persist zero request-derived token IDs, transformer K/V, attention, or residual sequences; reusable static weights/tokenizers are outside the metric |
 | Context control | Fused scoring followed by top-N retrieval | Hard section budgets plus heat-weighted allocation of how much text each source contributes |
 | Correction/pruning | Current evaluation pipeline emphasizes ADD-only fact writes plus deduplication | Explicit supersede/delete/pin lifecycle, edge usage/decay, degree pruning, and rebuildable raw provenance |
 | Evidence | Strong vendor-reported public results; Platform/OSS parity is not guaranteed | Local containment/token replays only; no public answer-stage result yet |
@@ -55,7 +55,11 @@ currently reports 91.6–93.4% public accuracy. memory_condense has not yet show
 that its extra graph semantics translate into answer accuracy.
 
 The only fair head-to-head is same conversations, same answer and judge models,
-same prompt-token cap, same number of questions, and separate write/read cost.
+same local prompt-token-proxy cap and proxy identity, the same check of
+provider-reported input usage when available, the same number of questions,
+and separate write/read cost. The OSS Mem0 adapter therefore labels its
+caller-supplied counter as a proxy; it does not turn unavailable Mem0 provider
+usage into a fabricated exact count.
 The project target is now **at least 95% judge accuracy over at least 100 locked
 long-chat questions under an 8,000-token responder-prompt ceiling**. Until that
 gate passes, token reductions are secondary.

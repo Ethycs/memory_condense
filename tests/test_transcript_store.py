@@ -19,6 +19,23 @@ def test_source_id_round_trips(db):
     assert store.get_turn(turn.turn_id).source_id == "session-2"
 
 
+def test_source_metadata_returns_first_system_turn_per_source(db):
+    store = TranscriptStore(db)
+    store.append(
+        "system",
+        "[session-2 took place at 2023/06/28 (Wed) 20:26]",
+        source_id="session-2",
+    )
+    store.append("user", "real evidence", source_id="session-2")
+    store.append("system", "later metadata", source_id="session-2")
+    store.append("system", "[session-3 took place at Friday]", source_id="session-3")
+
+    assert store.source_metadata(["session-2", "missing", "session-3"]) == {
+        "session-2": "[session-2 took place at 2023/06/28 (Wed) 20:26]",
+        "session-3": "[session-3 took place at Friday]",
+    }
+
+
 def test_get_turn_not_found(db):
     store = TranscriptStore(db)
     assert store.get_turn("nonexistent") is None

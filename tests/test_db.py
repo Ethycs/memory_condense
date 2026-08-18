@@ -107,6 +107,52 @@ class TestFreshDatabase:
             assert db.execute("SELECT COUNT(*) FROM turns").fetchone()[0] == 1
 
 
+class TestReadOnlyDatabase:
+    def test_reads_existing_database_and_rejects_writes(self, tmp_path):
+        path = tmp_path / "read-only.db"
+        with Database(path) as db:
+            db.execute(
+                "INSERT INTO turns (turn_id, role, text, created_at, ordinal)"
+                " VALUES ('t1', 'user', 'hello', '2026-01-01T00:00:00+00:00', 1)"
+            )
+            db.commit()
+
+        before = path.read_bytes()
+        with Database(path, read_only=True) as db:
+            assert db.read_only is True
+            assert db.execute("PRAGMA query_only").fetchone()[0] == 1
+            assert db.execute("SELECT text FROM turns").fetchone()[0] == "hello"
+            with pytest.raises(sqlite3.OperationalError):
+                db.execute("UPDATE turns SET text = 'changed' WHERE turn_id = 't1'")
+
+        assert path.read_bytes() == before
+        assert not path.with_name(f"{path.name}-wal").exists()
+        assert not path.with_name(f"{path.name}-shm").exists()
+
+    def test_does_not_create_a_missing_database_or_parent(self, tmp_path):
+        path = tmp_path / "missing-parent" / "missing.db"
+
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path, read_only=True)
+
+        assert not path.exists()
+        assert not path.parent.exists()
+
+    def test_does_not_migrate_an_older_schema(self, tmp_path):
+        path = tmp_path / "legacy-read-only.db"
+        connection = sqlite3.connect(path)
+        connection.executescript(_V1_SCHEMA)
+        connection.commit()
+        connection.close()
+        before = path.read_bytes()
+
+        with Database(path, read_only=True) as db:
+            assert db.schema_version == 1
+            assert "ordinal" not in _column_names(db, "turns")
+
+        assert path.read_bytes() == before
+
+
 class TestMigrationFromV1:
     @pytest.fixture
     def v1_db_path(self, tmp_path):

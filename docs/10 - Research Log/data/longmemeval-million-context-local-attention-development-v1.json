@@ -1,0 +1,62 @@
+{
+  "format": "memory-condense-million-context-local-attention-development-v1",
+  "status": "implemented_promising_not_default",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split": "development",
+  "stress": {
+    "transcript_tokens": 1039203,
+    "turns": 5400,
+    "questions": 10,
+    "histories": 10
+  },
+  "coarse_partition_routing": {
+    "correct_partition_ranks": [1, 4, 1, 1, 1, 1, 1, 2, 1, 2],
+    "four_partition_routing_recall": 1.0,
+    "selected_arm": {
+      "name": "role_part4_v19",
+      "evidence_source_coverage": 0.947,
+      "literal_reachability": 0.5,
+      "mean_context_tokens": 2031,
+      "artifact": "C:\\Users\\Keytone\\Downloads\\memory-condense-rig\\longmemeval-million-context-role-part4-v19-10.csv",
+      "artifact_sha256": "a3dd66eda6e49174f0ca791d74632c12b964420f48a20ef4deabe19c2df0795b"
+    }
+  },
+  "attention": {
+    "model": "Qwen3-8B",
+    "prefix_layers": 2,
+    "attention_layer": 1,
+    "score": "max(0,qk)+log1p(max(0,ov_transport))",
+    "candidate_pool": 64,
+    "group_size": 8,
+    "max_workspace_tokens": 1024,
+    "retained_transformer_state_bytes": 0,
+    "source_unique_six_slot": {
+      "evidence_source_coverage": 0.947,
+      "literal_reachability": 0.5,
+      "mean_context_tokens": 1976,
+      "wall_seconds": 56.4,
+      "artifact": "C:\\Users\\Keytone\\Downloads\\memory-condense-rig\\longmemeval-million-context-role-part4-a250-qwen-unique-v23-10.csv",
+      "artifact_sha256": "aa1406735bf85bf1d888748791a51d431bd870869953205629068126cbb4fafd"
+    },
+    "source_unique_eight_slot": {
+      "evidence_source_coverage": 0.947,
+      "literal_reachability": 0.5,
+      "mean_context_tokens": 1976,
+      "wall_seconds": 56.6,
+      "artifact": "C:\\Users\\Keytone\\Downloads\\memory-condense-rig\\longmemeval-million-context-role-part4-a250-qwen-unique8-v24-10.csv",
+      "artifact_sha256": "f0a3cfba282028d4b16be284975be383034e5ea3bb6f13693bc5501821fca20b"
+    }
+  },
+  "complementarity": {
+    "museum_scalar_gold_sessions": [1, 2, 5, 6],
+    "museum_attention_gold_sessions": [1, 2, 4, 6],
+    "museum_union_coverage": "5/6",
+    "concert_coverage_both": "4/5"
+  },
+  "decision": "Keep source-unique attention opt-in. Next test a protected scalar plus attention-only source union; do not claim 95 percent answer accuracy.",
+  "tests": {
+    "command": "pixi run -e dev pytest -q",
+    "passed": 816,
+    "warnings": 1
+  }
+}

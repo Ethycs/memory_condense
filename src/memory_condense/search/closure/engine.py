@@ -24,6 +24,7 @@ from memory_condense.search.closure.request import (
     resolve_program,
 )
 from memory_condense.search.closure.results import completion, obligation_results
+from memory_condense.search.closure.scope_scan import scan_artifact_units
 from memory_condense.search.closure.semantics import (
     relation_confers_subject_connection,
     relation_is_useful,
@@ -760,52 +761,28 @@ class EvidenceClosureEngine:
         )
 
         probe_limit = self.policy.max_units + 1
-        try:
-            probed = self.store.units_for_artifact(
-                artifact_id,
-                limit=probe_limit,
-            )
-        except Exception as exc:
-            _record_witness(
-                walk,
-                kind="artifact_unit_scan",
-                subject_id=artifact_id,
-                requested_limit=self.policy.max_units,
-                returned_count=0,
-                exhaustive=False,
-                detail={"failure": type(exc).__name__},
-            )
-            return ()
-        if len(probed) > probe_limit:
-            raise ValueError("store returned more artifact units than the probe limit")
-        _validate_artifacts(probed, artifact_id, "artifact unit")
-        ordered = sorted(
-            probed,
-            key=lambda unit: unit_priority(
-                unit,
-                program,
-                connected=bool(unit_obligation_ids(unit, program, connected=False)),
-                route_rank=3,
-            ),
+        scan = scan_artifact_units(
+            self.store,
+            artifact_id=artifact_id,
+            program=program,
+            max_units=self.policy.max_units,
         )
-        admitted = tuple(ordered[: self.policy.max_units])
         _record_witness(
             walk,
             kind="artifact_unit_scan",
             subject_id=artifact_id,
             requested_limit=self.policy.max_units,
-            returned_count=len(admitted),
-            exhaustive=len(probed) <= self.policy.max_units,
+            returned_count=len(scan.units),
+            exhaustive=scan.exhaustive,
             detail={
                 "probe_limit": probe_limit,
-                "probe_count": len(probed),
-                "matched_count": sum(
-                    bool(unit_obligation_ids(unit, program, connected=False))
-                    for unit in admitted
-                ),
+                "probe_count": scan.scanned_count,
+                "matched_count": scan.matched_count,
+                "scan_mode": scan.scan_mode,
+                "failure": scan.failure,
             },
         )
-        return admitted
+        return scan.units
 
     def _annotation_coverage(
         self,

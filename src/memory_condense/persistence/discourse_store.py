@@ -40,6 +40,7 @@ from memory_condense.persistence.discourse_receipts import (
     DiscourseReceiptMixin,
     DiscourseSnapshotError,
 )
+from memory_condense.persistence.discourse_queries import DiscourseQueryMixin
 
 
 _T = TypeVar("_T")
@@ -60,7 +61,7 @@ class ArtifactCoverageMark:
             raise ValueError("coverage status must be annotated or no_output")
 
 
-class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin):
+class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMixin):
     """SQLite repository for immutable episodic and discourse graph records."""
 
     def __init__(self, db: Database) -> None:

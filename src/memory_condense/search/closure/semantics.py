@@ -12,6 +12,10 @@ from memory_condense.domain.discourse import (
     QueryProgram,
     canonical_json,
 )
+from memory_condense.domain.discourse_routing import DiscourseUnitRoute
+
+
+_RoutableUnit = DiscourseUnit | DiscourseUnitRoute
 
 
 REVISION_RELATIONS = frozenset(
@@ -75,7 +79,7 @@ def normalize_label(value: str) -> str:
 
 
 def unit_obligation_ids(
-    unit: DiscourseUnit,
+    unit: _RoutableUnit,
     program: QueryProgram,
     *,
     connected: bool,
@@ -120,7 +124,7 @@ def relation_obligation_ids(
 
 
 def subject_matches(
-    unit: DiscourseUnit,
+    unit: _RoutableUnit,
     obligation: EvidenceObligation,
     *,
     default_terms: Sequence[str] = (),
@@ -218,7 +222,7 @@ def relation_priority(
 
 
 def unit_priority(
-    unit: DiscourseUnit,
+    unit: _RoutableUnit,
     program: QueryProgram,
     *,
     connected: bool,

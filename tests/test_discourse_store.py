@@ -15,6 +15,7 @@ from memory_condense.domain.discourse import (
     RelationMember,
     quote_sha256,
 )
+from memory_condense.domain.discourse_routing import DiscourseUnitRoute
 from memory_condense.persistence.db import Database
 from memory_condense.persistence.discourse_store import (
     ArtifactCoverageMark,
@@ -188,6 +189,31 @@ def test_atomic_publication_roundtrips_every_contract(graph):
     assert receipt.max_turn_ordinal == 4
     assert receipt.chunk_count == 4
     assert store.stats()["retained_request_token_state_bytes"] == 0
+
+
+def test_artifact_unit_routes_stream_without_hydrating_evidence(graph, monkeypatch):
+    _, _, store, texts = graph
+    older = _unit("u-old", "state", "c1", texts["c1"], 1)
+    newer = _unit("u-new", "claim", "c3", texts["c3"], 3)
+    other_artifact = _artifact("other-artifact")
+    other = replace(
+        _unit("u-other", "claim", "c2", texts["c2"], 2),
+        artifact_id=other_artifact.artifact_id,
+    )
+    store.publish(_artifact(), units=(older, newer))
+    store.publish(other_artifact, units=(other,))
+
+    monkeypatch.setattr(
+        store,
+        "get_unit",
+        lambda _unit_id: (_ for _ in ()).throw(AssertionError("hydrated")),
+    )
+    routes = tuple(store.iter_unit_routes_for_artifact("disc-test"))
+
+    assert routes == (
+        DiscourseUnitRoute.from_unit(newer),
+        DiscourseUnitRoute.from_unit(older),
+    )
 
 
 def test_identical_replay_is_idempotent_and_does_not_advance_revision(graph):

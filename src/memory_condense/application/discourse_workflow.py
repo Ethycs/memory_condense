@@ -145,6 +145,11 @@ class _ArtifactScopedDiscourseStore:
             limit=limit,
         )
 
+    def iter_unit_routes_for_artifact(self, artifact_id):
+        return self.store.iter_unit_routes_for_artifact(
+            self._scope(artifact_id),
+        )
+
     def relations_for_chunks(self, chunk_ids, *, artifact_id=None, limit=None):
         return self.store.relations_for_chunks(
             chunk_ids,

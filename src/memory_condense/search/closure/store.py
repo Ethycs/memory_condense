@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Protocol, runtime_checkable
 
 from memory_condense.domain.discourse import (
@@ -13,6 +13,7 @@ from memory_condense.domain.discourse import (
     Episode,
     EvidenceSpan,
 )
+from memory_condense.domain.discourse_routing import DiscourseUnitRoute
 
 
 @runtime_checkable
@@ -70,6 +71,12 @@ class EvidenceClosureStore(Protocol):
         limit: int | None = None,
     ) -> tuple[DiscourseUnit, ...]:
         """Return a deterministic bounded artifact-wide unit scan."""
+
+    def iter_unit_routes_for_artifact(
+        self,
+        artifact_id: str,
+    ) -> Iterator[DiscourseUnitRoute]:
+        """Stream every artifact route without hydrating evidence text."""
 
     def units_for_chunks(
         self,

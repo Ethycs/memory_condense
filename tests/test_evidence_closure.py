@@ -23,6 +23,7 @@ from memory_condense.domain.discourse import (
     make_bundle_id,
     quote_sha256,
 )
+from memory_condense.domain.discourse_routing import DiscourseUnitRoute
 from memory_condense.search.closure import (
     EvidenceClosureStore,
     close_evidence,
@@ -262,6 +263,13 @@ class _MemoryGraph:
         if self.reverse_reads:
             values.reverse()
         return tuple(values if limit is None else values[:limit])
+
+    def iter_unit_routes_for_artifact(
+        self,
+        artifact_id: str,
+    ):
+        values = list(self.units_for_artifact(artifact_id))
+        yield from (DiscourseUnitRoute.from_unit(unit) for unit in values)
 
     def units_for_chunks(
         self,
@@ -1075,6 +1083,43 @@ def test_artifact_wide_unit_probe_reports_truncation_instead_of_global_completio
     assert plan.complete_claimed is False
 
 
+def test_artifact_stream_finds_old_match_beyond_newest_unit_prefix():
+    graph = _MemoryGraph()
+    relevant = graph.add_chunk(
+        "relevant",
+        "The account state is active.",
+        1,
+    )
+    graph.add_unit("relevant", "state", "account state", relevant)
+    for ordinal in range(2, 14):
+        chunk_id = f"noise-{ordinal}"
+        span = graph.add_chunk(
+            chunk_id,
+            f"Unrelated deployment note {ordinal}.",
+            ordinal,
+        )
+        graph.add_unit(chunk_id, "claim", "deployment note", span)
+
+    plan = close_evidence(
+        graph,
+        "What is the current account state?",
+        direct_chunk_ids=("noise-13",),
+        policy=ClosurePolicy(max_units=2),
+    )
+
+    assert plan.obligation_results[0].unit_ids == ("relevant",)
+    assert plan.complete_claimed is True
+    scan = next(
+        witness
+        for witness in plan.scope_witnesses
+        if witness.kind == "artifact_unit_scan"
+    )
+    assert scan.exhaustive is True
+    assert scan.detail["scan_mode"] == "exhaustive_stream"
+    assert scan.detail["probe_count"] == 13
+    assert scan.detail["matched_count"] == 1
+
+
 def test_optional_episode_mapping_failure_preserves_verified_raw_evidence():
     class _BrokenMapping(_MemoryGraph):
         def episode_ids_for_chunks(
@@ -1116,6 +1161,7 @@ def test_missing_relation_member_annotation_does_not_abort_raw_fail_open():
 
     graph.get_unit = broken_get_unit  # type: ignore[method-assign]
     graph.units_for_artifact = broken_global_scan  # type: ignore[method-assign]
+    graph.iter_unit_routes_for_artifact = broken_global_scan  # type: ignore[method-assign]
     plan = close_evidence(
         graph,
         "How should we improve request throughput?",

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
+import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -484,10 +487,14 @@ def test_isolated_bootstrap_fails_before_launch_on_source_drift(tmp_path):
     with pytest.raises(RuntimeError, match="frozen memory-condense source mismatch"):
         bootstrap.main(
             [
-                "--repository-root",
-                str(tmp_path),
+                "--source-root",
+                str(source),
+                "--tool-root",
+                str(tool),
                 "--expected-source-sha256",
                 "0" * 64,
+                "--expected-tool-sha256",
+                bootstrap._tree_sha256(tool),  # noqa: SLF001
                 "--module",
                 "tools.mem0_eval.preflight",
             ]
@@ -498,12 +505,12 @@ def test_isolated_bootstrap_sets_offline_guards_and_forwards_arguments(
     tmp_path,
     monkeypatch,
 ):
-    source = tmp_path / "src" / "memory_condense"
-    tool = tmp_path / "tools" / "mem0_eval"
+    source = tmp_path / "source-bundle" / "src" / "memory_condense"
+    tool = tmp_path / "tool-bundle" / "tools" / "mem0_eval"
     source.mkdir(parents=True)
     tool.mkdir(parents=True)
     (source / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (tool / "module.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (tool / "preflight.py").write_text("VALUE = 2\n", encoding="utf-8")
     source_digest = bootstrap._tree_sha256(source)  # noqa: SLF001
     tool_digest = bootstrap._tree_sha256(tool)  # noqa: SLF001
     launched: dict[str, object] = {}
@@ -512,6 +519,13 @@ def test_isolated_bootstrap_sets_offline_guards_and_forwards_arguments(
         bootstrap,
         "_deny_network",
         lambda: launched.setdefault("offline", True),
+    )
+    monkeypatch.setattr(bootstrap, "_verify_bootstrap_origin", lambda _root: None)
+    monkeypatch.setattr(bootstrap, "_verify_isolated_runtime", lambda: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "_verify_import_resolution",
+        lambda _source, _tool: None,
     )
     monkeypatch.setattr(
         bootstrap.runpy,
@@ -526,8 +540,10 @@ def test_isolated_bootstrap_sets_offline_guards_and_forwards_arguments(
     try:
         assert bootstrap.main(
             [
-                "--repository-root",
-                str(tmp_path),
+                "--source-root",
+                str(source),
+                "--tool-root",
+                str(tool),
                 "--expected-source-sha256",
                 source_digest,
                 "--expected-tool-sha256",
@@ -557,6 +573,126 @@ def test_isolated_bootstrap_sets_offline_guards_and_forwards_arguments(
     assert bootstrap.os.environ["TRANSFORMERS_OFFLINE"] == "1"
     assert bootstrap.os.environ["HF_HUB_DISABLE_TELEMETRY"] == "1"
     assert bootstrap.os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "true"
+
+
+@pytest.mark.parametrize("mutated", ["source", "tool"])
+def test_isolated_bootstrap_rechecks_both_frozen_trees_after_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutated: str,
+) -> None:
+    source = tmp_path / "source-bundle" / "src" / "memory_condense"
+    tool = tmp_path / "tool-bundle" / "tools" / "mem0_eval"
+    source.mkdir(parents=True)
+    tool.mkdir(parents=True)
+    source_file = source / "module.py"
+    tool_file = tool / "preflight.py"
+    source_file.write_text("VALUE = 1\n", encoding="utf-8")
+    tool_file.write_text("VALUE = 2\n", encoding="utf-8")
+    source_digest = bootstrap._tree_sha256(source)  # noqa: SLF001
+    tool_digest = bootstrap._tree_sha256(tool)  # noqa: SLF001
+
+    monkeypatch.setattr(bootstrap, "_deny_network", lambda: None)
+    monkeypatch.setattr(bootstrap, "_verify_bootstrap_origin", lambda _root: None)
+    monkeypatch.setattr(bootstrap, "_verify_isolated_runtime", lambda: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "_verify_import_resolution",
+        lambda _source, _tool: None,
+    )
+
+    def mutate_tree(*_args: object, **_kwargs: object) -> None:
+        target = source_file if mutated == "source" else tool_file
+        target.write_text("VALUE = 3\n", encoding="utf-8")
+        raise SystemExit(0)
+
+    monkeypatch.setattr(bootstrap.runpy, "run_module", mutate_tree)
+    match = (
+        "memory-condense source changed during launch"
+        if mutated == "source"
+        else "Mem0 tool changed during launch"
+    )
+    old_path = list(sys.path)
+    try:
+        with pytest.raises(RuntimeError, match=match):
+            bootstrap.main(
+                [
+                    "--source-root",
+                    str(source),
+                    "--tool-root",
+                    str(tool),
+                    "--expected-source-sha256",
+                    source_digest,
+                    "--expected-tool-sha256",
+                    tool_digest,
+                    "--module",
+                    "tools.mem0_eval.preflight",
+                ]
+            )
+    finally:
+        sys.path[:] = old_path
+
+
+def test_isolated_bootstrap_imports_preflight_against_exact_v3_source(
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    frozen = tmp_path / "frozen-v3"
+    frozen.mkdir()
+    archived = subprocess.run(
+        [
+            "git",
+            "archive",
+            "--format=tar",
+            "bfa5b6daf6a5e61881ac10f0555e5d9972f9e1c2",
+            "src/memory_condense",
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as archive:
+        archive.extractall(frozen, filter="data")
+
+    source = frozen / "src" / "memory_condense"
+    tool = repository / "tools" / "mem0_eval"
+    source_digest = bootstrap._tree_sha256(source)  # noqa: SLF001
+    assert source_digest == (
+        "452be3bfa7524bb81676c7abcb032529a32a480311d24d1e17f8513c783ecd83"
+    )
+    tool_digest = bootstrap._tree_sha256(tool)  # noqa: SLF001
+    for module, forwarded in (
+        ("tools.mem0_eval.preflight", ["--", "--help"]),
+        ("tools.mem0_eval.production_binding", []),
+        ("tools.mem0_eval.report", []),
+        ("tools.mem0_eval.compare", []),
+    ):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(tool / "bootstrap.py"),
+                "--source-root",
+                str(source),
+                "--tool-root",
+                str(tool),
+                "--expected-source-sha256",
+                source_digest,
+                "--expected-tool-sha256",
+                tool_digest,
+                "--module",
+                module,
+                *forwarded,
+            ],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert completed.returncode == 0, f"{module}: {completed.stderr}"
+        if module.endswith("preflight"):
+            assert "Reconstruct the locked Mem0 comparison" in completed.stdout
 
 
 def test_preflight_output_is_atomic_no_clobber(

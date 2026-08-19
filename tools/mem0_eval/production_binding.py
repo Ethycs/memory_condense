@@ -28,7 +28,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from memory_condense.modeling.embedding import (
+from .source_compat import (
     BGE_M3_CHECKPOINT_SHA256,
     DEFAULT_MODEL_DIM,
     DEFAULT_MODEL_NAME,

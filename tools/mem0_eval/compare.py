@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
-from memory_condense.domain._tokenizer import (
+from .source_compat import (
     count_chat_prompt_token_proxy,
     count_tokens,
     tokenizer_proxy_identity,

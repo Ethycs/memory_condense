@@ -48,7 +48,7 @@ from memory_condense.eval.mem0_adapter import (
     _PreparedCorpus,
 )
 from memory_condense.eval.schemas import UsageStats
-from memory_condense.modeling.embedding import (
+from .source_compat import (
     BGE_M3_CHECKPOINT_SHA256,
     DEFAULT_MODEL_DIM,
     DEFAULT_MODEL_NAME,

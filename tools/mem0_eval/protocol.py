@@ -27,7 +27,7 @@ from memory_condense.eval.locked_split import (
     load_split_manifest,
 )
 from memory_condense.eval.sample_identity import canonical_sha256, sample_sha256
-from memory_condense.ingest.loader import BenchmarkSample, parse_longmemeval
+from .source_compat import BenchmarkSample, parse_longmemeval
 
 
 class Mem0ComparisonProtocolError(ValueError):

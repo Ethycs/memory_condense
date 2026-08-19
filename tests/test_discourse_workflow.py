@@ -138,7 +138,7 @@ def test_discourse_workflow_builds_links_closes_and_packs_exact_evidence(
             episode.evidence[0].chunk_id for episode in first.build.episodes
         ] == [chunk.chunk_id for chunk in chunks]
         assert len(first.representatives) == 3
-        assert first.retained_request_token_state_bytes == 0
+        assert first.returned_signal_transformer_state_bytes == 0
 
         replay = condenser.build_and_publish_discourse_episodes(
             artifact,

@@ -33,7 +33,7 @@ from memory_condense.eval.mem0_adapter import (
     MEM0_OFFICIAL_TOP_K,
     MEM0_SPACY_MODEL,
 )
-from memory_condense.modeling.embedding import (
+from .source_compat import (
     BGE_M3_CHECKPOINT_SHA256,
     DEFAULT_MODEL_DIM,
     DEFAULT_MODEL_NAME,

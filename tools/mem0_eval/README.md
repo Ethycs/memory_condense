@@ -59,29 +59,53 @@ That source is commit `bfa5b6daf6a5e61881ac10f0555e5d9972f9e1c2`.
 The responsibility-based source reorganization starts implementation epoch
 v4, and its path-sensitive digest is different even where module bytes are
 unchanged. Running the v3 preflight against the active v4 tree must therefore
-fail. Use an exact v3 worktree for the frozen comparison. A v4 comparison
-requires a separately frozen policy/tool identity and rebuilt population and
-cache attestations; do not replace the expected hash below and call it v3.
+fail. Use an exact v3 worktree for the frozen comparison. The frozen v3 source
+worktree supplies `src/memory_condense` and its repository-root `pixi.lock`;
+the comparison checkout supplies `tools/mem0_eval` under an independently
+frozen tool identity. Do not copy or overlay the current tool package into the
+v3 worktree.
 
-Mem0 tooling retains its own independently hashed implementation identity.
+The bootstrap requires non-overlapping, exact package roots, verifies both
+tree digests before importing either package, and rechecks both trees after
+the launched module exits. It must itself be executed from the hashed tool
+root under Python isolated mode (`-I`). `source_compat.py` selects exactly one
+verified source layout: the v3 root-module layout at `bfa5b6d` or the current
+v4 responsibility-based layout. It does not fall back to the other epoch when
+an import fails.
+
+A v4 comparison requires a separately frozen policy/tool identity and rebuilt
+population and cache attestations; do not replace the expected source hash
+below and call it v3.
 
 ## Provider-free preflight
 
-From the repository root, using the already-frozen development environment,
-launch through the standard-library bootstrap. The bootstrap verifies the
-frozen source tree before imports, forces Hugging Face and LiteLLM onto local
-artifacts, disables telemetry, and blocks sockets for this provider-free step:
+Launch from the exact v3 repository so `pixi` uses its frozen root environment,
+but execute the bootstrap from a separate comparison-tool checkout. The
+bootstrap forces Hugging Face and LiteLLM onto local artifacts, disables
+telemetry, and blocks sockets for this provider-free step. Use a new output
+path because preflight receipts are immutable and never overwritten:
 
 ```powershell
-pixi run -e dev python -I tools\mem0_eval\bootstrap.py `
-  --repository-root . `
-  --expected-source-sha256 452be3bfa7524bb81676c7abcb032529a32a480311d24d1e17f8513c783ecd83 `
-  --module tools.mem0_eval.preflight -- `
-  --benchmark-file "C:\Users\Keytone\Downloads\memory-condense-rig\datasets\longmemeval_s_cleaned.json" `
-  --split-manifest "docs\10 - Research Log\data\longmemeval-95-target-split-v2.json" `
-  --policy-manifest "docs\10 - Research Log\data\longmemeval-qwen-choice-coverage-operational-validation-v3.json" `
-  --repository-root . `
-  --output "eval_results\mem0-validation-v1-preflight.json"
+$sourceRepo = (Resolve-Path "C:\path\to\memory-condense-v3").Path
+$toolRepo = (Resolve-Path "C:\path\to\memory-condense-tools").Path
+$dataset = "C:\path\to\memory-condense-rig\datasets\longmemeval_s_cleaned.json"
+
+Push-Location $sourceRepo
+try {
+  pixi run -e dev python -I "$toolRepo\tools\mem0_eval\bootstrap.py" `
+    --source-root "$sourceRepo\src\memory_condense" `
+    --tool-root "$toolRepo\tools\mem0_eval" `
+    --expected-source-sha256 452be3bfa7524bb81676c7abcb032529a32a480311d24d1e17f8513c783ecd83 `
+    --expected-tool-sha256 e35c9e13c15b619e04a33b34559617166a4e922797f7d8e6d642a01820d03ed2 `
+    --module tools.mem0_eval.preflight -- `
+    --benchmark-file $dataset `
+    --split-manifest "$sourceRepo\docs\10 - Research Log\data\longmemeval-95-target-split-v2.json" `
+    --policy-manifest "$sourceRepo\docs\10 - Research Log\data\longmemeval-qwen-choice-coverage-operational-validation-v3.json" `
+    --repository-root $sourceRepo `
+    --output "$toolRepo\eval_results\mem0-validation-v1-preflight-v2.json"
+} finally {
+  Pop-Location
+}
 ```
 
 This command loads no Mem0 package or model and makes no provider call. The

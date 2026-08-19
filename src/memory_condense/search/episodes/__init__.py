@@ -1,4 +1,4 @@
-"""Provider-free episodic retrieval; EM-style surprise is an optional input."""
+"""Provider-free episodic retrieval with optional transient head signals."""
 
 from .boundaries import (
     AdaptiveBoundaryDetector,
@@ -18,8 +18,17 @@ from .retrieval import (
     expand_episode_seeds,
 )
 from .surprise import (
+    ATTENTION_HEAD_SIMILARITY_ALGORITHM,
+    ATTENTION_HEAD_SURPRISE_ALGORITHM,
+    ATTENTION_HEAD_SURPRISE_FORMAT,
+    ATTENTION_HEAD_SURPRISE_SCORE_FORMULA,
+    EPISODIC_SURPRISE_PROBE,
+    AttentionHeadSurpriseReceipt,
     LexicalEmbeddingChangeScorer,
+    QwenAttentionHeadSurpriseScorer,
+    ScoredSurpriseSequence,
     SurpriseScorer,
+    SurpriseSequenceScorer,
     dense_cosine,
     lexical_cosine,
     score_surprise_sequence,
@@ -27,12 +36,18 @@ from .surprise import (
 
 
 __all__ = [
+    "ATTENTION_HEAD_SIMILARITY_ALGORITHM",
+    "ATTENTION_HEAD_SURPRISE_ALGORITHM",
+    "ATTENTION_HEAD_SURPRISE_FORMAT",
+    "ATTENTION_HEAD_SURPRISE_SCORE_FORMULA",
     "AdaptiveBoundaryDetector",
+    "AttentionHeadSurpriseReceipt",
     "BoundaryDetector",
     "BoundaryProposal",
     "BoundaryRefinement",
     "CohesionBoundaryRefiner",
     "DirectChunkSeed",
+    "EPISODIC_SURPRISE_PROBE",
     "EpisodeBuildResult",
     "EpisodeBuilder",
     "EpisodeLookup",
@@ -40,7 +55,10 @@ __all__ = [
     "EpisodeRetrievalPolicy",
     "FixedIntervalBoundaryDetector",
     "LexicalEmbeddingChangeScorer",
+    "QwenAttentionHeadSurpriseScorer",
+    "ScoredSurpriseSequence",
     "SurpriseScorer",
+    "SurpriseSequenceScorer",
     "dense_cosine",
     "expand_episode_seeds",
     "lexical_cosine",

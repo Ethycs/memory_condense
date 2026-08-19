@@ -46,10 +46,14 @@ from memory_condense.search.episodes import (
     EpisodeBuilder,
     EpisodeRetrievalPlan,
     EpisodeRetrievalPolicy,
+    LexicalEmbeddingChangeScorer,
+    QwenAttentionHeadSurpriseScorer,
     SurpriseScorer,
+    SurpriseSequenceScorer,
     expand_episode_seeds,
     select_episode_representatives,
 )
+from memory_condense.search.episodes.surprise import _owned_qwen_receipt_matches
 from memory_condense.search.packing.evidence_packet import pack_evidence_plan
 
 
@@ -191,16 +195,25 @@ class _ArtifactScopedDiscourseStore:
 
 @dataclass(frozen=True, slots=True)
 class EpisodePublication:
-    """One atomic episode publication plus its immutable graph receipt."""
+    """One atomic episode publication plus its immutable graph receipt.
+
+    ``returned_signal_transformer_state_bytes`` is zero only when the exact
+    built-in episode result returned no token IDs, K/V, activations, or
+    transport vectors. ``None`` means an injected composition is unattested.
+    This field makes no claim about the rest of the process heap.
+    """
 
     build: EpisodeBuildResult
     representatives: tuple[EpisodeRepresentative, ...]
     snapshot: DiscourseSnapshot
-    retained_request_token_state_bytes: int = 0
+    returned_signal_transformer_state_bytes: int | None = None
 
     def __post_init__(self) -> None:
-        if self.retained_request_token_state_bytes != 0:
-            raise ValueError("episode publication cannot retain request token state")
+        retained = self.returned_signal_transformer_state_bytes
+        if retained is not None and (type(retained) is not int or retained != 0):
+            raise ValueError(
+                "episode publication retention must be zero or unattested"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +255,33 @@ def _aligned_scores(
     return tuple(by_span[_span_identity(span)] for span in ordered_spans)
 
 
+def _episode_retention_attestation(
+    *,
+    surprise_scores: Mapping[str, float] | Sequence[float] | None,
+    surprise_scorer: SurpriseScorer | SurpriseSequenceScorer | None,
+    builder: EpisodeBuilder,
+    build: EpisodeBuildResult,
+) -> int | None:
+    if type(builder) is not EpisodeBuilder:
+        return None
+    if surprise_scores is not None or surprise_scorer is None:
+        return 0
+    if type(surprise_scorer) is LexicalEmbeddingChangeScorer:
+        return 0
+    if type(surprise_scorer) is QwenAttentionHeadSurpriseScorer:
+        receipt = build.surprise_signal_receipt
+        if _owned_qwen_receipt_matches(
+            surprise_scorer,
+            receipt,
+        ):
+            return 0
+        if getattr(receipt, "owned_runtime_binding", False) is True:
+            raise RuntimeError(
+                "owned Qwen surprise receipt no longer matches its live runtime"
+            )
+    return None
+
+
 def _validate_episode_build(
     result: EpisodeBuildResult,
     *,
@@ -279,7 +319,7 @@ class DiscourseWorkflowMixin:
         builder: EpisodeBuilder | None = None,
         sequence_start: int = 0,
         surprise_scores: Mapping[str, float] | Sequence[float] | None = None,
-        surprise_scorer: SurpriseScorer | None = None,
+        surprise_scorer: SurpriseScorer | SurpriseSequenceScorer | None = None,
         embeddings: Mapping[str, Sequence[float]] | None = None,
         representative_limit: int = 2,
     ) -> EpisodePublication:
@@ -308,7 +348,8 @@ class DiscourseWorkflowMixin:
             if embeddings is None
             else tuple(embeddings.get(span.chunk_id) for span in spans)
         )
-        build = (builder or EpisodeBuilder()).build(
+        active_builder = builder if builder is not None else EpisodeBuilder()
+        build = active_builder.build(
             source_id=authoritative_source,
             artifact_id=artifact.artifact_id,
             spans=spans,
@@ -327,6 +368,12 @@ class DiscourseWorkflowMixin:
             artifact=artifact,
             source_id=authoritative_source,
             spans=spans,
+        )
+        returned_signal_transformer_state_bytes = _episode_retention_attestation(
+            surprise_scores=surprise_scores,
+            surprise_scorer=surprise_scorer,
+            builder=active_builder,
+            build=build,
         )
         representatives = tuple(
             representative
@@ -351,6 +398,9 @@ class DiscourseWorkflowMixin:
             build=build,
             representatives=representatives,
             snapshot=snapshot,
+            returned_signal_transformer_state_bytes=(
+                returned_signal_transformer_state_bytes
+            ),
         )
 
     def link_and_publish_discourse(

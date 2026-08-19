@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from memory_condense.domain._tokenizer import (
+from .source_compat import (
     count_chat_prompt_token_proxy,
     count_tokens,
     tokenizer_proxy_identity,

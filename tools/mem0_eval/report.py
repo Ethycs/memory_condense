@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from memory_condense.domain._tokenizer import (
+from .source_compat import (
     count_chat_prompt_token_proxy,
     count_tokens,
 )

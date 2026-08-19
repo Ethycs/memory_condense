@@ -22,7 +22,14 @@ from .boundaries import (
     BoundaryRefinement,
     CohesionBoundaryRefiner,
 )
-from .surprise import LexicalEmbeddingChangeScorer, SurpriseScorer, score_surprise_sequence
+from .surprise import (
+    AttentionHeadSurpriseReceipt,
+    LexicalEmbeddingChangeScorer,
+    ScoredSurpriseSequence,
+    SurpriseScorer,
+    SurpriseSequenceScorer,
+    score_surprise_sequence,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +42,7 @@ class EpisodeBuildResult:
     initial_boundaries: tuple[BoundaryProposal, ...]
     refined_boundaries: tuple[BoundaryRefinement, ...]
     forced_boundaries: tuple[int, ...]
+    surprise_signal_receipt: AttentionHeadSurpriseReceipt | None = None
 
     def __post_init__(self) -> None:
         if not self.source_id.strip() or not self.artifact_id.strip():
@@ -48,6 +56,26 @@ class EpisodeBuildResult:
         object.__setattr__(self, "initial_boundaries", tuple(self.initial_boundaries))
         object.__setattr__(self, "refined_boundaries", tuple(self.refined_boundaries))
         object.__setattr__(self, "forced_boundaries", tuple(self.forced_boundaries))
+        receipt = self.surprise_signal_receipt
+        if receipt is not None:
+            emitted_evidence = tuple(
+                span for episode in episodes for span in episode.evidence
+            )
+            if receipt.input_spans != len(emitted_evidence):
+                raise ValueError(
+                    "surprise receipt does not match the episode evidence count"
+                )
+            expected_evidence_sha256 = identity_sha256(
+                {
+                    "evidence": [
+                        span.identity_payload() for span in emitted_evidence
+                    ]
+                }
+            )
+            if receipt.evidence_sequence_sha256 != expected_evidence_sha256:
+                raise ValueError(
+                    "surprise receipt does not match the ordered episode evidence"
+                )
 
 
 class EpisodeBuilder:
@@ -87,7 +115,7 @@ class EpisodeBuilder:
         texts: Sequence[str] | None = None,
         embeddings: Sequence[Sequence[float] | None] | None = None,
         surprise_scores: Sequence[float] | None = None,
-        surprise_scorer: SurpriseScorer | None = None,
+        surprise_scorer: SurpriseScorer | SurpriseSequenceScorer | None = None,
         sequence_start: int = 0,
     ) -> EpisodeBuildResult:
         normalized_source = str(source_id).strip()
@@ -117,7 +145,7 @@ class EpisodeBuilder:
 
         text_rows = _validate_texts(texts, evidence)
         vector_rows = _validate_embeddings(embeddings, len(evidence))
-        scores = _resolve_surprises(
+        scores, signal_receipt, signal_similarities = _resolve_surprises(
             item_count=len(evidence),
             texts=text_rows,
             embeddings=vector_rows,
@@ -125,6 +153,8 @@ class EpisodeBuilder:
             surprise_scorer=surprise_scorer,
             require_scores=getattr(self.detector, "requires_surprise_scores", True),
         )
+        if signal_receipt is not None:
+            signal_receipt = signal_receipt.bind_evidence(evidence)
         initial = self.detector.detect(scores)
         if self.refiner is None:
             refined = tuple(
@@ -137,10 +167,15 @@ class EpisodeBuilder:
                 for item in initial
             )
         else:
+            similarities = (
+                signal_similarities
+                if signal_similarities is not None
+                else _similarity_lookup(text_rows, vector_rows)
+            )
             refined = self.refiner.refine(
                 initial,
                 item_count=len(evidence),
-                similarities=_similarity_lookup(text_rows, vector_rows),
+                similarities=similarities,
             )
 
         boundaries, forced = _select_size_bounded_boundaries(
@@ -214,6 +249,7 @@ class EpisodeBuilder:
             initial_boundaries=initial,
             refined_boundaries=refined,
             forced_boundaries=forced,
+            surprise_signal_receipt=signal_receipt,
         )
 
 
@@ -264,25 +300,46 @@ def _resolve_surprises(
     texts: tuple[str, ...] | None,
     embeddings: tuple[tuple[float, ...] | None, ...] | None,
     surprise_scores: Sequence[float] | None,
-    surprise_scorer: SurpriseScorer | None,
+    surprise_scorer: SurpriseScorer | SurpriseSequenceScorer | None,
     require_scores: bool,
-) -> tuple[float, ...]:
+) -> tuple[
+    tuple[float, ...],
+    AttentionHeadSurpriseReceipt | None,
+    tuple[tuple[float, ...], ...] | None,
+]:
+    if surprise_scores is not None and surprise_scorer is not None:
+        raise ValueError("surprise_scores and surprise_scorer are mutually exclusive")
     if surprise_scores is not None:
         values = tuple(float(value) for value in surprise_scores)
         if len(values) != item_count:
             raise ValueError("surprise_scores must align one-for-one with spans")
         if not all(math.isfinite(value) for value in values):
             raise ValueError("surprise_scores must all be finite")
-        return values
+        return values, None, None
     if texts is None:
         if not require_scores:
-            return (0.0,) * item_count
+            return (0.0,) * item_count, None, None
         raise ValueError("texts or injected surprise_scores are required")
     scorer = surprise_scorer or LexicalEmbeddingChangeScorer()
-    return score_surprise_sequence(
-        scorer,
-        texts,
-        embeddings=embeddings,
+    score_sequence = getattr(scorer, "score_sequence", None)
+    if callable(score_sequence):
+        signal = score_sequence(texts, embeddings=embeddings)
+        if not isinstance(signal, ScoredSurpriseSequence):
+            raise TypeError(
+                "sequence surprise scorers must return ScoredSurpriseSequence"
+            )
+        signal.validate_inputs(texts)
+        return signal.scores, signal.receipt, signal.similarities
+    if not isinstance(scorer, SurpriseScorer):
+        raise TypeError("surprise_scorer must implement a supported scoring seam")
+    return (
+        score_surprise_sequence(
+            scorer,
+            texts,
+            embeddings=embeddings,
+        ),
+        None,
+        None,
     )
 
 

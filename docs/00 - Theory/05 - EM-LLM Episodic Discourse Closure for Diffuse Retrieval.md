@@ -1,8 +1,8 @@
 # EM-LLM-inspired episodic discourse closure for diffuse retrieval
 
-**Status**: IMPLEMENTED PROVIDER-FREE PROTOTYPE — the general closure path is
-built; autoregressive EM-LLM surprise remains an optional, unevaluated boundary
-strategy
+**Status**: IMPLEMENTED PROVIDER-FREE PROTOTYPE — the general closure path and
+a bounded Qwen attention-head semantic-change path are built; paper-exact
+autoregressive token surprise remains an unevaluated ablation
 **Date**: 2026-08-18
 **Applies to**: long conversations whose answer depends on information spread
 across several episodes, especially explanation, diagnosis, recommendation,
@@ -19,7 +19,8 @@ EM-LLM package, its model wrapper, or persistent K/V memory:
 raw conversation
   -> exact raw chunks
   -> boundary strategy
-       fixed interval | lexical/embedding change | injected model surprise
+       fixed interval | lexical/embedding change | Qwen prefix OV change
+       | injected precomputed surprise
   -> optionally cohesion-refined, source-grounded episodes
   -> existing hybrid seeds + source-local temporal contiguity
   -> discourse-obligation closure
@@ -51,22 +52,43 @@ There are two separate hypotheses:
    typed discourse relations, explicit query obligations, bounded iterative
    closure, and atomic packing retrieve a sufficient evidence set more
    reliably than ordinary top-k chunks.
-2. **EM-style segmentation hypothesis**: autoregressive surprise plus bounded
-   cohesion refinement creates better episode boundaries than deterministic,
-   lexical-change, or ordinary-embedding-change controls.
+2. **EM-inspired segmentation hypothesis**: attention-head semantic change or
+   autoregressive token surprise plus bounded cohesion refinement creates
+   better episode boundaries than deterministic, lexical-change, or
+   ordinary-embedding-change controls.
 
 The first hypothesis can be implemented and tested without the second. The
-provider-free implementation therefore includes a fixed-interval detector, a
-lexical/ordinary-embedding change scorer, bounded cohesion refinement, and two
-injection seams. The stateless pairwise `SurpriseScorer` is suitable for local
-change controls; it is not itself an autoregressive `P(x_t | x_<t)` evaluator.
-A true EM-style experiment must externally precompute and freeze a
-full-sequence surprise signal, bind its model and signal identity in the
-experiment artifact, and then pass the numeric sequence through
-`surprise_scores`. The current API does not itself validate a first-class
-surprise-signal receipt. No EM-LLM code is imported, and no K/V
-cache, token IDs, prompt buffer, attention map, residual stream, or activation
-is stored.
+provider-free implementation includes a fixed-interval detector, a
+lexical/ordinary-embedding change scorer, bounded cohesion refinement, two
+scorer seams, and a precomputed-numeric control. The stateless pairwise
+`SurpriseScorer` remains the local control seam. The first-class
+`QwenAttentionHeadSurpriseScorer` instead reuses
+`QwenMemoryLinker.inspect_coverage`: one frozen neutral probe produces a
+normalized OV transport signature for every source span; adjacent cosine
+change proposes boundaries, and the refiner consumes a nonnegative-clipped
+version of the same transient scalar cosine matrix. Its canonical, text-free
+receipt binds the prefix model,
+revision, verified checkpoint, layer, dtype, versioned algorithm, exact signal
+implementation-source hash, token and workspace caps, input/score/matrix
+hashes, full ordered evidence-span identities after builder binding, bounded
+transport width, and observed work. A separate `owned_runtime_binding` bit
+records that the exact owned `QwenMemoryLinker` and `Qwen3PrefixEncoder` types,
+expected state-key shapes, and unshadowed inspection method were observed. It
+is provenance, not independently authenticated execution or a heap-erasure
+proof; injected test or research linkers cannot inherit it.
+
+This implemented signal is semantic change in Qwen prefix transport space,
+conditioned on a fixed probe. It is not the EM-LLM paper's autoregressive
+`-log P(x_t | x_<t)`. Separately, the existing prefix coverage selector reports
+`semantic_surprisal = -log(1 - p_new)`, where `p_new` is a
+**query-conditioned retrieval posterior** over EXISTING/NEW/NULL. That signal
+remains useful at retrieval time, but it is neither ingestion-time token NLL
+nor the episode-boundary signal described here. A paper-exact token-surprise
+experiment must still precompute and freeze a full-causal sequence signal,
+bind its model and reduction identity, and pass it through `surprise_scores`.
+No EM-LLM code is imported, and no K/V cache, token IDs, prompt buffer,
+attention map, residual stream, activation, or transport vector is retained by
+the episode result.
 
 ## Why ordinary RAG is insufficient
 
@@ -121,10 +143,13 @@ with human-perceived event boundaries than fixed segmentation.
 
 Initial surprise boundaries are refined using a similarity graph over
 attention keys. EM-LLM seeks high within-event cohesion and low between-event
-similarity, using modularity or conductance as the objective. Its bounded
-one-pass adjustment considers candidate positions between consecutive initial
-boundaries; the paper gives overall complexity `O(nm)` for sequence length `n`
-and processing chunk size `m`.
+similarity, using modularity or conductance as the objective. The official
+implementation exposes this distinction through settings including
+`surprisal_threshold_gamma`, `similarity_metric` (`modularity` or
+`conductance`), and `refine_from_layer`, and retains per-layer K/V events. Its
+bounded one-pass adjustment considers candidate positions between consecutive
+initial boundaries; the paper gives overall complexity `O(nm)` for sequence
+length `n` and processing chunk size `m`.
 
 This matters because surprise marks a change point, but it need not place the
 boundary at the best point for recalling the material together. Refinement
@@ -150,8 +175,8 @@ episode context.
 | Concern | EM-LLM | Episodic Discourse Closure adaptation |
 | --- | --- | --- |
 | Authoritative memory | Past per-layer K/V states | Immutable raw turns, chunks, and exact source spans |
-| Boundary signal | Autoregressive token surprise | Caller-supplied score sequence or stateless adjacent-change scorer; deterministic and embedding-change controls as ablations |
-| Refinement graph | Per-head key similarity | Transient key similarity or source-grounded embedding similarity; persist only boundary receipts and scalar identities |
+| Boundary signal | Autoregressive token surprise | Implemented adjacent change in normalized Qwen prefix OV-transport space; caller-supplied score sequence, lexical/embedding change, and deterministic controls remain available |
+| Refinement graph | Per-head key similarity with modularity or conductance | Implemented Qwen prefix OV-transport cosine clipped to `[0,1]` by bounded local cohesion, or source-grounded lexical/embedding similarity; paper-exact raw-key modularity/conductance remains an ablation |
 | Retrieval unit | K/V event block | Episode containing ordered evidence references |
 | Representatives | Influential tokens per event | Bounded representative chunk/span IDs plus feature/vector identity hashes; no episode ANN yet |
 | First retrieval stage | Similarity buffer | Caller-supplied lexical/dense/source hits mapped to episodes; no independent episode-similarity index yet |
@@ -205,16 +230,24 @@ content-bound whole-store snapshot; the episode record itself contains:
 - an immutable receipt hash over those episode fields and evidence.
 
 Representatives are separately published with their feature/vector identity
-hashes. Scorer, threshold-window, and policy identities can be declared in the
-caller-supplied annotation artifact, but the prototype does not yet derive and
-verify those declarations from the actual runtime strategy objects.
+hashes. The implemented Qwen episode pass also returns a canonical signal
+receipt that derives the actual prefix-checkpoint, layer, runtime, versioned
+algorithm, signal implementation source, input, output, evidence coordinates,
+bounded workspace, and observed owned-runtime identities. That receipt is
+returned in memory through `EpisodePublication.build`; it is not yet persisted
+or linked to the SQLite artifact. Threshold-window and publication-policy
+identities can be declared in the caller-supplied annotation artifact, but the
+workflow neither requires those declarations to match the returned signal
+receipt nor combines them into one durable publication receipt.
 
 The current provider-free API is a deterministic, idempotent batch publisher:
 
 1. append authoritative turns and chunks;
 2. have the caller select one source-local batch;
-3. propose boundaries with the configured fixed, change, or injected-surprise strategy;
-4. refine within the bounded source-local window when configured;
+3. propose boundaries with the configured fixed, local-change, Qwen
+   prefix-transport-change, or injected-surprise strategy;
+4. refine within the bounded source-local window when configured, using the
+   Qwen scalar cosine matrix clipped to `[0,1]` for the attention-head arm;
 5. validate minimum/maximum episode size and exact source-span hashes;
 6. atomically publish episodes and representatives; and
 7. advance the graph revision only after chunks and episodes are complete.
@@ -385,16 +418,19 @@ Required matched ablations are:
 
 1. fixed chunks + dense retrieval;
 2. fixed chunks + lexical/dense hybrid;
-3. surprise episodes without refinement;
-4. surprise + modularity refinement;
+3. Qwen prefix-transport-change episodes without refinement;
+4. Qwen prefix-transport change + bounded transport-space cohesion;
 5. similarity episodes without contiguity;
 6. similarity + contiguity;
 7. episodes + discourse graph without obligations;
 8. obligations without iterative closure;
 9. full episodic discourse closure;
 10. ordinary row packing versus atomic bundles; and
-11. transient-key boundaries versus embedding-change and deterministic
-    boundary controls.
+11. Qwen prefix-transport boundaries versus embedding-change and deterministic
+    boundary controls;
+12. frozen full-causal token NLL versus prefix-transport change; and
+13. paper-exact raw-key modularity/conductance versus bounded transport-space
+    cohesion.
 
 All arms must share the same raw corpus, questions, answerer, judge, final
 prompt cap, and seed budget. EM-LLM's published LongBench and InfiniteBench
@@ -416,8 +452,17 @@ closure, or packet workflow runs automatically:
    turn on write and read. Multiple chunks inside one turn carry an explicit
    turn-relative position, so random chunk IDs cannot reorder the source.
 3. Episode construction supports fixed intervals, lexical/ordinary-embedding
-   change, adaptive injected surprise, and bounded cohesion refinement. It
-   stores only evidence references, scalar boundary data, and feature hashes.
+   change, adaptive injected surprise, and bounded cohesion refinement. A
+   first-class Qwen adapter streams every span through bounded
+   `inspect_coverage` workspaces, converts normalized OV transport signatures
+   into adjacent semantic-change scores, and passes the same scalar cosine
+   matrix to refinement, which clips negative cosine edges to zero. Its
+   self-hashed receipt binds the model, checkpoint, layer, algorithm, source
+   implementation, caps, full ordered evidence identities, scalar-output
+   hashes, work counters, zero transformer-state bytes in the returned signal,
+   and whether the exact owned runtime shape supplied the signal. The self-hash
+   is tamper-evident consistency, not authentication. Only evidence references,
+   scalar boundary data, and identities survive the returned build.
 4. Caller-supplied retrieval results map to bounded episode seeds and
    source-local previous/next episodes. Missing or invalid annotations fall back to bounded
    original raw chunk IDs; every cap or omission is explicit and prevents a
@@ -467,10 +512,27 @@ Important prototype limitations remain:
 - an episode-neighbor lookup failure currently degrades to no temporal
   neighbors rather than carrying a distinct failure code, although corpus
   completion still depends on the separate exhaustive discourse scope;
-- EM-style autoregressive surprise has not been wired to a frozen model or
-  evaluated against deterministic and embedding-change controls; and
-- an injected scorer or linker is outside the built-in zero-retention proof
-  unless its own implementation is separately certified.
+- paper-exact autoregressive token NLL segmentation and EM-LLM raw-key
+  modularity/conductance have not been wired or evaluated against the Qwen
+  prefix-transport, deterministic, and embedding-change controls;
+- the Qwen adapter validates a bounded result and retains no request vectors in
+  its returned signal; `owned_runtime_binding` is an observed type/state/code
+  binding, not proof that external hooks, mutated model internals, or the wider
+  process heap retained nothing;
+- the implementation digest binds the local signal, receipt, prefix, linker,
+  and tokenizer source plus live callable bytecode, but not the full
+  Torch/Transformers/CUDA environment or authenticated loaded-code identity;
+- calls through one scorer instance are serialized, but direct or concurrent
+  use of the same linker's mutable tokenizer remains unsupported and must be
+  externally serialized;
+- the in-memory signal receipt is not durably linked to SQLite, and the caller's
+  annotation artifact is not yet required to match its model, checkpoint,
+  implementation, or policy identities;
+- arbitrary injected scorers and linkers receive an unattested (`None`)
+  publication retention value unless the exact owned binding is observed; and
+- the Qwen signal is conditioned on one frozen neutral probe and uses reduced
+  OV transport vectors, so it is an adaptation rather than parity with
+  EM-LLM's persistent per-layer K/V events.
 
 This path keeps the locked validation-v3 treatment untouched. Its workflows
 are opt-in, it belongs to implementation epoch v4, and it requires its own frozen artifacts,
@@ -481,9 +543,13 @@ annotated diffuse benchmark, and matched evaluation before any accuracy claim.
 The implemented claim is narrow:
 
 > A general source-grounded obligation-closure system can consume raw chunks
-> or episodes without persisting transformer token state. EM-style
-> surprise-refined episodes are one optional front end whose value must be
-> established by matched ablation.
+> or episodes without persisting transformer token state. A bounded Qwen
+> attention-head front end now forms and refines episodes from transient
+> prefix OV-transport similarity with a canonical, bounded signal receipt and
+> no transformer state in the returned signal. This is not an authenticated
+> whole-process heap-erasure claim. Its retrieval value, and the value of
+> paper-exact token NLL or raw-key graph refinement, must be established by
+> matched ablation.
 
 The mechanics and invariants are implemented; the accuracy claim remains a
 hypothesis until the matched ablations above pass.

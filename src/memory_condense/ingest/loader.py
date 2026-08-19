@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +142,9 @@ class BenchmarkSample(BaseModel):
     #: One source/session/document ID per flattened turn. Empty means legacy
     #: input without source boundaries.
     turn_source_ids: list[str | None] = Field(default_factory=list)
+    #: Authoritative source timestamps parallel to ``turns`` when supplied.
+    #: ``None`` preserves formats that do not expose a parseable turn time.
+    turn_created_at: list[datetime | None] = Field(default_factory=list)
     questions: list[BenchmarkQuestion] = Field(default_factory=list)
 
 
@@ -222,6 +226,28 @@ def _normalize_role(raw: Any, index: int) -> str:
     return "user" if index % 2 == 0 else "assistant"
 
 
+_LONGMEMEVAL_WEEKDAY_RE = re.compile(r"\([^)]*\)")
+
+
+def _parse_longmemeval_date(value: str) -> datetime | None:
+    """Parse one official session date as an explicit UTC timestamp."""
+
+    cleaned = _LONGMEMEVAL_WEEKDAY_RE.sub(" ", str(value).strip())
+    cleaned = " ".join(cleaned.split())
+    for format_string in (
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(cleaned, format_string).replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+    return None
+
+
 def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
     """Parse LongMemEval records into :class:`BenchmarkSample` objects.
 
@@ -240,8 +266,9 @@ def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
         }
 
     Each record is one sample carrying exactly one question. Sessions are
-    concatenated in the order given (the benchmark ships them chronologically,
-    aligned with ``haystack_dates``). Malformed records are skipped.
+    ordered by their parsed ``haystack_dates`` with original order as the
+    deterministic tie-break, then flattened with the same authoritative UTC
+    timestamp on every turn in that session. Malformed records are skipped.
     """
     samples: list[BenchmarkSample] = []
 
@@ -257,12 +284,16 @@ def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
 
         turns: list[tuple[str, str]] = []
         turn_source_ids: list[str | None] = []
+        turn_created_at: list[datetime | None] = []
         sessions = record.get("haystack_sessions") or []
         if not isinstance(sessions, list):
             sessions = []
 
         session_ids = _as_str_list(record.get("haystack_session_ids"))
         session_dates = _as_str_list(record.get("haystack_dates"))
+        session_rows: list[
+            tuple[int, list[Any], str, str, datetime | None]
+        ] = []
         for session_index, session in enumerate(sessions):
             if not isinstance(session, list):
                 continue
@@ -271,14 +302,44 @@ def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
                 if session_index < len(session_ids)
                 else f"session_{session_index + 1}"
             )
-            if session_index < len(session_dates) and session_dates[session_index]:
+            session_date = (
+                session_dates[session_index]
+                if session_index < len(session_dates)
+                else ""
+            )
+            session_rows.append(
+                (
+                    session_index,
+                    session,
+                    source_id,
+                    session_date,
+                    _parse_longmemeval_date(session_date),
+                )
+            )
+        distant_future = datetime.max.replace(tzinfo=timezone.utc)
+        session_rows.sort(
+            key=lambda row: (
+                row[4] is None,
+                row[4] or distant_future,
+                row[0],
+            )
+        )
+        for (
+            _original_index,
+            session,
+            source_id,
+            session_date,
+            parsed_date,
+        ) in session_rows:
+            if session_date:
                 turns.append(
                     (
                         "system",
-                        f"[{source_id} took place at {session_dates[session_index]}]",
+                        f"[{source_id} took place at {session_date}]",
                     )
                 )
                 turn_source_ids.append(source_id)
+                turn_created_at.append(parsed_date)
             for j, turn in enumerate(session):
                 if not isinstance(turn, dict):
                     continue
@@ -287,6 +348,7 @@ def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
                     continue
                 turns.append((_normalize_role(turn.get("role"), j), text))
                 turn_source_ids.append(source_id)
+                turn_created_at.append(parsed_date)
 
         answer = _as_answer_text(record.get("answer"))
         if not answer:
@@ -310,6 +372,7 @@ def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
                 sample_id=sample_id,
                 turns=turns,
                 turn_source_ids=turn_source_ids,
+                turn_created_at=turn_created_at,
                 questions=[question],
             )
         )

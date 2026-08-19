@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from memory_condense.domain._tokenizer import count_tokens
@@ -13,6 +15,7 @@ def _sample(sample_id: str, text: str) -> BenchmarkSample:
         sample_id=sample_id,
         turns=[("user", text)],
         turn_source_ids=["shared-source"],
+        turn_created_at=[datetime(2024, 1, 1, tzinfo=timezone.utc)],
         questions=[
             BenchmarkQuestion(
                 question_id=f"q-{sample_id}",
@@ -37,6 +40,10 @@ def test_compose_context_stress_sample_builds_one_namespaced_memory():
     assert combined.turn_source_ids == [
         "first::shared-source",
         "second::shared-source",
+    ]
+    assert combined.turn_created_at == [
+        datetime(2024, 1, 1, tzinfo=timezone.utc),
+        datetime(2024, 1, 1, tzinfo=timezone.utc),
     ]
     assert [q.evidence_sources for q in combined.questions] == [
         ["first::shared-source"],

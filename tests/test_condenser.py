@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import zlib
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import numpy as np
@@ -1882,6 +1883,22 @@ class TestIngest:
             assert {result.turn.source_id for result in source_results} == {
                 "session-alpha"
             }
+
+    def test_ingest_many_preserves_authoritative_source_times(self, tmp_path):
+        source_time = datetime(2024, 5, 1, 12, 30, tzinfo=timezone.utc)
+        with MemoryCondenser(
+            data_dir=tmp_path / "dated-batch",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+        ) as condenser:
+            rows = condenser.ingest_many(
+                [("user", "The deployment completed.", "session-1", source_time)]
+            )
+
+            assert rows[0][0].created_at == source_time
+            stored = condenser.transcript.get_turn(rows[0][0].turn_id)
+            assert stored is not None
+            assert stored.created_at == source_time
 
     def test_ingest_many_keeps_auto_extraction_turn_causal(self, tmp_path):
         with MemoryCondenser(

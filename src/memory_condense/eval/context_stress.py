@@ -8,6 +8,8 @@ their source/evidence identities disjoint.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.ingest.loader import BenchmarkSample
 
@@ -42,6 +44,7 @@ def compose_context_stress_sample(
 
     turns: list[tuple[str, str]] = []
     turn_source_ids: list[str | None] = []
+    turn_created_at: list[datetime | None] = []
     questions = []
     total_tokens = 0
 
@@ -52,6 +55,11 @@ def compose_context_stress_sample(
             raise ValueError(
                 f"sample {sample.sample_id!r} has misaligned turn source IDs"
             )
+        timestamps = sample.turn_created_at or [None] * len(sample.turns)
+        if len(timestamps) != len(sample.turns):
+            raise ValueError(
+                f"sample {sample.sample_id!r} has misaligned turn timestamps"
+            )
 
         def namespace(source_id: str | None) -> str | None:
             if source_id is None:
@@ -59,6 +67,7 @@ def compose_context_stress_sample(
             return f"{sample.sample_id}::{source_id}"
 
         turn_source_ids.extend(namespace(source_id) for source_id in source_ids)
+        turn_created_at.extend(timestamps)
         question_stop = question_offset + max_questions
         if len(questions) < question_stop:
             for question in sample.questions:
@@ -94,5 +103,6 @@ def compose_context_stress_sample(
         sample_id=f"context-stress-{target_tokens}",
         turns=turns,
         turn_source_ids=turn_source_ids,
+        turn_created_at=turn_created_at,
         questions=questions,
     )

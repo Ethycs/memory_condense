@@ -361,9 +361,17 @@ def ingest_sample(
         source_ids = sample.turn_source_ids or [None] * len(sample.turns)
         if len(source_ids) != len(sample.turns):
             raise ValueError("turn_source_ids must be empty or parallel to turns")
+        created_at = sample.turn_created_at or [None] * len(sample.turns)
+        if len(created_at) != len(sample.turns):
+            raise ValueError("turn_created_at must be empty or parallel to turns")
         records = [
-            (role, text, source_id)
-            for (role, text), source_id in zip(sample.turns, source_ids, strict=True)
+            (role, text, source_id, timestamp)
+            for (role, text), source_id, timestamp in zip(
+                sample.turns,
+                source_ids,
+                created_at,
+                strict=True,
+            )
             if text
         ]
         mc.ingest_many(records)

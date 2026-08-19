@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Sequence
 
 from memory_condense.associations.association_store import AssociationArtifact
@@ -17,6 +18,7 @@ class IngestWorkflowMixin:
         text: str,
         *,
         source_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> tuple[Turn, list[Chunk]]:
         """Ingest a single conversation turn.
 
@@ -25,7 +27,12 @@ class IngestWorkflowMixin:
         proposes memory items, validates their provenance, and applies the
         surviving ops.
         """
-        turn = self._transcript.append(role, text, source_id=source_id)
+        turn = self._transcript.append(
+            role,
+            text,
+            source_id=source_id,
+            created_at=created_at,
+        )
         chunks = self._chunker.chunk_turn(turn.turn_id, text)
 
         if chunks:
@@ -39,7 +46,10 @@ class IngestWorkflowMixin:
 
     def ingest_many(
         self,
-        turns: Sequence[tuple[str, str, str | None]],
+        turns: Sequence[
+            tuple[str, str, str | None]
+            | tuple[str, str, str | None, datetime | None]
+        ],
     ) -> list[tuple[Turn, list[Chunk]]]:
         """Ingest a turn batch with one embedding/index update.
 
@@ -52,17 +62,38 @@ class IngestWorkflowMixin:
         ``auto_extract=False``, which is already the retrieval-evaluation and
         corpus-indexing configuration.
         """
-        records = list(turns)
+        records: list[tuple[str, str, str | None, datetime | None]] = []
+        for record in turns:
+            if len(record) == 3:
+                role, text, source_id = record
+                records.append((role, text, source_id, None))
+            elif len(record) == 4:
+                role, text, source_id, created_at = record
+                records.append((role, text, source_id, created_at))
+            else:  # pragma: no cover - static tuple union, runtime guard
+                raise ValueError(
+                    "ingest records need role, text, source, and optional time"
+                )
         if self._auto_extract:
             return [
-                self.ingest(role, text, source_id=source_id)
-                for role, text, source_id in records
+                self.ingest(
+                    role,
+                    text,
+                    source_id=source_id,
+                    created_at=created_at,
+                )
+                for role, text, source_id, created_at in records
             ]
 
         staged: list[tuple[Turn, list[Chunk]]] = []
         flat_chunks: list[Chunk] = []
-        for role, text, source_id in records:
-            turn = self._transcript.append(role, text, source_id=source_id)
+        for role, text, source_id, created_at in records:
+            turn = self._transcript.append(
+                role,
+                text,
+                source_id=source_id,
+                created_at=created_at,
+            )
             chunks = self._chunker.chunk_turn(turn.turn_id, text)
             staged.append((turn, chunks))
             flat_chunks.extend(chunks)

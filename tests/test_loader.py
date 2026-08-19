@@ -235,6 +235,14 @@ def test_parse_longmemeval_flattens_sessions_in_order():
     assert s.turns[1][1] == "I am thinking about relocating."
     assert s.turns[4][1] == "I moved to Boston last week."
     assert s.turn_source_ids == ["s1", "s1", "s1", "s2", "s2", "s2"]
+    assert [value.isoformat() for value in s.turn_created_at if value] == [
+        "2023-05-01T09:00:00+00:00",
+        "2023-05-01T09:00:00+00:00",
+        "2023-05-01T09:00:00+00:00",
+        "2023-05-20T02:29:00+00:00",
+        "2023-05-20T02:29:00+00:00",
+        "2023-05-20T02:29:00+00:00",
+    ]
 
     assert len(s.questions) == 1
     q = s.questions[0]
@@ -245,6 +253,37 @@ def test_parse_longmemeval_flattens_sessions_in_order():
     assert q.evidence_sources == ["s2"]
     assert q.question_date == "2023/06/01 (Thu) 10:00"
     assert "Question asked at 2023/06/01" in q.dated_question
+
+
+def test_parse_longmemeval_canonicalizes_out_of_order_session_dates():
+    record = {
+        **LONGMEMEVAL_RECORD,
+        "haystack_session_ids": ["late", "early"],
+        "haystack_dates": [
+            "2024/05/02 (Thu) 12:00",
+            "2024/05/01 (Wed) 12:00",
+        ],
+        "haystack_sessions": [
+            [{"role": "user", "content": "Later event."}],
+            [{"role": "user", "content": "Earlier event."}],
+        ],
+    }
+
+    sample = parse_longmemeval([record])[0]
+
+    assert sample.turn_source_ids == ["early", "early", "late", "late"]
+    assert [turn[1] for turn in sample.turns] == [
+        "[early took place at 2024/05/01 (Wed) 12:00]",
+        "Earlier event.",
+        "[late took place at 2024/05/02 (Thu) 12:00]",
+        "Later event.",
+    ]
+    assert [value.isoformat() for value in sample.turn_created_at if value] == [
+        "2024-05-01T12:00:00+00:00",
+        "2024-05-01T12:00:00+00:00",
+        "2024-05-02T12:00:00+00:00",
+        "2024-05-02T12:00:00+00:00",
+    ]
 
 
 def test_parse_longmemeval_tolerates_missing_optional_keys():

@@ -478,6 +478,7 @@ def _anchor() -> RetrievalResult:
         end_char=len(turn.text),
         token_count=4,
         embedding=[1.0, 0.0],
+        lexical_weights={"direct": 1.0},
     )
     return RetrievalResult(
         chunk=chunk,
@@ -526,7 +527,7 @@ class _StagedSourceFake:
         return self._streams
 
 
-def test_staged_source_scope_can_recover_a_source_missing_from_anchors() -> None:
+def _staged_case():
     artifact_id = "artifact-v4"
     snapshot = DiscourseSnapshot(
         max_turn_ordinal=1,
@@ -542,6 +543,11 @@ def test_staged_source_scope_can_recover_a_source_missing_from_anchors() -> None
     fake = _StagedSourceFake(_anchor(), snapshot)
     retrieval = RetrievalConfig(mode="dense", k=1)
     query = "Where is the beta evidence?"
+    return artifact_id, fake, retrieval, query
+
+
+def test_staged_source_scope_can_recover_a_source_missing_from_anchors() -> None:
+    artifact_id, fake, retrieval, query = _staged_case()
     frozen = freeze_legacy_query_inputs(fake, (query,), retrieval)
     provider = FrozenLegacyDiffuseInputProvider(frozen, max_sources=64)
 
@@ -569,3 +575,66 @@ def test_staged_source_scope_can_recover_a_source_missing_from_anchors() -> None
     )
     assert "source_tfisf" in beta.route
     assert candidates.source_candidate_scope.selected_scope_exhaustive
+
+
+def test_frozen_provider_rejects_mutation_before_construction() -> None:
+    _, fake, retrieval, query = _staged_case()
+    frozen = freeze_legacy_query_inputs(fake, (query,), retrieval)
+    frozen[0].anchors[0].chunk.lexical_weights["direct"] = 0.25  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="receipt does not match"):
+        FrozenLegacyDiffuseInputProvider(frozen)
+
+
+def test_frozen_provider_detaches_original_anchor_graph() -> None:
+    artifact_id, fake, retrieval, query = _staged_case()
+    frozen = freeze_legacy_query_inputs(fake, (query,), retrieval)
+    provider = FrozenLegacyDiffuseInputProvider(frozen)
+    identity = provider.analysis_identity_payload()
+    original = frozen[0].anchors[0]
+    original.score = 0.1
+    original.chunk.embedding[0] = -1.0  # type: ignore[index]
+    original.chunk.lexical_weights["direct"] = 0.25  # type: ignore[index]
+
+    candidates = provider(
+        fake,
+        query=query,
+        retrieval=retrieval,
+        artifact_id=artifact_id,
+    )
+
+    assert candidates.anchors[0].score == 0.9
+    assert candidates.anchors[0].chunk.embedding == [1.0, 0.0]
+    assert candidates.anchors[0].chunk.lexical_weights == {"direct": 1.0}
+    assert provider.analysis_identity_payload() == identity
+
+
+def test_frozen_provider_materializes_a_fresh_anchor_graph_per_call() -> None:
+    artifact_id, fake, retrieval, query = _staged_case()
+    frozen = freeze_legacy_query_inputs(fake, (query,), retrieval)
+    provider = FrozenLegacyDiffuseInputProvider(frozen)
+
+    first = provider(
+        fake,
+        query=query,
+        retrieval=retrieval,
+        artifact_id=artifact_id,
+    )
+    first_anchor = first.anchors[0]
+    first_anchor.score = 0.1
+    first_anchor.chunk.embedding.append(7.0)  # type: ignore[union-attr]
+    first_anchor.chunk.lexical_weights["injected"] = 2.0  # type: ignore[index]
+    second = provider(
+        fake,
+        query=query,
+        retrieval=retrieval,
+        artifact_id=artifact_id,
+    )
+    second_anchor = second.anchors[0]
+
+    assert second_anchor.score == 0.9
+    assert second_anchor.chunk.embedding == [1.0, 0.0]
+    assert second_anchor.chunk.lexical_weights == {"direct": 1.0}
+    assert second_anchor is not first_anchor
+    assert second_anchor.chunk is not first_anchor.chunk
+    assert second_anchor.turn is not first_anchor.turn

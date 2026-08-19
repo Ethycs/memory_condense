@@ -30,6 +30,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
 from memory_condense.application.condenser import MemoryCondenser
@@ -37,7 +38,7 @@ from memory_condense.application.discourse_sources import (
     build_episode_source_candidate_scope,
 )
 from memory_condense.associations.qwen_memory_linker import QwenMemoryLinker
-from memory_condense.domain.discourse import identity_sha256, quote_sha256
+from memory_condense.domain.discourse import canonical_json, identity_sha256, quote_sha256
 from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.eval.diffuse_longmemeval_analysis import (
     DiffuseLongMemEvalArm,
@@ -538,27 +539,62 @@ class ResidentLegacyDiffuseInputProvider:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrozenLegacyQuerySnapshot:
+    query: str
+    retrieval_policy_sha256: str
+    anchor_json: tuple[str, ...]
+    lexical_sources: tuple[tuple[str, float], ...]
+    universe_source_ids: tuple[str, ...]
+    source_streams_sha256: str
+    receipt_sha256: str
+
+    def materialize_anchors(self) -> tuple[RetrievalResult, ...]:
+        return tuple(
+            RetrievalResult.model_validate_json(payload)
+            for payload in self.anchor_json
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FrozenLegacyDiffuseInputProvider:
     """Bind pre-Qwen rows to the compiled artifact without another search."""
 
     inputs: tuple[FrozenLegacyQueryInputs, ...]
     max_sources: int = 64
     rrf_constant: int = 60
-    _by_query: Mapping[str, FrozenLegacyQueryInputs] = field(init=False, repr=False)
+    _snapshots: tuple[_FrozenLegacyQuerySnapshot, ...] = field(init=False, repr=False)
+    _by_query: Mapping[str, _FrozenLegacyQuerySnapshot] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_sources", _positive_int(self.max_sources, "max_sources"))
         object.__setattr__(self, "rrf_constant", _positive_int(self.rrf_constant, "rrf_constant"))
         rows = tuple(self.inputs)
-        by_query: dict[str, FrozenLegacyQueryInputs] = {}
+        snapshots: list[_FrozenLegacyQuerySnapshot] = []
+        by_query: dict[str, _FrozenLegacyQuerySnapshot] = {}
         for row in rows:
             if not isinstance(row, FrozenLegacyQueryInputs):
                 raise TypeError("inputs must contain FrozenLegacyQueryInputs")
-            previous = by_query.setdefault(row.query, row)
-            if previous.receipt_sha256 != row.receipt_sha256:
+            receipt = identity_sha256(row.identity_payload(include_receipt=False))
+            if receipt != row.receipt_sha256:
+                raise ValueError("frozen legacy query receipt does not match")
+            snapshot = _FrozenLegacyQuerySnapshot(
+                query=row.query,
+                retrieval_policy_sha256=row.retrieval_policy_sha256,
+                anchor_json=tuple(
+                    canonical_json(item.model_dump(mode="json")) for item in row.anchors
+                ),
+                lexical_sources=row.lexical_sources,
+                universe_source_ids=row.universe_source_ids,
+                source_streams_sha256=row.source_streams_sha256,
+                receipt_sha256=receipt,
+            )
+            snapshots.append(snapshot)
+            previous = by_query.setdefault(row.query, snapshot)
+            if previous.receipt_sha256 != receipt:
                 raise ValueError("duplicate staged query has different frozen inputs")
         object.__setattr__(self, "inputs", rows)
-        object.__setattr__(self, "_by_query", by_query)
+        object.__setattr__(self, "_snapshots", tuple(snapshots))
+        object.__setattr__(self, "_by_query", MappingProxyType(by_query))
 
     def analysis_identity_payload(self) -> Mapping[str, object]:
         return {
@@ -567,7 +603,7 @@ class FrozenLegacyDiffuseInputProvider:
             "max_sources": self.max_sources,
             "rrf_constant": self.rrf_constant,
             "frozen_query_receipts_sha256": identity_sha256(
-                [item.receipt_sha256 for item in self.inputs]
+                [item.receipt_sha256 for item in self._snapshots]
             ),
         }
 
@@ -590,18 +626,19 @@ class FrozenLegacyDiffuseInputProvider:
         universe, streams_sha256 = _source_streams_identity(condenser)
         if universe != row.universe_source_ids or streams_sha256 != row.source_streams_sha256:
             raise RuntimeError("source corpus changed after staged acquisition")
+        anchors = row.materialize_anchors()
         scope = build_episode_source_candidate_scope(
             artifact_id=artifact_id,
             snapshot=condenser.discourse.snapshot(),
             query=normalized_query,
-            anchors=row.anchors,
+            anchors=anchors,
             lexical_sources=row.lexical_sources,
             universe_source_ids=row.universe_source_ids,
             max_sources=self.max_sources,
             rrf_constant=self.rrf_constant,
         )
         return LegacyDiffuseCandidates(
-            anchors=row.anchors,
+            anchors=anchors,
             source_candidate_scope=scope,
         )
 

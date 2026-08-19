@@ -196,6 +196,7 @@ class EmbeddingService:
         self._device = device
         self._batch_size = batch_size
         self._model: SentenceTransformer | None = None
+        self._verified_checkpoint_sha256: str | None = None
         self._dim: int | None = None
 
     def _load_model(self) -> SentenceTransformer:
@@ -208,6 +209,7 @@ class EmbeddingService:
             if self._model_revision is not None:
                 kwargs["revision"] = self._model_revision
             model = SentenceTransformer(self._model_name, **kwargs)
+            verified_checkpoint_sha256: str | None = None
             if self._verify_checkpoint:
                 try:
                     actual = verify_bge_m3_checkpoint()
@@ -217,6 +219,8 @@ class EmbeddingService:
                 if self._checkpoint_sha256 and actual != self._checkpoint_sha256:
                     del model
                     raise ValueError("loaded BGE-M3 checkpoint identity mismatch")
+                verified_checkpoint_sha256 = actual
+            self._verified_checkpoint_sha256 = verified_checkpoint_sha256
             self._model = model
         return self._model
 
@@ -285,6 +289,7 @@ class EmbeddingService:
 
         model = self._model
         self._model = None
+        self._verified_checkpoint_sha256 = None
         if model is None:
             return
         del model

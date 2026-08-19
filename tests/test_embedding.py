@@ -189,6 +189,9 @@ def test_default_model_load_is_revision_pinned_and_hash_verified(monkeypatch):
             {"device": "cpu", "revision": DEFAULT_MODEL_REVISION},
         )
     ]
+    assert svc._verified_checkpoint_sha256 == BGE_M3_CHECKPOINT_SHA256
+    svc.close()
+    assert svc._verified_checkpoint_sha256 is None
 
 
 def test_unpinned_embedding_cannot_claim_pinned_checkpoint_verification():

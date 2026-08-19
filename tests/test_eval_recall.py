@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memory_condense import decay
+from memory_condense.domain import decay
 from memory_condense.eval.recall import (
     QuestionRecall,
     answer_value_component_coverage,
@@ -17,8 +17,8 @@ from memory_condense.eval.recall import (
     run_recall,
 )
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
-from memory_condense.schemas import (
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.domain.schemas import (
     CreateOp,
     MemoryType,
     PackedContext,
@@ -237,7 +237,7 @@ def _item(content: str, turns_old: float, importance: float = 0.8):
         provenance=[Provenance(turn_id="t1", quote=content)],
         importance=importance,
     )
-    from memory_condense.schemas import MemoryItem
+    from memory_condense.domain.schemas import MemoryItem
 
     return MemoryItem(
         type=op.type,

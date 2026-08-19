@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from memory_condense.embedding import (
+from memory_condense.modeling.embedding import (
     BGE_M3_CHECKPOINT_SHA256,
     DEFAULT_MODEL_NAME,
     DEFAULT_MODEL_REVISION,
@@ -25,7 +25,7 @@ from memory_condense.eval.compiled_cache import (
 )
 from memory_condense.eval.cache_receipts import canonical_sha256
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 
 
 class CountingEmbedder:

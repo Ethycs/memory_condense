@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from memory_condense.embedding import EmbeddingService
+from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.eval.compiled_cache import compiled_store_ingest_fn
 from memory_condense.eval.locked_split import (
     file_sha256,
@@ -17,7 +17,7 @@ from memory_condense.eval.transition_trace import (
     build_transition_trace,
     save_transition_trace,
 )
-from memory_condense.loader import load_benchmark
+from memory_condense.ingest.loader import load_benchmark
 
 
 parser = argparse.ArgumentParser(description=__doc__)

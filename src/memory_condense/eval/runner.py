@@ -7,9 +7,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from memory_condense._tokenizer import count_tokens
-from memory_condense.condenser import MemoryCondenser
-from memory_condense.context_packer import ContextBudget
+from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.search.packing.context_packer import ContextBudget
 from memory_condense.eval.judge import judge_response_with_usage
 from memory_condense.eval.responder import (
     SYSTEM_PROMPT,

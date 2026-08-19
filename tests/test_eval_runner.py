@@ -271,7 +271,7 @@ def test_hybrid_run_filenames_are_distinct(tmp_path):
 
 
 def _run_memory_mode(config, tmp_path):
-    from memory_condense.schemas import PackedContext
+    from memory_condense.domain.schemas import PackedContext
 
     with patch("memory_condense.eval.runner.MemoryCondenser") as mock_cls, patch(
         "memory_condense.eval.responder.litellm"
@@ -361,7 +361,7 @@ def test_memory_mode_records_the_header_drop_count(tmp_path):
     with patch("memory_condense.eval.runner.MemoryCondenser") as mock_cls, patch(
         "memory_condense.eval.responder.litellm"
     ) as mock_resp, patch("memory_condense.eval.judge.litellm") as mock_judge:
-        from memory_condense.schemas import PackedContext
+        from memory_condense.domain.schemas import PackedContext
 
         mock_resp.completion.side_effect = _mock_responder_completion
         mock_judge.completion.side_effect = _mock_judge_completion

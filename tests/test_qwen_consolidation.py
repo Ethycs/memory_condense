@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from memory_condense.consolidation import ConsolidationUpdate
-from memory_condense.head_memory import MemoryLinkHit, MemoryLinkResult
-from memory_condense.qwen_consolidation import (
+from memory_condense.associations.consolidation import ConsolidationUpdate
+from memory_condense.associations.head_memory import MemoryLinkHit, MemoryLinkResult
+from memory_condense.tooling.qwen_consolidation import (
     build_parser,
     consolidate_packed_context,
 )
-from memory_condense.schemas import PackedContext
+from memory_condense.domain.schemas import PackedContext
 
 
 class FakeQwenLinker:

@@ -55,9 +55,9 @@ def _data_dir() -> Path:
 
 def _collect() -> list[str]:
     """Pinned first, then hottest. No embedding, no reheating."""
-    from memory_condense.db import Database
-    from memory_condense.decay import item_energy
-    from memory_condense.memory_store import MemoryStore
+    from memory_condense.persistence.db import Database
+    from memory_condense.domain.decay import item_energy
+    from memory_condense.persistence.memory_store import MemoryStore
 
     db_path = _data_dir() / "memory.db"
     if not db_path.exists():

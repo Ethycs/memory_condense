@@ -5,8 +5,8 @@ import sqlite3
 import numpy as np
 import pytest
 
-from memory_condense.association_store import AssociationArtifact, AssociationStore
-from memory_condense.db import Database
+from memory_condense.associations.association_store import AssociationArtifact, AssociationStore
+from memory_condense.persistence.db import Database
 
 
 def _artifact(**updates) -> AssociationArtifact:

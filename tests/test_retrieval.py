@@ -3,10 +3,10 @@ import json
 import numpy as np
 import pytest
 
-from memory_condense.ranking import blend_hybrid
-from memory_condense.retrieval import SimilarityRetriever
-from memory_condense.schemas import Chunk
-from memory_condense.transcript_store import TranscriptStore
+from memory_condense.domain.ranking import blend_hybrid
+from memory_condense.search.indexes.retrieval import SimilarityRetriever
+from memory_condense.domain.schemas import Chunk
+from memory_condense.persistence.transcript_store import TranscriptStore
 
 DIM = 16
 
@@ -594,7 +594,7 @@ def _vector_query(components: dict[int, float]) -> np.ndarray:
 
 def _seed(retriever, db, prefix, n, dim=8):
     """Add n chunks through `retriever`, returning their ids."""
-    from memory_condense.schemas import Chunk, Turn
+    from memory_condense.domain.schemas import Chunk, Turn
 
     ids = []
     for i in range(n):
@@ -622,8 +622,8 @@ def _seed(retriever, db, prefix, n, dim=8):
 
 def test_two_retrievers_on_one_store_do_not_collide(tmp_path):
     """The regression: the second writer used to raise IntegrityError."""
-    from memory_condense.db import Database
-    from memory_condense.retrieval import SimilarityRetriever
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
 
     db_path = tmp_path / "shared.db"
     db_a, db_b = Database(db_path), Database(db_path)
@@ -648,8 +648,8 @@ def test_two_retrievers_on_one_store_do_not_collide(tmp_path):
 
 def test_a_session_adopts_another_sessions_writes(tmp_path):
     """SQLite is the source of truth, so a live session must reconcile to it."""
-    from memory_condense.db import Database
-    from memory_condense.retrieval import SimilarityRetriever
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
 
     db_path = tmp_path / "shared.db"
     db_a, db_b = Database(db_path), Database(db_path)
@@ -670,8 +670,8 @@ def test_a_session_adopts_another_sessions_writes(tmp_path):
 
 def test_label_counter_repairs_a_store_written_before_it_existed(tmp_path):
     """Older stores have labels but no counter row; allocation must not reuse them."""
-    from memory_condense.db import Database
-    from memory_condense.retrieval import SimilarityRetriever
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
 
     db = Database(tmp_path / "legacy.db")
     retriever = SimilarityRetriever(db=db, dim=8, index_path=tmp_path / "i.bin")

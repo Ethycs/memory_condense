@@ -8,8 +8,8 @@ their source/evidence identities disjoint.
 
 from __future__ import annotations
 
-from memory_condense._tokenizer import count_tokens
-from memory_condense.loader import BenchmarkSample
+from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.ingest.loader import BenchmarkSample
 
 
 def transcript_tokens(sample: BenchmarkSample) -> int:

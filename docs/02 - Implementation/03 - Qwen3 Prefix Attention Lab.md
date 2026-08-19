@@ -101,7 +101,7 @@ peak CUDA allocation: 3,956,855,296 bytes
 ## 4. Python interface
 
 ```python
-from memory_condense.qwen_prefix import Qwen3PrefixEncoder, mean_pool_residual
+from memory_condense.modeling.qwen_prefix import Qwen3PrefixEncoder, mean_pool_residual
 
 encoder = Qwen3PrefixEncoder(
     ".cache/models/Qwen3-8B",

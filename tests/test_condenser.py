@@ -14,8 +14,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from memory_condense.association_store import AssociationArtifact
-from memory_condense.condenser import (
+from memory_condense.associations.association_store import AssociationArtifact
+from memory_condense.application.condenser import (
     MemoryCondenser,
     is_multi_fact_query,
     query_facets,
@@ -23,10 +23,10 @@ from memory_condense.condenser import (
     role_aware_results,
     source_diverse_results,
 )
-from memory_condense.consolidation import ConsolidationNode
-from memory_condense.context_packer import ContextBudget
-from memory_condense.head_memory import MemoryLinkHit, MemoryLinkResult
-from memory_condense.schemas import (
+from memory_condense.associations.consolidation import ConsolidationNode
+from memory_condense.search.packing.context_packer import ContextBudget
+from memory_condense.associations.head_memory import MemoryLinkHit, MemoryLinkResult
+from memory_condense.domain.schemas import (
     Chunk,
     MemoryOps,
     MemoryStatus,
@@ -839,7 +839,7 @@ class TestIngest:
                 return list(memories), list(reversed(expansions))
 
             monkeypatch.setattr(
-                "memory_condense.condenser.expand_context_associations",
+                "memory_condense.application.condenser.expand_context_associations",
                 reorder_after_prevalidation,
             )
             small.build_context(
@@ -869,7 +869,7 @@ class TestIngest:
                 return list(memories), changed
 
             monkeypatch.setattr(
-                "memory_condense.condenser.expand_context_associations",
+                "memory_condense.application.condenser.expand_context_associations",
                 mutate_audited_route,
             )
             small.build_context(

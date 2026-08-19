@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from memory_condense.head_memory import MemoryLinkHit, NestedMemoryInspection
-from memory_condense.qwen_rerank import QwenCandidateReranker, _qk_ov_cav_utility
-from memory_condense.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.associations.head_memory import MemoryLinkHit, NestedMemoryInspection
+from memory_condense.search.selectors.qwen_rerank import QwenCandidateReranker, _qk_ov_cav_utility
+from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
 
 
 def _result(index: int, *, source_id: str = "source-a") -> RetrievalResult:

@@ -3,9 +3,9 @@ from datetime import timedelta
 import numpy as np
 import pytest
 
-from memory_condense import decay
-from memory_condense.memory_store import MemoryStore
-from memory_condense.schemas import (
+from memory_condense.domain import decay
+from memory_condense.persistence.memory_store import MemoryStore
+from memory_condense.domain.schemas import (
     CreateOp,
     DeleteOp,
     Heat,
@@ -19,8 +19,8 @@ from memory_condense.schemas import (
     UpdateOp,
     ValidationReport,
 )
-from memory_condense.transcript_store import TranscriptStore
-from memory_condense.validator import Validator
+from memory_condense.persistence.transcript_store import TranscriptStore
+from memory_condense.ingest.validator import Validator
 
 TEXT = "I prefer dark mode. We decided to use Postgres for storage."
 

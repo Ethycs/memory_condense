@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from memory_condense.head_memory import (
+from memory_condense.associations.head_memory import (
     AssociativeMemoryCandidate,
     CAVLinkIndex,
     HeadAssociationGraph,

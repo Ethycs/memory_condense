@@ -11,8 +11,8 @@ from types import ModuleType
 import numpy as np
 import pytest
 
-import memory_condense.embedding as embedding_module
-from memory_condense.embedding import (
+import memory_condense.modeling.embedding as embedding_module
+from memory_condense.modeling.embedding import (
     BGE_M3_CHECKPOINT_SHA256,
     DEFAULT_MODEL_DIM,
     DEFAULT_MODEL_NAME,
@@ -20,7 +20,7 @@ from memory_condense.embedding import (
     EmbeddingService,
     verify_bge_m3_checkpoint,
 )
-from memory_condense.schemas import Chunk
+from memory_condense.domain.schemas import Chunk
 
 
 class FakeModel:

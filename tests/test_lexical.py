@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from memory_condense.lexical import (
+from memory_condense.search.indexes.lexical import (
     BM25_B,
     BM25_K1,
     STOPWORDS,
@@ -12,8 +12,8 @@ from memory_condense.lexical import (
     term_frequencies,
     tokenize,
 )
-from memory_condense.schemas import Chunk
-from memory_condense.transcript_store import TranscriptStore
+from memory_condense.domain.schemas import Chunk
+from memory_condense.persistence.transcript_store import TranscriptStore
 
 
 def _make_chunk(turn_id: str, text: str) -> Chunk:

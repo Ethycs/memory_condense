@@ -6,12 +6,12 @@ import argparse
 import json
 from pathlib import Path
 
-from memory_condense.embedding import EmbeddingService
+from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.eval.compiled_cache import compiled_store_ingest_fn
 from memory_condense.eval.locked_split import load_split_manifest, select_locked_split
 from memory_condense.eval.recall import contains_answer
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
-from memory_condense.loader import load_benchmark
+from memory_condense.ingest.loader import load_benchmark
 
 
 def main() -> None:

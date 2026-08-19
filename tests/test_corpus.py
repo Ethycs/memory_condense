@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from memory_condense.corpus import (
+from memory_condense.ingest.corpus import (
     build_conversation_recall_slice,
     load_corpus_directory,
     parse_chatgpt_json,

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_condense._tokenizer import tokenizer_proxy_identity
+from memory_condense.domain._tokenizer import tokenizer_proxy_identity
 from memory_condense.eval.campaign import (
     CampaignMergeError,
     build_locked_validation_plan,

@@ -10,7 +10,7 @@ import zlib
 import numpy as np
 import pytest
 
-from memory_condense.condenser import MemoryCondenser
+from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.eval.consolidation_replay import (
     FrozenQueryEmbedder,
     _source_rows,
@@ -25,8 +25,8 @@ from memory_condense.eval.causal_benchmark import (
     causal_consolidation_ingest_fn,
 )
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
-from memory_condense.schemas import Chunk
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.domain.schemas import Chunk
 
 
 class ReplayEmbedder:

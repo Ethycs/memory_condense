@@ -15,7 +15,7 @@ from memory_condense.eval.transition_trace import (
     save_transition_trace,
     score_transition_arm,
 )
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 
 
 class TraceEmbedder:

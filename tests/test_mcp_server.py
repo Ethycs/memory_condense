@@ -12,14 +12,14 @@ import asyncio
 
 import pytest
 
-from memory_condense import mcp_server
+from memory_condense.interfaces import mcp_server
 from tests.test_condenser import FakeEmbedder
 
 
 @pytest.fixture
 def server(tmp_path, monkeypatch):
     """Point the server at a temp store backed by a fake embedder."""
-    from memory_condense.condenser import MemoryCondenser
+    from memory_condense.application.condenser import MemoryCondenser
 
     monkeypatch.setenv("MEMORY_CONDENSE_DATA_DIR", str(tmp_path / "store"))
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)

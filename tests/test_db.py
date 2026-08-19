@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from memory_condense.db import CURRENT_SCHEMA_VERSION, Database
+from memory_condense.persistence.db import CURRENT_SCHEMA_VERSION, Database
 
 # The v1 schema exactly as it shipped in cd9f423, used to build a legacy
 # database and prove the migration path works on real pre-existing files.
@@ -247,7 +247,7 @@ class TestSchemaParity:
 
     def test_fresh_matches_migrated_from_v2(self, tmp_path):
         """v2 is what a store written before this change actually looks like."""
-        from memory_condense.db import _MIGRATIONS
+        from memory_condense.persistence.db import _MIGRATIONS
 
         v2_sql = _V1_SCHEMA.replace(
             "INSERT INTO meta (key, value) VALUES ('schema_version', '1');", ""
@@ -271,7 +271,7 @@ class TestV4TurnCoordinateBackfill:
 
     @pytest.fixture
     def v3_db_path(self, tmp_path):
-        from memory_condense.db import _MIGRATIONS
+        from memory_condense.persistence.db import _MIGRATIONS
 
         path = tmp_path / "v3.db"
         sql = (
@@ -323,8 +323,8 @@ class TestV4TurnCoordinateBackfill:
 
     def test_existing_memories_enter_fresh_not_cold(self, v3_db_path):
         """The whole point of backfilling to the latest turn rather than 0."""
-        from memory_condense import decay
-        from memory_condense.memory_store import MemoryStore
+        from memory_condense.domain import decay
+        from memory_condense.persistence.memory_store import MemoryStore
 
         with Database(v3_db_path) as db:
             item = MemoryStore(db).get("m1")
@@ -338,7 +338,7 @@ class TestV4TurnCoordinateBackfill:
             assert db.current_turn() == 0
 
     def test_appending_advances_the_clock(self, tmp_path):
-        from memory_condense.transcript_store import TranscriptStore
+        from memory_condense.persistence.transcript_store import TranscriptStore
 
         with Database(tmp_path / "advance.db") as db:
             store = TranscriptStore(db)
@@ -349,7 +349,7 @@ class TestV4TurnCoordinateBackfill:
     def test_the_clock_is_max_not_count(self, tmp_path):
         """A count would renumber backwards if a row ever went missing, aging
         every memory item at once. MAX only ever moves forward."""
-        from memory_condense.transcript_store import TranscriptStore
+        from memory_condense.persistence.transcript_store import TranscriptStore
 
         with Database(tmp_path / "gap.db") as db:
             store = TranscriptStore(db)

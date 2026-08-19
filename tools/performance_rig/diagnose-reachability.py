@@ -6,9 +6,9 @@ import argparse
 import json
 from pathlib import Path
 
-from memory_condense.association_store import AssociationStore
-from memory_condense.db import Database
-from memory_condense.experiment_rig import load_anchor_pack
+from memory_condense.associations.association_store import AssociationStore
+from memory_condense.persistence.db import Database
+from memory_condense.tooling.experiment_rig import load_anchor_pack
 
 
 parser = argparse.ArgumentParser(description=__doc__)

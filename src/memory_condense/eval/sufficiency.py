@@ -15,7 +15,7 @@ from typing import Callable
 
 from pydantic import BaseModel, Field
 
-from memory_condense._tokenizer import count_tokens
+from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.eval.benchmark import (
     IngestFn,
     cap_context_to_prompt_budget,
@@ -24,7 +24,7 @@ from memory_condense.eval.benchmark import (
 )
 from memory_condense.eval.recall import _assemble, contains_answer
 from memory_condense.eval.schemas import EvalConfig, UsageStats
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 
 
 SUFFICIENCY_SYSTEM_PROMPT = (

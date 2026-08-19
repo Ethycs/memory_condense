@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from memory_condense.transition_policy import (
+from memory_condense.associations.transition_policy import (
     CausalTransitionPolicy,
     TransitionCandidate,
 )

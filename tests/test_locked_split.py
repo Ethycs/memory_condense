@@ -9,7 +9,7 @@ from memory_condense.eval.locked_split import (
     file_sha256,
     select_locked_split,
 )
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 
 
 def _samples(n: int) -> list[BenchmarkSample]:

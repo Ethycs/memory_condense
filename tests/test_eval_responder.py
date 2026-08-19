@@ -6,7 +6,7 @@ from memory_condense.eval.responder import (
     generate_response,
     generate_response_with_usage,
 )
-from memory_condense.schemas import Chunk, RetrievalResult
+from memory_condense.domain.schemas import Chunk, RetrievalResult
 
 
 def _mock_response(content: str, prompt_tokens: int = 0, completion_tokens: int = 0):

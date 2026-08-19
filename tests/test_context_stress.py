@@ -1,11 +1,11 @@
 import pytest
 
-from memory_condense._tokenizer import count_tokens
+from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.eval.context_stress import (
     compose_context_stress_sample,
     transcript_tokens,
 )
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 
 
 def _sample(sample_id: str, text: str) -> BenchmarkSample:

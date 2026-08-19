@@ -9,6 +9,13 @@ This tree follows the folder system in the style guide: each numbered folder is 
 
 > **Built and locally measured; external competitiveness remains open.** A ten-question LongMemEval-S development pilot reached 10/10 judge accuracy. The final v3 no-provider replay then reached 100% raw/packed source coverage and 11/11 scored answer-value components with a mean 1,986-token context from a 1,039,203-token transcript proxy. Prompt accounting is now explicitly a frozen local proxy with provider-usage postchecks. This is development evidence, not the required held-out minimum-100-question validation or a completed Mem0 comparison. `git log --oneline` and the machine-readable artifacts remain the authority over prose.
 
+> **Code/evidence boundary.** The organized source tree is implementation epoch
+> v4. Frozen validation-v3 evidence still certifies commit
+> `bfa5b6daf6a5e61881ac10f0555e5d9972f9e1c2` and implementation SHA
+> `452be3bfa7524bb81676c7abcb032529a32a480311d24d1e17f8513c783ecd83`.
+> Because the implementation digest includes package-relative paths, v3 caches
+> cannot be relabeled for v4; see `03 - Architecture/03 - Code Package Layout.md`.
+
 ## Reconciliation state (2026-08-16)
 
 | Doc | Reconciled? | Substance of the change |
@@ -21,6 +28,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `03 - Architecture/00 - System Overview.md` | ✅ | Diagram and every subsystem rewritten; "there is no condensation yet" was false |
 | `03 - Architecture/01 - Native Hypergraph Memory Plane.md` | **new / proposed** | Event-centric hypergraph for live QK/OV/CAV observations, with the measured pairwise graph retained as a bounded serving projection; no durable request-derived transformer token state (static model/tokenizer assets excluded) |
 | `03 - Architecture/02 - Query-Conditioned Bayesian Coverage Loop.md` | **implemented / prefix measurement pending** | Primary full-width Qwen3-8B layers 0–5 with layer-5 QK/OV transport-affinity grouping; secondary compact-INI classifier; recall-safe coverage ordering and zero durable transformer state |
+| `03 - Architecture/03 - Code Package Layout.md` | **new / current** | Maps responsibility packages and the objects → transformations → stateful-workflows rule, stable facades, canonical imports, size gates, and the path-sensitive validation-v3 → implementation-v4 evidence boundary |
 | `04 - Reference/01 - Vocabulary.md` | ✅ | Lifecycle + retrieval terms moved out of *(planned)*; BM25/hybrid/α/`term_count`/`UsageStats`/F1/provenance added |
 | `05 - Standards/00 - MC-STD-DATA-v0.md` | ✅ | Schema v2 + migration path; new normative clauses 8–10 (provenance, no destruction, migrate-in-place). Still **DRAFT** |
 | `06 - Roadmaps/00 - Gap Analysis and Roadmap.md` | ✅ | Status table and tiers rewritten; Decision Point now *unblocked* but still *open*. **Partly superseded 2026-08-15** — see below |
@@ -28,6 +36,8 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `00 - Theory/00 …` | — | Not touched; stable by policy (corrections only) |
 | `00 - Theory/01 …` | **new draft** | Extracted-head associative memory with CAV/J-Space concepts, QK routing, OV transport, live-head pruning, and a falsification sequence; the prefix prototype now has a locked local token-saving result but no fresh recall gain |
 | `00 - Theory/03 …` | **implemented / locally measured** | Schema-v9 prompt/response binding across typed memories and evidence; repeated activation, turn decay, bounded two-hop reads, and transient CAV/QK/OV weighting |
+| `00 - Theory/04 - From Top-K Recall to Proof-Carrying Factual Retrieval.md` | **implemented / development-evidenced** | Separates reachability, event identity, packet sufficiency, role/time integrity, and proof scope; explains the structural scan, scalar bypass, event deduplication, scoped closure, and reproducibility repairs |
+| `00 - Theory/05 - EM-LLM Episodic Discourse Closure for Diffuse Retrieval.md` | **adopted design / unbuilt** | Adapts EM-LLM surprise segmentation, graph-refined episodes, and similarity-plus-contiguity recall to source-grounded discourse obligations and atomic evidence bundles with zero persisted transformer token state |
 | `04 - Reference/00 - Competitive Landscape 2026.md` | — | Not touched this pass |
 | `08 - Analysis/00 - Retrieval Ablation…` | ✅ | Sweep corrected to 54 configs; a position-bin analysis was added and then **retracted the same day** — it does not replicate on the second run pair, and every bin-to-bin difference is inside noise. The aggregate ablation result stands |
 | `08 - Analysis/01 - Extraction and Decay Audit` | **new** | 70.6% of memory items never reach the prompt; COLD is unreachable by construction; the default extractor is 65% spurious `Constraint`s. All free, all previously unmeasured |
@@ -40,16 +50,17 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `10 - Research Log/09 - 2026-08-16 - Causal binding reaches 97.4 percent evidence recall.md` | **new development replay** | Four-arm chronological replay: original 35/39, packing-only 36/39, rank graph 37/39, Qwen graph 38/39 with no losses and zero retained transformer-state bytes; answer-stage evaluation remains open |
 | `10 - Research Log/15 - 2026-08-18 - Policy-locked 1M-context answer pilot.md` | **development pilot** | Ten of ten LongMemEval-S answers passed the independent judge; mean responder prompt 2,342 tokens from 1,039,203 transcript tokens; selected-scope closure is non-global and ≥100 held-out validation remains open |
 | `10 - Research Log/16 - 2026-08-18 - V3 retrieval freeze and validation campaign.md` | **frozen development treatment** | Final no-provider replay reached 100% source and scored answer-value coverage at a mean 1,986 returned tokens; exact cache receipts, prompt-proxy identity, a 100-question campaign plan, and the corrected Mem0 protocol are frozen, but no held-out provider calls have run |
+| `10 - Research Log/17 - 2026-08-18 - Locked treatment handoff and discourse closure frontier.md` | **operational handoff / incomplete goal** | Consolidates the treatment, ten prepared cache shards, hard invariants, controlled Mem0 tooling, current test evidence, explicit NO-GO boundaries, and the proposed general-purpose Grounded Discourse Closure RAG design |
 | `07 - Status Reports/…` | ✅ | Three dated handoffs; **2026-08-15 is the current one** and supersedes the earlier test counts (48 → 366 → 523) |
 
 ## The tree
 
 ```
 docs/
-├── 00 - Theory/           Retrieval-weighted context plus extracted-head associative memory
+├── 00 - Theory/           Retrieval, proof-carrying coverage, associative memory, and episodic closure
 ├── 01 - Design/           The original architecture plan + eval design rationale
 ├── 02 - Implementation/   Setup, the four eval modes, and MCP/Claude Code integration
-├── 03 - Architecture/     The as-built system map plus the proposed hypergraph memory plane
+├── 03 - Architecture/     The as-built system map, package layout, and proposed hypergraph memory plane
 ├── 04 - Reference/        External landscape (SimpleMem, Mem0, MemDelta…) + vocabulary
 ├── 05 - Standards/        Normative data contracts (SQLite v2, embedding, memory provenance, formats)
 ├── 06 - Roadmaps/         Gap analysis: designed vs. built vs. measured, tiered next steps
@@ -78,6 +89,9 @@ docs/
 
 - Resuming cold? → **`06 - Roadmaps/01 - Delivering the Specified System.md` first** — it explains why every memory-arm number on record is void and what order the remaining work has to happen in. Then `07 - Status Reports/2026-08-15_retrieval-measurement-session.md` for the retrieval half, which still stands.
 - "What does the system do?" → `03 - Architecture/00 - System Overview.md`.
+- "How did factual retrieval improve, and what remains unproven?" → `00 - Theory/04 - From Top-K Recall to Proof-Carrying Factual Retrieval.md`.
+- "How will diffuse evidence use EM-LLM?" → `00 - Theory/05 - EM-LLM Episodic Discourse Closure for Diffuse Retrieval.md` — surprise-refined episodes and temporal contiguity feed source-grounded obligation closure; this is adopted design, not yet an implementation result.
+- "Where does the code live, and which imports are supported?" → `03 - Architecture/03 - Code Package Layout.md`.
 - "How would a native hypergraph interact with live memory?" → `03 - Architecture/01 - Native Hypergraph Memory Plane.md` — canonical higher-order observations, pairwise serving projections, bounded traversal, and event-aware pruning.
 - "How are complete sets deduplicated without losing distinct events?" → `03 - Architecture/02 - Query-Conditioned Bayesian Coverage Loop.md` — a primary six-layer Qwen3-8B QK/OV affinity arm plus a secondary compact-INI classifier, followed by recall-safe representative-first packing; the locked baseline isolates a 100%-raw versus 94.7%-packed gap and the prefix treatment is pending measurement.
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
@@ -96,10 +110,16 @@ docs/
 - "Did causal Qwen consolidation improve the operational long-chat probe?" → `10 - Research Log/09 - 2026-08-16 - Causal binding reaches 97.4 percent evidence recall.md` — yes on the locked local literal-evidence test (38/39, no regressions); answer-stage judged LongMemEval remains the primary gate.
 - "Did it answer LongMemEval questions from a 1M-token chat?" → `10 - Research Log/15 - 2026-08-18 - Policy-locked 1M-context answer pilot.md` — yes, 10/10 on the development pilot with a mean 2,342-token legacy local prompt proxy; provider input usage was unavailable, and held-out scale plus the Mem0 comparison remain open.
 - "What is the frozen v3 treatment and validation plan?" → `10 - Research Log/16 - 2026-08-18 - V3 retrieval freeze and validation campaign.md` — the final no-provider replay, exact artifact/cache identities, ten-shard held-out plan, prompt-proxy semantics, and corrected Mem0 comparison boundary.
+- "What is operational now, what is still unmeasured, and what comes next?" → `10 - Research Log/17 - 2026-08-18 - Locked treatment handoff and discourse closure frontier.md` — the current readiness matrix, exact invariants and hashes, Mem0 production NO-GO, authorization gates, and the general-purpose diffuse-retrieval design.
 
 ## The one distinction this tree tries hardest to keep
 
 **Built ≠ measured, and locally measured ≠ externally competitive.** Passing tests establish implementation behavior. The local analyses and research logs establish only their stated datasets, splits, and metrics. The QK/CAV result currently supports token saving with recall non-regression on one locked fresh split; it does not support a general recall-gain claim. Any broader claim without a public benchmark is a bug — report it.
+
+Dated status reports, analyses, research logs, and frozen scripts may cite the
+flat module paths that existed when their artifacts were produced. Active code
+examples use the canonical v4 package paths; historical evidence is not
+mechanically rewritten.
 
 ---
 

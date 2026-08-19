@@ -33,7 +33,7 @@ from memory_condense.eval.schemas import (
     RetrievalConfig,
     UsageStats,
 )
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample, load_benchmark
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample, load_benchmark
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -253,7 +253,7 @@ def test_source_mode_reaches_the_benchmark_prompt():
 
 
 def test_prompt_budget_caps_and_truncates_context():
-    from memory_condense._tokenizer import count_chat_prompt_token_proxy
+    from memory_condense.domain._tokenizer import count_chat_prompt_token_proxy
 
     uncapped = ["Boston " * 200, "Pepper " * 200]
     # Leave room for the fixed provenance/update instructions while still

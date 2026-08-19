@@ -13,9 +13,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from memory_condense.condenser import MemoryCondenser
-from memory_condense.db import CURRENT_SCHEMA_VERSION, Database
-from memory_condense.embedding import DEFAULT_MODEL_NAME, EmbeddingService
+from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.persistence.db import CURRENT_SCHEMA_VERSION, Database
+from memory_condense.modeling.embedding import DEFAULT_MODEL_NAME, EmbeddingService
 from memory_condense.eval.benchmark import IngestFn, ingest_sample
 from memory_condense.eval.cache_receipts import canonical_sha256
 from memory_condense.eval.reproducibility import (
@@ -24,7 +24,7 @@ from memory_condense.eval.reproducibility import (
 )
 from memory_condense.eval.sample_identity import sample_sha256
 from memory_condense.eval.schemas import EvalConfig
-from memory_condense.loader import BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkSample
 
 
 CACHE_FORMAT = "memory-condense-compiled-benchmark-store-v1"

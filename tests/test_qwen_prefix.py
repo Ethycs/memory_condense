@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_condense.qwen_prefix import (
+from memory_condense.modeling.qwen_prefix import (
     DEFAULT_MODEL_ID,
     DEFAULT_MODEL_REVISION,
     FIRST_SHARD,

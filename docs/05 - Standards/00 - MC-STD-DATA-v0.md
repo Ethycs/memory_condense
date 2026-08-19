@@ -144,7 +144,7 @@ Filename: `benchmark_{label}_{min}-{max}_k{k}_ef{ef}_{YYYYMMDD_HHMMSS}.json`. *(
 
 ```powershell
 pixi run -e dev pytest -q -m "not slow" tests/test_db.py tests/test_memory_store.py tests/test_validator.py tests/test_lexical.py
-pixi run python -c "import sqlite3, tempfile, pathlib; from memory_condense.db import Database; p=pathlib.Path(tempfile.mkdtemp())/'v.db'; d=Database(p); print(d.schema_version); print(sorted(r[0] for r in d.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")))"
+pixi run python -c "import sqlite3, tempfile, pathlib; from memory_condense.persistence.db import Database; p=pathlib.Path(tempfile.mkdtemp())/'v.db'; d=Database(p); print(d.schema_version); print(sorted(r[0] for r in d.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")))"
 ```
 
 Expect `9` and a table list containing the transcript, chunk/BM25, memory/provenance, CAV/QK/OV, v7 Hebbian, and v8 consolidation tables; schema v9 adds `consolidation_edges.causal_count`.

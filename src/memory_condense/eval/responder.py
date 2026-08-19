@@ -7,7 +7,7 @@ import time
 import litellm
 
 from memory_condense.eval.schemas import DEFAULT_RESPONDER_MODEL, UsageStats
-from memory_condense.schemas import RetrievalResult
+from memory_condense.domain.schemas import RetrievalResult
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant. You have access to a memory system that "

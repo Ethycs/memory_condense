@@ -1,7 +1,7 @@
 # memory_condense System Overview (as-built)
 
 **Status**: CURRENT
-**Date**: 2026-08-16
+**Date**: 2026-08-18
 **Supersedes**: the earlier 2026-08-14 "dense-retrieval-only / no condensation yet" version of this document, which described the tree at commit `cd9f423`
 **Applies to**: the current working tree — core memory, compiled Qwen
 association artifacts, bounded associative reads, eval harness, and MCP server.
@@ -333,8 +333,9 @@ provider-agnostic, while public common-benchmark validation remains open.
 
 ```powershell
 pixi run --frozen -e dev pytest -q -m "not slow"
-pixi run python -c "from memory_condense.db import Database; import tempfile, pathlib; d=Database(pathlib.Path(tempfile.mkdtemp())/'v.db'); print('schema_version', d.schema_version)"
+pixi run python -c "from memory_condense.persistence.db import Database; import tempfile, pathlib; d=Database(pathlib.Path(tempfile.mkdtemp())/'v.db'); print('schema_version', d.schema_version)"
 git log --oneline -1                            # expect merge f3edc91 on main
 ```
 
-Expect `schema_version 6`.
+Expect `schema_version 9`. Canonical package ownership and import paths are
+listed in [`03 - Code Package Layout.md`](03%20-%20Code%20Package%20Layout.md).

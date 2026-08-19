@@ -1,6 +1,6 @@
 import pytest
 
-from memory_condense.performance_events import (
+from memory_condense.search.packing.performance_events import (
     is_direct_past_performance,
     performance_event_key,
 )

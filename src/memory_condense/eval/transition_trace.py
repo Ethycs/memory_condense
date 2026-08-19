@@ -10,8 +10,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from memory_condense._tokenizer import count_tokens
-from memory_condense.embedding import EmbeddingService
+from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.eval.benchmark import (
     QA_SYSTEM_PROMPT,
     QA_USER_TEMPLATE,
@@ -21,7 +21,7 @@ from memory_condense.eval.benchmark import (
 )
 from memory_condense.eval.recall import best_f1, contains_answer
 from memory_condense.eval.schemas import EvalConfig
-from memory_condense.loader import BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkSample
 
 
 TRACE_FORMAT = "memory-condense-transition-candidate-trace-v1"

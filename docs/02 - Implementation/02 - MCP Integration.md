@@ -9,7 +9,7 @@ The memory system is exposed to Claude Code — and any other MCP client — as 
 
 | Half | Mechanism | What it does | Cost |
 | --- | --- | --- | --- |
-| **Active** | MCP server ([`mcp_server.py`](../../src/memory_condense/mcp_server.py)) | Eight tools the model calls when it decides memory is relevant. Full semantic + keyword retrieval. | One model load per server process (lazy) |
+| **Active** | MCP server ([`interfaces/mcp_server.py`](../../src/memory_condense/interfaces/mcp_server.py)) | Eight tools the model calls when it decides memory is relevant. Full semantic + keyword retrieval. | One model load per server process (lazy) |
 | **Passive** *(opt-in)* | `UserPromptSubmit` hook ([`memory_context_hook.py`](../../examples/claude_hooks/memory_context_hook.py)) | Prepends pinned and still-hot facts to every prompt. | Single-digit ms; **no embedding model at all** |
 
 The split is forced by how each runs. The MCP server is one long-lived process, so it can afford to hold bge-m3 in memory. A hook is a **fresh process on every prompt**, so semantic search there would reload a 2.3 GB model per turn. The hook therefore ranks by pin state and decayed energy only — pure SQLite. Query-specific recall is the `recall` tool's job, not the hook's.
@@ -49,7 +49,7 @@ The repo ships a **project-scoped** [`.mcp.json`](../../.mcp.json), so anyone wh
     "memory_condense": {
       "type": "stdio",
       "command": "pixi",
-      "args": ["run", "python", "-m", "memory_condense.mcp_server"]
+      "args": ["run", "python", "-m", "memory_condense.interfaces.mcp_server"]
     }
   }
 }
@@ -58,7 +58,7 @@ The repo ships a **project-scoped** [`.mcp.json`](../../.mcp.json), so anyone wh
 To register it for **every** project instead of just this one:
 
 ```powershell
-claude mcp add --scope user memory_condense -- pixi run python -m memory_condense.mcp_server
+claude mcp add --scope user memory_condense -- pixi run python -m memory_condense.interfaces.mcp_server
 ```
 
 The `--` is required: everything after it is passed to the server untouched. Manage it with `claude mcp list`, `claude mcp get memory_condense`, `claude mcp remove memory_condense`.
@@ -155,4 +155,4 @@ claude mcp list                              # expect memory_condense listed and
 pixi run -e dev pytest tests/test_mcp_server.py -q   # expect 38 passed
 ```
 
-Then, in a Claude Code session, ask it to store and retrieve a fact — the round trip through `remember` → `recall` is the real check. If `claude mcp list` shows the server as failed, run `pixi run python -m memory_condense.mcp_server` directly: it should start, log to stderr, and wait on stdin rather than exiting.
+Then, in a Claude Code session, ask it to store and retrieve a fact — the round trip through `remember` → `recall` is the real check. If `claude mcp list` shows the server as failed, run `pixi run python -m memory_condense.interfaces.mcp_server` directly: it should start, log to stderr, and wait on stdin rather than exiting.

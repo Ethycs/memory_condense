@@ -13,7 +13,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from memory_condense.loader import BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkSample
 
 
 class LockedSplitManifest(BaseModel):

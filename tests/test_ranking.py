@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from memory_condense.ranking import (
+from memory_condense.domain.ranking import (
     DEFAULT_WEIGHTS,
     RankWeights,
     blend_hybrid,
@@ -11,7 +11,7 @@ from memory_condense.ranking import (
     rank_score,
     top_k,
 )
-from memory_condense.schemas import PinState
+from memory_condense.domain.schemas import PinState
 
 # The decay kernel used to live here as `recency_score`, a second copy of the
 # exponential in decay.py. It now has one home; its tests moved with it to

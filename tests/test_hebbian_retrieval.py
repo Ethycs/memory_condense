@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from memory_condense.association_store import AssociationArtifact, AssociationStore
-from memory_condense.db import Database
-from memory_condense.hebbian_retrieval import expand_hebbian_results
-from memory_condense.schemas import Chunk, RetrievalResult
+from memory_condense.associations.association_store import AssociationArtifact, AssociationStore
+from memory_condense.persistence.db import Database
+from memory_condense.associations.hebbian_retrieval import expand_hebbian_results
+from memory_condense.domain.schemas import Chunk, RetrievalResult
 
 
 def _artifact() -> AssociationArtifact:

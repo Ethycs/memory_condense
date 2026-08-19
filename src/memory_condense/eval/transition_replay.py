@@ -20,7 +20,7 @@ from typing import Any, Sequence
 
 from pydantic import BaseModel, Field
 
-from memory_condense.transition_policy import (
+from memory_condense.associations.transition_policy import (
     CausalTransitionPolicy,
     TransitionCandidate,
 )

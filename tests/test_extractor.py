@@ -2,17 +2,17 @@ import json
 
 import pytest
 
-from memory_condense.extractor import (
+from memory_condense.ingest.extractor import (
     MEMORY_OPS_SYSTEM_PROMPT,
     RULES,
     LLMExtractor,
     RuleBasedExtractor,
     parse_memory_ops,
 )
-from memory_condense.memory_store import MemoryStore
-from memory_condense.schemas import Chunk, MemoryOps, MemoryType, Turn
-from memory_condense.transcript_store import TranscriptStore
-from memory_condense.validator import Validator
+from memory_condense.persistence.memory_store import MemoryStore
+from memory_condense.domain.schemas import Chunk, MemoryOps, MemoryType, Turn
+from memory_condense.persistence.transcript_store import TranscriptStore
+from memory_condense.ingest.validator import Validator
 
 
 @pytest.fixture

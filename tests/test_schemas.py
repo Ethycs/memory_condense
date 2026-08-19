@@ -1,4 +1,4 @@
-from memory_condense.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
 
 
 def test_turn_defaults():

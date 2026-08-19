@@ -17,11 +17,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from memory_condense._tokenizer import count_tokens
-from memory_condense.condenser import MemoryCondenser, query_facets
-from memory_condense.context_packer import ContextBudget
-from memory_condense.embedding import DEFAULT_MODEL_NAME, EmbeddingService
-from memory_condense.db import CURRENT_SCHEMA_VERSION
+from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.application.condenser import MemoryCondenser, query_facets
+from memory_condense.search.packing.context_packer import ContextBudget
+from memory_condense.modeling.embedding import DEFAULT_MODEL_NAME, EmbeddingService
+from memory_condense.persistence.db import CURRENT_SCHEMA_VERSION
 from memory_condense.eval.benchmark import IngestFn, ingest_sample
 from memory_condense.eval.compiled_cache import (
     _embedding_execution_identity,
@@ -41,7 +41,7 @@ from memory_condense.eval.reproducibility import (
     environment_lock_sha256,
     implementation_sha256,
 )
-from memory_condense.loader import BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkSample
 
 
 CAUSAL_CACHE_FORMAT = "memory-condense-causal-benchmark-store-v1"

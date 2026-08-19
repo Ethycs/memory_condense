@@ -6,14 +6,14 @@ import json
 
 import pytest
 
-from memory_condense.extractor import LLMExtractor, RuleBasedExtractor
-from memory_condense.llm_provider import (
+from memory_condense.ingest.extractor import LLMExtractor, RuleBasedExtractor
+from memory_condense.application.llm_provider import (
     DEFAULT_MODEL,
     api_key_present,
     make_completer,
     resolve_extractor,
 )
-from memory_condense.schemas import Turn
+from memory_condense.domain.schemas import Turn
 
 
 @pytest.fixture(autouse=True)
@@ -29,7 +29,7 @@ def clean_env(monkeypatch):
     # resolve_extractor calls load_dotenv(), which would put the developer's
     # real key back into the environment and make these assertions machine-
     # dependent. Stub it out.
-    monkeypatch.setattr("memory_condense.llm_provider._load_env", lambda: None)
+    monkeypatch.setattr("memory_condense.application.llm_provider._load_env", lambda: None)
 
 
 class _FakeResponse:

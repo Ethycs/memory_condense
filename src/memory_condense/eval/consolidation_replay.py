@@ -23,13 +23,13 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from memory_condense._tokenizer import count_tokens
-from memory_condense.condenser import MemoryCondenser
-from memory_condense.context_packer import ContextBudget
-from memory_condense.embedding import EmbeddingService
+from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.search.packing.context_packer import ContextBudget
+from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.eval.recall import contains_answer
-from memory_condense.qwen_consolidation import load_qwen_linker
-from memory_condense.schemas import Chunk, PackedContext
+from memory_condense.tooling.qwen_consolidation import load_qwen_linker
+from memory_condense.domain.schemas import Chunk, PackedContext
 
 
 @dataclass(frozen=True, slots=True)

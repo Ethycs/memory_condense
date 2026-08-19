@@ -7,16 +7,16 @@ import zlib
 import numpy as np
 import pytest
 
-from memory_condense.association_store import AssociationArtifact
-from memory_condense.condenser import MemoryCondenser
-from memory_condense.experiment_rig import (
+from memory_condense.associations.association_store import AssociationArtifact
+from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.tooling.experiment_rig import (
     AssociativeSweepRig,
     SweepArm,
     SweepQuestion,
     load_anchor_pack,
     save_anchor_pack,
 )
-from memory_condense.schemas import Chunk
+from memory_condense.domain.schemas import Chunk
 
 
 class CountingEmbedder:

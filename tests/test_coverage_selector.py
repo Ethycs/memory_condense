@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from memory_condense.context_packer import ContextBudget, ContextPacker
-from memory_condense.coverage_selector import (
+from memory_condense.search.packing.context_packer import ContextBudget, ContextPacker
+from memory_condense.search.selectors.coverage_selector import (
     _canonical_answer_object_key,
     SetOrdering,
     SetQuantifier,
@@ -17,7 +17,7 @@ from memory_condense.coverage_selector import (
     SetOperator,
     compile_set_program,
 )
-from memory_condense.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
 
 
 def _result(

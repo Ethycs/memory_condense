@@ -42,7 +42,7 @@ from memory_condense.eval.schemas import (
     EvalConfig,
     RetrievalConfig,
 )
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 
 
 def _sample(question_count: int) -> BenchmarkSample:
@@ -504,7 +504,7 @@ def test_choice_coverage_is_mutually_exclusive_with_other_score_backends():
 
 
 def test_ms_marco_cross_encoder_is_exact_opt_in_backend():
-    from memory_condense.cross_encoder_selector import (
+    from memory_condense.search.selectors.cross_encoder_selector import (
         MS_MARCO_MODEL_ID,
         MS_MARCO_MODEL_REVISION,
         MS_MARCO_WEIGHTS_SHA256,
@@ -752,10 +752,10 @@ def test_choice_selector_loads_staged_and_injects_forward_only_provider(
 ):
     import torch
 
-    import memory_condense.causal_choice_scorer as choice_module
+    import memory_condense.search.selectors.causal_choice_scorer as choice_module
     import memory_condense.eval.local_qwen as local_qwen_module
-    import memory_condense.head_memory as head_memory_module
-    import memory_condense.qwen_prefix as qwen_prefix_module
+    import memory_condense.associations.head_memory as head_memory_module
+    import memory_condense.modeling.qwen_prefix as qwen_prefix_module
 
     events = []
 
@@ -882,7 +882,7 @@ def test_lazy_qwen_prefix_forwards_companions_to_score_provider():
 
 
 def test_local_ini_selector_loads_only_after_embedder_release(monkeypatch):
-    import memory_condense.coverage_selector as coverage_selector_module
+    import memory_condense.search.selectors.coverage_selector as coverage_selector_module
     import memory_condense.eval.local_qwen as local_qwen_module
 
     events = []
@@ -951,7 +951,7 @@ def test_local_ini_selector_loads_only_after_embedder_release(monkeypatch):
 
 
 def test_cross_encoder_selector_loads_only_after_embedder_release(monkeypatch):
-    import memory_condense.cross_encoder_selector as cross_encoder_module
+    import memory_condense.search.selectors.cross_encoder_selector as cross_encoder_module
     import sentence_transformers
 
     events = []

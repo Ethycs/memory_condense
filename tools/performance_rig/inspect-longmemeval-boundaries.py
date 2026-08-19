@@ -6,11 +6,11 @@ import argparse
 import json
 from pathlib import Path
 
-from memory_condense._tokenizer import count_tokens
+from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.eval.locked_split import load_split_manifest, select_locked_split
 from memory_condense.eval.recall import contains_answer
 from memory_condense.eval.transition_trace import load_transition_trace
-from memory_condense.loader import load_benchmark
+from memory_condense.ingest.loader import load_benchmark
 
 
 def main() -> None:

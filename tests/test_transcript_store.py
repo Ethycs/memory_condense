@@ -1,4 +1,4 @@
-from memory_condense.transcript_store import TranscriptStore
+from memory_condense.persistence.transcript_store import TranscriptStore
 
 
 def test_append_and_get(db):

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_condense.db import Database
+from memory_condense.persistence.db import Database
 
 
 @pytest.fixture

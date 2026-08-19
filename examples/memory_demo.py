@@ -14,8 +14,8 @@ import shutil
 from pathlib import Path
 
 from memory_condense import MemoryCondenser
-from memory_condense.decay import item_energy, item_heat
-from memory_condense.schemas import CreateOp, MemoryType, PinState, PinOp, Provenance
+from memory_condense.domain.decay import item_energy, item_heat
+from memory_condense.domain.schemas import CreateOp, MemoryType, PinState, PinOp, Provenance
 
 DATA_DIR = Path("./demo_data_memory")
 
@@ -71,7 +71,7 @@ def main() -> None:
                 Provenance(turn_id="does-not-exist", quote="rewrite everything in Rust")
             ],
         )
-        from memory_condense.schemas import MemoryOps
+        from memory_condense.domain.schemas import MemoryOps
 
         report = mc.validator.validate(MemoryOps(create=[fake]))
         for err in report.rejected:

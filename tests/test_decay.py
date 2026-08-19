@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from memory_condense.decay import (
+from memory_condense.domain.decay import (
     HOT_CAP,
     HOT_SEED_ENERGY,
     REHEAT_BOOST,
@@ -17,7 +17,7 @@ from memory_condense.decay import (
     seed_energy,
     should_reheat,
 )
-from memory_condense.schemas import (
+from memory_condense.domain.schemas import (
     DEFAULT_HALF_LIFE_TURNS,
     Heat,
     MemoryItem,

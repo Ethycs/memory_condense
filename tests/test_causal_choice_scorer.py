@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from memory_condense.causal_choice_scorer import (
+from memory_condense.search.selectors.causal_choice_scorer import (
     CausalChoiceScorer,
     verify_local_causal_checkpoint,
 )
-from memory_condense.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
 
 
 def _result(index: int, text: str, *, role: str = "user") -> RetrievalResult:
@@ -300,7 +300,7 @@ def test_choice_companion_selection_applies_query_role_before_answerability():
 
 
 def test_choice_companion_blends_answerability_with_surface_value(monkeypatch):
-    import memory_condense.coverage_selector as coverage_selector_module
+    import memory_condense.search.selectors.coverage_selector as coverage_selector_module
 
     generic = _result(0, "I kept a generic ticket stub.")
     answer = _result(

@@ -1,13 +1,13 @@
 import pytest
 
-from memory_condense._tokenizer import (
+from memory_condense.domain._tokenizer import (
     CHAT_FRAMING_TOKENS_FIXED,
     CHAT_FRAMING_TOKENS_PER_MESSAGE,
     count_chat_prompt_token_proxy,
     count_tokens,
     tokenizer_proxy_identity,
 )
-from memory_condense.chunker import Chunker
+from memory_condense.ingest.chunker import Chunker
 
 
 @pytest.fixture

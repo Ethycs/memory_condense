@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from memory_condense._tokenizer import count_tokens
-from memory_condense.derived_scalar import (
+from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.search.packing.derived_scalar import (
     filter_conflicting_approximate_duration_recaps,
 )
-from memory_condense.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
 
 
 QUERY = (

@@ -11,7 +11,7 @@ import hashlib
 import json
 from typing import Any
 
-from memory_condense.loader import BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkSample
 
 
 def canonical_sha256(value: Any) -> str:

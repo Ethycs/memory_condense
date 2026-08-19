@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from memory_condense.loader import (
+from memory_condense.ingest.loader import (
     detect_benchmark_format,
     load_benchmark,
     load_conversation,

@@ -5,16 +5,16 @@ import hashlib
 import numpy as np
 import pytest
 
-import memory_condense.cross_encoder_selector as cross_encoder_module
-from memory_condense.coverage_selector import CoverageSelectionReport
-from memory_condense.cross_encoder_selector import (
+import memory_condense.search.selectors.cross_encoder_selector as cross_encoder_module
+from memory_condense.search.selectors.coverage_selector import CoverageSelectionReport
+from memory_condense.search.selectors.cross_encoder_selector import (
     MS_MARCO_MODEL_ID,
     MS_MARCO_MODEL_REVISION,
     MS_MARCO_WEIGHTS_SHA256,
     MSMarcoCrossEncoderSelector,
     verify_ms_marco_checkpoint,
 )
-from memory_condense.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
 
 
 def _result(index: int, text: str | None = None) -> RetrievalResult:

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from memory_condense.source_hierarchy import SourceContractionIndex
-from memory_condense.transcript_store import TranscriptStore
+from memory_condense.search.indexes.source_hierarchy import SourceContractionIndex
+from memory_condense.persistence.transcript_store import TranscriptStore
 
 
 def _add_source(db, source_id: str, vector: list[float], label: int) -> None:

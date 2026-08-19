@@ -1,5 +1,5 @@
-from memory_condense.memory_store import MemoryStore
-from memory_condense.schemas import (
+from memory_condense.persistence.memory_store import MemoryStore
+from memory_condense.domain.schemas import (
     CreateOp,
     DeleteOp,
     MemoryOps,
@@ -10,8 +10,8 @@ from memory_condense.schemas import (
     SupersedeOp,
     UpdateOp,
 )
-from memory_condense.transcript_store import TranscriptStore
-from memory_condense.validator import (
+from memory_condense.persistence.transcript_store import TranscriptStore
+from memory_condense.ingest.validator import (
     REASON_EMPTY_CONTENT,
     REASON_MISSING_PROVENANCE,
     REASON_QUOTE_NOT_FOUND,

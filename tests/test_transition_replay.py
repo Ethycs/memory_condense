@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from memory_condense.db import Database
-from memory_condense.association_store import AssociationArtifact, AssociationStore
+from memory_condense.persistence.db import Database
+from memory_condense.associations.association_store import AssociationArtifact, AssociationStore
 from memory_condense.eval.transition_replay import (
     TransitionReplayExample,
     load_compiled_transition_examples,
     run_transition_replay,
 )
-from memory_condense.schemas import Chunk
-from memory_condense.transcript_store import TranscriptStore
-from memory_condense.transition_policy import CausalTransitionPolicy, TransitionCandidate
+from memory_condense.domain.schemas import Chunk
+from memory_condense.persistence.transcript_store import TranscriptStore
+from memory_condense.associations.transition_policy import CausalTransitionPolicy, TransitionCandidate
 
 
 def _candidate(destination: str, score: float, head: int) -> TransitionCandidate:

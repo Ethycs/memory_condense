@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from memory_condense._tokenizer import count_tokens, truncate_to_tokens
-from memory_condense.context_packer import ContextBudget, ContextPacker
-from memory_condense.schemas import (
+from memory_condense.domain._tokenizer import count_tokens, truncate_to_tokens
+from memory_condense.search.packing.context_packer import ContextBudget, ContextPacker
+from memory_condense.domain.schemas import (
     Chunk,
     MemoryItem,
     MemoryResult,

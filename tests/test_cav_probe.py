@@ -5,7 +5,7 @@ import json
 import pytest
 import torch
 
-from memory_condense.cav_probe import (
+from memory_condense.tooling.cav_probe import (
     bootstrap_stability,
     evaluate_cav,
     fit_mean_difference_cav,

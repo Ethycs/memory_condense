@@ -30,7 +30,7 @@ $stderr = Join-Path $sweepDir 'sweep.stderr.log'
 $output = Join-Path $sweepDir 'sweep_report.json'
 
 $arguments = @(
-    'run', '--frozen', 'python', '-m', 'memory_condense.experiment_rig',
+    'run', '--frozen', 'python', '-m', 'memory_condense.tooling.experiment_rig',
     '--store', "`"$store`"",
     '--artifact-id', $artifactId,
     '--anchor-pack', "`"$anchorPack`"",

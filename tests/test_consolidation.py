@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from memory_condense.consolidation import (
+from memory_condense.associations.consolidation import (
     ConsolidationNode,
     ConsolidationNodeKind,
     LiveConsolidationStore,
@@ -12,9 +12,9 @@ from memory_condense.consolidation import (
     inspect_qwen_context_hyperplane,
     qwen_head_activations,
 )
-from memory_condense.head_memory import MemoryLinkHit, MemoryLinkResult
-from memory_condense.memory_store import MemoryStore
-from memory_condense.schemas import (
+from memory_condense.associations.head_memory import MemoryLinkHit, MemoryLinkResult
+from memory_condense.persistence.memory_store import MemoryStore
+from memory_condense.domain.schemas import (
     Chunk,
     CreateOp,
     MemoryResult,
@@ -23,7 +23,7 @@ from memory_condense.schemas import (
     Provenance,
     RetrievalResult,
 )
-from memory_condense.transcript_store import TranscriptStore
+from memory_condense.persistence.transcript_store import TranscriptStore
 
 
 def _populate(db, *, memory_count: int = 4, chunk_count: int = 4):

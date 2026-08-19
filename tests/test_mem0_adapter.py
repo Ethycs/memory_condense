@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memory_condense._tokenizer import count_tokens, tokenizer_proxy_identity
+from memory_condense.domain._tokenizer import count_tokens, tokenizer_proxy_identity
 from memory_condense.eval.mem0_adapter import (
     MEM0AI_PIN,
     MEM0_API_VERSION,
@@ -30,7 +30,7 @@ from memory_condense.eval.mem0_adapter import (
     Mem0ProtocolError,
     Mem0StackIdentity,
 )
-from memory_condense.loader import BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkSample
 
 
 class _StepClock:

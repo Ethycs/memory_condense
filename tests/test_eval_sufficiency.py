@@ -8,8 +8,8 @@ from memory_condense.eval.sufficiency import (
     build_sufficiency_prompt,
     run_sufficiency_audit,
 )
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
-from memory_condense.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
 
 
 SAMPLE = BenchmarkSample(

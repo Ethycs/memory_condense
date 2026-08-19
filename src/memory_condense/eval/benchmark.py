@@ -31,22 +31,22 @@ from typing import Callable, Optional, Protocol
 
 from pydantic import BaseModel, Field
 
-from memory_condense._tokenizer import (
+from memory_condense.domain._tokenizer import (
     count_chat_prompt_token_proxy,
     count_tokens,
     tokenizer_proxy_identity,
     truncate_to_tokens,
 )
-from memory_condense.condenser import MemoryCondenser
-from memory_condense.context_packer import ContextBudget
-from memory_condense.embedding import EmbeddingService
+from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.search.packing.context_packer import ContextBudget
+from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.eval.reproducibility import file_sha256
 from memory_condense.eval.schemas import EvalConfig, UsageStats
 from memory_condense.eval.cache_receipts import (
     cache_receipts_sha256,
     validated_cache_receipts,
 )
-from memory_condense.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 
 # ---------------------------------------------------------------------------
 # Injected callable types
@@ -69,7 +69,7 @@ JudgeFn = Callable[
 class SupportsSearch(Protocol):
     """Minimal surface :func:`run_benchmark` needs from an ingested store.
 
-    :class:`memory_condense.condenser.MemoryCondenser` satisfies this; tests
+    :class:`memory_condense.application.condenser.MemoryCondenser` satisfies this; tests
     can substitute a fake to avoid downloading an embedding model.
 
     ``search_hybrid`` and ``build_context`` are only called in their
@@ -971,7 +971,7 @@ def run_benchmark(
 
     Args:
         samples: Parsed benchmark samples (see
-            :func:`memory_condense.loader.load_benchmark`).
+            :func:`memory_condense.ingest.loader.load_benchmark`).
         config: Chunker/retrieval settings for this run.
         answer_fn: Injected QA callable, ``messages -> answer text``.
         judge_fn: Optional semantic-equivalence judge; when given, judge

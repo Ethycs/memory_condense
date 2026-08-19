@@ -6,14 +6,14 @@ import zlib
 import numpy as np
 import pytest
 
-from memory_condense.association_store import AssociationArtifact
-from memory_condense.condenser import MemoryCondenser
-from memory_condense.context_packer import ContextBudget, ContextPacker
-from memory_condense.heat_diffusion import (
+from memory_condense.associations.association_store import AssociationArtifact
+from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.search.packing.context_packer import ContextBudget, ContextPacker
+from memory_condense.associations.heat_diffusion import (
     diffuse_association_heat,
     expand_heat_diffusion_results,
 )
-from memory_condense.schemas import Chunk, RetrievalResult
+from memory_condense.domain.schemas import Chunk, RetrievalResult
 
 
 class TinyEmbedder:

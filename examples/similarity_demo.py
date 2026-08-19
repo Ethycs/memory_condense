@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from memory_condense import MemoryCondenser
-from memory_condense.loader import load_conversation, load_directory
+from memory_condense.ingest.loader import load_conversation, load_directory
 
 
 def demo_from_files(convo_dir: Path) -> None:

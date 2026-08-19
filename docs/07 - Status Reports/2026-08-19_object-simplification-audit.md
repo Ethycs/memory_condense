@@ -155,4 +155,12 @@ Applied by five package-scoped agents on disjoint file sets plus an application-
 
 **One incident worth remembering**: annotated `ClassVar`s inside a dataclass body land in the raw `__dataclass_fields__` mapping as pseudo-fields. The parallel replay workstream rebuilds snapshot identity payloads by iterating that raw mapping, so the mixin's per-class `_SEAL_FIELD`/`_SEAL_MISMATCH` annotations broke its digest check. Fixed by declaring the seal knobs as plain un-annotated class attributes (they now vanish from `__dataclass_fields__` entirely); the rule is documented in `domain/sealed.py`.
 
+**Round 2 (same day) — plumbing pass**
+- `condenser.build_context` no longer introspects `self._packer.pack`'s signature to decide which kwargs to forward — the packer is always a real `ContextPacker` (verified: nothing injects a substitute), so the snapshot's `pack_fields()` forwards directly.
+- `search/indexes/retrieval.py` dropped ~19 "historical binding" imports nothing used (the real re-export surface — `SimilarityRetriever`, `DEFAULT_SPAN_TOKENS`, `hydrate_chunk_result`, payload loaders — is kept).
+- Model-free import paths no longer load the Qwen stack through the `head_memory` facade: `qwen_rerank.py`, `prefix_scoring.py`, and six test files now import the model types from `head_memory_models` directly.
+- `association_store.py` and `recall.py` facades dropped their private re-exports (verified zero importers, zero monkeypatches).
+
+Round-2 skips, each checked and rejected on evidence: `NestedMemoryInspection`/`MemoryLinkResult` merge (real semantic split — single-pass vs max-over-passes — plus an `isinstance` gate and four test constructors on its field names, for ~8 lines saved); the prefix-pipeline type-union failure signaling (the union is 4 lines of orchestration; the fail-open returns originate deep inside three large modules); phase-extraction of `search_hybrid_graph` (attention-feedback block has essentially one local validation test, and the in-flight diffuse runtime calls the method).
+
 **Deferred** (blocked on the in-flight diffuse workstream): §A's 15 eval receipt classes and shared `_digest`/`_positive_int` validators; §G4's `RepresentativePolicyFactory` and `ExactLegacyDiffuseInputs`. Also deferred by choice: §G2 (QuestionRecall nesting changes the persisted report schema — author decision), §C1's public parameter-object restructuring, and the `campaign_validation.py` pydantic merge (documented as deliberate independent re-validation).

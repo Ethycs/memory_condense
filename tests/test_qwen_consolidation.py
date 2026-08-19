@@ -4,7 +4,10 @@ import json
 from types import SimpleNamespace
 
 from memory_condense.associations.consolidation import ConsolidationUpdate
-from memory_condense.associations.head_memory import MemoryLinkHit, MemoryLinkResult
+from memory_condense.associations.head_memory_models import (
+    MemoryLinkHit,
+    MemoryLinkResult,
+)
 from memory_condense.tooling.qwen_consolidation import (
     build_parser,
     consolidate_packed_context,

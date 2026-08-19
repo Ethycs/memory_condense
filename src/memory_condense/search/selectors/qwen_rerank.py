@@ -15,7 +15,7 @@ from typing import Any, Sequence
 
 from memory_condense.domain._tokenizer import truncate_to_tokens
 from memory_condense.associations.association_store import AssociationArtifact
-from memory_condense.associations.head_memory import (
+from memory_condense.associations.head_memory_models import (
     AssociativeMemoryCandidate,
     NestedMemoryInspection,
 )

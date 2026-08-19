@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from memory_condense.associations.head_memory import (
+from memory_condense.associations.head_memory_models import (
     MemoryLinkHit,
     NestedMemoryInspection,
 )

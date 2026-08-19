@@ -13,8 +13,6 @@ from memory_condense.associations.association_models import (
     StoredCAVSignature,
     StoredHeadEdge,
     StoredHebbianNeighbor,
-    _canonical_json,
-    _now_iso,
 )
 from memory_condense.associations.association_repository import AssociationStore
 

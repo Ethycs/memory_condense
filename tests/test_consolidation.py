@@ -12,7 +12,10 @@ from memory_condense.associations.consolidation import (
     inspect_qwen_context_hyperplane,
     qwen_head_activations,
 )
-from memory_condense.associations.head_memory import MemoryLinkHit, MemoryLinkResult
+from memory_condense.associations.head_memory_models import (
+    MemoryLinkHit,
+    MemoryLinkResult,
+)
 from memory_condense.persistence.memory_store import MemoryStore
 from memory_condense.domain.schemas import (
     Chunk,

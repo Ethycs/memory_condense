@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -370,22 +369,9 @@ class MemoryCondenser(
                     "active_partition_snapshot_invalidated_reason"
                 ] = "audited_frontier_changed_before_pack"
 
-        active_partition_kwargs: dict[str, Any] = {}
-        if routing_snapshot is not None:
-            pack_fields = routing_snapshot.pack_fields()
-            try:
-                pack_parameters = inspect.signature(self._packer.pack).parameters
-            except (TypeError, ValueError):
-                pack_parameters = {}
-            accepts_kwargs = any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in pack_parameters.values()
-            )
-            active_partition_kwargs = {
-                key: value
-                for key, value in pack_fields.items()
-                if accepts_kwargs or key in pack_parameters
-            }
+        active_partition_kwargs: dict[str, Any] = (
+            routing_snapshot.pack_fields() if routing_snapshot is not None else {}
+        )
         packed = self._packer.pack(
             system_prompt=system_prompt,
             memories=memories,

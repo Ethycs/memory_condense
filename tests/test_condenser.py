@@ -26,7 +26,10 @@ from memory_condense.application.condenser import (
 )
 from memory_condense.associations.consolidation import ConsolidationNode
 from memory_condense.search.packing.context_packer import ContextBudget
-from memory_condense.associations.head_memory import MemoryLinkHit, MemoryLinkResult
+from memory_condense.associations.head_memory_models import (
+    MemoryLinkHit,
+    MemoryLinkResult,
+)
 from memory_condense.domain.schemas import (
     Chunk,
     MemoryOps,

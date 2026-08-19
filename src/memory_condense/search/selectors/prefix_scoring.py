@@ -49,7 +49,9 @@ def score_prefix_coverage(
     frontier_batches = 0
     max_workspace_tokens = 0
     try:
-        from memory_condense.associations.head_memory import AssociativeMemoryCandidate
+        from memory_condense.associations.head_memory_models import (
+            AssociativeMemoryCandidate,
+        )
 
         linker_limit = int(getattr(self.linker, "max_candidates", 0))
         batch_limit = min(self.candidate_pool, linker_limit)

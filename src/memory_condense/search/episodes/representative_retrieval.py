@@ -961,6 +961,7 @@ def _linker_identity(linker: object) -> dict[str, object]:
 
     encoder = getattr(linker, "encoder", None)
     checkpoint = getattr(encoder, "checkpoint_identity", None)
+    raw_device = getattr(encoder, "device", None)
     try:
         from memory_condense.associations.qwen_memory_linker import (
             QwenMemoryLinker,
@@ -998,7 +999,10 @@ def _linker_identity(linker: object) -> dict[str, object]:
         "model_revision": getattr(checkpoint, "model_revision", None),
         "checkpoint_sha256": getattr(checkpoint, "checkpoint_sha256", None),
         "encoder_layers": getattr(encoder, "layers", None),
-        "device": getattr(encoder, "device", None),
+        # Qwen3PrefixEncoder stores a torch.device, which is not JSON-native.
+        # Its canonical string preserves the exact device/index while making
+        # the runtime identity strict-JSON serializable.
+        "device": None if raw_device is None else str(raw_device).strip(),
         "dtype": getattr(encoder, "dtype_name", None),
     }
 

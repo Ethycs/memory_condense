@@ -9,7 +9,9 @@ import numpy as np
 import pytest
 
 import memory_condense.eval.diffuse_longmemeval_analysis as analysis_module
+import memory_condense.search.episodes.representative_retrieval as rep_module
 from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.associations.qwen_memory_linker import QwenMemoryLinker
 from memory_condense.associations.head_memory_models import (
     MemoryLinkHit,
     NestedMemoryInspection,
@@ -36,6 +38,10 @@ from memory_condense.eval.schemas import (
     RetrievalConfig,
 )
 from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.modeling.qwen_prefix import (
+    Qwen3PrefixEncoder,
+    QwenPrefixCheckpointIdentity,
+)
 from memory_condense.search.episodes import (
     EpisodeRepresentativeRetrievalPolicy,
 )
@@ -105,6 +111,64 @@ class _SelectEveryEpisodeLinker:
             max_workspace_tokens=sum(len(item.text) for item in candidates),
             total_candidate_inspections=len(candidates),
         )
+
+
+def test_owned_linker_torch_device_has_strict_json_analysis_identity() -> None:
+    """Exercise the production identity shape without loading a model."""
+
+    torch = pytest.importorskip("torch")
+    encoder = object.__new__(Qwen3PrefixEncoder)
+    encoder.__dict__.update(
+        {
+            "model_dir": None,
+            "layers": 2,
+            "model_id": "Qwen/Qwen3-8B",
+            "model_revision": "revision-1",
+            "checkpoint_identity": QwenPrefixCheckpointIdentity(
+                model_id="Qwen/Qwen3-8B",
+                model_revision="revision-1",
+                checkpoint_sha256="a" * 64,
+                verified_files=(),
+            ),
+            "checkpoint_sha256": "a" * 64,
+            "_torch": torch,
+            "_apply_rotary_pos_emb": None,
+            "device": torch.device("cuda:0"),
+            "dtype": torch.float32,
+            "dtype_name": "float32",
+            "config": None,
+            "model": None,
+            "tokenizer": None,
+            "loaded_parameter_names": frozenset(),
+        }
+    )
+    linker = object.__new__(QwenMemoryLinker)
+    linker.__dict__.update(
+        {
+            "encoder": encoder,
+            "layer": 1,
+            "cav_bank": None,
+            "max_candidates": 8,
+            "max_workspace_tokens": 2048,
+            "max_neighbors_per_episode": 16,
+            "head_vote_k": 4,
+        }
+    )
+
+    payload = rep_module._linker_identity(linker)
+
+    assert payload["owned_runtime_binding"] is True
+    assert payload["device"] == "cuda:0"
+    cuda_zero_sha256 = analysis_module._representative_linker_identity_sha256(
+        linker
+    )
+    assert cuda_zero_sha256 == identity_sha256(payload)
+
+    encoder.device = torch.device("cuda:1")
+    assert (
+        analysis_module._representative_linker_identity_sha256(linker)
+        != cuda_zero_sha256
+    )
 
 
 def _sample(*, answer: str = "cobalt blue") -> BenchmarkSample:

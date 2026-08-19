@@ -443,6 +443,59 @@ class HybridQueryMixin:
                 scores[str(chunk_id)] = float(np.dot(query, vector) / denominator)
         return scores
 
+    def stored_embeddings(
+        self,
+        chunk_ids: Sequence[str],
+    ) -> dict[str, tuple[float, ...]]:
+        """Load exact durable chunk vectors for an explicit bounded ID set.
+
+        Ordinary result hydration deliberately omits the dense vector.  Episode
+        compilation is the narrow exception: its cohesion control must use the
+        same vectors that were indexed, without embedding the source a second
+        time.  This method therefore reads only the requested IDs, validates
+        their fixed-width finite float32 payloads, and preserves input order.
+        """
+
+        ids = list(dict.fromkeys(str(value).strip() for value in chunk_ids))
+        if any(not value for value in ids):
+            raise ValueError("chunk_ids must contain only non-empty IDs")
+        if not ids:
+            return {}
+
+        found: dict[str, tuple[float, ...]] = {}
+        batch_size = 500
+        for start in range(0, len(ids), batch_size):
+            batch = ids[start : start + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._db.execute(
+                "SELECT chunk_id, embedding FROM chunks "
+                f"WHERE chunk_id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            for chunk_id, blob in rows:
+                if blob is None:
+                    raise ValueError(
+                        f"chunk {chunk_id!r} has no durable embedding"
+                    )
+                vector = np.frombuffer(blob, dtype=np.float32)
+                if vector.ndim != 1 or vector.size != self._dim:
+                    raise ValueError(
+                        f"chunk {chunk_id!r} embedding has the wrong width"
+                    )
+                if not np.isfinite(vector).all():
+                    raise ValueError(
+                        f"chunk {chunk_id!r} embedding contains non-finite values"
+                    )
+                found[str(chunk_id)] = tuple(float(value) for value in vector)
+
+        missing = [chunk_id for chunk_id in ids if chunk_id not in found]
+        if missing:
+            raise ValueError(
+                "durable embeddings are missing for requested chunks: "
+                + ", ".join(missing[:3])
+            )
+        return {chunk_id: found[chunk_id] for chunk_id in ids}
+
 
     def _load_chunk(self, chunk_id: str) -> Chunk | None:
         """Load retrieval payload only; the 1024-float source vector stays put.

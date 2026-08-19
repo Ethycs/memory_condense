@@ -48,8 +48,9 @@ class TranscriptStore:
         *,
         source_id: str | None = None,
         created_at: datetime | None = None,
+        turn_id: str | None = None,
     ) -> Turn:
-        """Create and persist a new turn. Returns the Turn with generated ID.
+        """Create and persist a turn with a generated or explicit stable ID.
 
         Advancing ``ordinal`` here is what makes decay happen: every item the
         conversation did *not* reach for this turn falls one turn further
@@ -58,6 +59,11 @@ class TranscriptStore:
         normalized_source = (
             source_id.strip() if source_id and source_id.strip() else None
         )
+        normalized_turn_id = None
+        if turn_id is not None:
+            normalized_turn_id = str(turn_id).strip()
+            if not normalized_turn_id:
+                raise ValueError("turn_id must be non-empty when supplied")
         normalized_created_at = created_at
         if normalized_created_at is not None:
             normalized_created_at = (
@@ -69,6 +75,11 @@ class TranscriptStore:
             role=role,
             text=text,
             source_id=normalized_source,
+            **(
+                {"turn_id": normalized_turn_id}
+                if normalized_turn_id is not None
+                else {}
+            ),
             **(
                 {"created_at": normalized_created_at}
                 if normalized_created_at is not None

@@ -564,6 +564,17 @@ def _compile_obligations(
                 else "any"
             ),
         ),
+        # The rule linker deliberately falls back to ``claim``/``question``
+        # for ordinary conversation without an ontology cue. Keep that exact
+        # evidence eligible for lookup packets, but do not let an unverified
+        # claim or a question satisfy the required answer-fact obligation.
+        _obligation(
+            "lookup_context",
+            kinds=("claim", "question"),
+            subjects=subjects,
+            required=False,
+            weight=0.7,
+        ),
     )
 
 

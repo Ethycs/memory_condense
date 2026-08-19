@@ -1,3 +1,5 @@
+import pytest
+
 from memory_condense.persistence.transcript_store import TranscriptStore
 
 
@@ -17,6 +19,20 @@ def test_source_id_round_trips(db):
     turn = store.append("user", "session fact", source_id="session-2")
     assert turn.source_id == "session-2"
     assert store.get_turn(turn.turn_id).source_id == "session-2"
+
+
+def test_explicit_turn_id_round_trips_and_empty_id_is_rejected(db):
+    store = TranscriptStore(db)
+    turn = store.append(
+        "user",
+        "stable source turn",
+        source_id="session-2",
+        turn_id="stable-turn-0001",
+    )
+    assert turn.turn_id == "stable-turn-0001"
+    assert store.get_turn("stable-turn-0001") == turn
+    with pytest.raises(ValueError, match="turn_id must be non-empty"):
+        store.append("user", "invalid", turn_id="   ")
 
 
 def test_source_metadata_returns_first_system_turn_per_source(db):

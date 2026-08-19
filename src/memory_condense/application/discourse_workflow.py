@@ -40,17 +40,28 @@ from memory_condense.persistence.discourse_store import (
     ArtifactCoverageMark,
     DiscourseStore,
 )
+from memory_condense.application.discourse_sources import (
+    SourceChunkStream,
+    build_episode_source_candidate_scope,
+    scan_discourse_source_chunks,
+)
 from memory_condense.search.closure import close_evidence
 from memory_condense.search.episodes import (
     EpisodeBuildResult,
     EpisodeBuilder,
     EpisodeRetrievalPlan,
     EpisodeRetrievalPolicy,
+    EpisodeRepresentativeRetrievalPlan,
+    EpisodeRepresentativeRetrievalPolicy,
+    EpisodeSourceCandidate,
+    EpisodeSourceCandidateScope,
     LexicalEmbeddingChangeScorer,
     QwenAttentionHeadSurpriseScorer,
     SurpriseScorer,
     SurpriseSequenceScorer,
+    NestedEpisodeLinker,
     expand_episode_seeds,
+    retrieve_episode_representatives,
     select_episode_representatives,
 )
 from memory_condense.search.episodes.surprise import _owned_qwen_receipt_matches
@@ -100,6 +111,11 @@ class _ArtifactScopedDiscourseStore:
     def get_episode(self, episode_id):
         value = self.store.get_episode(episode_id)
         return value if value is not None and value.artifact_id == self.artifact_id else None
+
+    def get_representatives(self, episode_id):
+        if self.get_episode(episode_id) is None:
+            return ()
+        return self.store.get_representatives(episode_id)
 
     def adjacent_episodes(self, episode_id, *, radius=1, include_self=False):
         seed = self.get_episode(episode_id)
@@ -314,6 +330,53 @@ class DiscourseWorkflowMixin:
         """Access the opt-in, source-grounded discourse repository."""
 
         return self._discourse
+
+    def discourse_source_streams(self) -> tuple[SourceChunkStream, ...]:
+        """Return exact ordered source/chunk identities without evidence text."""
+
+        return scan_discourse_source_chunks(self._db)
+
+    def discourse_chunk_embeddings(
+        self,
+        chunk_ids: Sequence[str],
+    ) -> dict[str, tuple[float, ...]]:
+        """Return exact stored ordinary embeddings for compilation only."""
+
+        return self._retriever.stored_embeddings(chunk_ids)
+
+    def route_discourse_episode_sources(
+        self,
+        query: str,
+        anchors: Sequence[RetrievalResult],
+        *,
+        artifact_id: str,
+        max_sources: int = 64,
+        rrf_constant: int = 60,
+    ) -> EpisodeSourceCandidateScope:
+        """Fuse direct and all-source lexical routes with a scope receipt."""
+
+        normalized_query = str(query).strip()
+        if not normalized_query:
+            raise ValueError("query must be non-empty")
+        selected_artifact = self._resolve_discourse_artifact(artifact_id)
+        if selected_artifact is None:
+            raise ValueError("source routing requires an explicit artifact")
+        streams = self.discourse_source_streams()
+        universe = tuple(stream.source_id for stream in streams)
+        lexical_sources = self._retriever.source_tfisf_query(
+            normalized_query,
+            k_sources=max(len(universe), 1),
+        )
+        return build_episode_source_candidate_scope(
+            artifact_id=selected_artifact,
+            snapshot=self._discourse.snapshot(),
+            query=normalized_query,
+            anchors=anchors,
+            lexical_sources=lexical_sources,
+            universe_source_ids=universe,
+            max_sources=max_sources,
+            rrf_constant=rrf_constant,
+        )
 
     def build_and_publish_discourse_episodes(
         self,
@@ -583,6 +646,17 @@ class DiscourseWorkflowMixin:
             coverage_kind="discourse",
         )
 
+    def finalize_episode_coverage(
+        self,
+        artifact_id: str,
+    ) -> ArtifactCoverageReceipt:
+        """Assert full-corpus episode processing after store verification."""
+
+        return self._discourse.finalize_artifact_coverage(
+            artifact_id,
+            coverage_kind="episode",
+        )
+
     def expand_discourse_episode_seeds(
         self,
         results: Sequence[RetrievalResult],
@@ -592,6 +666,51 @@ class DiscourseWorkflowMixin:
         """Bridge direct retrieval hits to episode seeds with raw fail-open IDs."""
 
         return expand_episode_seeds(results, self._discourse, policy=policy)
+
+    def retrieve_discourse_episode_representatives(
+        self,
+        query: str,
+        source_candidates: Sequence[EpisodeSourceCandidate],
+        linker: NestedEpisodeLinker,
+        *,
+        policy: EpisodeRepresentativeRetrievalPolicy,
+        source_scope: EpisodeSourceCandidateScope | None = None,
+    ) -> EpisodeRepresentativeRetrievalPlan:
+        """Discover bounded episode seeds beyond the direct chunk hits."""
+
+        selected_artifact = self._resolve_discourse_artifact(policy.artifact_id)
+        if selected_artifact is None:  # pragma: no cover - policy requires one
+            raise ValueError("representative retrieval requires an artifact")
+        if source_scope is not None:
+            current = self._discourse.snapshot()
+            current_universe = tuple(
+                stream.source_id for stream in self.discourse_source_streams()
+            )
+            if (
+                source_scope.artifact_id != selected_artifact
+                or source_scope.snapshot_sha256 != current.snapshot_sha256
+                or source_scope.source_revision != current.source_revision
+                or source_scope.source_content_sha256
+                != current.source_content_sha256
+            ):
+                raise ValueError("representative source scope is stale or foreign")
+            if source_scope.universe_source_ids != current_universe:
+                raise ValueError(
+                    "representative source scope universe is stale or foreign"
+                )
+        store = _ArtifactScopedDiscourseStore(
+            self._discourse,
+            selected_artifact,
+        )
+        return retrieve_episode_representatives(
+            query,
+            source_candidates,
+            store,
+            self._retriever.hydrate_chunk,
+            linker,
+            policy=policy,
+            source_scope=source_scope,
+        )
 
     def close_discourse_evidence(
         self,

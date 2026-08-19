@@ -1900,6 +1900,51 @@ class TestIngest:
             assert stored is not None
             assert stored.created_at == source_time
 
+    def test_explicit_batch_turn_ids_make_fresh_chunk_ids_replayable(self, tmp_path):
+        source_time = datetime(2024, 5, 1, 12, 30, tzinfo=timezone.utc)
+        records = [
+            (
+                "user",
+                "The deployment completed with the amber badge.",
+                "session-1",
+                source_time,
+                "stable-turn-0001",
+            )
+        ]
+
+        def ingest_at(path, rows):
+            with MemoryCondenser(
+                data_dir=path,
+                embedder=FakeEmbedder(),
+                auto_extract=False,
+                chunker_min_tokens=1,
+                chunker_max_tokens=20,
+            ) as condenser:
+                return condenser.ingest_many(rows)
+
+        first = ingest_at(tmp_path / "stable-a", records)
+        replay = ingest_at(tmp_path / "stable-b", records)
+        changed = ingest_at(
+            tmp_path / "stable-c",
+            [
+                (
+                    "user",
+                    "The deployment completed with the green badge.",
+                    "session-1",
+                    source_time,
+                    "stable-turn-0001",
+                )
+            ],
+        )
+
+        assert first[0][0].turn_id == replay[0][0].turn_id == "stable-turn-0001"
+        assert [chunk.chunk_id for chunk in first[0][1]] == [
+            chunk.chunk_id for chunk in replay[0][1]
+        ]
+        assert [chunk.chunk_id for chunk in first[0][1]] != [
+            chunk.chunk_id for chunk in changed[0][1]
+        ]
+
     def test_ingest_many_keeps_auto_extraction_turn_causal(self, tmp_path):
         with MemoryCondenser(
             data_dir=tmp_path / "causal-batch",

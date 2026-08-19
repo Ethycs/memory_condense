@@ -2,11 +2,38 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from typing import Sequence
 
 from memory_condense.associations.association_store import AssociationArtifact
 from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
+
+
+def _bind_explicit_chunk_ids(
+    turn_id: str,
+    chunks: Sequence[Chunk],
+) -> list[Chunk]:
+    """Derive stable chunk IDs from an explicit turn and exact source slice."""
+
+    output: list[Chunk] = []
+    for chunk in chunks:
+        body = json.dumps(
+            {
+                "format": "memory-condense-explicit-chunk-id-v1",
+                "turn_id": turn_id,
+                "start_char": chunk.start_char,
+                "end_char": chunk.end_char,
+                "text": chunk.text,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        chunk_id = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        output.append(chunk.model_copy(update={"chunk_id": chunk_id}))
+    return output
 
 
 class IngestWorkflowMixin:
@@ -19,6 +46,7 @@ class IngestWorkflowMixin:
         *,
         source_id: str | None = None,
         created_at: datetime | None = None,
+        turn_id: str | None = None,
     ) -> tuple[Turn, list[Chunk]]:
         """Ingest a single conversation turn.
 
@@ -32,8 +60,11 @@ class IngestWorkflowMixin:
             text,
             source_id=source_id,
             created_at=created_at,
+            turn_id=turn_id,
         )
         chunks = self._chunker.chunk_turn(turn.turn_id, text)
+        if turn_id is not None:
+            chunks = _bind_explicit_chunk_ids(turn.turn_id, chunks)
 
         if chunks:
             chunks = self._embedder.embed_chunks(chunks)
@@ -49,6 +80,7 @@ class IngestWorkflowMixin:
         turns: Sequence[
             tuple[str, str, str | None]
             | tuple[str, str, str | None, datetime | None]
+            | tuple[str, str, str | None, datetime | None, str]
         ],
     ) -> list[tuple[Turn, list[Chunk]]]:
         """Ingest a turn batch with one embedding/index update.
@@ -62,17 +94,28 @@ class IngestWorkflowMixin:
         ``auto_extract=False``, which is already the retrieval-evaluation and
         corpus-indexing configuration.
         """
-        records: list[tuple[str, str, str | None, datetime | None]] = []
+        records: list[
+            tuple[str, str, str | None, datetime | None, str | None]
+        ] = []
         for record in turns:
             if len(record) == 3:
                 role, text, source_id = record
-                records.append((role, text, source_id, None))
+                records.append((role, text, source_id, None, None))
             elif len(record) == 4:
                 role, text, source_id, created_at = record
-                records.append((role, text, source_id, created_at))
+                records.append((role, text, source_id, created_at, None))
+            elif len(record) == 5:
+                role, text, source_id, created_at, turn_id = record
+                normalized_turn_id = str(turn_id).strip()
+                if not normalized_turn_id:
+                    raise ValueError("explicit turn IDs must be non-empty")
+                records.append(
+                    (role, text, source_id, created_at, normalized_turn_id)
+                )
             else:  # pragma: no cover - static tuple union, runtime guard
                 raise ValueError(
-                    "ingest records need role, text, source, and optional time"
+                    "ingest records need role, text, source, optional time, "
+                    "and optional explicit turn ID"
                 )
         if self._auto_extract:
             return [
@@ -81,20 +124,24 @@ class IngestWorkflowMixin:
                     text,
                     source_id=source_id,
                     created_at=created_at,
+                    turn_id=turn_id,
                 )
-                for role, text, source_id, created_at in records
+                for role, text, source_id, created_at, turn_id in records
             ]
 
         staged: list[tuple[Turn, list[Chunk]]] = []
         flat_chunks: list[Chunk] = []
-        for role, text, source_id, created_at in records:
+        for role, text, source_id, created_at, turn_id in records:
             turn = self._transcript.append(
                 role,
                 text,
                 source_id=source_id,
                 created_at=created_at,
+                turn_id=turn_id,
             )
             chunks = self._chunker.chunk_turn(turn.turn_id, text)
+            if turn_id is not None:
+                chunks = _bind_explicit_chunk_ids(turn.turn_id, chunks)
             staged.append((turn, chunks))
             flat_chunks.extend(chunks)
 

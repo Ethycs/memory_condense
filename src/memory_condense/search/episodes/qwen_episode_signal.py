@@ -17,7 +17,7 @@ import numpy as np
 
 from memory_condense.domain._tokenizer import (
     tokenizer_proxy_identity,
-    truncate_to_tokens,
+    truncate_to_tokens_lossless,
 )
 from memory_condense.domain.discourse import identity_sha256, quote_sha256
 
@@ -389,15 +389,8 @@ def _normalized_transport_signature(
 def _lossless_proxy_prefix(text: str, max_tokens: int) -> str:
     """Return a nonempty exact prefix for nonempty source text."""
 
-    value = str(text)
     cap = exact_integer(max_tokens, "max_tokens", minimum=1)
-    if not value:
-        return ""
-    for token_limit in range(cap, 0, -1):
-        prefix = truncate_to_tokens(value, token_limit)
-        if prefix and value.startswith(prefix):
-            return prefix
-    raise ValueError("token cap cannot preserve one complete source character")
+    return truncate_to_tokens_lossless(str(text), cap)
 
 
 def _qwen_linker_identity(linker: Any) -> dict[str, str | int | bool]:

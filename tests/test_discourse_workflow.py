@@ -27,7 +27,12 @@ from memory_condense.persistence.discourse_store import (
     ArtifactCoverageMark,
     DiscourseStore,
 )
-from memory_condense.search.episodes import EpisodeBuilder, EpisodeRetrievalPolicy
+from memory_condense.search.episodes import (
+    EpisodeBuilder,
+    EpisodeRepresentativeRetrievalPolicy,
+    EpisodeRetrievalPolicy,
+    EpisodeSourceCandidate,
+)
 
 
 class _FakeEmbedder:
@@ -77,6 +82,13 @@ class _NoOutputLinker:
         return LinkerOutput((), ())
 
 
+class _BombNestedLinker:
+    max_candidates = 8
+
+    def inspect_nested(self, *_args, **_kwargs):
+        raise AssertionError("invalid source scope reached the nested linker")
+
+
 def _artifact() -> DiscourseArtifact:
     return DiscourseArtifact.create(
         kind="rule-based-discourse-test",
@@ -94,6 +106,219 @@ def _condenser(tmp_path) -> MemoryCondenser:
         chunker_max_tokens=100,
         persist_index_on_close=False,
     )
+
+
+def test_discourse_source_streams_separate_metadata_without_emitting_text(
+    tmp_path,
+) -> None:
+    with _condenser(tmp_path / "source-streams") as condenser:
+        marker = condenser.ingest(
+            "system",
+            "[session-a took place at 2024/05/01 (Wed) 12:00]",
+            source_id="session-a",
+        )[1][0]
+        content = condenser.ingest(
+            "user",
+            "The launch badge was amber.",
+            source_id="session-a",
+        )[1][0]
+        other = condenser.ingest(
+            "assistant",
+            "The deployment completed.",
+            source_id="session-b",
+        )[1][0]
+
+        streams = condenser.discourse_source_streams()
+
+        assert [stream.source_id for stream in streams] == [
+            "session-a",
+            "session-b",
+        ]
+        assert streams[0].content_chunk_ids == (content.chunk_id,)
+        assert streams[0].metadata_chunk_ids == (marker.chunk_id,)
+        assert streams[1].content_chunk_ids == (other.chunk_id,)
+        assert "amber" not in repr(streams)
+
+
+def test_episode_source_router_attests_the_complete_source_universe(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = _artifact()
+    with _condenser(tmp_path / "source-router") as condenser:
+        direct = condenser.ingest(
+            "user",
+            "The directly retrieved alpha note.",
+            source_id="source-a",
+        )
+        condenser.ingest(
+            "assistant",
+            "The independently routed beta note.",
+            source_id="source-b",
+        )
+        condenser.discourse.publish(artifact)
+        anchor = condenser.retriever.hydrate_chunk(
+            direct[1][0].chunk_id,
+            score=0.8,
+            route="hybrid",
+        )
+        assert anchor is not None
+        monkeypatch.setattr(
+            condenser._retriever,
+            "source_tfisf_query",
+            lambda *_args, **_kwargs: [("source-b", 9.0)],
+        )
+
+        scope = condenser.route_discourse_episode_sources(
+            "Where is beta?",
+            (anchor,),
+            artifact_id=artifact.artifact_id,
+            max_sources=2,
+        )
+
+        assert scope.universe_source_ids == ("source-a", "source-b")
+        assert {item.source_id for item in scope.candidates} == {
+            "source-a",
+            "source-b",
+        }
+        assert scope.selected_scope_exhaustive
+        assert scope.truncated_source_ids == ()
+
+
+def test_representative_retrieval_rejects_self_hashed_forged_source_universes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = _artifact()
+    query = "Where is beta?"
+    with _condenser(tmp_path / "forged-source-scope") as condenser:
+        direct = condenser.ingest(
+            "user",
+            "The directly retrieved alpha note.",
+            source_id="source-a",
+        )
+        condenser.ingest(
+            "assistant",
+            "The independently routed beta note.",
+            source_id="source-b",
+        )
+        condenser.discourse.publish(artifact)
+        anchor = condenser.retriever.hydrate_chunk(
+            direct[1][0].chunk_id,
+            score=0.8,
+            route="hybrid",
+        )
+        assert anchor is not None
+        monkeypatch.setattr(
+            condenser._retriever,
+            "source_tfisf_query",
+            lambda *_args, **_kwargs: [("source-b", 9.0)],
+        )
+        scope = condenser.route_discourse_episode_sources(
+            query,
+            (anchor,),
+            artifact_id=artifact.artifact_id,
+            max_sources=2,
+        )
+        source_a = tuple(
+            candidate
+            for candidate in scope.candidates
+            if candidate.source_id == "source-a"
+        )
+        forged_scopes = (
+            replace(
+                scope,
+                universe_source_ids=("source-a",),
+                candidates=source_a,
+                truncated_source_ids=(),
+                receipt_sha256="",
+            ),
+            replace(
+                scope,
+                universe_source_ids=("source-a", "source-b", "source-c"),
+                candidates=(
+                    *scope.candidates,
+                    EpisodeSourceCandidate(
+                        "source-c",
+                        0.0,
+                        "forged-unscored-source",
+                    ),
+                ),
+                truncated_source_ids=(),
+                receipt_sha256="",
+            ),
+            replace(
+                scope,
+                universe_source_ids=tuple(reversed(scope.universe_source_ids)),
+                receipt_sha256="",
+            ),
+        )
+        policy = EpisodeRepresentativeRetrievalPolicy(
+            artifact_id=artifact.artifact_id,
+        )
+
+        for forged in forged_scopes:
+            with pytest.raises(ValueError, match="scope universe"):
+                condenser.retrieve_discourse_episode_representatives(
+                    query,
+                    forged.candidates,
+                    _BombNestedLinker(),
+                    policy=policy,
+                    source_scope=forged,
+                )
+
+
+def test_representative_retrieval_rejects_scope_after_source_universe_changes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    artifact = _artifact()
+    query = "Where is beta?"
+    with _condenser(tmp_path / "stale-source-scope") as condenser:
+        direct = condenser.ingest(
+            "user",
+            "The directly retrieved alpha note.",
+            source_id="source-a",
+        )
+        condenser.ingest(
+            "assistant",
+            "The independently routed beta note.",
+            source_id="source-b",
+        )
+        condenser.discourse.publish(artifact)
+        anchor = condenser.retriever.hydrate_chunk(
+            direct[1][0].chunk_id,
+            score=0.8,
+            route="hybrid",
+        )
+        assert anchor is not None
+        monkeypatch.setattr(
+            condenser._retriever,
+            "source_tfisf_query",
+            lambda *_args, **_kwargs: [("source-b", 9.0)],
+        )
+        scope = condenser.route_discourse_episode_sources(
+            query,
+            (anchor,),
+            artifact_id=artifact.artifact_id,
+            max_sources=2,
+        )
+        condenser.ingest(
+            "user",
+            "A new source appeared after routing.",
+            source_id="source-c",
+        )
+
+        with pytest.raises(ValueError, match="stale or foreign"):
+            condenser.retrieve_discourse_episode_representatives(
+                query,
+                scope.candidates,
+                _BombNestedLinker(),
+                policy=EpisodeRepresentativeRetrievalPolicy(
+                    artifact_id=artifact.artifact_id,
+                ),
+                source_scope=scope,
+            )
 
 
 def test_discourse_workflow_builds_links_closes_and_packs_exact_evidence(

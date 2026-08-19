@@ -136,3 +136,27 @@ def truncate_to_tokens(
     if len(tokens) <= max_tokens:
         return text
     return enc.decode(tokens[:max_tokens])
+
+
+def truncate_to_tokens_lossless(
+    text: str,
+    max_tokens: int,
+    encoding: str = DEFAULT_ENCODING,
+) -> str:
+    """Return an exact source prefix without replacement-character decoding.
+
+    Some Unicode code points span several BPE tokens.  Ordinary token-prefix
+    decoding can therefore synthesize U+FFFD, which is not a prefix of the
+    source.  This helper backs off to the longest token prefix that is also an
+    exact character prefix and fails closed when even one character cannot
+    fit a positive cap.
+    """
+
+    value = str(text)
+    if max_tokens <= 0 or not value:
+        return ""
+    for token_limit in range(int(max_tokens), 0, -1):
+        prefix = truncate_to_tokens(value, token_limit, encoding=encoding)
+        if prefix and value.startswith(prefix):
+            return prefix
+    raise ValueError("token cap cannot preserve one complete source character")

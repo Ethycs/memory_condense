@@ -2,17 +2,38 @@
 
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.search.selectors.evidence_features import (
+    _normalized_event_key,
+)
+from memory_condense.search.selectors.set_program import SetProgram
 
-class _RawAssignment(BaseModel):
-    """One validated row emitted by the injected set classifier."""
 
-    id: int = Field(ge=0)
+class ReportDumpMixin:
+    """Uniform ``model_dump`` seam for frozen report dataclasses."""
+
+    def model_dump(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class CandidateAssignment(BaseModel):
+    """One validated classifier row, normalized into selector evidence.
+
+    Field constraints validate the raw injected-classifier values; the
+    posterior triple is then renormalized to sum to one on construction.
+    A zero-mass row is a classifier fault and raises ``ValueError``.
+    """
+
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    candidate_id: int = Field(ge=0, validation_alias="id")
     event_key: str | None = None
     answer_value: str | None = ""
     timestamp: str | None = None
@@ -21,20 +42,33 @@ class _RawAssignment(BaseModel):
     p_null: float = Field(default=0.0, ge=0.0, le=1.0)
     answerability: float = Field(default=0.5, ge=0.0, le=1.0)
 
+    def model_post_init(self, __context: Any) -> None:
+        values = [float(self.p_existing), float(self.p_new), float(self.p_null)]
+        total = sum(values)
+        if total <= 0.0:
+            raise ValueError(
+                f"candidate {self.candidate_id} has zero posterior mass"
+            )
+        existing, new, null = (value / total for value in values)
+        # ``frozen`` guards outside mutation; normalization is part of
+        # construction, so write through the instance dict directly.
+        self.__dict__.update(
+            event_key=_normalized_event_key(self.event_key),
+            answer_value=(self.answer_value or "").strip(),
+            timestamp=self.timestamp.strip() if self.timestamp else None,
+            p_existing=existing,
+            p_new=new,
+            p_null=null,
+            answerability=float(self.answerability),
+        )
 
-@dataclass(frozen=True, slots=True)
-class CandidateAssignment:
-    """Normalized existing/new/null assignment used by the selector."""
-
-    candidate_id: int
-    event_key: str | None
-    answer_value: str
-    timestamp: str | None
-    p_existing: float
-    p_new: float
-    p_null: float
-    answerability: float
-    entropy: float
+    @property
+    def entropy(self) -> float:
+        return -sum(
+            probability * math.log(probability)
+            for probability in (self.p_existing, self.p_new, self.p_null)
+            if probability > 0.0
+        )
 
     @property
     def member_probability(self) -> float:
@@ -42,7 +76,7 @@ class CandidateAssignment:
 
 
 @dataclass(frozen=True, slots=True)
-class CoverageSelectionReport:
+class CoverageSelectionReport(ReportDumpMixin):
     """Text-free diagnostics for one transient set-selection pass."""
 
     operator: str
@@ -131,8 +165,44 @@ class CoverageSelectionReport:
     query_timestamp: str | None = None
     temporal_window_days: int | None = None
 
-    def model_dump(self) -> dict[str, Any]:
-        return asdict(self)
+    @classmethod
+    def uninspected(
+        cls,
+        program: SetProgram,
+        *,
+        started: float,
+        input_candidates: int,
+        selection_status: str,
+        **overrides: Any,
+    ) -> "CoverageSelectionReport":
+        """Report a pass that classified nothing, with standard zero counters.
+
+        Every candidate is treated as its own uncertain cluster and returned
+        unchanged.  Sites that deviate from the standard shape pass explicit
+        ``overrides``.
+        """
+
+        values: dict[str, Any] = {
+            "operator": program.operator.value,
+            "cardinality": program.cardinality,
+            "requires_completeness": program.requires_completeness,
+            "input_candidates": input_candidates,
+            "inspected_candidates": 0,
+            "classified_candidates": 0,
+            "event_clusters": 0,
+            "new_assignments": 0,
+            "existing_assignments": 0,
+            "null_assignments": 0,
+            "uncertain_assignments": input_candidates,
+            "output_candidates": input_candidates,
+            "representatives": 0,
+            "supporting_candidates": 0,
+            "workspace_tokens": 0,
+            "elapsed_s": time.perf_counter() - started,
+            "selection_status": selection_status,
+        }
+        values.update(overrides)
+        return cls(**values)
 
 
 CompletionFn = Callable[[list[dict[str, str]]], Any]

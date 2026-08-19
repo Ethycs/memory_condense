@@ -7,10 +7,10 @@ maps, residuals, and K/V state never enter this layer.
 
 from __future__ import annotations
 
-import math
 from typing import Callable, Sequence
 
 from memory_condense.associations.association_store import AssociationStore
+from memory_condense.associations.coaccess_graph import rank_discount
 from memory_condense.domain.schemas import RetrievalResult
 
 
@@ -33,7 +33,7 @@ def retrieval_concept_activations(
         # Rank discount is stable across retrievers whose raw score scales are
         # not comparable. Every exposed concept remains active, but an early
         # result contributes more to the learned association.
-        activations[chunk_id] = 1.0 / math.sqrt(rank)
+        activations[chunk_id] = rank_discount(rank)
         if len(activations) >= max_concepts:
             break
     return activations

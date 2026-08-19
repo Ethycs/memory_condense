@@ -127,11 +127,7 @@ def is_multi_fact_query(query: str) -> bool:
 
 
 def _retrieval_source_id(result: RetrievalResult) -> str:
-    return str(
-        result.memory_source_id
-        or (result.turn.source_id if result.turn is not None else None)
-        or result.chunk.turn_id
-    )
+    return result.durable_source_id
 
 
 def source_diverse_results(
@@ -142,11 +138,7 @@ def source_diverse_results(
     source_order: list[str] = []
     groups: dict[str, list[RetrievalResult]] = {}
     for result in candidates:
-        source_id = (
-            str(result.turn.source_id or result.turn.turn_id)
-            if result.turn is not None
-            else result.memory_source_id or result.chunk.turn_id
-        )
+        source_id = result.source_key
         if source_id not in groups:
             source_order.append(source_id)
             groups[source_id] = []
@@ -216,7 +208,7 @@ def source_partition_ranking(
     for rank, result in enumerate(candidates, start=1):
         if result.turn is None:
             continue
-        source_id = str(result.turn.source_id or result.turn.turn_id)
+        source_id = result.source_key
         partition = _source_partition(source_id, separator)
         count = hit_counts.get(partition, 0)
         if count >= max_hits_per_partition:

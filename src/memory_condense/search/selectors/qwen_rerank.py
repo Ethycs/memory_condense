@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import gc
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 from memory_condense.domain._tokenizer import truncate_to_tokens
@@ -21,6 +21,7 @@ from memory_condense.associations.head_memory import (
 )
 from memory_condense.domain.ranking import min_max_normalize
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.search.selectors.coverage_models import ReportDumpMixin
 
 
 def _qk_ov_cav_utility(hit: Any) -> float:
@@ -39,7 +40,7 @@ def _qk_ov_cav_utility(hit: Any) -> float:
 
 
 @dataclass(frozen=True, slots=True)
-class QwenRerankReport:
+class QwenRerankReport(ReportDumpMixin):
     """Text-free diagnostics for one bounded candidate tournament."""
 
     input_candidates: int
@@ -52,9 +53,6 @@ class QwenRerankReport:
     max_workspace_tokens: int
     total_candidate_inspections: int
     retained_transformer_state_bytes: int = 0
-
-    def model_dump(self) -> dict[str, int]:
-        return asdict(self)
 
 
 class QwenCandidateReranker:

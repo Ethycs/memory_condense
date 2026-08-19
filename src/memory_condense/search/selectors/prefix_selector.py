@@ -352,24 +352,13 @@ class QwenPrefixCoverageSelector:
 
         output = list(candidates)
         self.last_candidate_trace = self._uninspected_trace(output, program)
-        self.last_report = CoverageSelectionReport(
-            operator=program.operator.value,
-            cardinality=program.cardinality,
-            requires_completeness=program.requires_completeness,
+        self.last_report = CoverageSelectionReport.uninspected(
+            program,
+            started=started,
             input_candidates=len(output),
-            inspected_candidates=inspected,
-            classified_candidates=0,
-            event_clusters=0,
-            new_assignments=0,
-            existing_assignments=0,
-            null_assignments=0,
-            uncertain_assignments=len(output),
-            output_candidates=len(output),
-            representatives=0,
-            supporting_candidates=0,
-            workspace_tokens=workspace_tokens,
-            elapsed_s=time.perf_counter() - started,
             selection_status=selection_status,
+            inspected_candidates=inspected,
+            workspace_tokens=workspace_tokens,
             bypass_reason=bypass_reason,
             fallback_reason=reason,
             quantifier=program.quantifier.value,
@@ -383,7 +372,6 @@ class QwenPrefixCoverageSelector:
                 if selection_status == "bypassed"
                 else attempted == len(output)
             ),
-            frontier_exhaustive=False,
             frontier_batches=batches,
             active_partition_total=active_partition_total,
             active_partition_inspected=active_partition_inspected,

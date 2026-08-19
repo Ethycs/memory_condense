@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable
 
 from memory_condense.domain.schemas import RetrievalResult
@@ -15,30 +15,51 @@ _PROVENANCE_TIMESTAMP_RE = re.compile(
     r"[/-](?P<day>\d{1,2})(?:\D+(?P<hour>\d{1,2})"
     r":(?P<minute>\d{2}))?"
 )
+_BARE_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 
 
-def provenance_timestamp_key(value: str | None) -> float | None:
-    """Parse a full source date conservatively for closure-order validation."""
+def provenance_timestamp_key(
+    value: str | None,
+    *,
+    allow_bare_year: bool = False,
+    assume_utc: bool = False,
+) -> float | None:
+    """Parse a full source date conservatively for closure-order validation.
+
+    ``allow_bare_year`` opts into the coverage selectors' lossy fallback of
+    reading a lone four-digit year as a comparable float.  ``assume_utc``
+    interprets naive dates as UTC instead of local time, matching the
+    derived-scalar arithmetic contract.
+    """
 
     if not isinstance(value, str) or not value.strip():
         return None
     cleaned = value.strip().replace("Z", "+00:00")
+    tzinfo = timezone.utc if assume_utc else None
     try:
-        return datetime.fromisoformat(cleaned).timestamp()
+        parsed = datetime.fromisoformat(cleaned)
+        if assume_utc and parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
     except ValueError:
         match = _PROVENANCE_TIMESTAMP_RE.search(cleaned)
-        if match is None:
+        if match is not None:
+            try:
+                return datetime(
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                    int(match.group("hour") or 0),
+                    int(match.group("minute") or 0),
+                    tzinfo=tzinfo,
+                ).timestamp()
+            except (OverflowError, ValueError):
+                if not allow_bare_year:
+                    return None
+        elif not allow_bare_year:
             return None
-        try:
-            return datetime(
-                int(match.group("year")),
-                int(match.group("month")),
-                int(match.group("day")),
-                int(match.group("hour") or 0),
-                int(match.group("minute") or 0),
-            ).timestamp()
-        except (OverflowError, ValueError):
-            return None
+        year = _BARE_YEAR_RE.search(cleaned)
+        return float(year.group()) if year is not None else None
 
 
 def is_source_metadata_text(text: str) -> bool:

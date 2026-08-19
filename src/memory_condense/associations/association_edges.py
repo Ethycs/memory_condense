@@ -7,7 +7,10 @@ from typing import Sequence
 
 import numpy as np
 
-from memory_condense.associations.association_models import StoredHeadEdge
+from memory_condense.associations.association_models import (
+    StoredHeadEdge,
+    evidence_weighted_mean,
+)
 
 
 class AssociationEdgeStoreMixin:
@@ -97,18 +100,18 @@ class AssociationEdgeStoreMixin:
         else:
             old_count = int(existing[3])
             merged_count = old_count + evidence_count
-            old_weights = np.frombuffer(existing[0], dtype="<f4")
-            new_weights = np.frombuffer(weights_blob, dtype="<f4")
-            merged_weights = (
-                (old_weights * old_count + new_weights * evidence_count)
-                / merged_count
+            merged_weights = evidence_weighted_mean(
+                np.frombuffer(existing[0], dtype="<f4"),
+                np.frombuffer(weights_blob, dtype="<f4"),
+                old_count,
+                evidence_count,
             ).astype("<f4").tobytes()
-            merged_qk = (
-                float(existing[1]) * old_count + qk_score * evidence_count
-            ) / merged_count
-            merged_ov = (
-                float(existing[2]) * old_count + ov_transport * evidence_count
-            ) / merged_count
+            merged_qk = evidence_weighted_mean(
+                float(existing[1]), qk_score, old_count, evidence_count
+            )
+            merged_ov = evidence_weighted_mean(
+                float(existing[2]), ov_transport, old_count, evidence_count
+            )
             old_direction = (
                 None if existing[4] is None else bool(existing[4])
             )

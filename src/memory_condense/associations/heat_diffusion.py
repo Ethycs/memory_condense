@@ -14,10 +14,12 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from memory_condense.associations.association_store import AssociationStore
-from memory_condense.associations.associative_retrieval import expand_associative_results
-from memory_condense.associations.head_memory import (
-    AssociativeMemoryCandidate,
+from memory_condense.associations.associative_composition import (
     compose_associative_candidates,
+)
+from memory_condense.associations.associative_retrieval import expand_associative_results
+from memory_condense.associations.head_memory_models import (
+    AssociativeMemoryCandidate,
 )
 from memory_condense.domain.schemas import RetrievalResult
 
@@ -375,6 +377,34 @@ def expand_heat_diffusion_results(
 
     direct_tokens = sum(anchor.chunk.token_count for anchor in bounded_anchors)
     total_source_heat = sum(source_heat.values()) or 1.0
+
+    def candidate_metadata(
+        *,
+        anchor_chunk_id: str | None,
+        edge_source_id: str | None,
+        association_hop: int | None,
+        association_path: tuple[str, ...] | None,
+        diffusion_heat: float,
+        association_support: int,
+        source_id: str,
+        token_count: int,
+    ) -> dict[str, object]:
+        """The packed-candidate metadata shape shared by both routes."""
+        return {
+            "anchor_chunk_id": anchor_chunk_id,
+            "edge_source_id": edge_source_id,
+            "association_hop": association_hop,
+            "association_path": association_path,
+            "diffusion_heat": diffusion_heat,
+            "association_support": association_support,
+            "memory_source_id": source_id,
+            "source_heat": source_heat[source_id],
+            "source_token_budget": round(
+                direct_tokens * source_heat[source_id] / total_source_heat
+            ),
+            "token_count": token_count,
+        }
+
     heat_candidates: list[AssociativeMemoryCandidate] = []
     for node in diffusion.nodes:
         if node.chunk_id in anchor_ids:
@@ -389,22 +419,18 @@ def expand_heat_diffusion_results(
                 text=result.chunk.text,
                 score=node.heat,
                 route="heat",
-                metadata={
-                    "anchor_chunk_id": node.best_path[0],
-                    "edge_source_id": (
+                metadata=candidate_metadata(
+                    anchor_chunk_id=node.best_path[0],
+                    edge_source_id=(
                         node.best_path[-2] if len(node.best_path) > 1 else None
                     ),
-                    "association_hop": max(1, node.hop),
-                    "association_path": node.best_path,
-                    "diffusion_heat": node.heat,
-                    "association_support": node.supporting_transitions,
-                    "memory_source_id": source_id,
-                    "source_heat": source_heat[source_id],
-                    "source_token_budget": round(
-                        direct_tokens * source_heat[source_id] / total_source_heat
-                    ),
-                    "token_count": result.chunk.token_count,
-                },
+                    association_hop=max(1, node.hop),
+                    association_path=node.best_path,
+                    diffusion_heat=node.heat,
+                    association_support=node.supporting_transitions,
+                    source_id=source_id,
+                    token_count=result.chunk.token_count,
+                ),
             )
         )
     heat_candidates.sort(
@@ -462,24 +488,18 @@ def expand_heat_diffusion_results(
                     text=result.chunk.text,
                     score=result.score,
                     route="qk",
-                    metadata={
-                        "anchor_chunk_id": result.anchor_chunk_id,
-                        "edge_source_id": result.edge_source_chunk_id,
-                        "association_hop": result.association_hop,
-                        "association_path": result.association_path,
-                        "diffusion_heat": 0.0 if node is None else node.heat,
-                        "association_support": (
+                    metadata=candidate_metadata(
+                        anchor_chunk_id=result.anchor_chunk_id,
+                        edge_source_id=result.edge_source_chunk_id,
+                        association_hop=result.association_hop,
+                        association_path=result.association_path,
+                        diffusion_heat=0.0 if node is None else node.heat,
+                        association_support=(
                             0 if node is None else node.supporting_transitions
                         ),
-                        "memory_source_id": source_id,
-                        "source_heat": source_heat[source_id],
-                        "source_token_budget": round(
-                            direct_tokens
-                            * source_heat[source_id]
-                            / total_source_heat
-                        ),
-                        "token_count": result.chunk.token_count,
-                    },
+                        source_id=source_id,
+                        token_count=result.chunk.token_count,
+                    ),
                 )
             )
     ranked_ids = {candidate.episode_id for candidate in ranked_candidates}

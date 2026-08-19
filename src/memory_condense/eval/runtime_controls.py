@@ -253,10 +253,6 @@ class _LazyQwenPrefixCoverageSelector:
             selector.close()
 
 
-class _LazyLocalINICoverageSelector(_LazyQwenPrefixCoverageSelector):
-    """Load the local INI classifier only after BGE leaves the shared GPU."""
-
-
 class _LazyCrossEncoderCoverageSelector(_LazyQwenPrefixCoverageSelector):
     """Load semantic reranking only after BGE leaves the shared GPU."""
 
@@ -603,7 +599,9 @@ def _load_coverage_selector(args: argparse.Namespace, config: EvalConfig):
             strict=config.retrieval.coverage_selector_strict,
         )
 
-    return _LazyLocalINICoverageSelector(
+    # Lazy so the local INI classifier loads only after BGE leaves the
+    # shared GPU.
+    return _LazyQwenPrefixCoverageSelector(
         load_local_ini_selector,
         allow_selected_scope_fixed_k_closure=(
             config.retrieval.allow_selected_scope_fixed_k_closure

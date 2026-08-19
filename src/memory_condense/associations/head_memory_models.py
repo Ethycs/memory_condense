@@ -30,12 +30,10 @@ class HeadMemoryItem:
 class HeadAddress:
     indices: Any
     aggregate_scores: Any
-    head_scores: Any
     # Full external-attention probabilities: [query_heads, query_slots, memory_slots].
     head_weights: Any
     # OV input before W_O: [query_slots, query_heads, head_dim].
     mixed_values: Any
-    concept_scores: Any | None
     slot_ranges: tuple[tuple[int, int], ...]
 
 
@@ -110,13 +108,6 @@ class NestedMemoryInspection:
     max_workspace_candidates: int
     max_workspace_tokens: int
     total_candidate_inspections: int
-
-
-@dataclass(frozen=True, slots=True)
-class CAVNeighbor:
-    episode_id: str
-    score: float
-    shared_concepts: tuple[str, ...]
 
 
 @dataclass(slots=True)

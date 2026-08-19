@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias
 
 MEM0AI_PIN = "2.0.18"
@@ -164,8 +164,9 @@ class Mem0AdapterStats:
     search_context_tokens: int = 0
     search_prompt_token_proxy: int = 0
     # Compatibility spelling. This is the same caller-supplied local proxy,
-    # not an exact provider-token count.
-    search_prompt_tokens: int = 0
+    # not an exact provider-token count. Always derived from
+    # ``search_prompt_token_proxy`` in ``__post_init__``.
+    search_prompt_tokens: int = field(init=False, default=0)
     add_returned_memories: int = 0
     unique_ledger_memories: int = 0
     search_returned_memories: int = 0
@@ -176,6 +177,11 @@ class Mem0AdapterStats:
     provider_usage_status: str = MEM0_PROVIDER_USAGE_STATUS
     token_counter_identity: str = ""
     token_counter_identity_verified: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "search_prompt_tokens", self.search_prompt_token_proxy
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,8 +237,13 @@ class Mem0PackDiagnostic:
     reason: str
     context_tokens_after: int
     prompt_token_proxy_after: int
-    # Compatibility spelling for prompt_token_proxy_after.
-    prompt_tokens_after: int
+    # Compatibility spelling, always derived from prompt_token_proxy_after.
+    prompt_tokens_after: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "prompt_tokens_after", self.prompt_token_proxy_after
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,15 +267,16 @@ class Mem0SearchResult:
     prompt_token_proxy_budget_compliant: bool
     token_counter_identity: str
     token_counter_identity_verified: bool
-    # Compatibility fields below mirror their ``*_proxy`` counterparts.
-    # In particular, prompt_budget_certified certifies only deterministic
-    # local packing under the declared counter; it is not provider usage.
-    prompt_tokens: int
-    max_prompt_tokens: int
-    prompt_token_overhead: int
-    empty_context_prompt_tokens: int
-    residual_prompt_tokens: int
-    prompt_budget_certified: bool
+    # Compatibility fields below mirror their ``*_proxy`` counterparts and are
+    # always derived from them in ``__post_init__``. In particular,
+    # prompt_budget_certified certifies only deterministic local packing under
+    # the declared counter; it is not provider usage.
+    prompt_tokens: int = field(init=False)
+    max_prompt_tokens: int = field(init=False)
+    prompt_token_overhead: int = field(init=False)
+    empty_context_prompt_tokens: int = field(init=False)
+    residual_prompt_tokens: int = field(init=False)
+    prompt_budget_certified: bool = field(init=False)
     packed: tuple[Mem0Candidate, ...]
     raw_pool: tuple[Mem0Candidate, ...]
     diagnostics: tuple[Mem0PackDiagnostic, ...]
@@ -278,3 +290,20 @@ class Mem0SearchResult:
     comparison_certified: bool
     runtime_identity: Mapping[str, Any]
     stats: Mem0AdapterStats
+
+    def __post_init__(self) -> None:
+        for alias, canonical in (
+            ("prompt_tokens", self.prompt_token_proxy),
+            ("max_prompt_tokens", self.max_prompt_token_proxy),
+            ("prompt_token_overhead", self.prompt_token_proxy_overhead),
+            (
+                "empty_context_prompt_tokens",
+                self.empty_context_prompt_token_proxy,
+            ),
+            ("residual_prompt_tokens", self.residual_prompt_token_proxy),
+            (
+                "prompt_budget_certified",
+                self.prompt_token_proxy_budget_compliant,
+            ),
+        ):
+            object.__setattr__(self, alias, canonical)

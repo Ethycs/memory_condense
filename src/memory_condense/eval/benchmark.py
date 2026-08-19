@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from memory_condense.domain._tokenizer import (
     count_chat_prompt_token_proxy,
@@ -165,8 +165,6 @@ class BenchmarkQuestionResult(BaseModel):
     #: Deterministic cl100k message-content count plus the explicit fixed chat
     #: framing reserve. This is not provider-token usage.
     prompt_token_proxy: int = 0
-    #: Compatibility alias for ``prompt_token_proxy`` in historical reports.
-    prompt_tokens: int = 0
     responder_output_token_reserve: int = 0
     request_token_proxy: int = 0
     #: ``None`` means the provider did not report a nonzero input count.
@@ -176,6 +174,12 @@ class BenchmarkQuestionResult(BaseModel):
     transcript_token_savings: float = 0.0
     responder_usage: UsageStats = Field(default_factory=UsageStats)
     judge_usage: UsageStats = Field(default_factory=UsageStats)
+
+    @computed_field
+    @property
+    def prompt_tokens(self) -> int:
+        """Compatibility alias for ``prompt_token_proxy`` in historical reports."""
+        return self.prompt_token_proxy
 
 
 class BenchmarkSampleResult(BaseModel):
@@ -201,11 +205,15 @@ class BenchmarkSampleResult(BaseModel):
     mean_context_tokens: float = 0.0
     mean_prompt_token_proxy: float = 0.0
     mean_request_token_proxy: float = 0.0
-    #: Compatibility alias for ``mean_prompt_token_proxy``.
-    mean_prompt_tokens: float = 0.0
     transcript_tokens: int = 0
     mean_context_fraction: float = 0.0
     mean_transcript_token_savings: float = 0.0
+
+    @computed_field
+    @property
+    def mean_prompt_tokens(self) -> float:
+        """Compatibility alias for ``mean_prompt_token_proxy``."""
+        return self.mean_prompt_token_proxy
 
 
 class CategoryMetrics(BaseModel):
@@ -240,14 +248,9 @@ class BenchmarkRunResult(BaseModel):
     #: ``None`` means no responder call returned nonzero provider input usage.
     provider_prompt_budget_compliance: Optional[bool] = None
     provider_input_usage_status: str = "unavailable"
-    #: Compatibility aliases for the prompt-token-proxy fields.
-    mean_prompt_tokens: float = 0.0
-    p95_prompt_tokens: int = 0
     mean_transcript_tokens: float = 0.0
     mean_context_fraction: float = 0.0
     mean_transcript_token_savings: float = 0.0
-    max_prompt_tokens_observed: int = 0
-    prompt_budget_compliance: bool = True
     accuracy_target: float = 0.95
     min_target_questions: int = 100
     accuracy_target_met: Optional[bool] = None
@@ -266,6 +269,31 @@ class BenchmarkRunResult(BaseModel):
     evaluation_protocol: dict[str, object] = Field(default_factory=dict)
     by_category: dict[str, CategoryMetrics] = Field(default_factory=dict)
     run_timestamp: str = ""
+
+    # Compatibility aliases for the prompt-token-proxy fields.
+
+    @computed_field
+    @property
+    def mean_prompt_tokens(self) -> float:
+        return self.mean_prompt_token_proxy
+
+    @computed_field
+    @property
+    def p95_prompt_tokens(self) -> int:
+        return self.p95_prompt_token_proxy
+
+    @computed_field
+    @property
+    def max_prompt_tokens_observed(self) -> int:
+        return self.max_prompt_token_proxy_observed
+
+    @computed_field
+    @property
+    def prompt_budget_compliance(self) -> bool:
+        return (
+            self.prompt_token_proxy_budget_compliance
+            and self.provider_prompt_budget_compliance is not False
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -868,7 +896,6 @@ def evaluate_sample(
                     judge_reasoning=judge_reasoning,
                     context_tokens=context_tokens,
                     prompt_token_proxy=prompt_tokens,
-                    prompt_tokens=prompt_tokens,
                     responder_output_token_reserve=(
                         responder_output_token_reserve
                     ),
@@ -917,9 +944,6 @@ def evaluate_sample(
         ),
         mean_request_token_proxy=_mean(
             [float(qr.request_token_proxy) for qr in question_results]
-        ),
-        mean_prompt_tokens=_mean(
-            [float(qr.prompt_token_proxy) for qr in question_results]
         ),
         transcript_tokens=transcript_tokens,
         mean_context_fraction=_mean(
@@ -1120,10 +1144,6 @@ def run_benchmark(
         ),
         provider_prompt_budget_compliance=provider_prompt_budget_compliance,
         provider_input_usage_status=provider_input_usage_status,
-        mean_prompt_tokens=_mean(
-            [float(qr.prompt_token_proxy) for qr in all_questions]
-        ),
-        p95_prompt_tokens=(prompt_counts[p95_index] if prompt_counts else 0),
         mean_transcript_tokens=_mean(
             [float(qr.transcript_tokens) for qr in all_questions]
         ),
@@ -1133,8 +1153,6 @@ def run_benchmark(
         mean_transcript_token_savings=_mean(
             [qr.transcript_token_savings for qr in all_questions]
         ),
-        max_prompt_tokens_observed=max(prompt_counts, default=0),
-        prompt_budget_compliance=prompt_budget_compliance,
         accuracy_target=config.accuracy_target,
         min_target_questions=config.min_target_questions,
         accuracy_target_met=target_met,

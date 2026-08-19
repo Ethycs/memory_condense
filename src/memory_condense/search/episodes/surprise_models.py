@@ -12,6 +12,7 @@ from memory_condense.domain.discourse import (
     identity_sha256,
     quote_sha256,
 )
+from memory_condense.domain.sealed import SealedIdentity
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -32,8 +33,10 @@ EPISODIC_SURPRISE_PROBE = (
 
 
 @dataclass(frozen=True, slots=True)
-class AttentionHeadSurpriseReceipt:
+class AttentionHeadSurpriseReceipt(SealedIdentity):
     """Canonical, text-free identity for one transient Qwen episode pass."""
+
+    _SEAL_MISMATCH = "surprise receipt does not match its contents"
 
     model_id: str
     model_revision: str
@@ -196,56 +199,9 @@ class AttentionHeadSurpriseReceipt:
             raise ValueError("total workspace exceeds its bounded batch budget")
         if self.retained_signal_transformer_state_bytes != 0:
             raise ValueError("attention-head signal cannot retain transformer state")
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("surprise receipt does not match its contents")
-        object.__setattr__(self, "receipt_sha256", expected)
-
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "format": self.format,
-            "algorithm": self.algorithm,
-            "score_formula": self.score_formula,
-            "head_similarity_algorithm": self.head_similarity_algorithm,
-            "model_id": self.model_id,
-            "model_revision": self.model_revision,
-            "checkpoint_sha256": self.checkpoint_sha256,
-            "device": self.device,
-            "dtype": self.dtype,
-            "prefix_layers": self.prefix_layers,
-            "attention_layer": self.attention_layer,
-            "head_vote_k": self.head_vote_k,
-            "linker_implementation": self.linker_implementation,
-            "implementation_sha256": self.implementation_sha256,
-            "owned_runtime_binding": self.owned_runtime_binding,
-            "tokenizer_proxy_sha256": self.tokenizer_proxy_sha256,
-            "neutral_probe_sha256": self.neutral_probe_sha256,
-            "max_input_spans": self.max_input_spans,
-            "span_token_cap": self.span_token_cap,
-            "probe_token_cap": self.probe_token_cap,
-            "max_transport_dimension": self.max_transport_dimension,
-            "linker_max_candidates": self.linker_max_candidates,
-            "linker_max_workspace_tokens": self.linker_max_workspace_tokens,
-            "input_spans": self.input_spans,
-            "workspace_batches": self.workspace_batches,
-            "forward_passes": self.forward_passes,
-            "inspected_spans": self.inspected_spans,
-            "transport_dimension": self.transport_dimension,
-            "similarity_scalar_pairs": self.similarity_scalar_pairs,
-            "max_workspace_candidates": self.max_workspace_candidates,
-            "max_workspace_tokens": self.max_workspace_tokens,
-            "total_workspace_tokens": self.total_workspace_tokens,
-            "input_sequence_sha256": self.input_sequence_sha256,
-            "score_sequence_sha256": self.score_sequence_sha256,
-            "similarity_matrix_sha256": self.similarity_matrix_sha256,
-            "evidence_sequence_sha256": self.evidence_sequence_sha256,
-            "retained_signal_transformer_state_bytes": (
-                self.retained_signal_transformer_state_bytes
-            ),
-        }
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+        # ``identity_payload`` is inherited: every field except the seal feeds
+        # the digest, including the constant format/algorithm markers.
+        self._seal()
 
     def bind_evidence(
         self,

@@ -32,13 +32,6 @@ from memory_condense.eval.mem0_models import (
 _OWNERSHIP_MARKER = ".memory-condense-owned-state"
 
 
-def _adapter_override(name: str, default: Any) -> Any:
-    """Resolve a legacy facade monkeypatch without importing Mem0 itself."""
-
-    facade = sys.modules.get("memory_condense.eval.mem0_adapter")
-    return getattr(facade, name, default)
-
-
 _SECRET_CONFIG_KEYS = {
     "api_key",
     "password",
@@ -504,9 +497,7 @@ class Mem0OSSBackendFactory:
         self._state_root = state_root
         self._version_reader = _version_reader
         self._module_importer = _module_importer
-        self._stack_preflight = _stack_preflight or _adapter_override(
-            "_default_stack_preflight", _default_stack_preflight
-        )
+        self._stack_preflight = _stack_preflight or _default_stack_preflight
         self._ownership_token = uuid.uuid4().hex
         self._called = False
 

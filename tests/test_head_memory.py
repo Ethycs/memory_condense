@@ -4,7 +4,6 @@ import torch
 
 from memory_condense.associations.head_memory import (
     AssociativeMemoryCandidate,
-    CAVLinkIndex,
     HeadAssociationGraph,
     HeadKVStore,
     HeadMemoryItem,
@@ -398,25 +397,6 @@ def test_reserved_association_slots_backfill_with_direct_anchors() -> None:
         "c",
     ]
     assert result.anchors_displaced == 0
-
-
-def test_cav_link_index_links_episodes_and_concepts_compactly() -> None:
-    index = CAVLinkIndex(("retrieval", "pruning", "unrelated"))
-    index.add("seed", (2.0, 1.0, -1.0))
-    index.add("related", (1.5, 0.5, -2.0))
-    index.add("partial", (0.5, -1.0, -1.0))
-    index.add("noise", (-1.0, -1.0, 2.0))
-
-    neighbors = index.neighbors(["seed"], top_k=3)
-
-    assert [hit.episode_id for hit in neighbors] == ["related", "partial"]
-    assert neighbors[0].shared_concepts == ("retrieval", "pruning")
-    assert index.concept_neighbors("retrieval")[0] == ("pruning", 2)
-    assert index.signature_bytes == 4 * 3 * 4
-
-    assert index.remove(["related", "missing"]) == 1
-    assert index.episode_count == 3
-    assert index.concept_neighbors("retrieval")[0] == ("pruning", 1)
 
 
 def test_association_graph_selects_heads_that_recover_known_links() -> None:

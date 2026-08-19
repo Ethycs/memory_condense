@@ -168,60 +168,6 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
                 snapshot = self.latest_snapshot()
         return snapshot
 
-    def put_artifact(self, artifact: DiscourseArtifact) -> DiscourseSnapshot:
-        return self.publish(artifact)
-
-    def register_artifact(self, artifact: DiscourseArtifact) -> DiscourseSnapshot:
-        """Compatibility spelling for stores that register artifact identities."""
-
-        return self.put_artifact(artifact)
-
-    def publish_batch(
-        self,
-        artifact: DiscourseArtifact,
-        *,
-        episodes: Sequence[Episode] = (),
-        representatives: Sequence[EpisodeRepresentative] = (),
-        units: Sequence[DiscourseUnit] = (),
-        relations: Sequence[DiscourseRelation] = (),
-        coverage: Sequence[ArtifactCoverageMark] = (),
-    ) -> DiscourseSnapshot:
-        """Explicit batch spelling of :meth:`publish`."""
-
-        return self.publish(
-            artifact,
-            episodes=episodes,
-            representatives=representatives,
-            units=units,
-            relations=relations,
-            coverage=coverage,
-        )
-
-    def put_episodes(
-        self,
-        artifact: DiscourseArtifact,
-        episodes: Sequence[Episode],
-        *,
-        representatives: Sequence[EpisodeRepresentative] = (),
-    ) -> DiscourseSnapshot:
-        return self.publish(
-            artifact, episodes=episodes, representatives=representatives
-        )
-
-    def put_units(
-        self,
-        artifact: DiscourseArtifact,
-        units: Sequence[DiscourseUnit],
-    ) -> DiscourseSnapshot:
-        return self.publish(artifact, units=units)
-
-    def put_relations(
-        self,
-        artifact: DiscourseArtifact,
-        relations: Sequence[DiscourseRelation],
-    ) -> DiscourseSnapshot:
-        return self.publish(artifact, relations=relations)
-
     def _insert_artifact(self, artifact: DiscourseArtifact) -> bool:
         metadata = _safe_metadata(
             artifact.metadata,
@@ -1129,17 +1075,6 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
             values = tuple(self.get_relation(row[0]) for row in rows)
             result[unit_id] = tuple(item for item in values if item is not None)
         return result
-
-    def relations_incident_to(
-        self,
-        unit_id: str,
-        *,
-        artifact_id: str | None = None,
-        max_degree: int,
-    ) -> tuple[DiscourseRelation, ...]:
-        return self.incident_relations(
-            (unit_id,), artifact_id=artifact_id, max_degree=max_degree
-        )[unit_id]
 
     def incident_units(
         self,

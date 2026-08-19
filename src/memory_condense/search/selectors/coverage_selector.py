@@ -9,7 +9,6 @@ from memory_condense.search.selectors.coverage_models import (
     CompletionFn,
     CoverageScoreProvider,
     CoverageSelectionReport,
-    _RawAssignment,
 )
 from memory_condense.search.selectors.evidence_features import (
     _VENUE_QUERY_RE,
@@ -30,7 +29,6 @@ from memory_condense.search.selectors.ini_coverage_selector import (
     _clean_ini_field,
     _decode_assignment_rows,
     _extract_json_object,
-    _normalize_assignment,
     _parse_assignment,
 )
 from memory_condense.search.selectors.prefix_models import (

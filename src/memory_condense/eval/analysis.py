@@ -62,6 +62,22 @@ class ConversationDelta(BaseModel):
     model_config = {"frozen": True}
 
 
+def _paired_delta_fields(
+    baseline_mean: float,
+    treatment_mean: float,
+    baseline_n: int,
+    treatment_n: int,
+) -> dict[str, float | int]:
+    """The five delta fields BinDelta and ConversationDelta share."""
+    return {
+        "baseline_mean": baseline_mean,
+        "treatment_mean": treatment_mean,
+        "delta": treatment_mean - baseline_mean,
+        "baseline_n": baseline_n,
+        "treatment_n": treatment_n,
+    }
+
+
 class ComparisonReport(BaseModel):
     """The k=0 vs k=N ablation, rendered as data."""
 
@@ -170,11 +186,7 @@ def compare_runs(
     bin_deltas = [
         BinDelta(
             bin_index=i,
-            baseline_mean=b.mean_score,
-            treatment_mean=t.mean_score,
-            delta=t.mean_score - b.mean_score,
-            baseline_n=b.n,
-            treatment_n=t.n,
+            **_paired_delta_fields(b.mean_score, t.mean_score, b.n, t.n),
         )
         for i, (b, t) in enumerate(zip(b_bins, t_bins))
     ]
@@ -190,11 +202,12 @@ def compare_runs(
         by_conversation.append(
             ConversationDelta(
                 filename=filename,
-                baseline_mean=b_mean,
-                treatment_mean=t_mean,
-                delta=t_mean - b_mean,
-                baseline_n=len(b_cr.turn_results) if b_cr else 0,
-                treatment_n=len(t_cr.turn_results) if t_cr else 0,
+                **_paired_delta_fields(
+                    b_mean,
+                    t_mean,
+                    len(b_cr.turn_results) if b_cr else 0,
+                    len(t_cr.turn_results) if t_cr else 0,
+                ),
             )
         )
 

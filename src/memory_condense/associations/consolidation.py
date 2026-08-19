@@ -14,13 +14,29 @@ and ``chunks`` partitions, never another memory payload.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from dataclasses import dataclass
 from enum import Enum
 from itertools import combinations
 from typing import Callable, Mapping, Protocol, Sequence
 
+from memory_condense.associations.association_models import (
+    CoaccessUpdate,
+    _canonical_json,
+)
+from memory_condense.associations.coaccess_graph import (
+    accumulate_neighbor_evidence,
+    decayed_mass,
+    rank_discount,
+    ranked_neighbor_states,
+    score_coaccess_edges,
+    select_prune_victims,
+    validate_observation_params,
+)
+from memory_condense.associations.head_memory_models import (
+    AssociativeMemoryCandidate,
+    MemoryLinkResult,
+)
 from memory_condense.domain import decay, ranking
 from memory_condense.persistence.db import Database
 from memory_condense.domain.schemas import MemoryItem, MemoryResult, MemoryStatus, RetrievalResult
@@ -69,15 +85,8 @@ class ConsolidationNode:
         raise ValueError("invalid consolidation node kind prefix")
 
 
-@dataclass(frozen=True, slots=True)
-class ConsolidationUpdate:
-    """Result of one idempotent packed-context observation."""
-
-    event_id: str
-    created: bool
-    nodes_observed: int
-    edges_reinforced: int
-    edges_pruned: int
+#: Backward-compatible name for the consolidation store's update result.
+ConsolidationUpdate = CoaccessUpdate
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,10 +100,6 @@ class ConsolidationNeighbor:
     coactivation_count: int
     causal_count: int
     last_reinforced_turn: int
-
-
-def _canonical_json(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def context_activations(
@@ -122,7 +127,7 @@ def context_activations(
             if not item_id.strip():
                 continue
             rank += 1
-            ranked[constructor(item_id)] = 1.0 / math.sqrt(rank)
+            ranked[constructor(item_id)] = rank_discount(rank)
     selected = sorted(ranked.items(), key=lambda item: (-item[1], item[0].key))[
         :max_nodes
     ]
@@ -208,10 +213,6 @@ def inspect_qwen_context_hyperplane(
     candidate and workspace caps remain authoritative.
     """
 
-    # Local import avoids making the low-level consolidation store depend on
-    # the experimental Qwen module merely to support rank-only operation.
-    from memory_condense.associations.head_memory import AssociativeMemoryCandidate
-
     if max_nodes < 1:
         raise ValueError("max_nodes must be positive")
     candidates = [
@@ -255,8 +256,6 @@ def inspect_qwen_context_hyperplane(
     if len(results) == 1:
         result = results[0]
     else:
-        from memory_condense.associations.head_memory import MemoryLinkResult
-
         signatures = [
             tuple(float(value) for value in result.source_cav_signature)
             for result in results
@@ -301,58 +300,6 @@ class LiveConsolidationStore:
 
     def __init__(self, db: Database) -> None:
         self._db = db
-
-    @staticmethod
-    def _decayed_mass(
-        mass: float,
-        last_turn: int,
-        now_turn: int,
-        half_life_turns: float,
-    ) -> float:
-        return max(0.0, float(mass)) * decay.decay_factor(
-            last_turn,
-            now_turn,
-            half_life_turns,
-        )
-
-    @classmethod
-    def _edge_score(
-        cls,
-        *,
-        coactivation_mass: float,
-        last_reinforced_turn: int,
-        left_mass: float,
-        left_turn: int,
-        right_mass: float,
-        right_turn: int,
-        now_turn: int,
-        half_life_turns: float,
-    ) -> float:
-        edge = cls._decayed_mass(
-            coactivation_mass,
-            last_reinforced_turn,
-            now_turn,
-            half_life_turns,
-        )
-        left = cls._decayed_mass(
-            left_mass, left_turn, now_turn, half_life_turns
-        )
-        right = cls._decayed_mass(
-            right_mass, right_turn, now_turn, half_life_turns
-        )
-        denominator = math.sqrt(left * right)
-        if denominator <= 0.0:
-            return 0.0
-        normalized = min(1.0, max(0.0, edge / denominator))
-        # Normalization alone would leave an isolated pair at 1 forever because
-        # its node and edge masses decay together.  Freshness makes inactivity
-        # actually weaken the association.
-        freshness = decay.decay_factor(
-            last_reinforced_turn,
-            now_turn,
-            half_life_turns,
-        )
-        return normalized * freshness
 
     def _validate_nodes(self, nodes: Sequence[ConsolidationNode]) -> None:
         memory_ids = [
@@ -432,28 +379,19 @@ class LiveConsolidationStore:
         completed interaction, distinct from incidental co-access.
         """
 
-        event_id = str(access_event_id).strip()
-        if not event_id:
-            raise ValueError("access_event_id must be non-empty")
-        if len(event_id) > 256:
-            raise ValueError("access_event_id must be at most 256 characters")
+        event_id, rate, half_life = validate_observation_params(
+            access_event_id=access_event_id,
+            learning_rate=learning_rate,
+            half_life_turns=half_life_turns,
+            max_members_per_event=max_nodes_per_event,
+            max_degree=max_degree,
+            min_edge_score=min_edge_score,
+            max_event_history=max_event_history,
+            member_limit_name="max_nodes_per_event",
+        )
         turn = self._db.current_turn() if now_turn is None else int(now_turn)
         if turn < 0:
             raise ValueError("now_turn must be non-negative")
-        rate = float(learning_rate)
-        half_life = float(half_life_turns)
-        if not math.isfinite(rate) or rate <= 0.0:
-            raise ValueError("learning_rate must be finite and positive")
-        if not math.isfinite(half_life) or half_life <= 0.0:
-            raise ValueError("half_life_turns must be finite and positive")
-        if max_nodes_per_event < 1:
-            raise ValueError("max_nodes_per_event must be positive")
-        if max_degree < 0:
-            raise ValueError("max_degree must be non-negative")
-        if not 0.0 <= min_edge_score <= 1.0:
-            raise ValueError("min_edge_score must lie in [0, 1]")
-        if max_event_history < 1:
-            raise ValueError("max_event_history must be positive")
 
         ranked: list[tuple[ConsolidationNode, float]] = []
         for node, raw_activation in activations.items():
@@ -515,7 +453,7 @@ class LiveConsolidationStore:
             return ConsolidationUpdate(
                 event_id=event_id,
                 created=False,
-                nodes_observed=int(existing_event[1]),
+                members_observed=int(existing_event[1]),
                 edges_reinforced=0,
                 edges_pruned=0,
             )
@@ -561,7 +499,7 @@ class LiveConsolidationStore:
             old_mass, old_count, old_turn = existing_nodes.get(
                 node.key, (0.0, 0, turn)
             )
-            mass = self._decayed_mass(old_mass, old_turn, turn, half_life)
+            mass = decayed_mass(old_mass, old_turn, turn, half_life)
             mass += rate * activation * activation
             node_rows.append(
                 (
@@ -587,7 +525,7 @@ class LiveConsolidationStore:
             old_mass, old_count, old_causal_count, old_turn = existing_edges.get(
                 (left.key, right.key), (0.0, 0, 0, turn)
             )
-            mass = self._decayed_mass(old_mass, old_turn, turn, half_life)
+            mass = decayed_mass(old_mass, old_turn, turn, half_life)
             # Rank-only operation uses affinity=1.  A transient CAV/QK/OV
             # inspection can provide a bounded gate per pair, turning the Qwen
             # heads into the association teacher without persisting their
@@ -658,7 +596,7 @@ class LiveConsolidationStore:
         return ConsolidationUpdate(
             event_id=event_id,
             created=True,
-            nodes_observed=len(selected),
+            members_observed=len(selected),
             edges_reinforced=len(edge_rows),
             edges_pruned=edges_pruned,
         )
@@ -701,15 +639,13 @@ class LiveConsolidationStore:
         if turn < 0:
             raise ValueError("now_turn must be non-negative")
 
-        seeds: dict[str, tuple[ConsolidationNode, float]] = {}
+        seeds: dict[str, float] = {}
         for node, raw_activation in activations.items():
             activation = float(raw_activation)
             if not math.isfinite(activation) or not 0.0 <= activation <= 1.0:
                 raise ValueError("node activations must be finite and in [0, 1]")
             if activation > 0.0:
-                current = seeds.get(node.key)
-                if current is None or activation > current[1]:
-                    seeds[node.key] = (node, activation)
+                seeds[node.key] = max(seeds.get(node.key, 0.0), activation)
         if not seeds:
             return ()
 
@@ -736,98 +672,36 @@ class LiveConsolidationStore:
             f"WHERE node_key IN ({endpoint_placeholders})",
             tuple(endpoint_keys),
         ).fetchall()
-        nodes = {
-            str(row[0]): (
-                self._node_from_row(row),
-                float(row[4]),
-                int(row[5]),
-            )
-            for row in node_rows
+        nodes = {str(row[0]): self._node_from_row(row) for row in node_rows}
+        node_masses = {
+            str(row[0]): (float(row[4]), int(row[5])) for row in node_rows
         }
-        excluded = {node.key for node in exclude} | set(seed_keys)
-        candidates: dict[str, dict[str, object]] = {}
-        for low, high, mass, count, causal_count, edge_turn in edge_rows:
-            low = str(low)
-            high = str(high)
-            if (
-                int(count) < min_coactivation_count
-                and int(causal_count) < min_causal_count
-            ):
-                continue
-            if low in seeds and high not in seeds:
-                anchor_key, candidate_key = low, high
-            elif high in seeds and low not in seeds:
-                anchor_key, candidate_key = high, low
-            else:
-                continue
-            if candidate_key in excluded or candidate_key not in nodes:
-                continue
-            candidate_node = nodes[candidate_key][0]
-            if target_kind is not None and candidate_node.kind is not target_kind:
-                continue
-            left = nodes.get(low)
-            right = nodes.get(high)
-            if left is None or right is None:
-                continue
-            edge_score = self._edge_score(
-                coactivation_mass=float(mass),
-                last_reinforced_turn=int(edge_turn),
-                left_mass=left[1],
-                left_turn=left[2],
-                right_mass=right[1],
-                right_turn=right[2],
-                now_turn=turn,
-                half_life_turns=half_life,
-            )
-            evidence = min(1.0, edge_score * seeds[anchor_key][1])
-            if evidence < min_score:
-                continue
-            current = candidates.setdefault(
-                candidate_key,
-                {
-                    "score": 0.0,
-                    "anchors": set(),
-                    "anchor_key": anchor_key,
-                    "best_evidence": -1.0,
-                    "coactivation_count": 0,
-                    "causal_count": 0,
-                    "last_reinforced_turn": 0,
-                },
-            )
-            current["score"] = 1.0 - (1.0 - float(current["score"])) * (
-                1.0 - evidence
-            )
-            anchors = current["anchors"]
-            assert isinstance(anchors, set)
-            anchors.add(anchor_key)
-            current["coactivation_count"] = int(current["coactivation_count"]) + int(
-                count
-            )
-            current["causal_count"] = int(current["causal_count"]) + int(
-                causal_count
-            )
-            current["last_reinforced_turn"] = max(
-                int(current["last_reinforced_turn"]), int(edge_turn)
-            )
-            if evidence > float(current["best_evidence"]):
-                current["best_evidence"] = evidence
-                current["anchor_key"] = anchor_key
-
+        candidates = accumulate_neighbor_evidence(
+            edge_rows,
+            seeds=seeds,
+            excluded={node.key for node in exclude} | set(seed_keys),
+            nodes=node_masses,
+            default_node=None,
+            now_turn=turn,
+            half_life_turns=half_life,
+            min_score=min_score,
+            min_coaccess_count=min_coactivation_count,
+            min_causal_count=min_causal_count,
+            candidate_allowed=lambda key: key in nodes
+            and (target_kind is None or nodes[key].kind is target_kind),
+        )
         neighbors = [
             ConsolidationNeighbor(
-                node=nodes[key][0],
-                score=float(state["score"]),
-                support=len(state["anchors"]),
-                anchor=nodes[str(state["anchor_key"])][0],
-                coactivation_count=int(state["coactivation_count"]),
-                causal_count=int(state["causal_count"]),
-                last_reinforced_turn=int(state["last_reinforced_turn"]),
+                node=nodes[key],
+                score=float(state.score),
+                support=state.support,
+                anchor=nodes[str(state.anchor_key)],
+                coactivation_count=int(state.coaccess_count),
+                causal_count=int(state.causal_count),
+                last_reinforced_turn=int(state.last_reinforced_turn),
             )
-            for key, state in candidates.items()
+            for key, state in ranked_neighbor_states(candidates)
         ]
-        neighbors.sort(
-            key=lambda item: (-item.score, -item.support, item.node.key)
-        )
         return tuple(neighbors[:top_k])
 
     def prune_edges(
@@ -884,32 +758,19 @@ class LiveConsolidationStore:
         nodes = {
             str(row[0]): (float(row[1]), int(row[2])) for row in node_rows
         }
-        scored: dict[tuple[str, str], float] = {}
-        for low, high, mass, _count, edge_turn in edge_rows:
-            low = str(low)
-            high = str(high)
-            left = nodes.get(low, (0.0, turn))
-            right = nodes.get(high, (0.0, turn))
-            scored[(low, high)] = self._edge_score(
-                coactivation_mass=float(mass),
-                last_reinforced_turn=int(edge_turn),
-                left_mass=left[0],
-                left_turn=left[1],
-                right_mass=right[0],
-                right_turn=right[1],
-                now_turn=turn,
-                half_life_turns=half_life,
-            )
-        deletions = {edge for edge, score in scored.items() if score < min_score}
-        scoped = set(endpoint_keys) if node_keys is None else set(scoped_keys)
-        for node_key in scoped:
-            incident = [
-                (score, edge)
-                for edge, score in scored.items()
-                if node_key in edge and edge not in deletions
-            ]
-            incident.sort(key=lambda item: (-item[0], item[1]))
-            deletions.update(edge for _score, edge in incident[max_degree:])
+        scored = score_coaccess_edges(
+            ((low, high, mass, edge_turn)
+             for low, high, mass, _count, edge_turn in edge_rows),
+            nodes,
+            now_turn=turn,
+            half_life_turns=half_life,
+        )
+        deletions = select_prune_victims(
+            scored,
+            set(endpoint_keys) if node_keys is None else set(scoped_keys),
+            max_degree=max_degree,
+            min_score=min_score,
+        )
         if not deletions:
             return 0
         cursor = self._db.executemany(

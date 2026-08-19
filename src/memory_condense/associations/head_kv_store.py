@@ -219,18 +219,11 @@ class HeadKVStore:
             aggregate[candidate_tensor], k=top_k
         )
         selected_indices = candidate_tensor[selected_local_indices]
-        selected_head_scores = head_scores[:, selected_indices]
         return HeadAddress(
             indices=selected_indices,
             aggregate_scores=selected_scores,
-            head_scores=selected_head_scores,
             head_weights=attention_weights,
             mixed_values=mixed_values,
-            concept_scores=(
-                None
-                if concept_scores is None
-                else concept_scores[selected_local_indices]
-            ),
             slot_ranges=tuple(slot_ranges),
         )
 

@@ -15,12 +15,13 @@ import inspect
 import json
 import math
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from memory_condense.domain._tokenizer import truncate_to_tokens
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.search.selectors.coverage_models import ReportDumpMixin
 
 
 QWEN_CHOICE_MODEL_ID = "Qwen/Qwen3-0.6B"
@@ -148,7 +149,7 @@ Label:"""
 
 
 @dataclass(frozen=True, slots=True)
-class CausalChoiceEvidence:
+class CausalChoiceEvidence(ReportDumpMixin):
     """One candidate's normalized forced-choice evidence."""
 
     candidate_id: str
@@ -159,12 +160,9 @@ class CausalChoiceEvidence:
     direct_log_likelihood: float
     indirect_log_likelihood: float
 
-    def model_dump(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass(frozen=True, slots=True)
-class CausalChoiceScoreReport:
+class CausalChoiceScoreReport(ReportDumpMixin):
     """Text-free provenance and bounds for one scoring call."""
 
     model_id: str
@@ -184,12 +182,9 @@ class CausalChoiceScoreReport:
     retained_transformer_state_bytes: int = 0
     fallback_reason: str = ""
 
-    def model_dump(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass(frozen=True, slots=True)
-class CausalChoiceCompanionReport:
+class CausalChoiceCompanionReport(ReportDumpMixin):
     """Text-free diagnostics for query-conditioned source hydration."""
 
     input_sources: int
@@ -207,9 +202,6 @@ class CausalChoiceCompanionReport:
     score_report: Mapping[str, Any] | None
     retained_transformer_state_bytes: int = 0
     fallback_reason: str = ""
-
-    def model_dump(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 def _weight_paths(root: Path) -> list[Path]:

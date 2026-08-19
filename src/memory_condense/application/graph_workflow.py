@@ -10,6 +10,7 @@ from memory_condense.application.condenser_contracts import (
     ActivePartitionRoutingSnapshot as _ActivePartitionRoutingSnapshot,
 )
 from memory_condense.application.query_routing import (
+    _retrieval_source_id,
     is_multi_fact_query,
     query_facets,
     rank_concept_members,
@@ -20,6 +21,58 @@ from memory_condense.application.query_routing import (
 from memory_condense.domain._tokenizer import count_tokens, truncate_to_tokens
 from memory_condense.domain.ranking import DEFAULT_WEIGHTS, RankWeights
 from memory_condense.domain.schemas import MemoryResult, RetrievalResult
+
+
+def _round_robin_unique(
+    groups: Sequence[Sequence[RetrievalResult]],
+    limit: int,
+    seen: set[str],
+    *,
+    stop_on_stall: bool,
+) -> list[RetrievalResult]:
+    """Interleave groups position-by-position, skipping seen chunk IDs.
+
+    ``stop_on_stall=True`` gives up the first time a full position yields
+    nothing new; ``False`` keeps scanning until every group is exhausted.
+    """
+    output: list[RetrievalResult] = []
+    position = 0
+    while groups and len(output) < limit:
+        added = False
+        for group in groups:
+            if position >= len(group):
+                continue
+            result = group[position]
+            if result.chunk.chunk_id in seen:
+                continue
+            seen.add(result.chunk.chunk_id)
+            output.append(result)
+            added = True
+            if len(output) >= limit:
+                break
+        if not added and (
+            stop_on_stall
+            or all(position >= len(group) - 1 for group in groups)
+        ):
+            break
+        position += 1
+    return output
+
+
+def _accumulate_source_activation(
+    results: Sequence[RetrievalResult],
+    anchor_by_source: dict[str, str],
+    source_scores: dict[str, float],
+) -> None:
+    """Record each result's source anchor and best score in place."""
+    for result in results:
+        if result.turn is None:
+            continue
+        source_id = result.source_key
+        anchor_by_source.setdefault(source_id, result.chunk.chunk_id)
+        source_scores[source_id] = max(
+            source_scores.get(source_id, 0.0), float(result.score)
+        )
 
 
 class GraphWorkflowMixin:
@@ -132,6 +185,18 @@ class GraphWorkflowMixin:
             raise ValueError("source_partition_separator must be non-empty")
 
         self.last_partition_routing_report = {}
+
+        def apply_role_weights(
+            text: str, results: list[RetrievalResult]
+        ) -> list[RetrievalResult]:
+            return role_aware_results(
+                text,
+                results,
+                user_weight=role_user_weight,
+                assistant_weight=role_assistant_weight,
+                system_weight=role_system_weight,
+            )
+
         query_embedding = self._embedder.embed_query(query)
         pool_size = max(k, source_candidate_pool)
         routed_source_ids: list[str] | None = None
@@ -150,13 +215,7 @@ class GraphWorkflowMixin:
                 alpha=alpha,
             )
             if role_aware_retrieval:
-                coarse_pool = role_aware_results(
-                    query,
-                    coarse_pool,
-                    user_weight=role_user_weight,
-                    assistant_weight=role_assistant_weight,
-                    system_weight=role_system_weight,
-                )
+                coarse_pool = apply_role_weights(query, coarse_pool)
             partition_ranking = source_partition_ranking(
                 coarse_pool,
                 separator=source_partition_separator,
@@ -222,13 +281,7 @@ class GraphWorkflowMixin:
                 alpha=alpha,
             )
         if role_aware_retrieval:
-            pool = role_aware_results(
-                query,
-                pool,
-                user_weight=role_user_weight,
-                assistant_weight=role_assistant_weight,
-                system_weight=role_system_weight,
-            )
+            pool = apply_role_weights(query, pool)
             anchors = pool[:k]
         use_source_diversity = (
             multi_fact_source_diversity and is_multi_fact_query(query)
@@ -241,7 +294,7 @@ class GraphWorkflowMixin:
             "applied": use_source_diversity,
             "activated_prefix_sources": len(
                 {
-                    str(result.turn.source_id or result.turn.turn_id)
+                    result.source_key
                     for result in pool[:activation_k]
                     if result.turn is not None
                 }
@@ -297,13 +350,7 @@ class GraphWorkflowMixin:
                         alpha=alpha,
                     )
                     if role_aware_retrieval:
-                        concept_results = role_aware_results(
-                            query,
-                            concept_results,
-                            user_weight=role_user_weight,
-                            assistant_weight=role_assistant_weight,
-                            system_weight=role_system_weight,
-                        )
+                        concept_results = apply_role_weights(query, concept_results)
                     concept_results = source_diverse_results(concept_results)
         self.last_source_diversity_report.update(
             {
@@ -345,34 +392,18 @@ class GraphWorkflowMixin:
                         alpha=alpha,
                     )
                 if role_aware_retrieval:
-                    facet_pool = role_aware_results(
-                        facet,
-                        facet_pool,
-                        user_weight=role_user_weight,
-                        assistant_weight=role_assistant_weight,
-                        system_weight=role_system_weight,
-                    )
+                    facet_pool = apply_role_weights(facet, facet_pool)
                 facet_groups.append(facet_pool)
 
-        facet_results: list[RetrievalResult] = []
-        facet_seen = {result.chunk.chunk_id for result in anchors}
-        position = 0
-        while facet_groups and len(facet_results) < query_facet_slots:
-            added = False
-            for group in facet_groups:
-                if position >= len(group):
-                    continue
-                result = group[position]
-                if result.chunk.chunk_id in facet_seen:
-                    continue
-                facet_seen.add(result.chunk.chunk_id)
-                facet_results.append(result.model_copy(update={"route": "query_facet"}))
-                added = True
-                if len(facet_results) >= query_facet_slots:
-                    break
-            if not added and all(position >= len(group) - 1 for group in facet_groups):
-                break
-            position += 1
+        facet_results = [
+            result.model_copy(update={"route": "query_facet"})
+            for result in _round_robin_unique(
+                facet_groups,
+                query_facet_slots,
+                {result.chunk.chunk_id for result in anchors},
+                stop_on_stall=False,
+            )
+        ]
         self.last_query_facet_report = {
             "enabled": query_facet_retrieval,
             "facets": len(facets),
@@ -400,31 +431,9 @@ class GraphWorkflowMixin:
         for result in [*pool, *facet_results, *concept_results]:
             if result.turn is None:
                 continue
-            source_id = str(result.turn.source_id or result.turn.turn_id)
-            first_pool_result_by_source.setdefault(source_id, result)
-        for result in pool[:activation_k]:
-            if result.turn is not None:
-                source_id = str(result.turn.source_id or result.turn.turn_id)
-                anchor_by_source.setdefault(source_id, result.chunk.chunk_id)
-                source_scores[source_id] = max(
-                    source_scores.get(source_id, 0.0), float(result.score)
-                )
-        for result in facet_results:
-            if result.turn is None:
-                continue
-            source_id = str(result.turn.source_id or result.turn.turn_id)
-            anchor_by_source.setdefault(source_id, result.chunk.chunk_id)
-            source_scores[source_id] = max(
-                source_scores.get(source_id, 0.0), float(result.score)
-            )
-        for result in concept_results:
-            if result.turn is None:
-                continue
-            source_id = str(result.turn.source_id or result.turn.turn_id)
-            anchor_by_source.setdefault(source_id, result.chunk.chunk_id)
-            source_scores[source_id] = max(
-                source_scores.get(source_id, 0.0), float(result.score)
-            )
+            first_pool_result_by_source.setdefault(result.source_key, result)
+        for group in (pool[:activation_k], facet_results, concept_results):
+            _accumulate_source_activation(group, anchor_by_source, source_scores)
 
         tfisf_ranked = (
             self._retriever.source_tfisf_query(
@@ -560,13 +569,7 @@ class GraphWorkflowMixin:
                 exclude_chunk_ids=tuple(seen),
             )
             if role_aware_retrieval:
-                source_extras = role_aware_results(
-                    query,
-                    source_extras,
-                    user_weight=role_user_weight,
-                    assistant_weight=role_assistant_weight,
-                    system_weight=role_system_weight,
-                )
+                source_extras = apply_role_weights(query, source_extras)
             if use_source_diversity:
                 source_extras = source_diverse_results(source_extras)
             if use_source_reranker:
@@ -586,19 +589,11 @@ class GraphWorkflowMixin:
                     )
                     protected_anchor_by_source: dict[str, str] = {}
                     protected_source_scores: dict[str, float] = {}
-                    for result in pool[:protected_activation_k]:
-                        if result.turn is None:
-                            continue
-                        source_id = str(
-                            result.turn.source_id or result.turn.turn_id
-                        )
-                        protected_anchor_by_source.setdefault(
-                            source_id, result.chunk.chunk_id
-                        )
-                        protected_source_scores[source_id] = max(
-                            protected_source_scores.get(source_id, 0.0),
-                            float(result.score),
-                        )
+                    _accumulate_source_activation(
+                        pool[:protected_activation_k],
+                        protected_anchor_by_source,
+                        protected_source_scores,
+                    )
                     protected_extras = self._retriever.hybrid_query_sources(
                         query,
                         query_embedding,
@@ -611,13 +606,7 @@ class GraphWorkflowMixin:
                         exclude_chunk_ids=tuple(seen),
                     )
                     if role_aware_retrieval:
-                        protected_extras = role_aware_results(
-                            query,
-                            protected_extras,
-                            user_weight=role_user_weight,
-                            assistant_weight=role_assistant_weight,
-                            system_weight=role_system_weight,
-                        )
+                        protected_extras = apply_role_weights(query, protected_extras)
                     protected_extras = source_diverse_results(protected_extras)
                     protected_ids = {
                         result.chunk.chunk_id for result in protected_extras
@@ -664,15 +653,7 @@ class GraphWorkflowMixin:
                     source_unique: list[RetrievalResult] = []
                     seen_sources: set[str] = set()
                     for result in combined:
-                        source_id = str(
-                            result.memory_source_id
-                            or (
-                                result.turn.source_id
-                                if result.turn is not None
-                                else None
-                            )
-                            or result.chunk.turn_id
-                        )
+                        source_id = _retrieval_source_id(result)
                         if source_id in seen_sources:
                             continue
                         seen_sources.add(source_id)
@@ -691,7 +672,7 @@ class GraphWorkflowMixin:
                     break
                 if result.turn is None or result.chunk.chunk_id in seen:
                     continue
-                source_id = result.turn.source_id or result.turn.turn_id
+                source_id = result.source_key
                 anchor_id = anchor_by_source.get(source_id)
                 if anchor_id is None:
                     continue
@@ -730,13 +711,7 @@ class GraphWorkflowMixin:
                 for result in hsc_extras
             ]
             if role_aware_retrieval:
-                hsc_extras = role_aware_results(
-                    query,
-                    hsc_extras,
-                    user_weight=role_user_weight,
-                    assistant_weight=role_assistant_weight,
-                    system_weight=role_system_weight,
-                )
+                hsc_extras = apply_role_weights(query, hsc_extras)
             if use_source_diversity:
                 hsc_extras = source_diverse_results(hsc_extras)
         source_extras = [*source_extras, *hsc_extras]
@@ -745,30 +720,17 @@ class GraphWorkflowMixin:
             # Sample every first-round route instead of letting the longest
             # route monopolize the Qwen workspace. IDs/scalars cross rounds;
             # request-token state does not.
-            groups = [
-                list(anchors),
-                list(facet_results),
-                list(neighbors),
-                list(source_extras),
-            ]
-            attention_candidates: list[RetrievalResult] = []
-            attention_seen: set[str] = set()
-            position = 0
-            while len(attention_candidates) < self._source_candidate_reranker.candidate_pool:
-                added = False
-                for group in groups:
-                    if position >= len(group):
-                        continue
-                    result = group[position]
-                    if result.chunk.chunk_id not in attention_seen:
-                        attention_seen.add(result.chunk.chunk_id)
-                        attention_candidates.append(result)
-                        added = True
-                        if len(attention_candidates) >= self._source_candidate_reranker.candidate_pool:
-                            break
-                if not added:
-                    break
-                position += 1
+            attention_candidates = _round_robin_unique(
+                [
+                    list(anchors),
+                    list(facet_results),
+                    list(neighbors),
+                    list(source_extras),
+                ],
+                self._source_candidate_reranker.candidate_pool,
+                set(),
+                stop_on_stall=True,
+            )
 
             seeds = self._source_candidate_reranker.select(
                 query,
@@ -782,7 +744,7 @@ class GraphWorkflowMixin:
             for seed in seeds:
                 if seed.turn is None:
                     continue
-                source_id = seed.turn.source_id or seed.turn.turn_id
+                source_id = seed.source_key
                 if source_id not in feedback_source_scores:
                     feedback_source_ids.append(source_id)
                     feedback_anchor_by_source[source_id] = seed.chunk.chunk_id
@@ -1004,8 +966,12 @@ class GraphWorkflowMixin:
             routing_identity = hashlib.sha256(
                 identity_payload.encode("utf-8")
             ).hexdigest()
+            # ``active_partition_candidates_truncated`` already carries
+            # ``total_truncated`` — the admission update above wrote it into
+            # the report before this binding.
             self._active_partition_routing_snapshot = (
-                _ActivePartitionRoutingSnapshot(
+                _ActivePartitionRoutingSnapshot.from_report(
+                    active_partition_report,
                     routing_identity=routing_identity,
                     query_sha256=query_sha256,
                     transcript_turn=transcript_turn,
@@ -1015,81 +981,6 @@ class GraphWorkflowMixin:
                     frontier_chunk_ids=frontier_ids,
                     frontier_routes=frontier_routes,
                     active_frontier_rows=active_frontier_rows,
-                    active_partition_total=int(
-                        active_partition_report["active_partition_total"]
-                    ),
-                    active_partition_inspected=int(
-                        active_partition_report["active_partition_inspected"]
-                    ),
-                    active_partition_exhaustive=bool(
-                        active_partition_report["active_partition_exhaustive"]
-                    ),
-                    active_partition_sources_total=int(
-                        active_partition_report[
-                            "active_partition_sources_total"
-                        ]
-                    ),
-                    active_partition_structural_rows=int(
-                        active_partition_report[
-                            "active_partition_structural_rows"
-                        ]
-                    ),
-                    active_partition_structural_hypotheses=int(
-                        active_partition_report[
-                            "active_partition_structural_hypotheses"
-                        ]
-                    ),
-                    active_partition_candidates_admitted=int(
-                        active_partition_report[
-                            "active_partition_candidates_admitted"
-                        ]
-                    ),
-                    active_partition_candidates_already_present=int(
-                        active_partition_report[
-                            "active_partition_candidates_already_present"
-                        ]
-                    ),
-                    active_partition_candidates_replaced=int(
-                        active_partition_report[
-                            "active_partition_candidates_replaced"
-                        ]
-                    ),
-                    active_partition_candidates_truncated=total_truncated,
-                    active_partition_structural_overflow=int(
-                        active_partition_report[
-                            "active_partition_structural_overflow"
-                        ]
-                    ),
-                    active_partition_scan_contract=str(
-                        active_partition_report[
-                            "active_partition_scan_contract"
-                        ]
-                    ),
-                    active_partition_semantically_complete=bool(
-                        active_partition_report[
-                            "active_partition_semantically_complete"
-                        ]
-                    ),
-                    partition_scope_kind=str(
-                        active_partition_report["partition_scope_kind"]
-                    ),
-                    partition_inventory_total=int(
-                        active_partition_report["partition_inventory_total"]
-                    ),
-                    selected_partition_count=int(
-                        active_partition_report["selected_partition_count"]
-                    ),
-                    partition_scope_exhaustive=bool(
-                        active_partition_report["partition_scope_exhaustive"]
-                    ),
-                    selected_scope_structurally_complete=bool(
-                        active_partition_report[
-                            "selected_scope_structurally_complete"
-                        ]
-                    ),
-                    global_semantic_complete=bool(
-                        active_partition_report["global_semantic_complete"]
-                    ),
                 )
             )
             self.last_partition_routing_report.update(

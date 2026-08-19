@@ -9,7 +9,6 @@ import pytest
 
 from memory_condense.eval.__main__ import (
     _LazyCrossEncoderCoverageSelector,
-    _LazyLocalINICoverageSelector,
     _LazyQwenPrefixCoverageSelector,
     _apply_sample_offset,
     _assert_implementation_unchanged,
@@ -936,7 +935,7 @@ def test_local_ini_selector_loads_only_after_embedder_release(monkeypatch):
     config = config_from_args(args)
     lazy = _load_coverage_selector(args, config)
 
-    assert isinstance(lazy, _LazyLocalINICoverageSelector)
+    assert type(lazy) is _LazyQwenPrefixCoverageSelector
     assert events == []
     condenser = _attach_coverage_selector(ingest, lazy)(None, config, None)
     assert events == ["ingest", "release-bge"]

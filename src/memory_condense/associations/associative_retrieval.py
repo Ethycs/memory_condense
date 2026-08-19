@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import Callable, Sequence
 
 from memory_condense.associations.association_store import AssociationStore
-from memory_condense.associations.head_memory import (
-    AssociativeMemoryCandidate,
+from memory_condense.associations.associative_composition import (
     compose_associative_candidates,
+)
+from memory_condense.associations.head_memory_models import (
+    AssociativeMemoryCandidate,
 )
 from memory_condense.domain.schemas import RetrievalResult
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Mapping, Protocol, Sequence
 
 from memory_condense.associations.association_store import AssociationArtifact
@@ -112,36 +112,60 @@ class ActivePartitionRoutingSnapshot:
             == self.active_frontier_rows
         )
 
-    def pack_fields(self) -> dict[str, Any]:
+    @classmethod
+    def from_report(
+        cls,
+        report: Mapping[str, Any],
+        **identity: Any,
+    ) -> ActivePartitionRoutingSnapshot:
+        """Bind one completed scan report to its immutable routing identity.
+
+        The scan counters are read from ``report`` under their own field
+        names and coerced to the declared field type; the identity and
+        frontier bindings arrive as keyword arguments.
+        """
         scan = {
-            field: getattr(self, field)
-            for field in (
-                "active_partition_total",
-                "active_partition_inspected",
-                "active_partition_exhaustive",
-                "active_partition_sources_total",
-                "active_partition_structural_rows",
-                "active_partition_structural_hypotheses",
-                "active_partition_candidates_admitted",
-                "active_partition_candidates_already_present",
-                "active_partition_candidates_replaced",
-                "active_partition_candidates_truncated",
-                "active_partition_structural_overflow",
-                "active_partition_scan_contract",
-                "active_partition_semantically_complete",
-                "partition_scope_kind",
-                "partition_inventory_total",
-                "selected_partition_count",
-                "partition_scope_exhaustive",
-                "selected_scope_structurally_complete",
-                "global_semantic_complete",
-            )
+            name: _SCAN_FIELD_TYPES[name](report[name])
+            for name in _SCAN_FIELDS
         }
+        return cls(**identity, **scan)
+
+    def pack_fields(self) -> dict[str, Any]:
         return {
             "active_partition_total": self.active_partition_total,
             "active_partition_inspected": self.active_partition_inspected,
-            "active_partition_scan": scan,
+            "active_partition_scan": {
+                field: getattr(self, field) for field in _SCAN_FIELDS
+            },
         }
+
+
+# The scan counters are every snapshot field that is not part of the routing
+# identity or frontier binding; deriving the list keeps ``from_report`` and
+# ``pack_fields`` in lockstep with the field declarations above.
+_IDENTITY_FIELDS = frozenset(
+    {
+        "routing_identity",
+        "query_sha256",
+        "transcript_turn",
+        "content_high_watermark",
+        "selected_partitions",
+        "routed_source_ids",
+        "frontier_chunk_ids",
+        "frontier_routes",
+        "active_frontier_rows",
+    }
+)
+_SCAN_FIELDS = tuple(
+    item.name
+    for item in fields(ActivePartitionRoutingSnapshot)
+    if item.name not in _IDENTITY_FIELDS
+)
+_SCAN_FIELD_TYPES = {
+    item.name: {"int": int, "bool": bool, "str": str}[item.type]
+    for item in fields(ActivePartitionRoutingSnapshot)
+    if item.name in _SCAN_FIELDS
+}
 
 
 __all__ = [

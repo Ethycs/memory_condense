@@ -7,7 +7,7 @@ import json
 import math
 import re
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -80,6 +80,28 @@ def _confidence(value: float, label: str = "confidence") -> float:
     if not math.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
         raise ValueError(f"{label} must be finite and inside [0, 1]")
     return normalized
+
+
+def _optional(
+    normalizer: Callable[[Any, str], Any],
+) -> Callable[[Any, str], Any]:
+    """Wrap a normalizer so ``None`` passes through untouched."""
+
+    def normalize(value: Any, label: str) -> Any:
+        return None if value is None else normalizer(value, label)
+
+    return normalize
+
+
+def normalize_fields(obj: Any, **normalizers: Callable[[Any, str], Any]) -> None:
+    """Rebind each named field to ``normalizer(value, field_name)`` in place.
+
+    Only for fields whose error label is the field name itself; labeled or
+    cross-field validation stays hand-written at the call site.
+    """
+
+    for name, normalizer in normalizers.items():
+        object.__setattr__(obj, name, normalizer(getattr(obj, name), name))
 
 
 def _json_mapping(value: Mapping[str, Any], label: str) -> Mapping[str, Any]:

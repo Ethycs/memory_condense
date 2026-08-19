@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any, Sequence
 
+from memory_condense.associations.association_models import (
+    evidence_weighted_mean,
+    qk_transport_utility,
+)
 from memory_condense.associations.head_memory_models import HeadAssociationEdge
 
 
@@ -74,11 +77,13 @@ class HeadAssociationGraph:
             )
             return
         count = current.evidence_count
-        current.head_weights = (current.head_weights * count + weights) / (count + 1)
+        current.head_weights = evidence_weighted_mean(
+            current.head_weights, weights, count, 1
+        )
         current.score = self._score(current.head_weights)
-        current.ov_transport = (
-            current.ov_transport * count + max(0.0, float(ov_transport))
-        ) / (count + 1)
+        current.ov_transport = evidence_weighted_mean(
+            current.ov_transport, max(0.0, float(ov_transport)), count, 1
+        )
         current.evidence_count += 1
         if current.temporal_forward != temporal_forward:
             current.temporal_forward = None
@@ -204,7 +209,7 @@ class HeadAssociationGraph:
             edges = self._adjacency[source_id]
             ranked = sorted(
                 edges.values(),
-                key=lambda edge: (edge.score + math.log1p(edge.ov_transport)),
+                key=lambda edge: qk_transport_utility(edge.score, edge.ov_transport),
                 reverse=True,
             )
             keep = {edge.destination_id for edge in ranked[:max_neighbors]}

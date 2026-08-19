@@ -172,6 +172,42 @@ class QwenLiveHeadMemory:
             head_weights = block.sum(dim=-1).mean(dim=-1)
             self.graph.add(item.episode_id, candidate.episode_id, head_weights)
 
+    @staticmethod
+    def _hit_from_item(item: HeadMemoryItem, score: float) -> LiveMemoryHit:
+        return LiveMemoryHit(
+            episode_id=item.episode_id,
+            text=item.text,
+            score=float(score),
+            access_count=item.access_count,
+            metadata=dict(item.metadata),
+        )
+
+    @staticmethod
+    def _signature_values(query_signature: Any | None) -> tuple[float, ...]:
+        if query_signature is None:
+            return ()
+        return tuple(float(value) for value in query_signature.tolist())
+
+    def _result(
+        self,
+        indices: Sequence[int],
+        scores: Sequence[float],
+        *,
+        hop_episode_ids: tuple[tuple[str, ...], ...] | None = None,
+        query_signature: Any | None = None,
+    ) -> LiveMemoryResult:
+        hits = tuple(
+            self._hit_from_item(self.store.items[int(index)], score)
+            for index, score in zip(indices, scores, strict=True)
+        )
+        if hop_episode_ids is None:
+            hop_episode_ids = (tuple(hit.episode_id for hit in hits),)
+        return LiveMemoryResult(
+            hits=hits,
+            hop_episode_ids=hop_episode_ids,
+            query_cav_signature=self._signature_values(query_signature),
+        )
+
     def _selected_ov_transport(self, address: HeadAddress) -> Any:
         """Measure each selected episode's actual contribution through W_O."""
         torch = self.encoder._torch
@@ -294,30 +330,15 @@ class QwenLiveHeadMemory:
             attention_mass=final.aggregate_scores,
             ov_transport=self._selected_ov_transport(final),
         )
-        hits = tuple(
-            LiveMemoryHit(
-                episode_id=self.store.items[int(index)].episode_id,
-                text=self.store.items[int(index)].text,
-                score=float(score),
-                access_count=self.store.items[int(index)].access_count,
-                metadata=dict(self.store.items[int(index)].metadata),
-            )
-            for index, score in zip(
-                final.indices.tolist(), final.aggregate_scores.tolist(), strict=True
-            )
-        )
         hop_ids = tuple(
             tuple(self.store.items[int(index)].episode_id for index in hop.indices.tolist())
             for hop in addresses
         )
-        return LiveMemoryResult(
-            hits=hits,
+        return self._result(
+            final.indices.tolist(),
+            final.aggregate_scores.tolist(),
             hop_episode_ids=hop_ids,
-            query_cav_signature=(
-                ()
-                if query_signature is None
-                else tuple(float(value) for value in query_signature.tolist())
-            ),
+            query_signature=query_signature,
         )
 
     def retrieve_candidates(
@@ -368,29 +389,10 @@ class QwenLiveHeadMemory:
             attention_mass=addressed.aggregate_scores,
             ov_transport=transports,
         )
-        hits = tuple(
-            LiveMemoryHit(
-                episode_id=self.store.items[int(index)].episode_id,
-                text=self.store.items[int(index)].text,
-                score=float(score),
-                access_count=self.store.items[int(index)].access_count,
-                metadata=dict(self.store.items[int(index)].metadata),
-            )
-            for index, score in zip(
-                addressed.indices.tolist(),
-                addressed.aggregate_scores.tolist(),
-                strict=True,
-            )
-        )
-        ids = tuple(hit.episode_id for hit in hits)
-        return LiveMemoryResult(
-            hits=hits,
-            hop_episode_ids=(ids,),
-            query_cav_signature=(
-                ()
-                if query_signature is None
-                else tuple(float(value) for value in query_signature.tolist())
-            ),
+        return self._result(
+            addressed.indices.tolist(),
+            addressed.aggregate_scores.tolist(),
+            query_signature=query_signature,
         )
 
     def retrieve_residual(
@@ -429,27 +431,10 @@ class QwenLiveHeadMemory:
             selected_scores, selected_indices = torch.topk(scores, k=count)
         if record_access:
             self.store.touch(selected_indices)
-        hits = tuple(
-            LiveMemoryHit(
-                episode_id=self.store.items[int(index)].episode_id,
-                text=self.store.items[int(index)].text,
-                score=float(score),
-                access_count=self.store.items[int(index)].access_count,
-                metadata=dict(self.store.items[int(index)].metadata),
-            )
-            for index, score in zip(
-                selected_indices.tolist(), selected_scores.tolist(), strict=True
-            )
-        )
-        ids = tuple(hit.episode_id for hit in hits)
-        return LiveMemoryResult(
-            hits=hits,
-            hop_episode_ids=(ids,),
-            query_cav_signature=(
-                ()
-                if query_signature is None
-                else tuple(float(value) for value in query_signature.tolist())
-            ),
+        return self._result(
+            selected_indices.tolist(),
+            selected_scores.tolist(),
+            query_signature=query_signature,
         )
 
     def retrieve_associative(
@@ -491,13 +476,7 @@ class QwenLiveHeadMemory:
             cav_weight=cav_weight,
         )
         hits = tuple(
-            LiveMemoryHit(
-                episode_id=episode_id,
-                text=by_id[episode_id].text,
-                score=score,
-                access_count=by_id[episode_id].access_count,
-                metadata=dict(by_id[episode_id].metadata),
-            )
+            self._hit_from_item(by_id[episode_id], score)
             for episode_id, score in ranked
         )
         return LiveMemoryResult(

@@ -2,22 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.search.packing.source_provenance import (
     provenance_timestamp_key as _provenance_timestamp_key,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _PostCoverageClosure:
-    """Exact closed evidence IDs plus the scope of the closure proof."""
-
-    chunk_ids: tuple[str, ...]
-    scope: str
-    global_recall_guaranteed: bool
 
 
 # Post-coverage closure is intentionally narrower than ordinary coverage
@@ -60,7 +50,7 @@ class _CoverageClosureMixin:
         reservation_bodies: Mapping[str, str],
         reservation_snippets: Mapping[str, str],
         source_timestamps: Mapping[str, str],
-    ) -> _PostCoverageClosure | None:
+    ) -> tuple[tuple[str, ...], str, bool] | None:
         """Prove when a typed FIXED frontier can safely close the prompt tail.
 
         Coverage ranking normally fails open: unselected and uncertain rows
@@ -69,6 +59,8 @@ class _CoverageClosureMixin:
         FIXED-K result whose exact raw bodies have all been preflighted.  Any
         absent, stale, malformed, contradictory, truncated, or rejected
         diagnostic returns ``None`` and preserves the ordinary fail-open path.
+        A proof returns ``(closed chunk_ids, closure scope,
+        global_recall_guaranteed)``.
         """
 
         if (
@@ -393,8 +385,8 @@ class _CoverageClosureMixin:
             )
         if not ordered:
             return None
-        return _PostCoverageClosure(
-            chunk_ids=requested_ids,
-            scope=("global_semantic" if global_proof else "selected_scope_policy"),
-            global_recall_guaranteed=global_proof,
+        return (
+            requested_ids,
+            "global_semantic" if global_proof else "selected_scope_policy",
+            global_proof,
         )

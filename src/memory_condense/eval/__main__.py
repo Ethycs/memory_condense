@@ -37,7 +37,8 @@ from memory_condense.eval.benchmark import (
     save_benchmark_report,
 )
 from memory_condense.eval.compiled_cache import sample_sha256
-from memory_condense.eval.recall import print_recall_report, run_recall
+from memory_condense.eval.recall_measurement import run_recall
+from memory_condense.eval.recall_reporting import print_recall_report
 from memory_condense.eval.report import (
     print_run_summary,
     print_sweep_table,
@@ -149,9 +150,6 @@ _load_candidate_reranker = _runtime_controls._load_candidate_reranker
 _attach_candidate_reranker = _runtime_controls._attach_candidate_reranker
 _LazyQwenPrefixCoverageSelector = (
     _runtime_controls._LazyQwenPrefixCoverageSelector
-)
-_LazyLocalINICoverageSelector = (
-    _runtime_controls._LazyLocalINICoverageSelector
 )
 _LazyCrossEncoderCoverageSelector = (
     _runtime_controls._LazyCrossEncoderCoverageSelector

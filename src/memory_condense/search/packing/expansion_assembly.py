@@ -573,12 +573,11 @@ class _ExpansionPackingMixin(
             reservation_snippets=reservation_snippets,
             source_timestamps=source_timestamps,
         )
-        closure_id_set = set(closure.chunk_ids if closure is not None else ())
-        closure_applied = closure is not None
-        closure_scope = closure.scope if closure is not None else ""
-        closure_global_recall_guaranteed = bool(
-            closure is not None and closure.global_recall_guaranteed
+        closure_chunk_ids, closure_scope, closure_global_recall_guaranteed = (
+            closure if closure is not None else ((), "", False)
         )
+        closure_id_set = set(closure_chunk_ids)
+        closure_applied = closure is not None
         scope_provenance = {
             "partition_scope_kind": (
                 _report_value(selector_report, "partition_scope_kind")

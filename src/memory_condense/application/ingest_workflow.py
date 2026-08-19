@@ -98,25 +98,20 @@ class IngestWorkflowMixin:
             tuple[str, str, str | None, datetime | None, str | None]
         ] = []
         for record in turns:
-            if len(record) == 3:
-                role, text, source_id = record
-                records.append((role, text, source_id, None, None))
-            elif len(record) == 4:
-                role, text, source_id, created_at = record
-                records.append((role, text, source_id, created_at, None))
-            elif len(record) == 5:
-                role, text, source_id, created_at, turn_id = record
-                normalized_turn_id = str(turn_id).strip()
-                if not normalized_turn_id:
-                    raise ValueError("explicit turn IDs must be non-empty")
-                records.append(
-                    (role, text, source_id, created_at, normalized_turn_id)
-                )
-            else:  # pragma: no cover - static tuple union, runtime guard
+            if not 3 <= len(record) <= 5:
                 raise ValueError(
                     "ingest records need role, text, source, optional time, "
                     "and optional explicit turn ID"
                 )
+            role, text, source_id, created_at, turn_id = (
+                *record,
+                *(None,) * (5 - len(record)),
+            )
+            if turn_id is not None:
+                turn_id = str(turn_id).strip()
+                if not turn_id:
+                    raise ValueError("explicit turn IDs must be non-empty")
+            records.append((role, text, source_id, created_at, turn_id))
         if self._auto_extract:
             return [
                 self.ingest(
@@ -192,10 +187,9 @@ class IngestWorkflowMixin:
             chunk
             for chunk in unique.values()
             if overwrite
-            or self._associations.get_signature(
+            or not self._associations.has_signature(
                 chunk.chunk_id, artifact.artifact_id
             )
-            is None
         ]
         span_texts: list[str] = []
         span_owners: list[str] = []

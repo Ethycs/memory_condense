@@ -45,11 +45,56 @@ from memory_condense.domain.schemas import (
     content_key,
 )
 
-_ITEM_COLUMNS = (
-    "mem_id, type, content, details, status, supersedes, pin, energy, "
-    "half_life_turns, importance, created_at, last_access_at, embedding, "
-    "last_access_turn"
+# One canonical column list for ``memory_items`` rows. The SELECT list, the
+# INSERT statement, and the row reader are all derived from it, so the three
+# can never drift out of positional sync. ``content_hash`` is write-only
+# (recomputed from type + content on read) and appended at INSERT time.
+_COLUMNS = (
+    "mem_id",
+    "type",
+    "content",
+    "details",
+    "status",
+    "supersedes",
+    "pin",
+    "energy",
+    "half_life_turns",
+    "importance",
+    "created_at",
+    "last_access_at",
+    "last_access_turn",
+    "embedding",
 )
+_ITEM_COLUMNS = ", ".join(_COLUMNS)
+
+# Per-column coercions between MemoryItem attributes and stored values.
+# Columns absent from a map pass through unchanged (plain TEXT / numerics).
+_TO_DB = {
+    "type": lambda v: v.value,
+    "status": lambda v: v.value,
+    "pin": lambda v: v.value,
+    "energy": float,
+    "half_life_turns": float,
+    "importance": float,
+    "created_at": lambda v: v.isoformat(),
+    "last_access_at": lambda v: v.isoformat(),
+    "last_access_turn": int,
+    "embedding": lambda v: _to_blob(v),
+}
+_FROM_DB = {
+    "type": MemoryType,
+    "status": MemoryStatus,
+    "pin": PinState,
+    "created_at": datetime.fromisoformat,
+    "last_access_at": datetime.fromisoformat,
+    "embedding": lambda v: (
+        None if v is None else np.frombuffer(v, dtype=np.float32).tolist()
+    ),
+}
+
+# Same single-source treatment for the ``memory_provenance`` round-trip
+# (``mem_id`` is the join key, supplied separately on both paths).
+_PROVENANCE_COLUMNS = ("turn_id", "chunk_id", "quote")
 
 
 class Embedder(Protocol):
@@ -110,23 +155,15 @@ class MemoryStore:
                 self._db.commit()
                 return self.touch(existing.mem_id) or existing
 
-        vector = self._resolve_embedding(op.content, embedding)
-        item = MemoryItem(
-            type=op.type,
-            content=op.content,
-            details=op.details,
-            provenance=list(op.provenance),
-            status=MemoryStatus.ACTIVE,
-            supersedes=supersedes,
-            pin=PinState.NONE,
-            energy=decay.seed_energy(op.importance),
+        item = MemoryItem.from_create(
+            op,
+            embedding=self._resolve_embedding(op.content, embedding),
             half_life_turns=half_life_turns,
-            importance=op.importance,
+            supersedes=supersedes,
             # Creation is an access: an item enters the store at the current
             # turn, not at turn 0. Without this every new memory would be born
             # already `current_turn` turns behind and go COLD immediately.
             last_access_turn=self._db.current_turn(),
-            embedding=vector,
         )
         self._insert(item)
         return item
@@ -592,29 +629,16 @@ class MemoryStore:
     # ------------------------------------------------------------------
 
     def _insert(self, item: MemoryItem) -> None:
+        values = tuple(
+            _TO_DB[column](getattr(item, column))
+            if column in _TO_DB
+            else getattr(item, column)
+            for column in _COLUMNS
+        )
         self._db.execute(
-            "INSERT INTO memory_items "
-            "(mem_id, type, content, details, status, supersedes, pin, energy, "
-            "half_life_turns, importance, created_at, last_access_at, "
-            "last_access_turn, embedding, content_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                item.mem_id,
-                item.type.value,
-                item.content,
-                item.details,
-                item.status.value,
-                item.supersedes,
-                item.pin.value,
-                float(item.energy),
-                float(item.half_life_turns),
-                float(item.importance),
-                item.created_at.isoformat(),
-                item.last_access_at.isoformat(),
-                int(item.last_access_turn),
-                _to_blob(item.embedding),
-                content_key(item.type, item.content),
-            ),
+            f"INSERT INTO memory_items ({_ITEM_COLUMNS}, content_hash) "
+            f"VALUES ({', '.join('?' * (len(_COLUMNS) + 1))})",
+            values + (content_key(item.type, item.content),),
         )
         self._insert_provenance(item.mem_id, item.provenance)
         self._db.commit()
@@ -622,12 +646,16 @@ class MemoryStore:
     def _insert_provenance(
         self, mem_id: str, provenance: Iterable[Provenance]
     ) -> None:
-        rows = [(mem_id, p.turn_id, p.chunk_id, p.quote) for p in provenance]
+        rows = [
+            (mem_id,) + tuple(getattr(p, column) for column in _PROVENANCE_COLUMNS)
+            for p in provenance
+        ]
         if not rows:
             return
         self._db.executemany(
             "INSERT OR IGNORE INTO memory_provenance "
-            "(mem_id, turn_id, chunk_id, quote) VALUES (?, ?, ?, ?)",
+            f"(mem_id, {', '.join(_PROVENANCE_COLUMNS)}) "
+            f"VALUES ({', '.join('?' * (len(_PROVENANCE_COLUMNS) + 1))})",
             rows,
         )
 
@@ -677,11 +705,12 @@ class MemoryStore:
 
     def _load_provenance(self, mem_id: str) -> list[Provenance]:
         cur = self._db.execute(
-            "SELECT turn_id, chunk_id, quote FROM memory_provenance WHERE mem_id = ?",
+            f"SELECT {', '.join(_PROVENANCE_COLUMNS)} "
+            "FROM memory_provenance WHERE mem_id = ?",
             (mem_id,),
         )
         return [
-            Provenance(turn_id=row[0], chunk_id=row[1], quote=row[2])
+            Provenance(**dict(zip(_PROVENANCE_COLUMNS, row)))
             for row in cur.fetchall()
         ]
 
@@ -696,44 +725,29 @@ class MemoryStore:
             batch = ids[start : start + 500]
             placeholders = ",".join("?" for _ in batch)
             rows = self._db.execute(
-                "SELECT mem_id, turn_id, chunk_id, quote "
+                f"SELECT mem_id, {', '.join(_PROVENANCE_COLUMNS)} "
                 f"FROM memory_provenance WHERE mem_id IN ({placeholders})",
                 tuple(batch),
             ).fetchall()
-            for mem_id, turn_id, chunk_id, quote in rows:
+            for mem_id, *values in rows:
                 out[mem_id].append(
-                    Provenance(turn_id=turn_id, chunk_id=chunk_id, quote=quote)
+                    Provenance(**dict(zip(_PROVENANCE_COLUMNS, values)))
                 )
         return out
 
     def _row_to_item(
         self, row: tuple, provenance: list[Provenance] | None = None
     ) -> MemoryItem:
-        embedding = None
-        if row[12] is not None:
-            embedding = np.frombuffer(row[12], dtype=np.float32).tolist()
-
-        return MemoryItem(
-            mem_id=row[0],
-            type=MemoryType(row[1]),
-            content=row[2],
-            details=row[3],
-            provenance=(
-                self._load_provenance(row[0])
-                if provenance is None
-                else provenance
-            ),
-            status=MemoryStatus(row[4]),
-            supersedes=row[5],
-            pin=PinState(row[6]),
-            energy=row[7],
-            half_life_turns=row[8],
-            importance=row[9],
-            created_at=datetime.fromisoformat(row[10]),
-            last_access_at=datetime.fromisoformat(row[11]),
-            last_access_turn=row[13],
-            embedding=embedding,
+        record = {
+            column: _FROM_DB[column](value) if column in _FROM_DB else value
+            for column, value in zip(_COLUMNS, row)
+        }
+        record["provenance"] = (
+            self._load_provenance(record["mem_id"])
+            if provenance is None
+            else provenance
         )
+        return MemoryItem(**record)
 
     def _resolve_embedding(self, text: str, embedding: Any) -> list[float] | None:
         if embedding is not None:

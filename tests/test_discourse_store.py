@@ -250,7 +250,7 @@ def test_identity_mismatch_is_rejected_without_new_revision(graph):
 def test_late_batch_failure_rolls_back_earlier_rows(graph):
     _, _, store, texts = graph
     artifact = _artifact()
-    store.put_artifact(artifact)
+    store.publish(artifact)
     new_unit = _unit("u-new", "setup", "c1", texts["c1"], 1)
     missing = _unit("u-missing", "result", "c2", texts["c2"], 2)
     invalid_relation = _relation(
@@ -407,7 +407,9 @@ def test_incident_queries_apply_per_unit_degree_cap(graph):
         units=(setup, result, decision),
         relations=(support, revision),
     )
-    assert store.relations_incident_to("u-result", max_degree=1) == (revision,)
+    assert store.incident_relations(("u-result",), max_degree=1)["u-result"] == (
+        revision,
+    )
     assert store.incident_units(("u-result",), max_degree=1)["u-result"] == (
         decision,
     )
@@ -465,7 +467,7 @@ def test_request_shaped_metadata_is_never_persisted(graph, metadata):
         metadata=metadata,
     )
     with pytest.raises(ValueError, match="cannot persist request-derived"):
-        store.put_artifact(artifact)
+        store.publish(artifact)
     assert store.get_artifact("disc-unsafe") is None
 
 
@@ -500,7 +502,7 @@ def test_graph_schema_has_no_evidence_text_or_transformer_state_columns(graph):
 
 def test_snapshot_receipt_is_immutable_and_detects_stale_high_water(graph):
     _, db, store, _ = graph
-    receipt = store.put_artifact(_artifact())
+    receipt = store.publish(_artifact())
     assert store.validate_snapshot(receipt)
     db.execute(
         "INSERT INTO turns "
@@ -516,7 +518,7 @@ def test_snapshot_receipt_is_immutable_and_detects_stale_high_water(graph):
 
 def test_snapshot_receipt_rejects_update_and_delete_at_storage_boundary(graph):
     _, db, store, _ = graph
-    receipt = store.put_artifact(_artifact())
+    receipt = store.publish(_artifact())
     with pytest.raises(sqlite3.IntegrityError, match="receipts are immutable"):
         db.execute(
             "UPDATE discourse_graph_revisions SET chunk_count = 0 "
@@ -567,14 +569,14 @@ def test_every_published_graph_row_family_is_update_immutable(graph):
 
 def test_read_only_store_can_verify_but_not_publish(graph):
     path, db, store, _ = graph
-    receipt = store.put_artifact(_artifact())
+    receipt = store.publish(_artifact())
     db.close()
     with Database(path, read_only=True) as read_db:
         read_store = DiscourseStore(read_db)
         assert read_store.get_artifact("disc-test") == _artifact()
         assert read_store.snapshot() == receipt
         with pytest.raises(sqlite3.OperationalError):
-            read_store.put_artifact(_artifact("disc-new"))
+            read_store.publish(_artifact("disc-new"))
 
 
 def test_multispan_graph_identity_is_canonical_and_member_ordinals_are_dense():
@@ -647,7 +649,7 @@ def test_new_publication_rejects_evidence_without_authoritative_source(graph):
 
 def test_same_count_source_mutation_invalidates_content_bound_snapshot(graph):
     _, db, store, _ = graph
-    before = store.put_artifact(_artifact())
+    before = store.publish(_artifact())
     db.execute(
         "UPDATE turns SET text = 'Setup uses DuckDB.' WHERE turn_id = 't1'"
     )
@@ -667,16 +669,16 @@ def test_same_count_source_mutation_invalidates_content_bound_snapshot(graph):
 
 def test_rolled_back_outer_transaction_cannot_poison_content_root_cache(graph):
     _, db, store, _ = graph
-    first = store.put_artifact(_artifact("disc-a"))
+    first = store.publish(_artifact("disc-a"))
     db.commit()
     assert store.snapshot() == first
 
     db.execute("BEGIN")
-    failed = store.put_artifact(_artifact("disc-b"))
+    failed = store.publish(_artifact("disc-b"))
     db.connection.rollback()
     assert store.snapshot() == first
 
-    committed = store.put_artifact(_artifact("disc-c"))
+    committed = store.publish(_artifact("disc-c"))
     _, authoritative_graph_root = discourse_content_digests(db)
     assert committed.graph_content_sha256 == authoritative_graph_root
     assert committed.graph_content_sha256 != failed.graph_content_sha256
@@ -702,7 +704,7 @@ def test_same_shape_databases_with_different_source_bytes_never_hash_identically
                 (text,),
             )
             db.commit()
-            snapshots.append(DiscourseStore(db).put_artifact(_artifact()))
+            snapshots.append(DiscourseStore(db).publish(_artifact()))
     assert snapshots[0].source_revision == snapshots[1].source_revision
     assert snapshots[0].chunk_count == snapshots[1].chunk_count
     assert snapshots[0].artifact_ids == snapshots[1].artifact_ids

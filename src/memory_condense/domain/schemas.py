@@ -190,6 +190,40 @@ class MemoryItem(BaseModel):
     def is_pinned(self) -> bool:
         return self.pin is not PinState.NONE
 
+    @classmethod
+    def from_create(
+        cls,
+        op: "CreateOp",
+        *,
+        embedding: Optional[list[float]] = None,
+        half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
+        supersedes: Optional[str] = None,
+        last_access_turn: int = 0,
+    ) -> "MemoryItem":
+        """Build the item a ``CreateOp`` proposes.
+
+        Pure field mapping only. Store-side context stays with the caller:
+        ``MemoryStore.create`` resolves the embedding, stamps
+        ``last_access_turn`` with the store's current turn, and handles
+        exact-duplicate merging before ever constructing an item.
+        """
+        from memory_condense.domain.decay import seed_energy
+
+        return cls(
+            type=op.type,
+            content=op.content,
+            details=op.details,
+            provenance=list(op.provenance),
+            status=MemoryStatus.ACTIVE,
+            supersedes=supersedes,
+            pin=PinState.NONE,
+            energy=seed_energy(op.importance),
+            half_life_turns=half_life_turns,
+            importance=op.importance,
+            last_access_turn=last_access_turn,
+            embedding=embedding,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Memory operations (extraction output schema)
@@ -294,7 +328,22 @@ class ValidationReport(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class RetrievalResult(BaseModel):
+class ConsolidationDiagnostics(BaseModel):
+    """Diagnostic fields shared by chunk and memory retrieval results.
+
+    Route is diagnostic only: scoring and the fixed result budget remain
+    explicit in the retrieval method that produced the row. The consolidation
+    trio is model-independent, prompt-driven scalar graph metadata; prompt
+    text and model state are never stored.
+    """
+
+    route: Optional[str] = None
+    consolidation_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    consolidation_anchor: Optional[str] = None
+    consolidation_support: Optional[int] = Field(default=None, ge=0)
+
+
+class RetrievalResult(ConsolidationDiagnostics):
     """A chunk returned from similarity search, with score."""
 
     chunk: Chunk
@@ -302,9 +351,6 @@ class RetrievalResult(BaseModel):
     turn: Optional[Turn] = None
     dense_score: Optional[float] = None
     lexical_score: Optional[float] = None
-    # Route is diagnostic only: scoring and the fixed result budget remain
-    # explicit in the retrieval method that produced the row.
-    route: Optional[str] = None
     association_score: Optional[float] = None
     anchor_chunk_id: Optional[str] = None
     association_hop: Optional[int] = Field(default=None, ge=1)
@@ -323,14 +369,35 @@ class RetrievalResult(BaseModel):
     # not retained activations or evidence text.
     transition_distance: Optional[int] = Field(default=None, ge=1)
     transition_direction: Optional[Literal["previous", "next"]] = None
-    # Model-independent, prompt-driven consolidation diagnostics.  These are
-    # scalar graph metadata only; prompt text and model state are never stored.
-    consolidation_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    consolidation_anchor: Optional[str] = None
-    consolidation_support: Optional[int] = Field(default=None, ge=0)
+
+    @property
+    def source_key(self) -> str:
+        """Source grouping key: the turn's source (or the turn itself).
+
+        Falls back to ``memory_source_id`` then the chunk's turn only when no
+        turn is hydrated.  Callers that must prefer the durable
+        ``memory_source_id`` even over a hydrated turn use
+        ``durable_source_id`` instead.
+        """
+        if self.turn is not None:
+            return str(self.turn.source_id or self.turn.turn_id)
+        return str(self.memory_source_id or self.chunk.turn_id)
+
+    @property
+    def durable_source_id(self) -> str:
+        """Source key preferring ``memory_source_id`` over the hydrated turn.
+
+        Evidence, selector, and packing paths group by the durable source a
+        companion was hydrated for; ``source_key`` groups by the turn first.
+        """
+        if self.memory_source_id:
+            return str(self.memory_source_id)
+        if self.turn is not None:
+            return str(self.turn.source_id or self.turn.turn_id)
+        return str(self.chunk.turn_id)
 
 
-class MemoryResult(BaseModel):
+class MemoryResult(ConsolidationDiagnostics):
     """A memory item returned from retrieval, with its score breakdown.
 
     ``energy`` is the scored term (decayed energy at query time). ``recency``
@@ -347,10 +414,6 @@ class MemoryResult(BaseModel):
     energy: float = 0.0
     recency: float = 0.0
     pin_boost: float = 0.0
-    route: Optional[str] = None
-    consolidation_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    consolidation_anchor: Optional[str] = None
-    consolidation_support: Optional[int] = Field(default=None, ge=0)
 
 
 # ---------------------------------------------------------------------------

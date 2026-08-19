@@ -54,7 +54,7 @@ class FakeCondenser:
             ConsolidationUpdate(
                 event_id=access_event_id or "generated-event",
                 created=True,
-                nodes_observed=len(candidates),
+                members_observed=len(candidates),
                 edges_reinforced=1,
                 edges_pruned=0,
             )

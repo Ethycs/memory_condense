@@ -16,13 +16,14 @@ from typing import Callable
 from pydantic import BaseModel, Field
 
 from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.eval.answer_value_coverage import contains_answer
 from memory_condense.eval.benchmark import (
     IngestFn,
     cap_context_to_prompt_budget,
     ingest_sample,
     shared_embedding_ingest_fn,
 )
-from memory_condense.eval.recall import _assemble, contains_answer
+from memory_condense.eval.recall_assembly import _assemble
 from memory_condense.eval.schemas import EvalConfig, UsageStats
 from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 

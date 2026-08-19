@@ -32,7 +32,10 @@ from memory_condense.application.query_routing import (
     source_partition_ranking,
 )
 from memory_condense.application.retrieval_workflow import RetrievalWorkflowMixin
-from memory_condense.application.source_companions import SourceCompanionWorkflowMixin
+from memory_condense.application.source_companions import (
+    SourceCompanionWorkflowMixin,
+    default_source_companion_report,
+)
 from memory_condense.associations.association_store import AssociationStore
 from memory_condense.associations.consolidation import (
     ConsolidationNode,
@@ -215,26 +218,7 @@ class MemoryCondenser(
         survive packing train the graph afterward, preventing a graph-selected
         result from reinforcing itself merely because the graph selected it.
         """
-        self.last_source_companion_report = {
-            "requested_sources": [],
-            "hydrated_sources": [],
-            "refreshed_sources": [],
-            "already_present_sources": [],
-            "orphan_sources": [],
-            "orphan_count": 0,
-            "direct_date_retained": 0,
-            "candidate_count_before": 0,
-            "candidate_count_after": 0,
-            "max_candidates_per_source": 1,
-            "companion_candidate_count": 0,
-            "selector_used": False,
-            "selector_fallback_sources": [],
-            "selector_fallback_reason": "",
-            "semantic_selector_report": {},
-            "selected_chunk_ids": {},
-            "refresh_all_activated_sources": False,
-            "choice_diagnostics": [],
-        }
+        self.last_source_companion_report = default_source_companion_report()
         # Ranking is a read; only memories that survive the header budget are
         # genuine accesses.  Reheating all top-k candidates here kept dropped
         # rows artificially warm and defeated pruning by access frequency.

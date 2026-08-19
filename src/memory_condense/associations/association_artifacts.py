@@ -170,6 +170,18 @@ class AssociationArtifactStoreMixin:
         self._cav_neighbor_cache.clear()
         return len(rows)
 
+    def has_signature(self, chunk_id: str, artifact_id: str) -> bool:
+        """Existence check that avoids hydrating stored signature values."""
+        self._require_artifact(artifact_id)
+        return (
+            self._db.execute(
+                "SELECT 1 FROM chunk_cav_signatures "
+                "WHERE chunk_id = ? AND artifact_id = ?",
+                (chunk_id, artifact_id),
+            ).fetchone()
+            is not None
+        )
+
     def get_signature(
         self, chunk_id: str, artifact_id: str
     ) -> StoredCAVSignature | None:
@@ -192,6 +204,53 @@ class AssociationArtifactStoreMixin:
             access_count=int(row[2]),
             last_access_turn=int(row[3]),
         )
+
+    def _retrievable_signatures(
+        self,
+        artifact: AssociationArtifact,
+        *,
+        excluded: set[str],
+        with_sources: bool = False,
+        source_ids: Sequence[str] = (),
+    ) -> list[tuple[str, tuple[float, ...], str | None]]:
+        """Scan retrievable chunks' fixed-width signatures for one artifact."""
+        params: list[Any] = [artifact.artifact_id]
+        where = [
+            "s.artifact_id = ?",
+            "c.embedding IS NOT NULL",
+            "c.hnsw_label IS NOT NULL",
+        ]
+        select = "SELECT s.chunk_id, s.signature"
+        join = (
+            "FROM chunk_cav_signatures AS s "
+            "JOIN chunks AS c ON c.chunk_id = s.chunk_id "
+        )
+        if with_sources:
+            select += ", COALESCE(t.source_id, t.turn_id)"
+            join += "JOIN turns AS t ON t.turn_id = c.turn_id "
+            if source_ids:
+                placeholders = ",".join("?" for _ in source_ids)
+                where.append(f"COALESCE(t.source_id, t.turn_id) IN ({placeholders})")
+                params.extend(source_ids)
+        rows = self._db.execute(
+            f"{select} {join}WHERE " + " AND ".join(where),
+            tuple(params),
+        ).fetchall()
+        scanned: list[tuple[str, tuple[float, ...], str | None]] = []
+        for row in rows:
+            chunk_id = row[0]
+            if chunk_id in excluded:
+                continue
+            values = self._unpack_f32(row[1])
+            if len(values) != len(artifact.concept_names):
+                raise ValueError(
+                    "stored CAV signature width does not match its artifact"
+                )
+            source_id = row[2] if with_sources else None
+            scanned.append(
+                (chunk_id, values, None if source_id is None else str(source_id))
+            )
+        return scanned
 
     def cav_neighbors(
         self,
@@ -232,21 +291,11 @@ class AssociationArtifactStoreMixin:
         if not seeds:
             return ()
 
-        rows = self._db.execute(
-            "SELECT s.chunk_id, s.signature FROM chunk_cav_signatures AS s "
-            "JOIN chunks AS c ON c.chunk_id = s.chunk_id "
-            "WHERE s.artifact_id = ? AND c.embedding IS NOT NULL "
-            "AND c.hnsw_label IS NOT NULL",
-            (artifact_id,),
-        ).fetchall()
         excluded = set(exclude) | set(unique_seeds)
         ranked: list[StoredCAVNeighbor] = []
-        for chunk_id, blob in rows:
-            if chunk_id in excluded:
-                continue
-            candidate = self._unpack_f32(blob)
-            if len(candidate) != len(artifact.concept_names):
-                raise ValueError("stored CAV signature width does not match its artifact")
+        for chunk_id, candidate, _source_id in self._retrievable_signatures(
+            artifact, excluded=excluded
+        ):
             best_score = -math.inf
             best_shared: tuple[str, ...] = ()
             for seed in seeds:
@@ -317,37 +366,16 @@ class AssociationArtifactStoreMixin:
             concept_index = artifact.concept_names.index(concept_name)
         except ValueError as exc:
             raise KeyError(f"unknown CAV concept: {concept_name}") from exc
-        params: list[Any] = [artifact_id]
-        where = [
-            "s.artifact_id = ?",
-            "c.embedding IS NOT NULL",
-            "c.hnsw_label IS NOT NULL",
-        ]
         filtered_source_ids = tuple(
             dict.fromkeys(str(value) for value in source_ids)
         )
-        if filtered_source_ids:
-            placeholders = ",".join("?" for _ in filtered_source_ids)
-            where.append(f"COALESCE(t.source_id, t.turn_id) IN ({placeholders})")
-            params.extend(filtered_source_ids)
-        rows = self._db.execute(
-            "SELECT s.chunk_id, s.signature, COALESCE(t.source_id, t.turn_id) "
-            "FROM chunk_cav_signatures AS s "
-            "JOIN chunks AS c ON c.chunk_id = s.chunk_id "
-            "JOIN turns AS t ON t.turn_id = c.turn_id WHERE "
-            + " AND ".join(where),
-            tuple(params),
-        ).fetchall()
-        excluded = set(exclude)
         ranked: list[StoredCAVNeighbor] = []
-        for chunk_id, blob, source_id in rows:
-            if chunk_id in excluded:
-                continue
-            signature = self._unpack_f32(blob)
-            if len(signature) != len(artifact.concept_names):
-                raise ValueError(
-                    "stored CAV signature width does not match its artifact"
-                )
+        for chunk_id, signature, source_id in self._retrievable_signatures(
+            artifact,
+            excluded=set(exclude),
+            with_sources=True,
+            source_ids=filtered_source_ids,
+        ):
             margin = float(signature[concept_index])
             if margin <= min_margin:
                 continue
@@ -356,7 +384,7 @@ class AssociationArtifactStoreMixin:
                     chunk_id=chunk_id,
                     score=margin,
                     shared_concepts=(concept_name,),
-                    source_id=str(source_id),
+                    source_id=source_id,
                 )
             )
         ranked.sort(key=lambda hit: (hit.score, hit.chunk_id), reverse=True)
@@ -364,10 +392,11 @@ class AssociationArtifactStoreMixin:
             seen_sources: set[str] = set()
             source_unique: list[StoredCAVNeighbor] = []
             for hit in ranked:
-                source_id = str(hit.source_id)
-                if source_id in seen_sources:
+                source_id = hit.source_id
+                if source_id is not None and source_id in seen_sources:
                     continue
-                seen_sources.add(source_id)
+                if source_id is not None:
+                    seen_sources.add(source_id)
                 source_unique.append(hit)
             ranked = source_unique
         return tuple(ranked[:top_k])

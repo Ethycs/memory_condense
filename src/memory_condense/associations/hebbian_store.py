@@ -12,71 +12,18 @@ from memory_condense.associations.association_models import (
     StoredHebbianNeighbor,
     _canonical_json,
 )
-from memory_condense.domain.decay import decay_factor
+from memory_condense.associations.coaccess_graph import (
+    accumulate_neighbor_evidence,
+    decayed_mass,
+    ranked_neighbor_states,
+    score_coaccess_edges,
+    select_prune_victims,
+    validate_observation_params,
+)
 
 
 class HebbianAssociationStoreMixin:
     """Decay-aware co-access reinforcement, traversal, and pruning."""
-
-    @staticmethod
-    def _decayed_mass(
-        mass: float,
-        last_turn: int,
-        now_turn: int,
-        half_life_turns: float,
-    ) -> float:
-        return max(
-            0.0,
-            float(mass)
-            * decay_factor(last_turn, now_turn, half_life_turns),
-        )
-
-    @classmethod
-    def _hebbian_edge_score(
-        cls,
-        *,
-        coaccess_mass: float,
-        last_reinforced_turn: int,
-        left_mass: float,
-        left_turn: int,
-        right_mass: float,
-        right_turn: int,
-        now_turn: int,
-        half_life_turns: float,
-    ) -> float:
-        """Time-decayed cosine association, which discounts frequent hubs."""
-        edge = cls._decayed_mass(
-            coaccess_mass,
-            last_reinforced_turn,
-            now_turn,
-            half_life_turns,
-        )
-        left = cls._decayed_mass(
-            left_mass,
-            left_turn,
-            now_turn,
-            half_life_turns,
-        )
-        right = cls._decayed_mass(
-            right_mass,
-            right_turn,
-            now_turn,
-            half_life_turns,
-        )
-        denominator = math.sqrt(left * right)
-        if denominator <= 0.0:
-            return 0.0
-        # With matching exponential updates the ratio is a cosine and
-        # therefore at most one. A separate freshness term is intentional:
-        # otherwise an isolated pair's node and edge masses decay in lockstep
-        # and its normalized score never cools.
-        normalized = min(1.0, max(0.0, edge / denominator))
-        freshness = decay_factor(
-            last_reinforced_turn,
-            now_turn,
-            half_life_turns,
-        )
-        return normalized * freshness
 
     def reinforce_retrieval_coaccess(
         self,
@@ -102,28 +49,19 @@ class HebbianAssociationStoreMixin:
         exact retry idempotent without retaining query text or result payloads.
         """
         self._require_artifact(artifact_id)
-        event_id = str(access_event_id).strip()
-        if not event_id:
-            raise ValueError("access_event_id must be non-empty")
-        if len(event_id) > 256:
-            raise ValueError("access_event_id must be at most 256 characters")
+        event_id, rate, half_life = validate_observation_params(
+            access_event_id=access_event_id,
+            learning_rate=learning_rate,
+            half_life_turns=half_life_turns,
+            max_members_per_event=max_concepts_per_event,
+            max_degree=max_degree,
+            min_edge_score=min_edge_score,
+            max_event_history=max_event_history,
+            member_limit_name="max_concepts_per_event",
+        )
         turn = self._db.current_turn() if now_turn is None else int(now_turn)
         if turn < 0:
             raise ValueError("now_turn must be non-negative")
-        rate = float(learning_rate)
-        half_life = float(half_life_turns)
-        if not math.isfinite(rate) or rate <= 0.0:
-            raise ValueError("learning_rate must be finite and positive")
-        if not math.isfinite(half_life) or half_life <= 0.0:
-            raise ValueError("half_life_turns must be finite and positive")
-        if max_concepts_per_event < 1:
-            raise ValueError("max_concepts_per_event must be positive")
-        if max_degree < 0:
-            raise ValueError("max_degree must be non-negative")
-        if not 0.0 <= min_edge_score <= 1.0:
-            raise ValueError("min_edge_score must lie in [0, 1]")
-        if max_event_history < 1:
-            raise ValueError("max_event_history must be positive")
 
         ranked: list[tuple[str, float]] = []
         for raw_chunk_id, raw_activation in concept_activations.items():
@@ -159,7 +97,7 @@ class HebbianAssociationStoreMixin:
             return HebbianUpdate(
                 event_id=event_id,
                 created=False,
-                concepts_observed=int(existing_event[1]),
+                members_observed=int(existing_event[1]),
                 edges_reinforced=0,
                 edges_pruned=0,
             )
@@ -201,7 +139,7 @@ class HebbianAssociationStoreMixin:
             old_mass, old_count, old_turn = existing_nodes.get(
                 chunk_id, (0.0, 0, turn)
             )
-            mass = self._decayed_mass(old_mass, old_turn, turn, half_life)
+            mass = decayed_mass(old_mass, old_turn, turn, half_life)
             mass += rate * activation * activation
             node_rows.append(
                 (artifact_id, chunk_id, mass, old_count + 1, turn)
@@ -212,7 +150,7 @@ class HebbianAssociationStoreMixin:
             old_mass, old_count, old_turn = existing_edges.get(
                 (low, high), (0.0, 0, turn)
             )
-            mass = self._decayed_mass(old_mass, old_turn, turn, half_life)
+            mass = decayed_mass(old_mass, old_turn, turn, half_life)
             mass += rate * low_activation * high_activation
             edge_rows.append(
                 (artifact_id, low, high, mass, old_count + 1, turn)
@@ -274,7 +212,7 @@ class HebbianAssociationStoreMixin:
         return HebbianUpdate(
             event_id=event_id,
             created=True,
-            concepts_observed=len(selected),
+            members_observed=len(selected),
             edges_reinforced=len(edge_rows),
             edges_pruned=edges_pruned,
         )
@@ -343,67 +281,28 @@ class HebbianAssociationStoreMixin:
         nodes = {
             row[0]: (float(row[1]), int(row[2])) for row in node_rows
         }
-        excluded = set(exclude) | set(seed_ids)
-        candidates: dict[str, dict[str, Any]] = {}
-        for low, high, mass, count, edge_turn in edge_rows:
-            if low in seeds and high not in seeds:
-                anchor_id, candidate_id = low, high
-            elif high in seeds and low not in seeds:
-                anchor_id, candidate_id = high, low
-            else:
-                continue
-            if candidate_id in excluded:
-                continue
-            left = nodes.get(low, (0.0, turn))
-            right = nodes.get(high, (0.0, turn))
-            edge_score = self._hebbian_edge_score(
-                coaccess_mass=float(mass),
-                last_reinforced_turn=int(edge_turn),
-                left_mass=left[0],
-                left_turn=left[1],
-                right_mass=right[0],
-                right_turn=right[1],
-                now_turn=turn,
-                half_life_turns=half_life,
-            )
-            evidence = min(1.0, edge_score * seeds[anchor_id])
-            if evidence < min_score:
-                continue
-            current = candidates.setdefault(
-                candidate_id,
-                {
-                    "score": 0.0,
-                    "anchors": set(),
-                    "anchor_chunk_id": anchor_id,
-                    "best_evidence": -1.0,
-                    "coaccess_count": 0,
-                    "last_reinforced_turn": 0,
-                },
-            )
-            # Noisy-OR combines support from several anchors without allowing
-            # a high-degree candidate to gain an unbounded additive score.
-            current["score"] = 1.0 - (1.0 - current["score"]) * (1.0 - evidence)
-            current["anchors"].add(anchor_id)
-            current["coaccess_count"] += int(count)
-            current["last_reinforced_turn"] = max(
-                current["last_reinforced_turn"], int(edge_turn)
-            )
-            if evidence > current["best_evidence"]:
-                current["best_evidence"] = evidence
-                current["anchor_chunk_id"] = anchor_id
-
+        candidates = accumulate_neighbor_evidence(
+            ((low, high, mass, count, 0, edge_turn)
+             for low, high, mass, count, edge_turn in edge_rows),
+            seeds=seeds,
+            excluded=set(exclude) | set(seed_ids),
+            nodes=nodes,
+            default_node=(0.0, turn),
+            now_turn=turn,
+            half_life_turns=half_life,
+            min_score=min_score,
+        )
         neighbors = [
             StoredHebbianNeighbor(
                 chunk_id=chunk_id,
-                score=float(state["score"]),
-                support=len(state["anchors"]),
-                anchor_chunk_id=str(state["anchor_chunk_id"]),
-                coaccess_count=int(state["coaccess_count"]),
-                last_reinforced_turn=int(state["last_reinforced_turn"]),
+                score=float(state.score),
+                support=state.support,
+                anchor_chunk_id=str(state.anchor_key),
+                coaccess_count=int(state.coaccess_count),
+                last_reinforced_turn=int(state.last_reinforced_turn),
             )
-            for chunk_id, state in candidates.items()
+            for chunk_id, state in ranked_neighbor_states(candidates)
         ]
-        neighbors.sort(key=lambda item: (-item.score, -item.support, item.chunk_id))
         return tuple(neighbors[:top_k])
 
     def prune_hebbian_edges(
@@ -462,33 +361,19 @@ class HebbianAssociationStoreMixin:
             (artifact_id, *endpoint_ids),
         ).fetchall()
         nodes = {row[0]: (float(row[1]), int(row[2])) for row in node_rows}
-        scored: dict[tuple[str, str], float] = {}
-        for low, high, mass, _count, edge_turn in edge_rows:
-            left = nodes.get(low, (0.0, turn))
-            right = nodes.get(high, (0.0, turn))
-            scored[(low, high)] = self._hebbian_edge_score(
-                coaccess_mass=float(mass),
-                last_reinforced_turn=int(edge_turn),
-                left_mass=left[0],
-                left_turn=left[1],
-                right_mass=right[0],
-                right_turn=right[1],
-                now_turn=turn,
-                half_life_turns=half_life,
-            )
-
-        deletions = {
-            edge for edge, score in scored.items() if score < min_score
-        }
-        scoped = set(endpoint_ids) if chunk_ids is None else set(scoped_ids)
-        for chunk_id in scoped:
-            incident = [
-                (score, edge)
-                for edge, score in scored.items()
-                if chunk_id in edge and edge not in deletions
-            ]
-            incident.sort(key=lambda item: (-item[0], item[1]))
-            deletions.update(edge for _score, edge in incident[max_degree:])
+        scored = score_coaccess_edges(
+            ((low, high, mass, edge_turn)
+             for low, high, mass, _count, edge_turn in edge_rows),
+            nodes,
+            now_turn=turn,
+            half_life_turns=half_life,
+        )
+        deletions = select_prune_victims(
+            scored,
+            set(endpoint_ids) if chunk_ids is None else set(scoped_ids),
+            max_degree=max_degree,
+            min_score=min_score,
+        )
         if not deletions:
             return 0
         cur = self._db.executemany(

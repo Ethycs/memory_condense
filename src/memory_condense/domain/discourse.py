@@ -15,6 +15,7 @@ from memory_condense.domain._discourse_identity import (
     _confidence,
     _json_mapping,
     _nonempty,
+    _optional,
     _plain_json,
     _sha256,
     canonical_json,
@@ -22,8 +23,10 @@ from memory_condense.domain._discourse_identity import (
     make_atom_id,
     make_bundle_id,
     make_episode_id,
+    normalize_fields,
     quote_sha256,
 )
+from memory_condense.domain.sealed import SealedIdentity, reflect_payload
 
 
 _TEMPORAL_STANCES = frozenset(
@@ -66,51 +69,28 @@ class EvidenceSpan:
     created_at: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "chunk_id", _nonempty(self.chunk_id, "chunk_id"))
+        normalize_fields(
+            self,
+            chunk_id=_nonempty,
+            quote_sha256=_sha256,
+            source_id=_optional(_nonempty),
+            turn_id=_optional(_nonempty),
+            created_at=_optional(_nonempty),
+        )
         if self.start_char < 0 or self.end_char <= self.start_char:
             raise ValueError("evidence span must have 0 <= start_char < end_char")
         if self.ordinal < 0:
             raise ValueError("evidence span ordinal must be non-negative")
         if self.turn_start_char < 0:
             raise ValueError("turn_start_char must be non-negative")
-        object.__setattr__(
-            self,
-            "quote_sha256",
-            _sha256(self.quote_sha256, "quote_sha256"),
-        )
-        if self.source_id is not None:
-            object.__setattr__(
-                self,
-                "source_id",
-                _nonempty(self.source_id, "source_id"),
-            )
-        if self.turn_id is not None:
-            object.__setattr__(self, "turn_id", _nonempty(self.turn_id, "turn_id"))
         if self.role is not None:
             role = _nonempty(self.role, "role")
             if role not in {"user", "assistant", "system"}:
                 raise ValueError("evidence role must be user, assistant, or system")
             object.__setattr__(self, "role", role)
-        if self.created_at is not None:
-            object.__setattr__(
-                self,
-                "created_at",
-                _nonempty(self.created_at, "created_at"),
-            )
 
     def identity_payload(self) -> dict[str, Any]:
-        return {
-            "chunk_id": self.chunk_id,
-            "start_char": self.start_char,
-            "end_char": self.end_char,
-            "quote_sha256": self.quote_sha256,
-            "ordinal": self.ordinal,
-            "source_id": self.source_id,
-            "turn_start_char": self.turn_start_char,
-            "turn_id": self.turn_id,
-            "role": self.role,
-            "created_at": self.created_at,
-        }
+        return reflect_payload(self)
 
 
 def evidence_span_sort_key(
@@ -147,29 +127,17 @@ class DiscourseArtifact:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "artifact_id", _nonempty(self.artifact_id, "artifact_id"))
         object.__setattr__(self, "kind", _nonempty(self.kind, "artifact kind"))
-        object.__setattr__(
+        normalize_fields(
             self,
-            "implementation_sha256",
-            _sha256(self.implementation_sha256, "implementation_sha256"),
+            artifact_id=_nonempty,
+            implementation_sha256=_sha256,
+            policy_sha256=_sha256,
+            checkpoint_sha256=_optional(_sha256),
+            model_id=_optional(_nonempty),
+            model_revision=_optional(_nonempty),
+            metadata=_json_mapping,
         )
-        object.__setattr__(
-            self,
-            "policy_sha256",
-            _sha256(self.policy_sha256, "policy_sha256"),
-        )
-        if self.checkpoint_sha256 is not None:
-            object.__setattr__(
-                self,
-                "checkpoint_sha256",
-                _sha256(self.checkpoint_sha256, "checkpoint_sha256"),
-            )
-        for name in ("model_id", "model_revision"):
-            value = getattr(self, name)
-            if value is not None:
-                object.__setattr__(self, name, _nonempty(value, name))
-        object.__setattr__(self, "metadata", _json_mapping(self.metadata, "metadata"))
 
     @classmethod
     def create(
@@ -216,21 +184,16 @@ class DiscourseArtifact:
         return cls(artifact_id=f"disc-{identity_sha256(body)[:24]}", **body)
 
     def identity_payload(self) -> dict[str, Any]:
-        return {
-            "artifact_id": self.artifact_id,
-            "kind": self.kind,
-            "implementation_sha256": self.implementation_sha256,
-            "policy_sha256": self.policy_sha256,
-            "model_id": self.model_id,
-            "model_revision": self.model_revision,
-            "checkpoint_sha256": self.checkpoint_sha256,
-            "metadata": _plain_json(self.metadata),
-        }
+        return reflect_payload(self)
 
 
 @dataclass(frozen=True, slots=True)
-class Episode:
+class Episode(SealedIdentity):
     """A source-local, ordered event backed only by exact source spans."""
+
+    _SEAL_MISMATCH = (
+        "episode receipt does not match its identity payload"
+    )
 
     episode_id: str
     artifact_id: str
@@ -247,13 +210,12 @@ class Episode:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "episode_id", _nonempty(self.episode_id, "episode_id"))
-        object.__setattr__(self, "artifact_id", _nonempty(self.artifact_id, "artifact_id"))
-        object.__setattr__(self, "source_id", _nonempty(self.source_id, "source_id"))
-        object.__setattr__(
+        normalize_fields(
             self,
-            "boundary_method",
-            _nonempty(self.boundary_method, "boundary_method"),
+            episode_id=_nonempty,
+            artifact_id=_nonempty,
+            source_id=_nonempty,
+            boundary_method=_nonempty,
         )
         evidence = tuple(self.evidence)
         if self.sequence_no < 0:
@@ -273,31 +235,7 @@ class Episode:
             if value is not None and not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
         object.__setattr__(self, "evidence", evidence)
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256:
-            if _sha256(self.receipt_sha256, "receipt_sha256") != expected:
-                raise ValueError("episode receipt does not match its identity payload")
-        else:
-            object.__setattr__(self, "receipt_sha256", expected)
-
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
-        payload = {
-            "episode_id": self.episode_id,
-            "artifact_id": self.artifact_id,
-            "source_id": self.source_id,
-            "sequence_no": self.sequence_no,
-            "first_ordinal": self.first_ordinal,
-            "last_ordinal": self.last_ordinal,
-            "evidence": [item.identity_payload() for item in self.evidence],
-            "boundary_method": self.boundary_method,
-            "initial_boundary": self.initial_boundary,
-            "refined_boundary": self.refined_boundary,
-            "boundary_score": self.boundary_score,
-            "boundary_threshold": self.boundary_threshold,
-        }
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,15 +246,14 @@ class EpisodeRepresentative:
     vector_identity_sha256: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "episode_id", _nonempty(self.episode_id, "episode_id"))
-        object.__setattr__(self, "chunk_id", _nonempty(self.chunk_id, "chunk_id"))
+        normalize_fields(
+            self,
+            episode_id=_nonempty,
+            chunk_id=_nonempty,
+            vector_identity_sha256=_sha256,
+        )
         if self.rank < 0:
             raise ValueError("representative rank must be non-negative")
-        object.__setattr__(
-            self,
-            "vector_identity_sha256",
-            _sha256(self.vector_identity_sha256, "vector_identity_sha256"),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,7 +346,10 @@ class DiscourseRelation:
 
 
 @dataclass(frozen=True, slots=True)
-class DiscourseSnapshot:
+class DiscourseSnapshot(SealedIdentity):
+    _SEAL_FIELD = "snapshot_sha256"
+    _SEAL_MISMATCH = "snapshot SHA-256 does not match its counters"
+
     max_turn_ordinal: int
     chunk_count: int
     graph_revision: int
@@ -433,15 +373,10 @@ class DiscourseSnapshot:
             raise ValueError("snapshot counters must be non-negative")
         artifacts = tuple(sorted({_nonempty(item, "artifact_id") for item in self.artifact_ids}))
         object.__setattr__(self, "artifact_ids", artifacts)
-        object.__setattr__(
+        normalize_fields(
             self,
-            "source_content_sha256",
-            _sha256(self.source_content_sha256, "source_content_sha256"),
-        )
-        object.__setattr__(
-            self,
-            "graph_content_sha256",
-            _sha256(self.graph_content_sha256, "graph_content_sha256"),
+            source_content_sha256=_sha256,
+            graph_content_sha256=_sha256,
         )
         zero = "0" * 64
         if (
@@ -452,27 +387,15 @@ class DiscourseSnapshot:
             artifacts or self.graph_content_revision
         ) and self.graph_content_sha256 == zero:
             raise ValueError("non-empty graph snapshot requires a content root")
-        body = {
-            "max_turn_ordinal": self.max_turn_ordinal,
-            "chunk_count": self.chunk_count,
-            "graph_revision": self.graph_revision,
-            "schema_version": self.schema_version,
-            "artifact_ids": list(artifacts),
-            "source_revision": self.source_revision,
-            "graph_content_revision": self.graph_content_revision,
-            "source_content_sha256": self.source_content_sha256,
-            "graph_content_sha256": self.graph_content_sha256,
-        }
-        expected = identity_sha256(body)
-        if self.snapshot_sha256:
-            if _sha256(self.snapshot_sha256, "snapshot_sha256") != expected:
-                raise ValueError("snapshot SHA-256 does not match its counters")
-        else:
-            object.__setattr__(self, "snapshot_sha256", expected)
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
-class ArtifactCoverageReceipt:
+class ArtifactCoverageReceipt(SealedIdentity):
+    _SEAL_MISMATCH = (
+        "coverage receipt SHA-256 does not match its contents"
+    )
+
     artifact_id: str
     coverage_kind: str
     source_revision: int
@@ -482,40 +405,17 @@ class ArtifactCoverageReceipt:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "artifact_id", _nonempty(self.artifact_id, "artifact_id"))
+        normalize_fields(
+            self,
+            artifact_id=_nonempty,
+            coverage_sha256=_sha256,
+            turn_coverage_sha256=_sha256,
+        )
         if self.coverage_kind not in {"episode", "discourse"}:
             raise ValueError("coverage_kind must be episode or discourse")
         if min(self.source_revision, self.chunk_count) < 0:
             raise ValueError("coverage receipt counters must be non-negative")
-        object.__setattr__(
-            self,
-            "coverage_sha256",
-            _sha256(self.coverage_sha256, "coverage_sha256"),
-        )
-        object.__setattr__(
-            self,
-            "turn_coverage_sha256",
-            _sha256(self.turn_coverage_sha256, "turn_coverage_sha256"),
-        )
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256:
-            if _sha256(self.receipt_sha256, "receipt_sha256") != expected:
-                raise ValueError("coverage receipt SHA-256 does not match its contents")
-        else:
-            object.__setattr__(self, "receipt_sha256", expected)
-
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
-        payload = {
-            "artifact_id": self.artifact_id,
-            "coverage_kind": self.coverage_kind,
-            "source_revision": self.source_revision,
-            "chunk_count": self.chunk_count,
-            "coverage_sha256": self.coverage_sha256,
-            "turn_coverage_sha256": self.turn_coverage_sha256,
-        }
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
@@ -547,9 +447,17 @@ class EvidenceObligation:
             values = tuple(dict.fromkeys(_nonempty(value, name) for value in getattr(self, name)))
             object.__setattr__(self, name, values)
 
+    def identity_payload(self) -> dict[str, Any]:
+        return reflect_payload(self)
+
 
 @dataclass(frozen=True, slots=True)
-class QueryProgram:
+class QueryProgram(SealedIdentity):
+    _SEAL_FIELD = "program_sha256"
+    _SEAL_MISMATCH = (
+        "query program SHA-256 does not match its contents"
+    )
+
     query: str
     intent: str
     subject_terms: tuple[str, ...]
@@ -560,9 +468,7 @@ class QueryProgram:
     program_sha256: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "query", _nonempty(self.query, "query"))
-        object.__setattr__(self, "intent", _nonempty(self.intent, "intent"))
-        object.__setattr__(self, "ordering", _nonempty(self.ordering, "ordering"))
+        normalize_fields(self, query=_nonempty, intent=_nonempty, ordering=_nonempty)
         subjects = tuple(dict.fromkeys(_nonempty(item, "subject term") for item in self.subject_terms))
         obligations = tuple(self.obligations)
         if not obligations:
@@ -597,42 +503,7 @@ class QueryProgram:
             raise ValueError("cardinality must be positive")
         object.__setattr__(self, "subject_terms", subjects)
         object.__setattr__(self, "obligations", obligations)
-        body = self.identity_payload(include_sha=False)
-        expected = identity_sha256(body)
-        if self.program_sha256:
-            if _sha256(self.program_sha256, "program_sha256") != expected:
-                raise ValueError("query program SHA-256 does not match its contents")
-        else:
-            object.__setattr__(self, "program_sha256", expected)
-
-    def identity_payload(self, *, include_sha: bool = True) -> dict[str, Any]:
-        payload = {
-            "query": self.query,
-            "intent": self.intent,
-            "subject_terms": list(self.subject_terms),
-            "obligations": [
-                {
-                    "obligation_id": item.obligation_id,
-                    "kind": item.kind,
-                    "required": item.required,
-                    "weight": item.weight,
-                    "unit_kinds": list(item.unit_kinds),
-                    "relation_types": list(item.relation_types),
-                    "subject_terms": list(item.subject_terms),
-                    "dependencies": list(item.dependencies),
-                    "min_count": item.min_count,
-                    "max_count": item.max_count,
-                    "temporal_stance": item.temporal_stance,
-                }
-                for item in self.obligations
-            ],
-            "as_of_ordinal": self.as_of_ordinal,
-            "ordering": self.ordering,
-            "cardinality": self.cardinality,
-        }
-        if include_sha:
-            payload["program_sha256"] = self.program_sha256
-        return payload
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
@@ -770,8 +641,13 @@ class ObligationResult:
 
 
 @dataclass(frozen=True, slots=True)
-class ClosureScopeWitness:
+class ClosureScopeWitness(SealedIdentity):
     """Receipt for one bounded graph read used by a closure plan."""
+
+    _SEAL_FIELD = "witness_sha256"
+    _SEAL_MISMATCH = (
+        "scope witness SHA-256 does not match its contents"
+    )
 
     kind: str
     subject_id: str
@@ -802,29 +678,14 @@ class ClosureScopeWitness:
             "detail",
             _json_mapping(self.detail, "scope witness detail"),
         )
-        expected = identity_sha256(self.identity_payload(include_sha=False))
-        if self.witness_sha256:
-            if _sha256(self.witness_sha256, "witness_sha256") != expected:
-                raise ValueError("scope witness SHA-256 does not match its contents")
-        else:
-            object.__setattr__(self, "witness_sha256", expected)
-
-    def identity_payload(self, *, include_sha: bool = True) -> dict[str, Any]:
-        payload = {
-            "kind": self.kind,
-            "subject_id": self.subject_id,
-            "requested_limit": self.requested_limit,
-            "returned_count": self.returned_count,
-            "exhaustive": self.exhaustive,
-            "detail": _plain_json(self.detail),
-        }
-        if include_sha:
-            payload["witness_sha256"] = self.witness_sha256
-        return payload
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
-class ClosurePlan:
+class ClosurePlan(SealedIdentity):
+    _SEAL_FIELD = "plan_sha256"
+    _SEAL_MISMATCH = "closure plan SHA-256 does not match its contents"
+
     query_program: QueryProgram
     policy: ClosurePolicy
     snapshot: DiscourseSnapshot
@@ -999,15 +860,9 @@ class ClosurePlan:
             "visited_relation_ids",
             tuple(sorted(dict.fromkeys(self.visited_relation_ids))),
         )
-        body = self.identity_payload(include_sha=False)
-        expected = identity_sha256(body)
-        if self.plan_sha256:
-            if _sha256(self.plan_sha256, "plan_sha256") != expected:
-                raise ValueError("closure plan SHA-256 does not match its contents")
-        else:
-            object.__setattr__(self, "plan_sha256", expected)
+        self._seal()
 
-    def identity_payload(self, *, include_sha: bool = True) -> dict[str, Any]:
+    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
         payload = {
             "query_program_sha256": self.query_program.program_sha256,
             "policy_sha256": self.policy.policy_sha256,
@@ -1068,13 +923,17 @@ class ClosurePlan:
             "stopping_reason": self.stopping_reason,
             "complete_claimed": self.complete_claimed,
         }
-        if include_sha:
+        if include_receipt:
             payload["plan_sha256"] = self.plan_sha256
         return payload
 
 
 @dataclass(frozen=True, slots=True)
-class ClosureReceipt:
+class ClosureReceipt(SealedIdentity):
+    _SEAL_MISMATCH = (
+        "closure receipt SHA-256 does not match its contents"
+    )
+
     plan_sha256: str
     context_sha256: str
     selected_bundle_ids: tuple[str, ...]
@@ -1098,8 +957,7 @@ class ClosureReceipt:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "plan_sha256", _sha256(self.plan_sha256, "plan_sha256"))
-        object.__setattr__(self, "context_sha256", _sha256(self.context_sha256, "context_sha256"))
+        normalize_fields(self, plan_sha256=_sha256, context_sha256=_sha256)
         for name in (
             "context_token_proxy",
             "max_context_token_proxy",
@@ -1163,30 +1021,13 @@ class ClosureReceipt:
                     "closure packet prompt proxy plus output reserve exceeds "
                     "its hard prompt budget"
                 )
-            object.__setattr__(
+            normalize_fields(
                 self,
-                "base_messages_sha256",
-                _sha256(str(self.base_messages_sha256), "base_messages_sha256"),
-            )
-            object.__setattr__(
-                self,
-                "evidence_prefix_sha256",
-                _sha256(str(self.evidence_prefix_sha256), "evidence_prefix_sha256"),
-            )
-            object.__setattr__(
-                self,
-                "evidence_suffix_sha256",
-                _sha256(str(self.evidence_suffix_sha256), "evidence_suffix_sha256"),
-            )
-            object.__setattr__(
-                self,
-                "prompt_messages_sha256",
-                _sha256(str(self.prompt_messages_sha256), "prompt_messages_sha256"),
-            )
-            object.__setattr__(
-                self,
-                "evidence_message_role",
-                _nonempty(str(self.evidence_message_role), "evidence_message_role"),
+                base_messages_sha256=_sha256,
+                evidence_prefix_sha256=_sha256,
+                evidence_suffix_sha256=_sha256,
+                prompt_messages_sha256=_sha256,
+                evidence_message_role=_nonempty,
             )
         elif self.responder_output_token_reserve != 0:
             raise ValueError(
@@ -1204,7 +1045,10 @@ class ClosureReceipt:
             "tokenizer_identity",
             _nonempty(self.tokenizer_identity, "tokenizer_identity"),
         )
-        body = {
+        self._seal()
+
+    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
+        payload = {
             "plan_sha256": self.plan_sha256,
             "context_sha256": self.context_sha256,
             "selected_bundle_ids": list(self.selected_bundle_ids),
@@ -1217,8 +1061,10 @@ class ClosureReceipt:
             "complete_claimed": self.complete_claimed,
             "retained_request_token_state_bytes": 0,
         }
-        if prompt_budget_enabled:
-            body.update(
+        # Prompt-budget fields feed the digest only when the budget is enabled;
+        # a disabled budget omits them entirely (never hashes them as nulls).
+        if self.prompt_token_proxy is not None:
+            payload.update(
                 {
                     "prompt_token_proxy": self.prompt_token_proxy,
                     "max_prompt_token_proxy": self.max_prompt_token_proxy,
@@ -1235,12 +1081,9 @@ class ClosureReceipt:
                     "prompt_messages_sha256": self.prompt_messages_sha256,
                 }
             )
-        expected = identity_sha256(body)
-        if self.receipt_sha256:
-            if _sha256(self.receipt_sha256, "receipt_sha256") != expected:
-                raise ValueError("closure receipt SHA-256 does not match its contents")
-        else:
-            object.__setattr__(self, "receipt_sha256", expected)
+        if include_receipt:
+            payload["receipt_sha256"] = self.receipt_sha256
+        return payload
 
 
 @dataclass(frozen=True, slots=True)

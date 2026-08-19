@@ -13,13 +13,14 @@ import gc
 import hashlib
 import inspect
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 from memory_condense.domain._tokenizer import truncate_to_tokens
+from memory_condense.search.selectors.coverage_models import ReportDumpMixin
 from memory_condense.search.selectors.coverage_selector import compile_set_program
 from memory_condense.domain.schemas import RetrievalResult
 
@@ -63,7 +64,7 @@ def verify_ms_marco_checkpoint(model_dir: str | Path) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class CrossEncoderSelectionReport:
+class CrossEncoderSelectionReport(ReportDumpMixin):
     """Text-free diagnostics for one semantic and optional grouping pass."""
 
     operator: str
@@ -128,12 +129,94 @@ class CrossEncoderSelectionReport:
     retained_transformer_state_bytes: int = 0
     fallback_reason: str = ""
 
-    def model_dump(self) -> dict[str, Any]:
-        return asdict(self)
+
+# The grouper's ``model_dump`` fields mirrored into the combined report, keyed
+# by the coercion each mirrored value receives.  Fields whose default or
+# coercion is unique (``operator``, ``uncertain_assignments``, ...) stay
+# explicit at the construction site.
+_GROUPING_INT_FIELDS = (
+    "event_clusters",
+    "new_assignments",
+    "existing_assignments",
+    "null_assignments",
+    "representatives",
+    "supporting_candidates",
+    "frontier_candidates",
+    "frontier_attempted",
+    "frontier_uninspected",
+    "frontier_batches",
+)
+_GROUPING_BLANKABLE_INT_FIELDS = (
+    "prefix_layers",
+    "active_partition_structural_rows",
+    "active_partition_structural_hypotheses",
+    "active_partition_candidates_admitted",
+    "active_partition_candidates_already_present",
+    "active_partition_candidates_replaced",
+    "active_partition_candidates_truncated",
+    "active_partition_structural_overflow",
+    "cardinality_deficit",
+)
+_GROUPING_STR_FIELDS = (
+    "prefix_model_id",
+    "prefix_model_revision",
+    "prefix_checkpoint_sha256",
+    "prefix_device",
+    "prefix_dtype",
+)
+_GROUPING_BOOL_FIELDS = (
+    "frontier_exhaustive",
+    "allow_selected_scope_fixed_k_closure",
+)
+_GROUPING_PASSTHROUGH_FIELDS = (
+    "routed_frontier_exhaustive",
+    "active_partition_total",
+    "active_partition_inspected",
+    "active_partition_exhaustive",
+    "active_partition_sources_total",
+    "active_partition_semantically_complete",
+    "partition_inventory_total",
+    "selected_partition_count",
+    "partition_scope_exhaustive",
+    "selected_scope_structurally_complete",
+    "global_semantic_complete",
+)
+
+
+def _mirrored_grouping_fields(grouping: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy the shared diagnostics out of one grouper report dict."""
+
+    mirrored: dict[str, Any] = {
+        name: int(grouping.get(name, 0)) for name in _GROUPING_INT_FIELDS
+    }
+    mirrored.update(
+        (name, int(grouping.get(name, 0) or 0))
+        for name in _GROUPING_BLANKABLE_INT_FIELDS
+    )
+    mirrored.update(
+        (name, str(grouping.get(name, ""))) for name in _GROUPING_STR_FIELDS
+    )
+    mirrored.update(
+        (name, bool(grouping.get(name, False)))
+        for name in _GROUPING_BOOL_FIELDS
+    )
+    mirrored.update(
+        (name, grouping.get(name)) for name in _GROUPING_PASSTHROUGH_FIELDS
+    )
+    mirrored["prefix_attention_layer"] = int(
+        grouping.get("prefix_attention_layer", -1)
+    )
+    mirrored["partition_scope_kind"] = str(
+        grouping.get("partition_scope_kind", "approximate_top_k")
+    )
+    mirrored["active_partition_scan_contract"] = str(
+        grouping.get("active_partition_scan_contract", "") or ""
+    )
+    return mirrored
 
 
 @dataclass(frozen=True, slots=True)
-class CrossEncoderCompanionReport:
+class CrossEncoderCompanionReport(ReportDumpMixin):
     """Text-free diagnostics for one bounded source-companion pass."""
 
     input_sources: int
@@ -147,16 +230,9 @@ class CrossEncoderCompanionReport:
     retained_transformer_state_bytes: int = 0
     fallback_reason: str = ""
 
-    def model_dump(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 def _source_id(result: RetrievalResult) -> str:
-    return str(
-        result.memory_source_id
-        or (result.turn.source_id if result.turn is not None else None)
-        or result.chunk.turn_id
-    )
+    return result.durable_source_id
 
 
 class MSMarcoCrossEncoderSelector:
@@ -540,9 +616,8 @@ class MSMarcoCrossEncoderSelector:
             trace_by_id[result.chunk.chunk_id] for result in unique
         ]
         program = compile_set_program(query)
-        grouping_fallback = str(
-            (grouping_report or {}).get("fallback_reason", "")
-        )
+        grouping = grouping_report or {}
+        grouping_fallback = str(grouping.get("fallback_reason", ""))
         fallback = "; ".join(
             reason for reason in (semantic_fallback, grouping_fallback) if reason
         )
@@ -551,24 +626,20 @@ class MSMarcoCrossEncoderSelector:
             if unique and semantic_scoring
             else 0
         )
-        group_workspace = int((grouping_report or {}).get("workspace_tokens", 0))
+        group_workspace = int(grouping.get("workspace_tokens", 0))
         peak_workspace = max(semantic_workspace_tokens, group_workspace)
         semantic_inspected = (
             min(len(unique), self.candidate_pool)
             if semantic_scoring
             else 0
         )
-        group_inspected = int(
-            (grouping_report or {}).get("inspected_candidates", 0)
-        )
-        group_classified = int(
-            (grouping_report or {}).get("classified_candidates", 0)
-        )
+        group_inspected = int(grouping.get("inspected_candidates", 0))
+        group_classified = int(grouping.get("classified_candidates", 0))
         self.last_report = CrossEncoderSelectionReport(
-            operator=str((grouping_report or {}).get("operator", program.operator.value)),
-            cardinality=(grouping_report or {}).get("cardinality", program.cardinality),
+            operator=str(grouping.get("operator", program.operator.value)),
+            cardinality=grouping.get("cardinality", program.cardinality),
             requires_completeness=bool(
-                (grouping_report or {}).get(
+                grouping.get(
                     "requires_completeness",
                     program.requires_completeness,
                 )
@@ -576,23 +647,13 @@ class MSMarcoCrossEncoderSelector:
             input_candidates=len(unique),
             inspected_candidates=max(semantic_inspected, group_inspected),
             classified_candidates=max(semantic_inspected, group_classified),
-            event_clusters=int((grouping_report or {}).get("event_clusters", 0)),
-            new_assignments=int((grouping_report or {}).get("new_assignments", 0)),
-            existing_assignments=int(
-                (grouping_report or {}).get("existing_assignments", 0)
-            ),
-            null_assignments=int((grouping_report or {}).get("null_assignments", 0)),
             uncertain_assignments=int(
-                (grouping_report or {}).get(
+                grouping.get(
                     "uncertain_assignments",
                     max(0, len(unique) - semantic_inspected),
                 )
             ),
             output_candidates=len(selected),
-            representatives=int((grouping_report or {}).get("representatives", 0)),
-            supporting_candidates=int(
-                (grouping_report or {}).get("supporting_candidates", 0)
-            ),
             workspace_tokens=peak_workspace,
             elapsed_s=time.perf_counter() - started,
             semantic_model_id=self.model_id,
@@ -603,140 +664,9 @@ class MSMarcoCrossEncoderSelector:
             semantic_inspected_candidates=semantic_inspected,
             semantic_workspace_tokens=semantic_workspace_tokens,
             semantic_elapsed_s=semantic_elapsed,
-            prefix_model_id=str(
-                (grouping_report or {}).get("prefix_model_id", "")
-            ),
-            prefix_model_revision=str(
-                (grouping_report or {}).get("prefix_model_revision", "")
-            ),
-            prefix_checkpoint_sha256=str(
-                (grouping_report or {}).get("prefix_checkpoint_sha256", "")
-            ),
-            prefix_device=str(
-                (grouping_report or {}).get("prefix_device", "")
-            ),
-            prefix_dtype=str(
-                (grouping_report or {}).get("prefix_dtype", "")
-            ),
-            prefix_layers=int(
-                (grouping_report or {}).get("prefix_layers", 0) or 0
-            ),
-            prefix_attention_layer=int(
-                (grouping_report or {}).get("prefix_attention_layer", -1)
-            ),
-            frontier_candidates=int(
-                (grouping_report or {}).get("frontier_candidates", 0)
-            ),
-            frontier_attempted=int(
-                (grouping_report or {}).get("frontier_attempted", 0)
-            ),
-            frontier_uninspected=int(
-                (grouping_report or {}).get("frontier_uninspected", 0)
-            ),
-            frontier_exhaustive=bool(
-                (grouping_report or {}).get("frontier_exhaustive", False)
-            ),
-            frontier_batches=int(
-                (grouping_report or {}).get("frontier_batches", 0)
-            ),
-            routed_frontier_exhaustive=(
-                (grouping_report or {}).get("routed_frontier_exhaustive")
-            ),
-            active_partition_total=(
-                (grouping_report or {}).get("active_partition_total")
-            ),
-            active_partition_inspected=(
-                (grouping_report or {}).get("active_partition_inspected")
-            ),
-            active_partition_exhaustive=(
-                (grouping_report or {}).get("active_partition_exhaustive")
-            ),
-            active_partition_sources_total=(
-                (grouping_report or {}).get("active_partition_sources_total")
-            ),
-            active_partition_structural_rows=int(
-                (grouping_report or {}).get("active_partition_structural_rows", 0)
-                or 0
-            ),
-            active_partition_structural_hypotheses=int(
-                (grouping_report or {}).get(
-                    "active_partition_structural_hypotheses", 0
-                )
-                or 0
-            ),
-            active_partition_candidates_admitted=int(
-                (grouping_report or {}).get(
-                    "active_partition_candidates_admitted", 0
-                )
-                or 0
-            ),
-            active_partition_candidates_already_present=int(
-                (grouping_report or {}).get(
-                    "active_partition_candidates_already_present", 0
-                )
-                or 0
-            ),
-            active_partition_candidates_replaced=int(
-                (grouping_report or {}).get(
-                    "active_partition_candidates_replaced", 0
-                )
-                or 0
-            ),
-            active_partition_candidates_truncated=int(
-                (grouping_report or {}).get(
-                    "active_partition_candidates_truncated", 0
-                )
-                or 0
-            ),
-            active_partition_structural_overflow=int(
-                (grouping_report or {}).get(
-                    "active_partition_structural_overflow", 0
-                )
-                or 0
-            ),
-            active_partition_scan_contract=str(
-                (grouping_report or {}).get("active_partition_scan_contract", "")
-                or ""
-            ),
-            active_partition_semantically_complete=(
-                (grouping_report or {}).get(
-                    "active_partition_semantically_complete"
-                )
-            ),
-            partition_scope_kind=str(
-                (grouping_report or {}).get(
-                    "partition_scope_kind",
-                    "approximate_top_k",
-                )
-            ),
-            partition_inventory_total=(
-                (grouping_report or {}).get("partition_inventory_total")
-            ),
-            selected_partition_count=(
-                (grouping_report or {}).get("selected_partition_count")
-            ),
-            partition_scope_exhaustive=(
-                (grouping_report or {}).get("partition_scope_exhaustive")
-            ),
-            selected_scope_structurally_complete=(
-                (grouping_report or {}).get(
-                    "selected_scope_structurally_complete"
-                )
-            ),
-            global_semantic_complete=(
-                (grouping_report or {}).get("global_semantic_complete")
-            ),
-            allow_selected_scope_fixed_k_closure=bool(
-                (grouping_report or {}).get(
-                    "allow_selected_scope_fixed_k_closure",
-                    False,
-                )
-            ),
-            cardinality_deficit=int(
-                (grouping_report or {}).get("cardinality_deficit", 0) or 0
-            ),
             duplicate_grouping=grouping_report,
             retained_transformer_state_bytes=0,
             fallback_reason=fallback,
+            **_mirrored_grouping_fields(grouping),
         )
         return selected

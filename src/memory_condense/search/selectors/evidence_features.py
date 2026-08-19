@@ -5,19 +5,17 @@ from __future__ import annotations
 import math
 import re
 import sys
-from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.search.packing.source_provenance import (
+    provenance_timestamp_key,
+)
 
 def _source_id(result: RetrievalResult) -> str:
-    return str(
-        result.memory_source_id
-        or (result.turn.source_id if result.turn is not None else None)
-        or result.chunk.turn_id
-    )
+    return result.durable_source_id
 
 
 def _normalized_event_key(value: str | None) -> str | None:
@@ -27,31 +25,7 @@ def _normalized_event_key(value: str | None) -> str | None:
     return key or None
 
 def _timestamp_key(value: str | None) -> float | None:
-    if not value:
-        return None
-    cleaned = value.strip().replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(cleaned).timestamp()
-    except ValueError:
-        date = re.search(
-            r"\b(?P<year>(?:19|20)\d{2})[/-](?P<month>\d{1,2})"
-            r"[/-](?P<day>\d{1,2})(?:\D+(?P<hour>\d{1,2})"
-            r":(?P<minute>\d{2}))?",
-            cleaned,
-        )
-        if date is not None:
-            try:
-                return datetime(
-                    int(date.group("year")),
-                    int(date.group("month")),
-                    int(date.group("day")),
-                    int(date.group("hour") or 0),
-                    int(date.group("minute") or 0),
-                ).timestamp()
-            except ValueError:
-                pass
-        year = re.search(r"\b(?:19|20)\d{2}\b", cleaned)
-        return float(year.group()) if year is not None else None
+    return provenance_timestamp_key(value, allow_bare_year=True)
 
 def _normalized_transport(value: Any) -> np.ndarray | None:
     if value is None:

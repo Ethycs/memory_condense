@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
 from memory_condense.search.indexes.lexical import tokenize
+from memory_condense.search.packing.source_provenance import (
+    provenance_timestamp_key,
+)
 from memory_condense.domain.schemas import RetrievalResult
 
 __all__ = [
@@ -105,11 +107,6 @@ _APPROXIMATE_DURATION_RE = re.compile(
     r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)"
     r"\s*(?P<unit>minutes?|hours?|days?|weeks?)\b",
     re.IGNORECASE,
-)
-_TIMESTAMP_RE = re.compile(
-    r"\b(?P<year>(?:19|20)\d{2})[/-](?P<month>\d{1,2})"
-    r"[/-](?P<day>\d{1,2})(?:\D+(?P<hour>\d{1,2})"
-    r":(?P<minute>\d{2}))?"
 )
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|[\r\n]+")
 
@@ -331,11 +328,7 @@ def _is_user_evidence(result: RetrievalResult) -> bool:
 
 
 def _source_id(result: RetrievalResult) -> str:
-    if result.memory_source_id:
-        return result.memory_source_id
-    if result.turn is not None:
-        return str(result.turn.source_id or result.turn.turn_id)
-    return result.chunk.turn_id
+    return result.durable_source_id
 
 
 def _source_timestamp(
@@ -346,29 +339,7 @@ def _source_timestamp(
 
 
 def _parse_timestamp(value: str | None) -> float | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    cleaned = value.strip().replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(cleaned)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.timestamp()
-    except ValueError:
-        match = _TIMESTAMP_RE.search(cleaned)
-        if match is None:
-            return None
-        try:
-            return datetime(
-                int(match.group("year")),
-                int(match.group("month")),
-                int(match.group("day")),
-                int(match.group("hour") or 0),
-                int(match.group("minute") or 0),
-                tzinfo=timezone.utc,
-            ).timestamp()
-        except (OverflowError, ValueError):
-            return None
+    return provenance_timestamp_key(value, assume_utc=True)
 
 
 def _event_timestamp(sentence: str, source_timestamp: float) -> float | None:

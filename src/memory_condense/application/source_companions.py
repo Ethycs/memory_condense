@@ -21,6 +21,42 @@ _SOURCE_CANONICAL_COMPANIONS_PER_SOURCE = 4
 _SOURCE_PERFORMANCE_COMPANIONS_PER_SOURCE = 1
 
 
+def default_source_companion_report(**overrides: Any) -> dict[str, Any]:
+    """Return the one authoritative ``last_source_companion_report`` shape.
+
+    Every producer starts from these defaults so the key set cannot drift
+    between the build-context preamble, the empty-report path, and the full
+    companion pass.  Unknown keys are rejected to catch typos at the caller.
+    """
+    report: dict[str, Any] = {
+        "requested_sources": [],
+        "hydrated_sources": [],
+        "refreshed_sources": [],
+        "already_present_sources": [],
+        "orphan_sources": [],
+        "orphan_count": 0,
+        "direct_date_retained": 0,
+        "candidate_count_before": 0,
+        "candidate_count_after": 0,
+        "max_candidates_per_source": 1,
+        "companion_candidate_count": 0,
+        "selector_used": False,
+        "selector_fallback_sources": [],
+        "selector_fallback_reason": "",
+        "semantic_selector_report": {},
+        "selected_chunk_ids": {},
+        "refresh_all_activated_sources": False,
+        "choice_diagnostics": [],
+    }
+    unknown = set(overrides) - set(report)
+    if unknown:
+        raise ValueError(
+            f"unknown source companion report fields: {sorted(unknown)}"
+        )
+    report.update(overrides)
+    return report
+
+
 class SourceCompanionWorkflowMixin:
     """Internal workflow methods composed by ``MemoryCondenser``."""
 
@@ -249,26 +285,14 @@ class SourceCompanionWorkflowMixin:
             fallback_reason: str = "",
             fallback_sources: Sequence[str] = (),
         ) -> dict[str, Any]:
-            return {
-                "requested_sources": requested,
-                "hydrated_sources": [],
-                "refreshed_sources": [],
-                "already_present_sources": [],
-                "orphan_sources": [],
-                "orphan_count": 0,
-                "direct_date_retained": 0,
-                "candidate_count_before": len(output),
-                "candidate_count_after": len(output),
-                "max_candidates_per_source": 1,
-                "companion_candidate_count": 0,
-                "selector_used": False,
-                "selector_fallback_sources": list(fallback_sources),
-                "selector_fallback_reason": fallback_reason,
-                "semantic_selector_report": {},
-                "selected_chunk_ids": {},
-                "refresh_all_activated_sources": refresh_all_sources,
-                "choice_diagnostics": [],
-            }
+            return default_source_companion_report(
+                requested_sources=requested,
+                candidate_count_before=len(output),
+                candidate_count_after=len(output),
+                selector_fallback_sources=list(fallback_sources),
+                selector_fallback_reason=fallback_reason,
+                refresh_all_activated_sources=refresh_all_sources,
+            )
 
         if not requested:
             self.last_source_companion_report = empty_report()
@@ -741,17 +765,16 @@ class SourceCompanionWorkflowMixin:
                 reason for reason in selector_fallback_reasons if reason
             )
         )
-        companion_report = {
-            "requested_sources": requested,
-            "hydrated_sources": hydrated_sources,
-            "refreshed_sources": refreshed_sources,
-            "already_present_sources": already_present_sources,
-            "orphan_sources": orphan_sources,
-            "orphan_count": len(orphan_sources),
-            "direct_date_retained": 0,
-            "candidate_count_before": len(expansions),
-            "candidate_count_after": len(output),
-            "max_candidates_per_source": (
+        companion_report = default_source_companion_report(
+            requested_sources=requested,
+            hydrated_sources=hydrated_sources,
+            refreshed_sources=refreshed_sources,
+            already_present_sources=already_present_sources,
+            orphan_sources=orphan_sources,
+            orphan_count=len(orphan_sources),
+            candidate_count_before=len(expansions),
+            candidate_count_after=len(output),
+            max_candidates_per_source=(
                 max_per_source
                 + (
                     _SOURCE_CANONICAL_COMPANIONS_PER_SOURCE
@@ -764,20 +787,20 @@ class SourceCompanionWorkflowMixin:
                     else 0
                 )
             ),
-            "companion_candidate_count": sum(
+            companion_candidate_count=sum(
                 len(candidates) for candidates in candidates_by_source.values()
             ),
-            "selector_used": selector_used,
-            "selector_fallback_sources": selector_fallback_sources,
-            "selector_fallback_reason": selector_fallback_reason,
-            "semantic_selector_report": semantic_selector_report,
-            "selected_chunk_ids": {
+            selector_used=selector_used,
+            selector_fallback_sources=selector_fallback_sources,
+            selector_fallback_reason=selector_fallback_reason,
+            semantic_selector_report=semantic_selector_report,
+            selected_chunk_ids={
                 source_id: result.chunk.chunk_id
                 for source_id, result in companion_by_source.items()
             },
-            "refresh_all_activated_sources": refresh_all_sources,
-            "choice_diagnostics": choice_diagnostics,
-        }
+            refresh_all_activated_sources=refresh_all_sources,
+            choice_diagnostics=choice_diagnostics,
+        )
         if active_partition_protected_sources:
             companion_report["active_partition_protected_sources"] = (
                 active_partition_protected_sources
@@ -785,4 +808,7 @@ class SourceCompanionWorkflowMixin:
         self.last_source_companion_report = companion_report
         return output, set(orphan_sources)
 
-__all__ = ["SourceCompanionWorkflowMixin"]
+__all__ = [
+    "SourceCompanionWorkflowMixin",
+    "default_source_companion_report",
+]

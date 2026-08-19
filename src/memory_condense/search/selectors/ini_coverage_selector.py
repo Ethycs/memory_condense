@@ -16,10 +16,8 @@ from memory_condense.search.selectors.coverage_models import (
     CandidateAssignment,
     CompletionFn,
     CoverageSelectionReport,
-    _RawAssignment,
 )
 from memory_condense.search.selectors.evidence_features import (
-    _normalized_event_key,
     _source_id,
     _timestamp_key,
 )
@@ -65,7 +63,7 @@ _ASSIGNMENT_COLUMNS = (
 )
 
 
-def _parse_assignment(value: Any) -> _RawAssignment:
+def _parse_assignment(value: Any) -> CandidateAssignment:
     """Accept compact production rows and verbose rows used by older fixtures."""
 
     if isinstance(value, list):
@@ -74,7 +72,7 @@ def _parse_assignment(value: Any) -> _RawAssignment:
                 f"compact classifier row needs {len(_ASSIGNMENT_COLUMNS)} fields"
             )
         value = dict(zip(_ASSIGNMENT_COLUMNS, value, strict=True))
-    return _RawAssignment.model_validate(value)
+    return CandidateAssignment.model_validate(value)
 
 
 def _clean_ini_field(value: Any) -> str:
@@ -152,29 +150,6 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             return decoded
     raise ValueError("classifier did not return a JSON object")
 
-
-def _normalize_assignment(raw: _RawAssignment) -> CandidateAssignment:
-    values = [float(raw.p_existing), float(raw.p_new), float(raw.p_null)]
-    total = sum(values)
-    if total <= 0.0:
-        raise ValueError(f"candidate {raw.id} has zero posterior mass")
-    existing, new, null = (value / total for value in values)
-    entropy = -sum(
-        probability * math.log(probability)
-        for probability in (existing, new, null)
-        if probability > 0.0
-    )
-    return CandidateAssignment(
-        candidate_id=raw.id,
-        event_key=_normalized_event_key(raw.event_key),
-        answer_value=(raw.answer_value or "").strip(),
-        timestamp=raw.timestamp.strip() if raw.timestamp else None,
-        p_existing=existing,
-        p_new=new,
-        p_null=null,
-        answerability=float(raw.answerability),
-        entropy=entropy,
-    )
 
 class QueryConditionedCoverageSelector:
     """Run one bounded listwise classification, then pack event coverage first."""
@@ -280,25 +255,14 @@ class QueryConditionedCoverageSelector:
         inspected: int = 0,
     ) -> list[RetrievalResult]:
         output = list(candidates)
-        self.last_report = CoverageSelectionReport(
-            operator=program.operator.value,
-            cardinality=program.cardinality,
-            requires_completeness=program.requires_completeness,
+        self.last_report = CoverageSelectionReport.uninspected(
+            program,
+            started=started,
             input_candidates=len(candidates),
-            inspected_candidates=inspected,
-            classified_candidates=0,
-            event_clusters=0,
-            new_assignments=0,
-            existing_assignments=0,
-            null_assignments=0,
-            uncertain_assignments=len(candidates),
-            output_candidates=len(output),
-            representatives=0,
-            supporting_candidates=0,
-            workspace_tokens=workspace_tokens,
-            elapsed_s=time.perf_counter() - started,
             selection_status="fallback",
             fallback_reason=reason,
+            inspected_candidates=inspected,
+            workspace_tokens=workspace_tokens,
         )
         return output
 
@@ -313,32 +277,20 @@ class QueryConditionedCoverageSelector:
         """Return candidates unchanged when set coverage is not applicable."""
 
         output = list(candidates)
-        self.last_report = CoverageSelectionReport(
-            operator=program.operator.value,
-            cardinality=program.cardinality,
-            requires_completeness=False,
+        self.last_report = CoverageSelectionReport.uninspected(
+            program,
+            started=started,
             input_candidates=len(output),
-            inspected_candidates=0,
-            classified_candidates=0,
-            event_clusters=0,
-            new_assignments=0,
-            existing_assignments=0,
-            null_assignments=0,
-            uncertain_assignments=len(output),
-            output_candidates=len(output),
-            representatives=0,
-            supporting_candidates=0,
-            workspace_tokens=0,
-            elapsed_s=time.perf_counter() - started,
             selection_status="bypassed",
             bypass_reason=reason,
+            # A bypassed pass reports the operator as not applicable, so it
+            # deliberately overrides the program's own completeness bit.
+            requires_completeness=False,
             quantifier=program.quantifier.value,
             ordering=program.ordering.value,
             frontier_candidates=len(output),
-            frontier_attempted=0,
             frontier_uninspected=len(output),
             routed_frontier_exhaustive=None,
-            active_partition_exhaustive=None,
             query_timestamp=program.query_timestamp,
             temporal_window_days=program.temporal_window_days,
         )
@@ -402,9 +354,9 @@ class QueryConditionedCoverageSelector:
             assignments: dict[int, CandidateAssignment] = {}
             for value in rows:
                 parsed = _parse_assignment(value)
-                if parsed.id >= inspected or parsed.id in assignments:
+                if parsed.candidate_id >= inspected or parsed.candidate_id in assignments:
                     continue
-                assignments[parsed.id] = _normalize_assignment(parsed)
+                assignments[parsed.candidate_id] = parsed
             if not assignments:
                 raise ValueError("classifier returned no valid candidate IDs")
         except Exception as exc:

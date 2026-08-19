@@ -148,8 +148,8 @@ candidate set. A later hop receives IDs selected by the preceding hop; it does
 not receive an ever-growing concatenation of prior transformer context.
 
 `QwenMemoryLinker` enforces candidate and token ceilings (currently 8 and
-1,024 by default). `CAVLinkIndex` stores only float32 concept coordinates and
-Concept↔Episode membership. `HeadAssociationGraph` stores sparse per-head QK
+1,024 by default). `AssociationStore.cav_neighbors` searches only durable
+float32 concept coordinates. `HeadAssociationGraph` stores sparse per-head QK
 evidence and scalar OV transport, with a hard degree bound. The older
 `QwenLiveHeadMemory` remains a bounded lab workspace and refuses more than 64
 items by default. It is not a corpus store.

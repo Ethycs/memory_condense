@@ -494,7 +494,7 @@ class RetrievalWorkflowMixin:
         for result in anchors:
             if result.turn is None:
                 continue
-            source_id = result.turn.source_id or result.turn.turn_id
+            source_id = result.source_key
             if source_id not in source_scores:
                 source_ids.append(source_id)
                 source_scores[source_id] = float(result.score)
@@ -569,7 +569,7 @@ class RetrievalWorkflowMixin:
         for result in pool[:activation_k]:
             if result.turn is None:
                 continue
-            source_id = result.turn.source_id or result.turn.turn_id
+            source_id = result.source_key
             anchor_by_source.setdefault(source_id, result.chunk.chunk_id)
             source_scores[source_id] = max(
                 source_scores.get(source_id, 0.0), float(result.score)
@@ -612,7 +612,7 @@ class RetrievalWorkflowMixin:
         for result in pool:
             if result.turn is None or result.chunk.chunk_id in anchor_ids:
                 continue
-            source_id = result.turn.source_id or result.turn.turn_id
+            source_id = result.source_key
             anchor_id = anchor_by_source.get(source_id)
             if anchor_id is None:
                 continue

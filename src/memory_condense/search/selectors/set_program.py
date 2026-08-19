@@ -39,9 +39,7 @@ class SetOrdering(str, Enum):
 class SetProgram:
     """Small, inspectable query program used by the neural classifier."""
 
-    operator: SetOperator
     cardinality: int | None
-    requires_completeness: bool
     identity_rule: str
     quantifier: SetQuantifier = SetQuantifier.SINGLE
     ordering: SetOrdering = SetOrdering.NONE
@@ -53,6 +51,33 @@ class SetProgram:
     required_evidence_role_basis: str | None = None
     query_timestamp: str | None = None
     temporal_window_days: int | None = None
+
+    @property
+    def operator(self) -> SetOperator:
+        """Deterministic answer-set operation derived from the clauses."""
+
+        if self.quantifier is SetQuantifier.COUNT:
+            return SetOperator.COUNT
+        if self.quantifier is SetQuantifier.FIXED:
+            return SetOperator.FIXED
+        if self.quantifier is SetQuantifier.ALL:
+            if self.ordering is not SetOrdering.NONE:
+                return SetOperator.ORDERED
+            return SetOperator.ALL
+        if self.ordering is SetOrdering.ASCENDING:
+            return SetOperator.EARLIEST
+        if self.ordering is SetOrdering.DESCENDING:
+            return SetOperator.LATEST
+        return SetOperator.SINGLE
+
+    @property
+    def requires_completeness(self) -> bool:
+        """Whether the reducer must see the complete matching set."""
+
+        return (
+            self.quantifier is not SetQuantifier.SINGLE
+            or self.ordering is not SetOrdering.NONE
+        )
 
 
 _NUMBER_WORDS = {
@@ -269,21 +294,6 @@ def compile_set_program(query: str) -> SetProgram:
     else:
         quantifier = SetQuantifier.SINGLE
 
-    if quantifier is SetQuantifier.COUNT:
-        operator = SetOperator.COUNT
-    elif quantifier is SetQuantifier.FIXED:
-        operator = SetOperator.FIXED
-    elif quantifier is SetQuantifier.ALL and ordering is not SetOrdering.NONE:
-        operator = SetOperator.ORDERED
-    elif quantifier is SetQuantifier.ALL:
-        operator = SetOperator.ALL
-    elif ordering is SetOrdering.ASCENDING:
-        operator = SetOperator.EARLIEST
-    elif ordering is SetOrdering.DESCENDING:
-        operator = SetOperator.LATEST
-    else:
-        operator = SetOperator.SINGLE
-
     if "museum" in lowered:
         identity_rule = (
             "Group by canonical museum venue. Different excerpts about the same "
@@ -353,12 +363,7 @@ def compile_set_program(query: str) -> SetProgram:
         temporal_window_days = count * unit_days
 
     return SetProgram(
-        operator=operator,
         cardinality=cardinality,
-        requires_completeness=(
-            quantifier is not SetQuantifier.SINGLE
-            or ordering is not SetOrdering.NONE
-        ),
         identity_rule=identity_rule,
         quantifier=quantifier,
         ordering=ordering,

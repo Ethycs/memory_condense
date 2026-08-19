@@ -16,6 +16,31 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def evidence_weighted_mean(
+    old_value: Any,
+    new_value: Any,
+    old_count: int,
+    new_count: int,
+) -> Any:
+    """Merge accumulated edge evidence with a new observation by count.
+
+    Works uniformly on floats, numpy arrays, and torch tensors, so the durable
+    SQLite edge store and the in-memory association graph share one formula.
+    """
+    return (old_value * old_count + new_value * new_count) / (old_count + new_count)
+
+
+def qk_transport_utility(
+    qk_score: float,
+    ov_transport: float,
+    *,
+    live_usage: float = 0.0,
+    usage_weight: float = 0.0,
+) -> float:
+    """QK evidence + transported value, optionally with live traversal usage."""
+    return qk_score + math.log1p(ov_transport) + usage_weight * live_usage
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -144,18 +169,41 @@ class StoredHeadEdge:
             now_turn,
             usage_half_life,
         )
-        return self.qk_score + math.log1p(self.ov_transport) + usage_weight * live_usage
+        return qk_transport_utility(
+            self.qk_score,
+            self.ov_transport,
+            live_usage=live_usage,
+            usage_weight=usage_weight,
+        )
 
 
 @dataclass(frozen=True, slots=True)
-class HebbianUpdate:
-    """Result of one idempotent same-turn co-access observation."""
+class CoaccessUpdate:
+    """Result of one idempotent bounded co-access observation.
+
+    Both durable co-access graphs return this shape; ``member_count`` is the
+    column both event-receipt schemas persist for the observed set.
+    """
 
     event_id: str
     created: bool
-    concepts_observed: int
+    members_observed: int
     edges_reinforced: int
     edges_pruned: int
+
+    @property
+    def concepts_observed(self) -> int:
+        """Hebbian spelling: observed members are conceptual chunks."""
+        return self.members_observed
+
+    @property
+    def nodes_observed(self) -> int:
+        """Consolidation spelling: observed members are graph nodes."""
+        return self.members_observed
+
+
+#: Backward-compatible name for the Hebbian store's update result.
+HebbianUpdate = CoaccessUpdate
 
 
 @dataclass(frozen=True, slots=True)

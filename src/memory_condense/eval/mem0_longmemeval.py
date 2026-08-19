@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import re
-import sys
 import time
 import uuid
 from collections import deque
@@ -61,33 +60,6 @@ from memory_condense.eval.mem0_runtime import (
     _raise_cleanup_errors,
 )
 from memory_condense.ingest.loader import BenchmarkSample
-
-
-def _adapter_override(name: str, default: Any) -> Any:
-    """Resolve a private helper patched through the compatibility facade."""
-
-    facade = sys.modules.get("memory_condense.eval.mem0_adapter")
-    return getattr(facade, name, default)
-
-
-def _facade_response_rows(response: Any, *, operation: str):
-    return _adapter_override("_response_rows", _response_rows)(
-        response,
-        operation=operation,
-    )
-
-
-def _facade_prepared_sample(sample: BenchmarkSample) -> _PreparedCorpus:
-    return _adapter_override("_prepared_sample", _prepared_sample)(sample)
-
-
-def _facade_prepared_longmemeval_record(
-    record: Mapping[str, Any],
-) -> _PreparedCorpus:
-    return _adapter_override(
-        "_prepared_longmemeval_record",
-        _prepared_longmemeval_record,
-    )(record)
 
 
 class Mem0LongMemEvalAdapter:
@@ -298,7 +270,7 @@ class Mem0LongMemEvalAdapter:
                     user_id=user_scope,
                     infer=True,
                 )
-                rows = _facade_response_rows(response, operation="add")
+                rows = _response_rows(response, operation="add")
                 response_ids: list[str] = []
                 for row_index, row in enumerate(rows):
                     memory_id = _memory_id(row)
@@ -375,14 +347,14 @@ class Mem0LongMemEvalAdapter:
         :meth:`ingest_longmemeval_record` for official comparisons.
         """
 
-        return self._ingest_prepared(_facade_prepared_sample(sample))
+        return self._ingest_prepared(_prepared_sample(sample))
 
     def ingest_longmemeval_record(
         self, record: Mapping[str, Any]
     ) -> Mem0IngestResult:
         """Ingest one raw record with official pairing and empty-pair parity."""
 
-        return self._ingest_prepared(_facade_prepared_longmemeval_record(record))
+        return self._ingest_prepared(_prepared_longmemeval_record(record))
 
     ingest = ingest_sample
 
@@ -391,7 +363,7 @@ class Mem0LongMemEvalAdapter:
     ) -> tuple[Mem0Candidate, ...]:
         candidates: list[Mem0Candidate] = []
         for rank, row in enumerate(
-            _facade_response_rows(response, operation="search"), start=1
+            _response_rows(response, operation="search"), start=1
         ):
             memory_id = _memory_id(row)
             if memory_id is None:
@@ -651,7 +623,6 @@ class Mem0LongMemEvalAdapter:
                     reason=reason,
                     context_tokens_after=context_tokens,
                     prompt_token_proxy_after=prompt_tokens,
-                    prompt_tokens_after=prompt_tokens,
                 )
             )
 
@@ -678,7 +649,6 @@ class Mem0LongMemEvalAdapter:
             search_prompt_token_proxy=(
                 self._stats.search_prompt_token_proxy + prompt_tokens
             ),
-            search_prompt_tokens=self._stats.search_prompt_tokens + prompt_tokens,
             search_returned_memories=(
                 self._stats.search_returned_memories + len(raw_pool)
             ),
@@ -700,12 +670,6 @@ class Mem0LongMemEvalAdapter:
             prompt_token_proxy_budget_compliant=True,
             token_counter_identity=self._token_counter_identity,
             token_counter_identity_verified=self._token_counter_identity_verified,
-            prompt_tokens=prompt_tokens,
-            max_prompt_tokens=max_prompt_tokens,
-            prompt_token_overhead=prompt_token_overhead,
-            empty_context_prompt_tokens=empty_prompt_tokens,
-            residual_prompt_tokens=max_prompt_tokens - prompt_tokens,
-            prompt_budget_certified=True,
             packed=tuple(packed),
             raw_pool=raw_pool,
             diagnostics=tuple(diagnostics),

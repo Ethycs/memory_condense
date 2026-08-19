@@ -79,8 +79,40 @@ class DiscourseLinker(Protocol):
     ) -> LinkerOutput: ...
 
 
+def _scoped_by_keyword(name: str):
+    """Forward to ``store.<name>`` with the ``artifact_id`` kwarg pinned."""
+
+    def method(self, *args, artifact_id=None, **kwargs):
+        return getattr(self.store, name)(
+            *args,
+            artifact_id=self._scope(artifact_id),
+            **kwargs,
+        )
+
+    method.__name__ = name
+    return method
+
+
+def _scoped_by_position(name: str):
+    """Forward to ``store.<name>`` with the leading ``artifact_id`` pinned."""
+
+    def method(self, artifact_id, *args, **kwargs):
+        return getattr(self.store, name)(
+            self._scope(artifact_id),
+            *args,
+            **kwargs,
+        )
+
+    method.__name__ = name
+    return method
+
+
 class _ArtifactScopedDiscourseStore:
-    """Fail-closed adapter preventing cross-artifact closure reads."""
+    """Fail-closed adapter preventing cross-artifact closure reads.
+
+    Only the methods assigned below are reachable; a store method absent from
+    this allowlist stays inaccessible rather than silently passing unscoped.
+    """
 
     __slots__ = ("artifact_id", "store")
 
@@ -93,6 +125,7 @@ class _ArtifactScopedDiscourseStore:
             raise ValueError("closure attempted to cross discourse artifacts")
         return self.artifact_id
 
+    # Scope-free reads deliberately allowed through unmodified.
     def snapshot(self, graph_revision: int | None = None):
         return self.store.snapshot(graph_revision)
 
@@ -102,12 +135,20 @@ class _ArtifactScopedDiscourseStore:
     def hydrate_span(self, span):
         return self.store.hydrate_span(span)
 
-    def episode_ids_for_chunks(self, chunk_ids, *, artifact_id=None):
-        return self.store.episode_ids_for_chunks(
-            chunk_ids,
-            artifact_id=self._scope(artifact_id),
-        )
+    # Reads that carry an ``artifact_id`` are pinned to this adapter's scope.
+    episode_ids_for_chunks = _scoped_by_keyword("episode_ids_for_chunks")
+    units_for_chunks = _scoped_by_keyword("units_for_chunks")
+    relations_for_chunks = _scoped_by_keyword("relations_for_chunks")
+    incident_relations = _scoped_by_keyword("incident_relations")
+    episodes_for_source = _scoped_by_position("episodes_for_source")
+    units_for_artifact = _scoped_by_position("units_for_artifact")
+    iter_unit_routes_for_artifact = _scoped_by_position(
+        "iter_unit_routes_for_artifact"
+    )
+    coverage_for_chunks = _scoped_by_position("coverage_for_chunks")
+    artifact_coverage = _scoped_by_position("artifact_coverage")
 
+    # ID lookups filter to this artifact after the fact.
     def get_episode(self, episode_id):
         value = self.store.get_episode(episode_id)
         return value if value is not None and value.artifact_id == self.artifact_id else None
@@ -131,48 +172,6 @@ class _ArtifactScopedDiscourseStore:
             if item.artifact_id == self.artifact_id
         )
 
-    def episodes_for_source(
-        self,
-        artifact_id,
-        source_id,
-        *,
-        start_sequence=None,
-        end_sequence=None,
-        limit=None,
-    ):
-        return self.store.episodes_for_source(
-            self._scope(artifact_id),
-            source_id,
-            start_sequence=start_sequence,
-            end_sequence=end_sequence,
-            limit=limit,
-        )
-
-    def units_for_chunks(self, chunk_ids, *, artifact_id=None, limit=None):
-        return self.store.units_for_chunks(
-            chunk_ids,
-            artifact_id=self._scope(artifact_id),
-            limit=limit,
-        )
-
-    def units_for_artifact(self, artifact_id, *, limit=None):
-        return self.store.units_for_artifact(
-            self._scope(artifact_id),
-            limit=limit,
-        )
-
-    def iter_unit_routes_for_artifact(self, artifact_id):
-        return self.store.iter_unit_routes_for_artifact(
-            self._scope(artifact_id),
-        )
-
-    def relations_for_chunks(self, chunk_ids, *, artifact_id=None, limit=None):
-        return self.store.relations_for_chunks(
-            chunk_ids,
-            artifact_id=self._scope(artifact_id),
-            limit=limit,
-        )
-
     def get_unit(self, unit_id):
         value = self.store.get_unit(unit_id)
         return value if value is not None and value.artifact_id == self.artifact_id else None
@@ -180,38 +179,6 @@ class _ArtifactScopedDiscourseStore:
     def get_relation(self, relation_id):
         value = self.store.get_relation(relation_id)
         return value if value is not None and value.artifact_id == self.artifact_id else None
-
-    def incident_relations(
-        self,
-        unit_ids,
-        *,
-        artifact_id=None,
-        max_degree,
-    ):
-        return self.store.incident_relations(
-            unit_ids,
-            artifact_id=self._scope(artifact_id),
-            max_degree=max_degree,
-        )
-
-    def coverage_for_chunks(
-        self,
-        artifact_id,
-        chunk_ids,
-        *,
-        coverage_kind="discourse",
-    ):
-        return self.store.coverage_for_chunks(
-            self._scope(artifact_id),
-            chunk_ids,
-            coverage_kind=coverage_kind,
-        )
-
-    def artifact_coverage(self, artifact_id, coverage_kind="discourse"):
-        return self.store.artifact_coverage(
-            self._scope(artifact_id),
-            coverage_kind,
-        )
 
 
 @dataclass(frozen=True, slots=True)

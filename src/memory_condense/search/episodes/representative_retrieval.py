@@ -30,6 +30,7 @@ from memory_condense.domain.discourse import (
     quote_sha256,
 )
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.search.episodes.retrieval import _exact_int
 
 
 @runtime_checkable
@@ -931,20 +932,6 @@ def _hit_utility(hit: object, *, score_mode: str) -> float:
                 sum(max(0.0, value) for value in values) / len(values)
             )
     return utility
-
-
-def _exact_int(value: object, label: str) -> int:
-    try:
-        normalized = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be an integer") from exc
-    try:
-        exact = float(value) == float(normalized)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        exact = False
-    if not exact:
-        raise ValueError(f"{label} must be an integer")
-    return normalized
 
 
 def _digest(value: object, label: str) -> str:

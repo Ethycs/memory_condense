@@ -10,7 +10,7 @@ from __future__ import annotations
 from memory_condense.associations.associative_composition import (
     compose_associative_candidates,
 )
-from memory_condense.associations.cav_memory import CAVBank, CAVLinkIndex
+from memory_condense.associations.cav_memory import CAVBank
 from memory_condense.associations.head_association_graph import (
     HeadAssociationGraph,
     _rank_association_walk,
@@ -24,7 +24,6 @@ from memory_condense.associations.head_memory_cli import (
 from memory_condense.associations.head_memory_models import (
     AssociativeComposition,
     AssociativeMemoryCandidate,
-    CAVNeighbor,
     HeadAddress,
     HeadAssociationEdge,
     HeadMemoryItem,
@@ -43,8 +42,6 @@ __all__ = [
     "AssociativeComposition",
     "AssociativeMemoryCandidate",
     "CAVBank",
-    "CAVLinkIndex",
-    "CAVNeighbor",
     "HeadAddress",
     "HeadAssociationEdge",
     "HeadAssociationGraph",

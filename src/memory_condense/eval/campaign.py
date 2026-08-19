@@ -7,49 +7,13 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
-from memory_condense.eval.campaign_merge import (
-    _category_metrics,
-    _distribution,
-    _mean,
-    _nearest_rank,
-    _sum_usage,
-    merge_benchmark_reports,
-)
+from memory_condense.eval.campaign_merge import merge_benchmark_reports
 from memory_condense.eval.campaign_models import (
     CampaignMergeError,
     ExpectedStressShard,
     LockedValidationPlan,
 )
-from memory_condense.eval.campaign_plan import (
-    _assert_locked_plan_unchanged,
-    _load_json_object,
-    _revalidate_locked_claim_profile,
-    _safe_repository_file,
-    build_locked_validation_plan,
-)
-from memory_condense.eval.campaign_validation import (
-    _BINARY_JUDGE_VERDICT,
-    _HASH_FIELDS,
-    _QUESTION_ERROR_FIELDS,
-    _assert_policy_retrieval_identity,
-    _canonical_json,
-    _ensure_same_identity,
-    _file_sha256,
-    _has_error,
-    _identity,
-    _json_constant,
-    _load_report,
-    _locked_judge_verdict,
-    _require_bool,
-    _require_float,
-    _require_int,
-    _require_list,
-    _require_mapping,
-    _require_nonempty_string,
-    _require_sha256,
-    _validate_question,
-    _validate_usage,
-)
+from memory_condense.eval.campaign_plan import build_locked_validation_plan
 from memory_condense.eval.context_stress import transcript_tokens
 from memory_condense.eval.reproducibility import file_sha256
 

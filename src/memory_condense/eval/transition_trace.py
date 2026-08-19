@@ -19,7 +19,7 @@ from memory_condense.eval.benchmark import (
     cap_context_to_prompt_budget,
     f1_score,
 )
-from memory_condense.eval.recall import best_f1, contains_answer
+from memory_condense.eval.answer_value_coverage import best_f1, contains_answer
 from memory_condense.eval.schemas import EvalConfig
 from memory_condense.ingest.loader import BenchmarkSample
 

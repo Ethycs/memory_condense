@@ -282,11 +282,7 @@ class _ExpansionOrderingMixin:
 
     @staticmethod
     def _result_source_id(result: RetrievalResult) -> str:
-        if result.memory_source_id:
-            return result.memory_source_id
-        if result.turn is not None:
-            return str(result.turn.source_id or result.turn.turn_id)
-        return result.chunk.turn_id
+        return result.durable_source_id
 
     def _heat_weighted_order(
         self, expansions: list[RetrievalResult]

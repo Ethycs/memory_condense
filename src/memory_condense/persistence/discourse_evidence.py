@@ -31,9 +31,24 @@ class _Executor(Protocol):
 
 
 _T = TypeVar("_T")
-_EVIDENCE_COLUMNS = (
-    "chunk_id, start_char, end_char, quote_sha256, ordinal, source_id, "
-    "turn_start_char, turn_id, role, created_at"
+# The stored evidence columns, in order. Names match ``EvidenceSpan`` fields
+# exactly so the SELECT list, the INSERT values, and the span reader are all
+# derived from this one tuple.
+_EVIDENCE_FIELDS = (
+    "chunk_id",
+    "start_char",
+    "end_char",
+    "quote_sha256",
+    "ordinal",
+    "source_id",
+    "turn_start_char",
+    "turn_id",
+    "role",
+    "created_at",
+)
+_EVIDENCE_COLUMNS = ", ".join(_EVIDENCE_FIELDS)
+_EVIDENCE_INT_FIELDS = frozenset(
+    {"start_char", "end_char", "ordinal", "turn_start_char"}
 )
 _METADATA_KEYS = {
     "artifact": frozenset(
@@ -59,6 +74,22 @@ class _SourceRow:
     source_id_raw: str | None
     role: str
     created_at: str
+
+    def span(self, start_char: int, end_char: int) -> EvidenceSpan:
+        """Build a fully-provenanced evidence span for the given chunk bounds."""
+
+        return EvidenceSpan(
+            chunk_id=self.chunk_id,
+            start_char=start_char,
+            end_char=end_char,
+            quote_sha256=quote_sha256(self.chunk_text[start_char:end_char]),
+            ordinal=self.ordinal,
+            source_id=self.source_id,
+            turn_start_char=self.chunk_start,
+            turn_id=self.turn_id,
+            role=self.role,
+            created_at=self.created_at,
+        )
 
     @property
     def identity_sha256(self) -> str:
@@ -239,18 +270,7 @@ class EvidenceStoreMixin:
                 raise SourceEvidenceError(
                     f"empty chunk {chunk_id!r} cannot form an evidence span"
                 )
-            span = EvidenceSpan(
-                chunk_id=chunk_id,
-                start_char=0,
-                end_char=len(source.chunk_text),
-                quote_sha256=quote_sha256(source.chunk_text),
-                ordinal=source.ordinal,
-                source_id=source.source_id,
-                turn_start_char=source.chunk_start,
-                turn_id=source.turn_id,
-                role=source.role,
-                created_at=source.created_at,
-            )
+            span = source.span(0, len(source.chunk_text))
             self._validate_span(span)
             spans.append(span)
         return tuple(spans)
@@ -274,16 +294,10 @@ class EvidenceStoreMixin:
             )
         spans = tuple(
             EvidenceSpan(
-                chunk_id=row[1],
-                start_char=int(row[2]),
-                end_char=int(row[3]),
-                quote_sha256=row[4],
-                ordinal=int(row[5]),
-                source_id=row[6],
-                turn_start_char=int(row[7]),
-                turn_id=row[8],
-                role=row[9],
-                created_at=row[10],
+                **{
+                    name: int(value) if name in _EVIDENCE_INT_FIELDS else value
+                    for name, value in zip(_EVIDENCE_FIELDS, row[1:])
+                }
             )
             for row in rows
         )
@@ -309,22 +323,10 @@ class EvidenceStoreMixin:
         self._db.executemany(
             f"INSERT INTO {table} "
             f"({owner_column}, evidence_order, {_EVIDENCE_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"VALUES ({', '.join('?' * (len(_EVIDENCE_FIELDS) + 2))})",
             [
-                (
-                    owner_id,
-                    position,
-                    span.chunk_id,
-                    span.start_char,
-                    span.end_char,
-                    span.quote_sha256,
-                    span.ordinal,
-                    span.source_id,
-                    span.turn_start_char,
-                    span.turn_id,
-                    span.role,
-                    span.created_at,
-                )
+                (owner_id, position)
+                + tuple(getattr(span, name) for name in _EVIDENCE_FIELDS)
                 for position, span in enumerate(evidence)
             ],
         )

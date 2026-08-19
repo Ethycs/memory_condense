@@ -6,7 +6,6 @@ import math
 from typing import Any, Literal, Sequence
 
 from memory_condense.associations.cav_memory import CAVBank
-from memory_condense.associations.head_association_graph import HeadAssociationGraph
 from memory_condense.associations.head_memory_models import (
     AssociativeMemoryCandidate,
     MemoryLinkHit,
@@ -262,28 +261,6 @@ class QwenMemoryLinker:
             passes=1,
             total_candidate_inspections=len(bounded),
         )
-
-    def link_into_graph(
-        self,
-        graph: HeadAssociationGraph,
-        source_id: str,
-        source_text: str,
-        candidates: Sequence[AssociativeMemoryCandidate],
-        *,
-        top_k: int | None = None,
-    ) -> MemoryLinkResult:
-        """Compile a transient pass into a bounded persistent association graph."""
-        result = self.link(source_text, candidates, top_k=top_k)
-        torch = self.encoder._torch
-        for hit in result.hits:
-            graph.add(
-                source_id,
-                hit.episode_id,
-                torch.tensor(hit.head_weights),
-                ov_transport=hit.ov_transport,
-            )
-        graph.prune_neighbors(self.max_neighbors_per_episode)
-        return result
 
     def inspect_coverage(
         self,

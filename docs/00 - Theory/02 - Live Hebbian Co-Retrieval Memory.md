@@ -81,8 +81,9 @@ The defaults are deliberately conservative:
 - only 4,096 event fingerprints are retained for retry idempotency;
 - an event receipt stores a SHA-256 membership fingerprint, not the query or
   retrieved payload;
-- `search_hebbian` reserves one slot inside the existing `k` rather than
-  appending context;
+- `expand_hebbian` reserves one slot inside the existing `k` rather than
+  appending context (its one-call `search_hebbian` wrapper was removed
+  2026-08-19, caller-less);
 - a replacement that adds any prompt tokens is rolled back by default;
 - strong lexical anchors are protected from learned replacement;
 - all traversal is one-hop and bounded before chunk text is hydrated.
@@ -108,8 +109,9 @@ really reached the model, and a single event cannot reinforce itself twice.
 - `AssociationStore.prune_hebbian_edges(...)` enforces the physical budget.
 - `MemoryCondenser.observe_retrieval_access(...)` turns ranked results into one
   live event.
-- `MemoryCondenser.search_hebbian(...)` uses learned links inside reserved
-  retrieval slots; passing `access_event_id` also observes its final result.
+- `MemoryCondenser.expand_hebbian(...)` uses learned links inside reserved
+  retrieval slots over already-ranked anchors;
+  `observe_retrieval_access(...)` records the final result as the live event.
 
 The graph is artifact-scoped. A Qwen checkpoint/CAV/head interpretation cannot
 silently share learned access weights with another artifact.

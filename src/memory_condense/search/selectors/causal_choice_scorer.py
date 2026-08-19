@@ -432,7 +432,7 @@ class CausalChoiceScorer:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from memory_condense.eval.local_qwen import resolve_local_qwen_dtype
+        from memory_condense.modeling.qwen_dtype import resolve_local_qwen_dtype
 
         root = Path(model_dir)
         checkpoint_sha256 = verify_local_causal_checkpoint(

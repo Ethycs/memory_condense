@@ -341,60 +341,6 @@ class QwenLiveHeadMemory:
             query_signature=query_signature,
         )
 
-    def retrieve_candidates(
-        self,
-        query: str,
-        episode_ids: Sequence[str],
-        *,
-        top_k: int = 4,
-        cav_weight: float = 0.0,
-        cav_mode: str = "similarity",
-    ) -> LiveMemoryResult:
-        """Run live QK/OV addressing only over a supplied candidate subgraph.
-
-        Stored K/V tensors are reused, so only the query is encoded. IDs absent
-        from the current store are ignored, which keeps calls safe after pruning
-        as long as at least one candidate remains.
-        """
-        torch = self.encoder._torch
-        candidate_indices = self.store.indices_for_episode_ids(episode_ids)
-        if not candidate_indices:
-            raise LookupError("none of the candidate episode IDs are in memory")
-        capture = self.encoder.capture(query, layer=self.layer)
-        query_signature = (
-            None
-            if self.cav_bank is None
-            else self.cav_bank.signature(capture.residual)
-        )
-        attention = self.decoder.self_attn
-        with torch.inference_mode():
-            normalized = capture.attention_input
-            queries = attention.q_norm(
-                attention.q_proj(normalized).view(
-                    *normalized.shape[:-1], -1, attention.head_dim
-                )
-            ).transpose(1, 2)[0]
-            addressed = self.store.address(
-                queries,
-                top_k=top_k,
-                scaling=float(attention.scaling),
-                cav_signature=query_signature,
-                cav_weight=cav_weight,
-                cav_mode=cav_mode,
-                candidate_indices=candidate_indices,
-            )
-            transports = self._selected_ov_transport(addressed)
-        self.store.touch(
-            addressed.indices,
-            attention_mass=addressed.aggregate_scores,
-            ov_transport=transports,
-        )
-        return self._result(
-            addressed.indices.tolist(),
-            addressed.aggregate_scores.tolist(),
-            query_signature=query_signature,
-        )
-
     def retrieve_residual(
         self,
         query: str,

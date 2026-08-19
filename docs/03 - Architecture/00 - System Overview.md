@@ -290,8 +290,11 @@ provider-agnostic, while public common-benchmark validation remains open.
   `search_hybrid_neighbors` (bounded source-local transitions) ·
   `search_hybrid_sources` (source-conditioned second stage) ·
   `search_hybrid_graph` (directional transition/source union) · `search_associative`
-  (ranked compiled links) · `search_heat_associative` (dual QK/heat allocation)
-  · `search_hebbian` / `observe_retrieval_access` (bounded live co-access)
+  (ranked compiled links) · `expand_hebbian` / `observe_retrieval_access`
+  (bounded live co-access over pre-ranked anchors; the one-call
+  `search_heat_associative` / `search_hebbian` wrappers were deleted 2026-08-19
+  as caller-less — heat diffusion stays reachable via
+  `expand_heat_diffusion_results`)
   · `recall_memories` (ranked `MemoryResult`, reheats) · `build_context`
   (packed prompt; `hybrid=True` by default; live consolidation read/write) ·
   `observe_context_access` (optional CAV/QK/OV-weighted update) · `heat_counts`

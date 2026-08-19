@@ -1,26 +1,8 @@
-"""Concrete local execution binding for gold-blind diffuse LongMemEval.
+"""Concrete local BGE/Qwen execution binding for gold-blind LongMemEval.
 
-The analysis runner intentionally owns no model construction.  This module is
-the corresponding local-only binding: it pins BGE-M3, owns one Qwen3 prefix
-and linker, maps the legacy ``RetrievalConfig`` search arms, and routes the
-complete source universe independently of the returned chunk anchors.
-
-Two memory-residency policies are explicit and receipt-bound:
-
-``resident_bge_qwen``
-    Keep both models resident after a CUDA free-memory preflight.  This is the
-    latency-oriented default for a host on which coexistence has been proven.
-
-``staged_bge_then_qwen``
-    Freeze legacy anchors and all-source lexical rows first, release BGE, then
-    load Qwen.  The frozen provider never invokes embedding retrieval after
-    compilation.  A staged binding is deliberately single-sample because the
-    owned Qwen prefix has no public unload/reload contract.
-
-No benchmark answer, evidence label, provider client, dataset loader, or
-network client is accepted here.
+The receipt distinguishes simultaneous residency from staged BGE release.
+This module accepts no benchmark answer, evidence label, provider, or loader.
 """
-
 from __future__ import annotations
 
 import hashlib
@@ -1031,6 +1013,26 @@ class DiffuseLongMemEvalExecutionBinding:
             embedder=self.embedder,
             persist_index_on_close=True,
         )
+
+    def prepare_resident_replay_runtime(self) -> tuple[ResidencyPreflightObservation, _OwnedQwenRuntime]:
+        """Establish certified simultaneous BGE/Qwen residency for replay."""
+        if self.runtime.residency_mode != "resident_bge_qwen":
+            raise ValueError("shared-base replay requires resident_bge_qwen")
+        if not self.runtime_binding_certified:
+            raise RuntimeError("embedding residency requires certified runtime")
+        self.embedder._load_model()  # noqa: SLF001 - owned runtime boundary
+        from memory_condense.eval._diffuse_base_store import (
+            owned_build_runtime_identity,
+            validate_embedder_certification,
+        )
+        validate_embedder_certification(
+            self.embedder, owned_build_runtime_identity(self.new_condenser)
+        )
+        observation = self._resident_preflight()
+        qwen = self.ensure_qwen_runtime()
+        if not self.runtime_binding_certified:
+            raise RuntimeError("runtime certification changed during model load")
+        return observation, qwen
 
     def _resident_preflight(self) -> ResidencyPreflightObservation:
         if self._preflight is None:

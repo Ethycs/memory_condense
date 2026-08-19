@@ -18,6 +18,7 @@ import pytest
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.domain.schemas import Chunk
 from memory_condense.eval.diffuse_longmemeval_base import (
+    DERIVED_FINALIZATION_NAME,
     DERIVED_ORIGIN_NAME,
     FROZEN_QUERY_INPUTS_NAME,
     QUERY_MANIFEST_NAME,
@@ -30,10 +31,12 @@ from memory_condense.eval.diffuse_longmemeval_base import (
     VerifiedDiffuseLongMemEvalBase,
     callable_build_factory_sha256,
     clone_diffuse_longmemeval_base,
+    finalize_diffuse_longmemeval_derived_store,
     open_diffuse_longmemeval_derived_store,
     owned_build_runtime_identity,
     publish_diffuse_longmemeval_base,
     verify_diffuse_longmemeval_base,
+    verify_diffuse_longmemeval_derived_finalization,
 )
 from memory_condense.eval.cache_receipts import canonical_sha256
 from memory_condense.eval.diffuse_compilation import (
@@ -42,7 +45,12 @@ from memory_condense.eval.diffuse_compilation import (
 )
 from memory_condense.eval.diffuse_longmemeval_inputs import (
     GoldBlindLongMemEvalSample,
+    LegacyDiffuseCandidates,
     gold_blind_longmemeval_sample,
+)
+from memory_condense.eval.diffuse_longmemeval_analysis import (
+    DiffuseLongMemEvalArm,
+    retrieve_diffuse_longmemeval_sample,
 )
 from memory_condense.eval.diffuse_longmemeval_runtime import (
     DiffuseLongMemEvalRuntimeConfig,
@@ -89,7 +97,6 @@ class _DeterministicEmbedder:
             "normalize_embeddings": False,
             "output_dtype": "float32",
         }
-
     def _vector(self, text: str) -> np.ndarray:
         vector = np.zeros(_DIMENSION, dtype=np.float32)
         for token in re.findall(r"[a-z0-9]+", text.casefold()):
@@ -108,6 +115,22 @@ class _DeterministicEmbedder:
             chunk.model_copy(update={"embedding": self._vector(chunk.text).tolist()})
             for chunk in chunks
         ]
+
+
+class _FrozenAnchorOnlyProvider:
+    def __init__(self, rows: tuple[object, ...]) -> None:
+        self._rows = rows
+
+    def analysis_identity_payload(self) -> dict[str, object]:
+        return {
+            "provider": "test-frozen-anchor-only-v1",
+            "receipts": [row.receipt_sha256 for row in self._rows],
+        }
+
+    def __call__(self, _condenser, *, query, retrieval, artifact_id):
+        del retrieval, artifact_id
+        row = next(item for item in self._rows if item.query == query)
+        return LegacyDiffuseCandidates(anchors=row.anchors)
 
 
 def _embedding_identity() -> DiffuseBaseEmbeddingIdentity:
@@ -223,6 +246,7 @@ def _published(
     *,
     sample: GoldBlindLongMemEvalSample | None = None,
     treatment: DiffuseBaseTreatmentIdentity | None = None,
+    config: EvalConfig | None = None,
 ) -> Iterator[
     tuple[
         VerifiedDiffuseLongMemEvalBase,
@@ -238,7 +262,7 @@ def _published(
 ]:
     active_sample = sample or _sample()
     active_treatment = treatment or _treatment()
-    config = _config()
+    config = config or _config()
     embedder = _DeterministicEmbedder()
     embedding = _embedding_identity()
     calls: list[Path] = []
@@ -1191,6 +1215,72 @@ def test_compiled_clone_mutates_only_sqlite_and_reuses_frozen_inputs(
             runtime=runtime,
         )
         assert verified.base_store_key == base.base_store_key
+
+
+def test_finalizer_seals_and_read_only_verifies_exact_phase(tmp_path: Path) -> None:
+    with _published(
+        tmp_path / "cache",
+        config=_config().model_copy(update={"max_prompt_tokens": 1024}),
+    ) as (
+        base,
+        sample,
+        config,
+        *_rest,
+    ):
+        arm = DiffuseLongMemEvalArm(
+            arm_id="fixed_interval",
+            compilation=DiffuseCompilationPolicy(
+                boundary_mode="fixed_interval",
+                min_episode_size=1,
+                max_episode_size=4,
+                fixed_interval=2,
+            ),
+            max_context_tokens=128,
+            responder_output_token_reserve=16,
+        )
+        clone = clone_diffuse_longmemeval_base(
+            base,
+            tmp_path / "finalized-arm",
+            arm_id=arm.arm_id,
+            arm_sha256=arm.arm_sha256,
+        )
+        condenser = open_diffuse_longmemeval_derived_store(
+            clone,
+            config=config,
+            embedder=_DeterministicEmbedder(),
+        )
+        phase = retrieve_diffuse_longmemeval_sample(
+            condenser,
+            sample,
+            config=config,
+            arm=arm,
+            legacy_input_provider=_FrozenAnchorOnlyProvider(
+                base.frozen_query_inputs
+            ),
+        )
+        condenser.close()
+
+        finalization = finalize_diffuse_longmemeval_derived_store(
+            clone,
+            phase=phase,
+        )
+        tracked = tuple(clone.path / name for name in (
+            _DATABASE_NAME,
+            _INDEX_NAME,
+            DERIVED_ORIGIN_NAME,
+            "derived-open.claim",
+            DERIVED_FINALIZATION_NAME,
+        ))
+        before = _bytes_and_mtime(tracked)
+
+        assert finalization.index_sha256 == base.store_manifest.index_sha256
+        assert verify_diffuse_longmemeval_derived_finalization(
+            clone,
+            phase=phase,
+        ) == finalization
+        assert _bytes_and_mtime(tracked) == before
+        with pytest.raises(FileExistsError):
+            finalize_diffuse_longmemeval_derived_store(clone, phase=phase)
 
 
 def test_short_text_equal_to_route_labels_is_not_mistaken_for_payload(

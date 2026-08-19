@@ -13,9 +13,12 @@ from pathlib import Path
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.eval._diffuse_base_contracts import (
     BASE_STORE_FORMAT,
+    DATABASE_NAME,
+    DERIVED_FINALIZATION_NAME,
     DERIVED_LEASE_NAME,
     DERIVED_ORIGIN_NAME,
     FROZEN_QUERY_INPUTS_NAME,
+    INDEX_NAME,
     QUERY_INPUT_FORMAT,
     QUERY_MANIFEST_NAME,
     STORE_DIRECTORY_NAME,
@@ -26,6 +29,7 @@ from memory_condense.eval._diffuse_base_contracts import (
     DiffuseBaseStoreManifest,
     DiffuseBaseTreatmentIdentity,
     DiffuseDerivedOrigin,
+    DiffuseDerivedFinalization,
     DiffuseDerivedStore,
     DiffuseQueryInputManifest,
     VerifiedDiffuseLongMemEvalBase,
@@ -40,7 +44,10 @@ from memory_condense.eval._diffuse_base_contracts import (
 )
 from memory_condense.eval._diffuse_base_derived import (
     clone_diffuse_longmemeval_base,
+    finalize_diffuse_longmemeval_derived_store,
     open_diffuse_longmemeval_derived_store,
+    verify_diffuse_longmemeval_derived_finalization,
+    verify_diffuse_longmemeval_finalized_store,
 )
 from memory_condense.eval._diffuse_base_queries import (
     publish_query_entry,
@@ -246,9 +253,12 @@ def verify_diffuse_longmemeval_base(
 
 __all__ = [
     "BASE_STORE_FORMAT",
+    "DATABASE_NAME",
+    "DERIVED_FINALIZATION_NAME",
     "DERIVED_LEASE_NAME",
     "DERIVED_ORIGIN_NAME",
     "FROZEN_QUERY_INPUTS_NAME",
+    "INDEX_NAME",
     "QUERY_INPUT_FORMAT",
     "QUERY_MANIFEST_NAME",
     "STORE_DIRECTORY_NAME",
@@ -259,6 +269,7 @@ __all__ = [
     "DiffuseBaseStoreManifest",
     "DiffuseBaseTreatmentIdentity",
     "DiffuseDerivedOrigin",
+    "DiffuseDerivedFinalization",
     "DiffuseDerivedStore",
     "DiffuseQueryInputManifest",
     "VerifiedDiffuseLongMemEvalBase",
@@ -266,8 +277,11 @@ __all__ = [
     "callable_build_factory_sha256",
     "diffuse_base_store_key",
     "diffuse_query_input_key",
+    "finalize_diffuse_longmemeval_derived_store",
     "open_diffuse_longmemeval_derived_store",
     "owned_build_runtime_identity",
     "publish_diffuse_longmemeval_base",
     "verify_diffuse_longmemeval_base",
+    "verify_diffuse_longmemeval_derived_finalization",
+    "verify_diffuse_longmemeval_finalized_store",
 ]

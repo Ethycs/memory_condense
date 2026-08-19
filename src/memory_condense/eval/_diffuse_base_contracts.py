@@ -43,6 +43,7 @@ QUERY_MANIFEST_NAME = "query-manifest.json"
 FROZEN_QUERY_INPUTS_NAME = "frozen-legacy-inputs.json"
 DERIVED_ORIGIN_NAME = "derived-origin.json"
 DERIVED_LEASE_NAME = "derived-open.claim"
+DERIVED_FINALIZATION_NAME = "derived-final.json"
 STORE_DIRECTORY_NAME = "store"
 DATABASE_NAME = "memory.db"
 INDEX_NAME = "hnsw_index.bin"
@@ -257,6 +258,25 @@ class DiffuseDerivedOrigin(_FrozenModel):
     arm_sha256: str = Field(pattern=_DIGEST_PATTERN)
     initial_database_sha256: str = Field(pattern=_DIGEST_PATTERN)
     initial_index_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    receipt_sha256: str = Field(pattern=_DIGEST_PATTERN)
+
+
+class DiffuseDerivedFinalization(_FrozenModel):
+    """Post-close integrity receipt for one consumed derived workspace."""
+
+    format: Literal[
+        "memory-condense-longmemeval-derived-finalization-v1"
+    ] = "memory-condense-longmemeval-derived-finalization-v1"
+    origin_receipt_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    arm_id: str = Field(min_length=1)
+    arm_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    compilation_receipt_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    retrieval_phase_receipt_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    final_snapshot_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    database_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    database_bytes: int = Field(ge=1)
+    index_sha256: str = Field(pattern=_DIGEST_PATTERN)
+    index_bytes: int = Field(ge=1)
     receipt_sha256: str = Field(pattern=_DIGEST_PATTERN)
 
 

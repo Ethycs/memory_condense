@@ -154,7 +154,10 @@ def _positive_int(value: object, label: str) -> int:
     return normalized
 
 
-def _callable_implementation_sha256(value: object, label: str) -> str:
+def analysis_callable_identity_payload(
+    value: object,
+    label: str,
+) -> dict[str, object]:
     """Bind the callable implementation without evaluating captured state.
 
     A callable may expose ``analysis_identity_payload()`` to bind immutable
@@ -199,14 +202,16 @@ def _callable_implementation_sha256(value: object, label: str) -> str:
             stable_filename=implementation,
         )
         code_sha256 = hashlib.sha256(canonical).hexdigest()
-    return identity_sha256(
-        {
-            "implementation_type": implementation_type,
-            "implementation": implementation,
-            "python_code_sha256": code_sha256,
-            "declared_identity": declared,
-        }
-    )
+    return {
+        "implementation_type": implementation_type,
+        "implementation": implementation,
+        "python_code_sha256": code_sha256,
+        "declared_identity": declared,
+    }
+
+
+def _callable_implementation_sha256(value: object, label: str) -> str:
+    return identity_sha256(analysis_callable_identity_payload(value, label))
 
 
 def _representative_linker_identity_sha256(
@@ -1025,6 +1030,7 @@ __all__ = [
     "LegacyDiffuseInputProvider",
     "LegacyDiffuseInputReceipt",
     "RepresentativePolicyFactory",
+    "analysis_callable_identity_payload",
     "capture_legacy_diffuse_inputs",
     "gold_blind_longmemeval_sample",
     "ingest_gold_blind_sample_deterministically",

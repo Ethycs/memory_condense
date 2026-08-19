@@ -506,6 +506,14 @@ def capture_legacy_diffuse_inputs(
     return ExactLegacyDiffuseInputs(candidates=candidates, receipt=receipt)
 
 
+def legacy_anchor_sequence_sha256(
+    anchors: Sequence[RetrievalResult],
+) -> str:
+    """Return the public text-free projection used by legacy input receipts."""
+
+    return identity_sha256(tuple(_anchor_identity(item) for item in anchors))
+
+
 
 __all__ = [
     "DETERMINISTIC_DIFFUSE_INGEST_FORMAT",
@@ -518,4 +526,5 @@ __all__ = [
     "capture_legacy_diffuse_inputs",
     "gold_blind_longmemeval_sample",
     "ingest_gold_blind_sample_deterministically",
+    "legacy_anchor_sequence_sha256",
 ]

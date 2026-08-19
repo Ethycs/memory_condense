@@ -160,6 +160,14 @@ def _anchor_payload(result: RetrievalResult) -> dict[str, object]:
     }
 
 
+def longmemeval_anchor_sequence_sha256(
+    anchors: Sequence[RetrievalResult],
+) -> str:
+    """Hash the exact reduced anchor projection used by the query receipt."""
+
+    return identity_sha256(tuple(_anchor_payload(item) for item in anchors))
+
+
 def _evidence_coordinates(packet: EvidencePacket) -> tuple[dict[str, object], ...]:
     return tuple(
         {
@@ -171,7 +179,7 @@ def _evidence_coordinates(packet: EvidencePacket) -> tuple[dict[str, object], ..
     )
 
 
-def _qa_packet_framing(question: str) -> tuple[str, str]:
+def qa_packet_framing(question: str) -> tuple[str, str]:
     """Split the authoritative QA template around one atomic packet."""
 
     if QA_USER_TEMPLATE.count("{context}") != 1:
@@ -431,7 +439,6 @@ def retrieve_longmemeval_diffuse_packet(
     exact_anchors = tuple(anchors)
     if any(not isinstance(item, RetrievalResult) for item in exact_anchors):
         raise TypeError("anchors must contain RetrievalResult values")
-    anchor_payload = tuple(_anchor_payload(item) for item in exact_anchors)
     active_episode_policy = episode_policy or EpisodeRetrievalPolicy(
         artifact_id=normalized_artifact
     )
@@ -547,7 +554,7 @@ def retrieve_longmemeval_diffuse_packet(
     if plan.expansion_receipt_sha256 != combined_expansion_sha256:
         raise RuntimeError("closure plan does not bind the combined expansion")
 
-    prefix, suffix = _qa_packet_framing(normalized_prompt_question)
+    prefix, suffix = qa_packet_framing(normalized_prompt_question)
     workspace_cap = prompt_cap + reserve
     packet = condenser.pack_discourse_evidence(
         plan,
@@ -586,7 +593,7 @@ def retrieve_longmemeval_diffuse_packet(
     receipt = LongMemEvalDiffuseQueryReceipt(
         artifact_id=normalized_artifact,
         snapshot_sha256=plan.snapshot.snapshot_sha256,
-        anchor_sequence_sha256=identity_sha256(anchor_payload),
+        anchor_sequence_sha256=longmemeval_anchor_sequence_sha256(exact_anchors),
         input_anchor_chunk_ids=tuple(
             item.chunk.chunk_id for item in exact_anchors
         ),
@@ -790,5 +797,7 @@ __all__ = [
     "LongMemEvalDiffuseRetrieval",
     "SupportsDiffuseEvidence",
     "measure_longmemeval_diffuse_packet",
+    "longmemeval_anchor_sequence_sha256",
+    "qa_packet_framing",
     "retrieve_longmemeval_diffuse_packet",
 ]

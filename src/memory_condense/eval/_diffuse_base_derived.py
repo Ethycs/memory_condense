@@ -11,6 +11,7 @@ from pathlib import Path
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.eval._diffuse_base_contracts import (
     DATABASE_NAME,
+    DERIVED_FINALIZATION_NAME,
     DERIVED_LEASE_NAME,
     DERIVED_ORIGIN_NAME,
     DERIVED_STORE_FORMAT,
@@ -21,6 +22,7 @@ from memory_condense.eval._diffuse_base_contracts import (
     STORE_MANIFEST_NAME,
     DiffuseBaseArtifactError,
     DiffuseDerivedOrigin,
+    DiffuseDerivedFinalization,
     DiffuseDerivedStore,
     VerifiedDiffuseLongMemEvalBase,
     canonical_json_bytes,
@@ -49,6 +51,23 @@ from memory_condense.eval._diffuse_base_store import (
 from memory_condense.eval.cache_receipts import canonical_sha256
 from memory_condense.eval.reproducibility import file_sha256
 from memory_condense.eval.schemas import EvalConfig
+from memory_condense.persistence.db import Database
+from memory_condense.persistence.discourse_store import DiscourseStore
+
+
+_FORBIDDEN_DERIVED_TABLES = (
+    "association_artifacts",
+    "chunk_cav_signatures",
+    "chunk_head_edges",
+    "consolidation_access_events",
+    "consolidation_edges",
+    "consolidation_nodes",
+    "hebbian_access_events",
+    "hebbian_chunk_edges",
+    "hebbian_chunk_nodes",
+    "memory_items",
+    "memory_provenance",
+)
 
 
 def _assert_verified_bundle_current(
@@ -385,3 +404,390 @@ def open_diffuse_longmemeval_derived_store(
             except Exception:
                 pass
         raise
+
+
+def _validated_finalization_phase(clone: DiffuseDerivedStore, phase: object):
+    from memory_condense.eval.diffuse_longmemeval_analysis import (
+        DiffuseLongMemEvalRetrievalPhase,
+    )
+
+    if not isinstance(clone, DiffuseDerivedStore):
+        raise TypeError("clone must be a DiffuseDerivedStore")
+    if type(phase) is not DiffuseLongMemEvalRetrievalPhase:
+        raise TypeError("phase must be an exact diffuse retrieval phase")
+    if (
+        phase.arm.arm_id != clone.origin.arm_id
+        or phase.arm.arm_sha256 != clone.origin.arm_sha256
+    ):
+        raise DiffuseBaseArtifactError("final phase belongs to another clone arm")
+    if (
+        phase.corpus_sha256 != clone.base.store_manifest.corpus_sha256
+        or any(
+            item.receipt.snapshot_sha256
+            != phase.compilation.final_snapshot.snapshot_sha256
+            for item in phase.questions
+        )
+    ):
+        raise DiffuseBaseArtifactError("final phase does not bind this base snapshot")
+    if canonical_sha256(list(phase.deterministic_turn_ids)) != (
+        clone.base.store_manifest.deterministic_turn_ids_sha256
+    ):
+        raise DiffuseBaseArtifactError("final phase changed deterministic ingest")
+    expected_probes = tuple(clone.base._sample.questions)
+    observed_probes = tuple(item.probe for item in phase.questions)
+    if observed_probes != expected_probes or len(observed_probes) != (
+        clone.base.query_manifest.query_count
+    ):
+        raise DiffuseBaseArtifactError("final phase changed the frozen query set")
+    if len(clone.base.frozen_query_inputs) != len(phase.questions):
+        raise DiffuseBaseArtifactError("frozen query rows are incomplete")
+    for frozen, question in zip(
+        clone.base.frozen_query_inputs,
+        phase.questions,
+        strict=True,
+    ):
+        frozen_identity = frozen.identity_payload(include_receipt=False)
+        receipt = question.legacy_inputs.receipt
+        if (
+            receipt.query_sha256 != frozen_identity["query_sha256"]
+            or receipt.retrieval_policy_sha256
+            != frozen.retrieval_policy_sha256
+            or receipt.anchor_chunk_ids
+            != tuple(item.chunk.chunk_id for item in frozen.anchors)
+            or question.legacy_inputs.candidates.anchors != frozen.anchors
+        ):
+            raise DiffuseBaseArtifactError(
+                "final phase changed a frozen query or anchor row"
+            )
+    return phase
+
+
+def _load_derived_finalization(path: Path) -> DiffuseDerivedFinalization:
+    marker = path / DERIVED_FINALIZATION_NAME
+    require_regular_file(marker, "derived finalization")
+    raw = marker.read_bytes()
+    try:
+        value = DiffuseDerivedFinalization.model_validate_json(raw)
+    except Exception as exc:
+        raise DiffuseBaseArtifactError("invalid derived finalization") from exc
+    if raw != model_bytes(value):
+        raise DiffuseBaseArtifactError("derived finalization is not canonical JSON")
+    if value.receipt_sha256 != self_sha256(value, "receipt_sha256"):
+        raise DiffuseBaseArtifactError("derived finalization receipt changed")
+    return value
+
+
+def _immutable_source_tables_sha256(database: Database) -> str:
+    """Bind exact transcript, chunk vectors, lexical rows, and ANN labels."""
+
+    turns = database.execute(
+        "SELECT turn_id, role, text, source_id, created_at, ordinal "
+        "FROM turns ORDER BY ordinal, turn_id"
+    ).fetchall()
+    chunks = database.execute(
+        "SELECT chunk_id, turn_id, text, start_char, end_char, token_count, "
+        "hex(embedding), lexical_weights, hnsw_label, term_count "
+        "FROM chunks ORDER BY rowid"
+    ).fetchall()
+    terms = database.execute(
+        "SELECT chunk_id, term, tf FROM chunk_terms ORDER BY chunk_id, term"
+    ).fetchall()
+    schema = database.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    meta = database.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+    return canonical_sha256(
+        {
+            "turns": [list(row) for row in turns],
+            "chunks": [list(row) for row in chunks],
+            "chunk_terms": [list(row) for row in terms],
+            "schema": [list(row) for row in schema],
+            "meta": [list(row) for row in meta],
+        }
+    )
+
+
+def _audit_derived_finalization(
+    clone: DiffuseDerivedStore,
+    *,
+    phase: object,
+    finalized: bool,
+) -> DiffuseDerivedFinalization:
+    phase = _validated_finalization_phase(clone, phase)
+    _assert_verified_bundle_current(clone.base)
+
+    require_regular_directory(clone.path, "derived store")
+    expected_children = {
+        DATABASE_NAME,
+        INDEX_NAME,
+        DERIVED_ORIGIN_NAME,
+        DERIVED_LEASE_NAME,
+    }
+    if finalized:
+        expected_children.add(DERIVED_FINALIZATION_NAME)
+    require_exact_children(
+        clone.path,
+        expected_children,
+        "finalized derived store" if finalized else "consumed derived store",
+    )
+    for name in expected_children:
+        require_regular_file(clone.path / name, f"derived store {name}")
+    require_no_sqlite_sidecars(clone.path)
+    origin = _load_derived_origin(clone.path)
+    if origin != clone.origin:
+        raise DiffuseBaseArtifactError("derived origin changed before finalization")
+    lease_payload = canonical_json_bytes(
+        {
+            "format": "memory-condense-longmemeval-derived-open-claim-v1",
+            "origin_receipt_sha256": clone.origin.receipt_sha256,
+        }
+    )
+    lease_path = clone.path / DERIVED_LEASE_NAME
+    require_regular_file(lease_path, "derived open claim")
+    if lease_path.read_bytes() != lease_payload:
+        raise DiffuseBaseArtifactError("derived open claim changed")
+
+    database_path = clone.path / DATABASE_NAME
+    index_path = clone.path / INDEX_NAME
+    base_store = clone.base.store_path / STORE_DIRECTORY_NAME
+    for name in (DATABASE_NAME, INDEX_NAME):
+        _assert_not_hardlinked(base_store / name, clone.path / name)
+    if file_sha256(index_path) != clone.origin.initial_index_sha256:
+        raise DiffuseBaseArtifactError("derived HNSW changed during compilation")
+    base_database_path = base_store / DATABASE_NAME
+    with Database(base_database_path, read_only=True) as base_database:
+        base_source_tables = _immutable_source_tables_sha256(base_database)
+        base_snapshot = DiscourseStore(base_database).snapshot()
+    with Database(database_path, read_only=True) as database:
+        integrity = database.execute("PRAGMA integrity_check").fetchall()
+        if integrity != [("ok",)]:
+            raise DiffuseBaseArtifactError("derived database integrity check failed")
+        if database.execute("PRAGMA foreign_key_check").fetchall():
+            raise DiffuseBaseArtifactError("derived database foreign keys failed")
+        derived_source_tables = _immutable_source_tables_sha256(database)
+        forbidden_counts = {
+            table: int(
+                database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            )
+            for table in _FORBIDDEN_DERIVED_TABLES
+        }
+        snapshot = DiscourseStore(database).snapshot()
+    if any(forbidden_counts.values()):
+        raise DiffuseBaseArtifactError(
+            "derived store persisted unauthorized memory or learned state"
+        )
+    if derived_source_tables != base_source_tables:
+        raise DiffuseBaseArtifactError(
+            "derived transcript, chunk vectors, or ANN labels changed"
+        )
+    base_source_identity = (
+        base_snapshot.max_turn_ordinal,
+        base_snapshot.chunk_count,
+        base_snapshot.schema_version,
+        base_snapshot.source_revision,
+        base_snapshot.source_content_sha256,
+    )
+    derived_source_identity = (
+        snapshot.max_turn_ordinal,
+        snapshot.chunk_count,
+        snapshot.schema_version,
+        snapshot.source_revision,
+        snapshot.source_content_sha256,
+    )
+    if derived_source_identity != base_source_identity:
+        raise DiffuseBaseArtifactError("derived immutable source snapshot changed")
+    if snapshot != phase.compilation.final_snapshot:
+        raise DiffuseBaseArtifactError("derived database snapshot differs from phase")
+    require_no_sqlite_sidecars(clone.path)
+
+    unsigned: dict[str, object] = {
+        "format": "memory-condense-longmemeval-derived-finalization-v1",
+        "origin_receipt_sha256": clone.origin.receipt_sha256,
+        "arm_id": clone.origin.arm_id,
+        "arm_sha256": clone.origin.arm_sha256,
+        "compilation_receipt_sha256": phase.compilation.receipt_sha256,
+        "retrieval_phase_receipt_sha256": phase.receipt_sha256,
+        "final_snapshot_sha256": snapshot.snapshot_sha256,
+        "database_sha256": file_sha256(database_path),
+        "database_bytes": database_path.stat().st_size,
+        "index_sha256": file_sha256(index_path),
+        "index_bytes": index_path.stat().st_size,
+    }
+    expected = DiffuseDerivedFinalization(
+        **unsigned,
+        receipt_sha256=canonical_sha256(unsigned),
+    )
+    if finalized:
+        observed = _load_derived_finalization(clone.path)
+        if observed != expected:
+            raise DiffuseBaseArtifactError("derived finalization no longer matches")
+    for name in (DATABASE_NAME, INDEX_NAME):
+        _assert_not_hardlinked(base_store / name, clone.path / name)
+    return expected
+
+
+def finalize_diffuse_longmemeval_derived_store(
+    clone: DiffuseDerivedStore,
+    *,
+    phase: object,
+) -> DiffuseDerivedFinalization:
+    """Seal one closed clone after retrieval and verify its final database."""
+
+    if (clone.path / DERIVED_FINALIZATION_NAME).exists():
+        raise FileExistsError(clone.path / DERIVED_FINALIZATION_NAME)
+    finalization = _audit_derived_finalization(
+        clone,
+        phase=phase,
+        finalized=False,
+    )
+    write_new_bytes(
+        clone.path / DERIVED_FINALIZATION_NAME,
+        model_bytes(finalization),
+    )
+    return verify_diffuse_longmemeval_derived_finalization(
+        clone,
+        phase=phase,
+    )
+
+
+def verify_diffuse_longmemeval_derived_finalization(
+    clone: DiffuseDerivedStore,
+    *,
+    phase: object,
+) -> DiffuseDerivedFinalization:
+    """Read and re-verify a sealed derived store without mutating it."""
+
+    tracked = tuple(clone.path / name for name in (
+        DATABASE_NAME,
+        INDEX_NAME,
+        DERIVED_ORIGIN_NAME,
+        DERIVED_LEASE_NAME,
+        DERIVED_FINALIZATION_NAME,
+    ))
+    before = {path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked}
+    value = _audit_derived_finalization(clone, phase=phase, finalized=True)
+    after = {path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked}
+    if before != after:
+        raise DiffuseBaseArtifactError("read-only finalization verification mutated files")
+    return value
+
+
+def verify_diffuse_longmemeval_finalized_store(
+    clone: DiffuseDerivedStore,
+    *,
+    expected_finalization: DiffuseDerivedFinalization,
+    expected_snapshot: object,
+) -> DiffuseDerivedFinalization:
+    """Verify a replay clone from persisted receipts, without a live phase."""
+
+    from memory_condense.domain.discourse import DiscourseSnapshot
+
+    if not isinstance(clone, DiffuseDerivedStore):
+        raise TypeError("clone must be a DiffuseDerivedStore")
+    if type(expected_finalization) is not DiffuseDerivedFinalization:
+        raise TypeError("expected_finalization must be exact")
+    if type(expected_snapshot) is not DiscourseSnapshot:
+        raise TypeError("expected_snapshot must be exact")
+    _assert_verified_bundle_current(clone.base)
+    require_regular_directory(clone.path, "finalized derived store")
+    require_exact_children(
+        clone.path,
+        {
+            DATABASE_NAME,
+            INDEX_NAME,
+            DERIVED_ORIGIN_NAME,
+            DERIVED_LEASE_NAME,
+            DERIVED_FINALIZATION_NAME,
+        },
+        "finalized derived store",
+    )
+    for name in (
+        DATABASE_NAME,
+        INDEX_NAME,
+        DERIVED_ORIGIN_NAME,
+        DERIVED_LEASE_NAME,
+        DERIVED_FINALIZATION_NAME,
+    ):
+        require_regular_file(clone.path / name, f"finalized derived {name}")
+    require_no_sqlite_sidecars(clone.path)
+    if _load_derived_origin(clone.path) != clone.origin:
+        raise DiffuseBaseArtifactError("finalized derived origin changed")
+    if _load_derived_finalization(clone.path) != expected_finalization:
+        raise DiffuseBaseArtifactError("persisted finalization differs from expected")
+    if (
+        expected_finalization.origin_receipt_sha256
+        != clone.origin.receipt_sha256
+        or expected_finalization.arm_id != clone.origin.arm_id
+        or expected_finalization.arm_sha256 != clone.origin.arm_sha256
+        or expected_finalization.final_snapshot_sha256
+        != expected_snapshot.snapshot_sha256
+    ):
+        raise DiffuseBaseArtifactError("finalization identity differs from clone")
+    lease_expected = canonical_json_bytes(
+        {
+            "format": "memory-condense-longmemeval-derived-open-claim-v1",
+            "origin_receipt_sha256": clone.origin.receipt_sha256,
+        }
+    )
+    if (clone.path / DERIVED_LEASE_NAME).read_bytes() != lease_expected:
+        raise DiffuseBaseArtifactError("finalized derived lease changed")
+
+    database_path = clone.path / DATABASE_NAME
+    index_path = clone.path / INDEX_NAME
+    tracked = tuple(clone.path / name for name in (
+        DATABASE_NAME,
+        INDEX_NAME,
+        DERIVED_ORIGIN_NAME,
+        DERIVED_LEASE_NAME,
+        DERIVED_FINALIZATION_NAME,
+    ))
+    before = {path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked}
+    if (
+        before[database_path][0] != expected_finalization.database_sha256
+        or database_path.stat().st_size != expected_finalization.database_bytes
+        or before[index_path][0] != expected_finalization.index_sha256
+        or index_path.stat().st_size != expected_finalization.index_bytes
+        or expected_finalization.index_sha256
+        != clone.origin.initial_index_sha256
+    ):
+        raise DiffuseBaseArtifactError("finalized derived file identity changed")
+    base_store = clone.base.store_path / STORE_DIRECTORY_NAME
+    for name in (DATABASE_NAME, INDEX_NAME):
+        _assert_not_hardlinked(base_store / name, clone.path / name)
+    with Database(base_store / DATABASE_NAME, read_only=True) as base_database:
+        base_source_tables = _immutable_source_tables_sha256(base_database)
+        base_snapshot = DiscourseStore(base_database).snapshot()
+    with Database(database_path, read_only=True) as database:
+        if database.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise DiffuseBaseArtifactError("finalized database integrity failed")
+        if database.execute("PRAGMA foreign_key_check").fetchall():
+            raise DiffuseBaseArtifactError("finalized database foreign keys failed")
+        derived_source_tables = _immutable_source_tables_sha256(database)
+        if any(
+            int(database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in _FORBIDDEN_DERIVED_TABLES
+        ):
+            raise DiffuseBaseArtifactError("finalized store has forbidden state")
+        observed_snapshot = DiscourseStore(database).snapshot()
+    source_fields = (
+        "max_turn_ordinal",
+        "chunk_count",
+        "schema_version",
+        "source_revision",
+        "source_content_sha256",
+    )
+    if (
+        derived_source_tables != base_source_tables
+        or tuple(getattr(observed_snapshot, name) for name in source_fields)
+        != tuple(getattr(base_snapshot, name) for name in source_fields)
+        or observed_snapshot != expected_snapshot
+    ):
+        raise DiffuseBaseArtifactError("finalized database snapshot changed")
+    require_no_sqlite_sidecars(clone.path)
+    after = {path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked}
+    if before != after:
+        raise DiffuseBaseArtifactError("standalone verification mutated files")
+    for name in (DATABASE_NAME, INDEX_NAME):
+        _assert_not_hardlinked(base_store / name, clone.path / name)
+    return expected_finalization

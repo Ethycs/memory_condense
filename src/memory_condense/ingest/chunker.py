@@ -44,7 +44,7 @@ class Chunker:
             return []
 
         offsets = self._compute_offsets(text, sentences)
-        return self._merge_sentences(sentences, offsets, turn_id)
+        return self._merge_sentences(text, sentences, offsets, turn_id)
 
     def _split_sentences(self, text: str) -> list[str]:
         """Split text into sentences using pySBD."""
@@ -119,11 +119,12 @@ class Chunker:
                     low = middle + 1
                 else:
                     high = middle - 1
-            # A single Unicode code point can occupy multiple tokens when a
-            # caller configures an unrealistically tiny maximum. Preserve the
-            # source character rather than corrupting it; normal production
-            # maxima are hundreds of tokens.
-            best = max(best, 1)
+            if best == 0:
+                codepoint_tokens = count_tokens(remaining[0])
+                raise ValueError(
+                    "max_tokens cannot fit the next Unicode code point "
+                    f"({codepoint_tokens} tokens required, {self.max_tokens} allowed)"
+                )
             whitespace = remaining.rfind(" ", 0, best + 1)
             cut = whitespace if whitespace > 0 else best
             part = remaining[:cut].rstrip()
@@ -158,23 +159,26 @@ class Chunker:
 
     def _merge_sentences(
         self,
+        source_text: str,
         sentences: list[str],
         offsets: list[tuple[int, int]],
         turn_id: str,
     ) -> list[Chunk]:
-        """Greedily merge consecutive sentences into chunks."""
+        """Greedily merge sentences while preserving their exact source slice."""
         chunks: list[Chunk] = []
         current_sents: list[str] = []
         current_tokens = 0
         current_start = offsets[0][0] if offsets else 0
 
         for i, (sent, (start, end)) in enumerate(zip(sentences, offsets)):
-            prospective_text = " ".join([*current_sents, sent])
+            prospective_text = source_text[
+                current_start if current_sents else start : end
+            ]
             prospective_tokens = count_tokens(prospective_text)
 
             if prospective_tokens > self.max_tokens and current_sents:
                 # Emit current chunk
-                chunk_text = " ".join(current_sents)
+                chunk_text = source_text[current_start : offsets[i - 1][1]]
                 exact_tokens = count_tokens(chunk_text)
                 chunks.append(
                     Chunk(
@@ -197,8 +201,8 @@ class Chunker:
 
         # Emit final chunk
         if current_sents:
-            chunk_text = " ".join(current_sents)
             last_end = offsets[-1][1]
+            chunk_text = source_text[current_start:last_end]
             chunk = Chunk(
                 turn_id=turn_id,
                 text=chunk_text,
@@ -208,7 +212,9 @@ class Chunker:
             )
 
             # Merge small final chunk into previous if possible
-            merged_text = chunks[-1].text + " " + chunk_text if chunks else ""
+            merged_text = (
+                source_text[chunks[-1].start_char:last_end] if chunks else ""
+            )
             merged_tokens = count_tokens(merged_text) if chunks else 0
             if (
                 current_tokens < self.min_tokens

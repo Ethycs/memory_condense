@@ -599,10 +599,19 @@ def _seed(retriever, db, prefix, n, dim=8):
     ids = []
     for i in range(n):
         turn = Turn(role="user", text=f"{prefix} turn {i}")
+        ordinal = int(
+            db.execute("SELECT COALESCE(MAX(ordinal), 0) + 1 FROM turns").fetchone()[0]
+        )
         db.execute(
-            "INSERT OR IGNORE INTO turns (turn_id, role, text, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (turn.turn_id, turn.role, turn.text, turn.created_at.isoformat()),
+            "INSERT INTO turns (turn_id, role, text, created_at, ordinal) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                turn.turn_id,
+                turn.role,
+                turn.text,
+                turn.created_at.isoformat(),
+                ordinal,
+            ),
         )
         db.commit()
         vec = [0.0] * dim

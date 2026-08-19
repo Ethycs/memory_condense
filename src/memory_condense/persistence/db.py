@@ -4,7 +4,48 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 11
+
+
+def _execute_sql_script(
+    conn: sqlite3.Connection,
+    script: str,
+) -> None:
+    """Execute a multi-statement script without sqlite3's implicit COMMIT.
+
+    ``Connection.executescript`` commits any open transaction before it runs,
+    which would publish DDL and ``schema_version`` before a Python post-hook
+    succeeds.  ``complete_statement`` also keeps trigger bodies intact while
+    this helper executes each top-level statement on the caller's transaction.
+    """
+
+    pending = ""
+    for character in script:
+        pending += character
+        if character == ";" and sqlite3.complete_statement(pending):
+            conn.execute(pending)
+            pending = ""
+    if pending.strip():
+        conn.execute(pending)
+
+
+def _apply_schema_transaction(
+    conn: sqlite3.Connection,
+    script: str,
+    *,
+    post: Callable[[sqlite3.Connection], None] | None = None,
+) -> None:
+    """Atomically apply DDL, its backfill hook, and version publication."""
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _execute_sql_script(conn, script)
+        if post is not None:
+            post(conn)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 #: DDL introduced by v3, written once and reused by both the fresh-database
 #: path and the migration path.
@@ -197,6 +238,412 @@ ALTER TABLE consolidation_edges
 ADD COLUMN causal_count INTEGER NOT NULL DEFAULT 0 CHECK(causal_count >= 0);
 """
 
+#: Source-grounded episodic discourse graph introduced by v10.  The graph is
+#: deliberately reference-only: factual text remains in ``turns``/``chunks``;
+#: these tables retain exact span coordinates and hashes, scalar routing
+#: metadata, and immutable publication receipts.  There is no column for
+#: generated evidence text, token IDs, activations, attention maps, or K/V.
+_V10_DISCOURSE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS discourse_artifacts (
+    artifact_id          TEXT PRIMARY KEY,
+    kind                 TEXT NOT NULL CHECK(length(trim(kind)) > 0),
+    implementation_sha256 TEXT NOT NULL
+                          CHECK(length(implementation_sha256) = 64
+                                AND implementation_sha256 NOT GLOB '*[^0-9a-f]*'),
+    policy_sha256        TEXT NOT NULL
+                          CHECK(length(policy_sha256) = 64
+                                AND policy_sha256 NOT GLOB '*[^0-9a-f]*'),
+    model_id             TEXT,
+    model_revision       TEXT,
+    checkpoint_sha256    TEXT
+                          CHECK(checkpoint_sha256 IS NULL
+                                OR (length(checkpoint_sha256) = 64
+                                    AND checkpoint_sha256 NOT GLOB '*[^0-9a-f]*')),
+    metadata             TEXT NOT NULL DEFAULT '{}'
+                          CHECK(json_valid(metadata) AND json_type(metadata) = 'object')
+);
+
+CREATE INDEX IF NOT EXISTS idx_discourse_artifacts_kind
+ON discourse_artifacts(kind, artifact_id);
+
+CREATE TABLE IF NOT EXISTS episodes (
+    episode_id        TEXT PRIMARY KEY,
+    artifact_id       TEXT NOT NULL REFERENCES discourse_artifacts(artifact_id)
+                      ON DELETE CASCADE,
+    source_id         TEXT NOT NULL CHECK(length(trim(source_id)) > 0),
+    sequence_no       INTEGER NOT NULL CHECK(sequence_no >= 0),
+    first_ordinal     INTEGER NOT NULL CHECK(first_ordinal >= 0),
+    last_ordinal      INTEGER NOT NULL CHECK(last_ordinal >= first_ordinal),
+    boundary_method   TEXT NOT NULL CHECK(length(trim(boundary_method)) > 0),
+    initial_boundary  INTEGER CHECK(initial_boundary IS NULL OR initial_boundary >= 0),
+    refined_boundary  INTEGER CHECK(refined_boundary IS NULL OR refined_boundary >= 0),
+    boundary_score    REAL,
+    boundary_threshold REAL,
+    receipt_sha256    TEXT NOT NULL UNIQUE
+                      CHECK(length(receipt_sha256) = 64
+                            AND receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+    UNIQUE (artifact_id, source_id, sequence_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_episodes_source_order
+ON episodes(artifact_id, source_id, sequence_no, episode_id);
+CREATE INDEX IF NOT EXISTS idx_episodes_ordinal
+ON episodes(artifact_id, first_ordinal, last_ordinal, episode_id);
+
+CREATE TABLE IF NOT EXISTS episode_evidence (
+    episode_id      TEXT NOT NULL REFERENCES episodes(episode_id) ON DELETE CASCADE,
+    evidence_order INTEGER NOT NULL CHECK(evidence_order >= 0),
+    chunk_id        TEXT NOT NULL REFERENCES chunks(chunk_id),
+    start_char      INTEGER NOT NULL CHECK(start_char >= 0),
+    end_char        INTEGER NOT NULL CHECK(end_char > start_char),
+    quote_sha256    TEXT NOT NULL
+                    CHECK(length(quote_sha256) = 64
+                          AND quote_sha256 NOT GLOB '*[^0-9a-f]*'),
+    ordinal         INTEGER NOT NULL CHECK(ordinal >= 0),
+    source_id       TEXT,
+    turn_start_char INTEGER NOT NULL DEFAULT 0 CHECK(turn_start_char >= 0),
+    PRIMARY KEY (episode_id, evidence_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_episode_evidence_chunk
+ON episode_evidence(chunk_id, episode_id, evidence_order);
+
+CREATE TABLE IF NOT EXISTS episode_representatives (
+    episode_id            TEXT NOT NULL REFERENCES episodes(episode_id)
+                          ON DELETE CASCADE,
+    chunk_id              TEXT NOT NULL REFERENCES chunks(chunk_id),
+    rank                  INTEGER NOT NULL CHECK(rank >= 0),
+    vector_identity_sha256 TEXT NOT NULL
+                           CHECK(length(vector_identity_sha256) = 64
+                                 AND vector_identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    PRIMARY KEY (episode_id, rank),
+    UNIQUE (episode_id, chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_episode_representatives_chunk
+ON episode_representatives(chunk_id, episode_id, rank);
+
+CREATE TABLE IF NOT EXISTS discourse_units (
+    unit_id          TEXT PRIMARY KEY,
+    artifact_id      TEXT NOT NULL REFERENCES discourse_artifacts(artifact_id)
+                     ON DELETE CASCADE,
+    kind             TEXT NOT NULL CHECK(length(trim(kind)) > 0),
+    canonical_key    TEXT NOT NULL CHECK(length(trim(canonical_key)) > 0),
+    asserted_ordinal INTEGER NOT NULL CHECK(asserted_ordinal >= 0),
+    confidence       REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    metadata         TEXT NOT NULL DEFAULT '{}'
+                     CHECK(json_valid(metadata) AND json_type(metadata) = 'object')
+);
+
+CREATE INDEX IF NOT EXISTS idx_discourse_units_key
+ON discourse_units(artifact_id, kind, canonical_key, asserted_ordinal, unit_id);
+
+CREATE TABLE IF NOT EXISTS discourse_unit_evidence (
+    unit_id         TEXT NOT NULL REFERENCES discourse_units(unit_id) ON DELETE CASCADE,
+    evidence_order INTEGER NOT NULL CHECK(evidence_order >= 0),
+    chunk_id        TEXT NOT NULL REFERENCES chunks(chunk_id),
+    start_char      INTEGER NOT NULL CHECK(start_char >= 0),
+    end_char        INTEGER NOT NULL CHECK(end_char > start_char),
+    quote_sha256    TEXT NOT NULL
+                    CHECK(length(quote_sha256) = 64
+                          AND quote_sha256 NOT GLOB '*[^0-9a-f]*'),
+    ordinal         INTEGER NOT NULL CHECK(ordinal >= 0),
+    source_id       TEXT,
+    turn_start_char INTEGER NOT NULL DEFAULT 0 CHECK(turn_start_char >= 0),
+    PRIMARY KEY (unit_id, evidence_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discourse_unit_evidence_chunk
+ON discourse_unit_evidence(chunk_id, unit_id, evidence_order);
+
+CREATE TABLE IF NOT EXISTS discourse_relations (
+    relation_id     TEXT PRIMARY KEY,
+    artifact_id     TEXT NOT NULL REFERENCES discourse_artifacts(artifact_id)
+                    ON DELETE CASCADE,
+    relation_type   TEXT NOT NULL CHECK(length(trim(relation_type)) > 0),
+    confidence      REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    created_ordinal INTEGER NOT NULL CHECK(created_ordinal >= 0),
+    metadata        TEXT NOT NULL DEFAULT '{}'
+                    CHECK(json_valid(metadata) AND json_type(metadata) = 'object')
+);
+
+CREATE INDEX IF NOT EXISTS idx_discourse_relations_type
+ON discourse_relations(artifact_id, relation_type, created_ordinal, relation_id);
+
+CREATE TABLE IF NOT EXISTS discourse_relation_members (
+    relation_id  TEXT NOT NULL REFERENCES discourse_relations(relation_id)
+                 ON DELETE CASCADE,
+    member_order INTEGER NOT NULL CHECK(member_order >= 0),
+    unit_id      TEXT NOT NULL REFERENCES discourse_units(unit_id),
+    role         TEXT NOT NULL CHECK(length(trim(role)) > 0),
+    ordinal      INTEGER NOT NULL CHECK(ordinal >= 0),
+    weight       REAL NOT NULL CHECK(weight >= 0.0),
+    PRIMARY KEY (relation_id, member_order),
+    UNIQUE (relation_id, unit_id, role, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discourse_relation_members_unit
+ON discourse_relation_members(unit_id, relation_id, member_order);
+
+CREATE TABLE IF NOT EXISTS discourse_relation_evidence (
+    relation_id    TEXT NOT NULL REFERENCES discourse_relations(relation_id)
+                   ON DELETE CASCADE,
+    evidence_order INTEGER NOT NULL CHECK(evidence_order >= 0),
+    chunk_id       TEXT NOT NULL REFERENCES chunks(chunk_id),
+    start_char     INTEGER NOT NULL CHECK(start_char >= 0),
+    end_char       INTEGER NOT NULL CHECK(end_char > start_char),
+    quote_sha256   TEXT NOT NULL
+                   CHECK(length(quote_sha256) = 64
+                         AND quote_sha256 NOT GLOB '*[^0-9a-f]*'),
+    ordinal        INTEGER NOT NULL CHECK(ordinal >= 0),
+    source_id      TEXT,
+    turn_start_char INTEGER NOT NULL DEFAULT 0 CHECK(turn_start_char >= 0),
+    PRIMARY KEY (relation_id, evidence_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discourse_relation_evidence_chunk
+ON discourse_relation_evidence(chunk_id, relation_id, evidence_order);
+
+CREATE TABLE IF NOT EXISTS discourse_graph_revisions (
+    graph_revision   INTEGER PRIMARY KEY CHECK(graph_revision > 0),
+    max_turn_ordinal INTEGER NOT NULL CHECK(max_turn_ordinal >= 0),
+    chunk_count      INTEGER NOT NULL CHECK(chunk_count >= 0),
+    schema_version   INTEGER NOT NULL CHECK(schema_version >= 0),
+    artifact_ids     TEXT NOT NULL
+                     CHECK(json_valid(artifact_ids) AND json_type(artifact_ids) = 'array'),
+    snapshot_sha256  TEXT NOT NULL UNIQUE
+                     CHECK(length(snapshot_sha256) = 64
+                           AND snapshot_sha256 NOT GLOB '*[^0-9a-f]*')
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_discourse_revision_no_update
+BEFORE UPDATE ON discourse_graph_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'discourse graph revision receipts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_discourse_revision_no_delete
+BEFORE DELETE ON discourse_graph_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'discourse graph revision receipts are immutable');
+END;
+"""
+
+
+_IMMUTABLE_DISCOURSE_TABLES = (
+    "discourse_artifacts",
+    "episodes",
+    "episode_evidence",
+    "episode_representatives",
+    "discourse_units",
+    "discourse_unit_evidence",
+    "discourse_relations",
+    "discourse_relation_members",
+    "discourse_relation_evidence",
+    "discourse_artifact_coverage",
+    "discourse_artifact_coverage_receipts",
+)
+
+
+def _immutable_discourse_triggers() -> str:
+    return "\n".join(
+        f"""
+CREATE TRIGGER IF NOT EXISTS trg_{table}_no_update
+BEFORE UPDATE ON {table}
+BEGIN
+    SELECT RAISE(ABORT, 'published discourse graph rows are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_{table}_no_delete
+BEFORE DELETE ON {table}
+BEGIN
+    SELECT RAISE(ABORT, 'published discourse graph rows are immutable');
+END;
+"""
+        for table in _IMMUTABLE_DISCOURSE_TABLES
+    )
+
+
+def _graph_content_revision_triggers() -> str:
+    return "\n".join(
+        f"""
+CREATE TRIGGER IF NOT EXISTS trg_{table}_content_insert
+AFTER INSERT ON {table}
+BEGIN
+    UPDATE discourse_revision_state
+    SET graph_content_revision = graph_content_revision + 1
+    WHERE singleton = 1;
+END;
+"""
+        for table in _IMMUTABLE_DISCOURSE_TABLES
+    )
+
+
+# v11 closes snapshot TOCTOU holes.  Source facts and immutable graph content
+# each advance a durable monotonic counter.  Derived retrieval/index payloads
+# (embeddings, lexical weights, HNSW labels, term counts) intentionally do not
+# invalidate a factual closure receipt.
+_V11_REVISION_SCHEMA = """
+-- ``ordinal`` is the authoritative global transcript clock used by evidence
+-- ordering and temporal closure.  A UNIQUE index both rejects concurrent/raw
+-- duplicate writes and fails migration closed if a legacy database has an
+-- ambiguous clock that must be repaired explicitly.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_ordinal_unique ON turns(ordinal);
+
+ALTER TABLE episode_evidence ADD COLUMN turn_id TEXT;
+ALTER TABLE episode_evidence ADD COLUMN role TEXT;
+ALTER TABLE episode_evidence ADD COLUMN created_at TEXT;
+
+ALTER TABLE discourse_unit_evidence ADD COLUMN turn_id TEXT;
+ALTER TABLE discourse_unit_evidence ADD COLUMN role TEXT;
+ALTER TABLE discourse_unit_evidence ADD COLUMN created_at TEXT;
+
+ALTER TABLE discourse_relation_evidence ADD COLUMN turn_id TEXT;
+ALTER TABLE discourse_relation_evidence ADD COLUMN role TEXT;
+ALTER TABLE discourse_relation_evidence ADD COLUMN created_at TEXT;
+
+ALTER TABLE discourse_graph_revisions
+ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 0 CHECK(source_revision >= 0);
+
+ALTER TABLE discourse_graph_revisions
+ADD COLUMN graph_content_revision INTEGER NOT NULL DEFAULT 0
+CHECK(graph_content_revision >= 0);
+
+ALTER TABLE discourse_graph_revisions
+ADD COLUMN source_content_sha256 TEXT NOT NULL DEFAULT
+'0000000000000000000000000000000000000000000000000000000000000000'
+CHECK(length(source_content_sha256) = 64
+      AND source_content_sha256 NOT GLOB '*[^0-9a-f]*');
+
+ALTER TABLE discourse_graph_revisions
+ADD COLUMN graph_content_sha256 TEXT NOT NULL DEFAULT
+'0000000000000000000000000000000000000000000000000000000000000000'
+CHECK(length(graph_content_sha256) = 64
+      AND graph_content_sha256 NOT GLOB '*[^0-9a-f]*');
+
+CREATE TABLE IF NOT EXISTS discourse_artifact_coverage (
+    artifact_id          TEXT NOT NULL REFERENCES discourse_artifacts(artifact_id),
+    chunk_id             TEXT NOT NULL REFERENCES chunks(chunk_id),
+    coverage_kind        TEXT NOT NULL
+                         CHECK(coverage_kind IN ('episode', 'discourse')),
+    source_revision      INTEGER NOT NULL CHECK(source_revision >= 0),
+    chunk_identity_sha256 TEXT NOT NULL
+                          CHECK(length(chunk_identity_sha256) = 64
+                                AND chunk_identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+    status               TEXT NOT NULL
+                         CHECK(status IN ('annotated', 'no_output')),
+    receipt_sha256       TEXT NOT NULL UNIQUE
+                         CHECK(length(receipt_sha256) = 64
+                               AND receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+    PRIMARY KEY (artifact_id, chunk_id, coverage_kind, chunk_identity_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discourse_coverage_chunk
+ON discourse_artifact_coverage(chunk_id, artifact_id, coverage_kind);
+
+CREATE TABLE IF NOT EXISTS discourse_artifact_coverage_receipts (
+    artifact_id      TEXT NOT NULL REFERENCES discourse_artifacts(artifact_id),
+    coverage_kind    TEXT NOT NULL
+                     CHECK(coverage_kind IN ('episode', 'discourse')),
+    source_revision  INTEGER NOT NULL CHECK(source_revision >= 0),
+    chunk_count      INTEGER NOT NULL CHECK(chunk_count >= 0),
+    coverage_sha256  TEXT NOT NULL
+                     CHECK(length(coverage_sha256) = 64
+                           AND coverage_sha256 NOT GLOB '*[^0-9a-f]*'),
+    turn_coverage_sha256 TEXT NOT NULL
+                         CHECK(length(turn_coverage_sha256) = 64
+                               AND turn_coverage_sha256 NOT GLOB '*[^0-9a-f]*'),
+    receipt_sha256   TEXT NOT NULL UNIQUE
+                     CHECK(length(receipt_sha256) = 64
+                           AND receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+    PRIMARY KEY (artifact_id, coverage_kind, source_revision)
+);
+
+CREATE TABLE IF NOT EXISTS discourse_revision_state (
+    singleton              INTEGER PRIMARY KEY CHECK(singleton = 1),
+    source_revision        INTEGER NOT NULL DEFAULT 0 CHECK(source_revision >= 0),
+    graph_content_revision INTEGER NOT NULL DEFAULT 0
+                           CHECK(graph_content_revision >= 0)
+);
+
+INSERT OR IGNORE INTO discourse_revision_state
+(singleton, source_revision, graph_content_revision) VALUES (1, 0, 0);
+
+CREATE TRIGGER IF NOT EXISTS trg_discourse_state_no_delete
+BEFORE DELETE ON discourse_revision_state
+BEGIN
+    SELECT RAISE(ABORT, 'discourse revision state is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_discourse_source_revision_monotonic
+BEFORE UPDATE OF source_revision ON discourse_revision_state
+WHEN NEW.source_revision <= OLD.source_revision
+BEGIN
+    SELECT RAISE(ABORT, 'source revision must increase monotonically');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_discourse_graph_content_revision_monotonic
+BEFORE UPDATE OF graph_content_revision ON discourse_revision_state
+WHEN NEW.graph_content_revision <= OLD.graph_content_revision
+BEGIN
+    SELECT RAISE(ABORT, 'graph content revision must increase monotonically');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turns_source_insert
+AFTER INSERT ON turns
+BEGIN
+    UPDATE discourse_revision_state
+    SET source_revision = source_revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turns_source_delete
+AFTER DELETE ON turns
+BEGIN
+    UPDATE discourse_revision_state
+    SET source_revision = source_revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turns_source_update
+AFTER UPDATE OF turn_id, role, text, source_id, created_at, ordinal ON turns
+WHEN OLD.turn_id IS NOT NEW.turn_id
+  OR OLD.role IS NOT NEW.role
+  OR OLD.text IS NOT NEW.text
+  OR OLD.source_id IS NOT NEW.source_id
+  OR OLD.created_at IS NOT NEW.created_at
+  OR OLD.ordinal IS NOT NEW.ordinal
+BEGIN
+    UPDATE discourse_revision_state
+    SET source_revision = source_revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_chunks_source_insert
+AFTER INSERT ON chunks
+BEGIN
+    UPDATE discourse_revision_state
+    SET source_revision = source_revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_chunks_source_delete
+AFTER DELETE ON chunks
+BEGIN
+    UPDATE discourse_revision_state
+    SET source_revision = source_revision + 1 WHERE singleton = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_chunks_source_update
+AFTER UPDATE OF chunk_id, turn_id, text, start_char, end_char, token_count ON chunks
+WHEN OLD.chunk_id IS NOT NEW.chunk_id
+  OR OLD.turn_id IS NOT NEW.turn_id
+  OR OLD.text IS NOT NEW.text
+  OR OLD.start_char IS NOT NEW.start_char
+  OR OLD.end_char IS NOT NEW.end_char
+  OR OLD.token_count IS NOT NEW.token_count
+BEGIN
+    UPDATE discourse_revision_state
+    SET source_revision = source_revision + 1 WHERE singleton = 1;
+END;
+""" + _immutable_discourse_triggers() + _graph_content_revision_triggers()
+
 #: Full schema for a freshly created database (already at CURRENT_SCHEMA_VERSION).
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS turns (
@@ -285,6 +732,8 @@ _SCHEMA_SQL = (
     + _V7_HEBBIAN_SCHEMA
     + _V8_CONSOLIDATION_SCHEMA
     + _V9_CAUSAL_BINDING_SCHEMA
+    + _V10_DISCOURSE_SCHEMA
+    + _V11_REVISION_SCHEMA
     + f"\nINSERT OR REPLACE INTO meta (key, value)"
     f" VALUES ('schema_version', '{CURRENT_SCHEMA_VERSION}');\n"
 )
@@ -385,6 +834,14 @@ UPDATE meta SET value = '8' WHERE key = 'schema_version';
     + """
 UPDATE meta SET value = '9' WHERE key = 'schema_version';
 """,
+    10: _V10_DISCOURSE_SCHEMA
+    + """
+UPDATE meta SET value = '10' WHERE key = 'schema_version';
+""",
+    11: _V11_REVISION_SCHEMA
+    + """
+UPDATE meta SET value = '11' WHERE key = 'schema_version';
+""",
 }
 
 
@@ -433,6 +890,184 @@ def _backfill_turn_ordinals(conn: sqlite3.Connection) -> None:
     )
 
 
+def _backfill_discourse_snapshot_revisions(conn: sqlite3.Connection) -> None:
+    """Re-hash immutable pre-v11 graph receipts with baseline revisions."""
+
+    for table in _IMMUTABLE_DISCOURSE_TABLES:
+        conn.execute(f"DROP TRIGGER IF EXISTS trg_{table}_no_update")
+        conn.execute(f"DROP TRIGGER IF EXISTS trg_{table}_no_delete")
+    conn.execute("DROP TRIGGER IF EXISTS trg_discourse_revision_no_update")
+    conn.execute("DROP TRIGGER IF EXISTS trg_discourse_revision_no_delete")
+    for table in (
+        "episode_evidence",
+        "discourse_unit_evidence",
+        "discourse_relation_evidence",
+    ):
+        conn.execute(
+            f"UPDATE {table} SET "
+            "source_id = (SELECT COALESCE(t.source_id, t.turn_id) "
+            "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
+            f"WHERE c.chunk_id = {table}.chunk_id), "
+            "turn_id = (SELECT c.turn_id FROM chunks AS c "
+            f"WHERE c.chunk_id = {table}.chunk_id), "
+            "role = (SELECT t.role FROM chunks AS c JOIN turns AS t "
+            "ON t.turn_id = c.turn_id "
+            f"WHERE c.chunk_id = {table}.chunk_id), "
+            "created_at = (SELECT t.created_at FROM chunks AS c JOIN turns AS t "
+            "ON t.turn_id = c.turn_id "
+            f"WHERE c.chunk_id = {table}.chunk_id)"
+        )
+
+    from memory_condense.domain.discourse import (
+        DiscourseSnapshot,
+        Episode,
+        EvidenceSpan,
+        canonical_json,
+    )
+    from memory_condense.persistence.discourse_receipts import (
+        discourse_content_digests,
+    )
+
+    episode_rows = conn.execute(
+        "SELECT episode_id, artifact_id, source_id, sequence_no, first_ordinal, "
+        "last_ordinal, boundary_method, initial_boundary, refined_boundary, "
+        "boundary_score, boundary_threshold FROM episodes"
+    ).fetchall()
+    episode_receipts: list[tuple[str, str]] = []
+    for episode_row in episode_rows:
+        evidence_rows = conn.execute(
+            "SELECT chunk_id, start_char, end_char, quote_sha256, ordinal, "
+            "source_id, turn_start_char, turn_id, role, created_at "
+            "FROM episode_evidence WHERE episode_id = ? ORDER BY evidence_order",
+            (episode_row[0],),
+        ).fetchall()
+        evidence = tuple(
+            EvidenceSpan(
+                chunk_id=row[0],
+                start_char=int(row[1]),
+                end_char=int(row[2]),
+                quote_sha256=row[3],
+                ordinal=int(row[4]),
+                source_id=row[5],
+                turn_start_char=int(row[6]),
+                turn_id=row[7],
+                role=row[8],
+                created_at=row[9],
+            )
+            for row in evidence_rows
+        )
+        episode = Episode(
+            episode_id=episode_row[0],
+            artifact_id=episode_row[1],
+            source_id=episode_row[2],
+            sequence_no=int(episode_row[3]),
+            first_ordinal=int(episode_row[4]),
+            last_ordinal=int(episode_row[5]),
+            evidence=evidence,
+            boundary_method=episode_row[6],
+            initial_boundary=episode_row[7],
+            refined_boundary=episode_row[8],
+            boundary_score=episode_row[9],
+            boundary_threshold=episode_row[10],
+        )
+        episode_receipts.append((episode.receipt_sha256, episode.episode_id))
+    conn.executemany(
+        "UPDATE episodes SET receipt_sha256 = ? WHERE episode_id = ?",
+        episode_receipts,
+    )
+    source_baseline = sum(
+        int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in ("turns", "chunks")
+    )
+    graph_baseline = sum(
+        int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in _IMMUTABLE_DISCOURSE_TABLES
+    )
+    if source_baseline:
+        conn.execute(
+            "UPDATE discourse_revision_state SET source_revision = ? "
+            "WHERE singleton = 1",
+            (source_baseline,),
+        )
+    if graph_baseline:
+        conn.execute(
+            "UPDATE discourse_revision_state SET graph_content_revision = ? "
+            "WHERE singleton = 1",
+            (graph_baseline,),
+        )
+    source_content, graph_content = discourse_content_digests(conn)
+    legacy_max_revision = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(graph_revision), 0) "
+            "FROM discourse_graph_revisions"
+        ).fetchone()[0]
+    )
+    # v10 rows do not record when each graph entity was introduced, so their
+    # historical contents cannot be reconstructed honestly.  Retire all old
+    # receipts and publish one explicit v11 baseline over the current content.
+    conn.execute("DELETE FROM discourse_graph_revisions")
+    if legacy_max_revision or graph_baseline:
+        baseline = DiscourseSnapshot(
+            max_turn_ordinal=int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(ordinal), 0) FROM turns"
+                ).fetchone()[0]
+            ),
+            chunk_count=int(
+                conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            ),
+            graph_revision=legacy_max_revision + 1,
+            schema_version=CURRENT_SCHEMA_VERSION,
+            artifact_ids=tuple(
+                row[0]
+                for row in conn.execute(
+                    "SELECT artifact_id FROM discourse_artifacts "
+                    "ORDER BY artifact_id"
+                ).fetchall()
+            ),
+            source_revision=source_baseline,
+            graph_content_revision=graph_baseline,
+            source_content_sha256=source_content,
+            graph_content_sha256=graph_content,
+        )
+        conn.execute(
+            "INSERT INTO discourse_graph_revisions "
+            "(graph_revision, max_turn_ordinal, chunk_count, schema_version, "
+            "artifact_ids, snapshot_sha256, source_revision, "
+            "graph_content_revision, source_content_sha256, "
+            "graph_content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                baseline.graph_revision,
+                baseline.max_turn_ordinal,
+                baseline.chunk_count,
+                baseline.schema_version,
+                canonical_json(list(baseline.artifact_ids)),
+                baseline.snapshot_sha256,
+                baseline.source_revision,
+                baseline.graph_content_revision,
+                baseline.source_content_sha256,
+                baseline.graph_content_sha256,
+            ),
+        )
+    _execute_sql_script(
+        conn,
+        """
+CREATE TRIGGER IF NOT EXISTS trg_discourse_revision_no_update
+BEFORE UPDATE ON discourse_graph_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'discourse graph revision receipts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_discourse_revision_no_delete
+BEFORE DELETE ON discourse_graph_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'discourse graph revision receipts are immutable');
+END;
+"""
+        + _immutable_discourse_triggers()
+    )
+
+
 #: Work that must run *after* the SQL for a version, when SQL alone cannot
 #: express it. Keyed by target version, same as :data:`_MIGRATIONS`.
 #:
@@ -445,6 +1080,7 @@ def _backfill_turn_ordinals(conn: sqlite3.Connection) -> None:
 _POST_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     3: _backfill_content_hash,
     4: _backfill_turn_ordinals,
+    11: _backfill_discourse_snapshot_revisions,
 }
 
 
@@ -489,24 +1125,27 @@ class Database:
         if self._read_only:
             self._conn.execute("PRAGMA query_only=ON")
         else:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._init_schema()
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._init_schema()
+            except BaseException:
+                self._conn.close()
+                raise
 
     def _init_schema(self) -> None:
         version = self._read_version()
 
         if version is None:
-            self._conn.executescript(_SCHEMA_SQL)
+            _apply_schema_transaction(self._conn, _SCHEMA_SQL)
         else:
             for target in range(version + 1, CURRENT_SCHEMA_VERSION + 1):
                 sql = _MIGRATIONS.get(target)
                 if sql is not None:
-                    self._conn.executescript(sql)
-                post = _POST_MIGRATIONS.get(target)
-                if post is not None:
-                    post(self._conn)
-
-        self._conn.commit()
+                    _apply_schema_transaction(
+                        self._conn,
+                        sql,
+                        post=_POST_MIGRATIONS.get(target),
+                    )
 
     def _read_version(self) -> int | None:
         """Current schema version, or None if the database is empty."""

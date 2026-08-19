@@ -50,6 +50,18 @@ def test_chunk_offsets():
         assert chunk.start_char < chunk.end_char
 
 
+def test_chunk_text_is_the_exact_authoritative_source_slice():
+    chunker = Chunker(min_tokens=5, max_tokens=200)
+    text = "First sentence.\n\nSecond   sentence.\tThird sentence."
+
+    chunks = chunker.chunk_turn("t1", text)
+
+    assert chunks
+    for chunk in chunks:
+        assert chunk.text == text[chunk.start_char : chunk.end_char]
+        assert chunk.token_count == count_tokens(chunk.text)
+
+
 def test_token_count_populated():
     chunker = Chunker(min_tokens=5, max_tokens=200)
     text = "This is a simple sentence with several words in it."
@@ -76,6 +88,14 @@ def test_chat_prompt_proxy_adds_explicit_framing_and_binds_vocabulary():
     assert len(str(identity["vocabulary_sha256"])) == 64
     assert identity["chat_framing_tokens_per_message"] == 8
     assert identity["chat_framing_tokens_fixed"] == 8
+
+
+def test_tokenizer_proxy_identity_returns_an_unshared_copy():
+    first = tokenizer_proxy_identity()
+    original = dict(first)
+    first["encoding"] = "forged"
+
+    assert tokenizer_proxy_identity() == original
 
 
 def test_conceptual_spans_separate_plan_from_completed_event(chunker):
@@ -116,6 +136,13 @@ def test_hard_split_preserves_unicode_and_exact_maximum():
     assert "".join(chunk.text for chunk in chunks) == text
     assert all(chunk.token_count == count_tokens(chunk.text) for chunk in chunks)
     assert all(chunk.token_count <= 10 for chunk in chunks)
+
+
+def test_hard_split_rejects_a_unicode_codepoint_that_cannot_fit() -> None:
+    chunker = Chunker(min_tokens=1, max_tokens=1)
+
+    with pytest.raises(ValueError, match="cannot fit the next Unicode code point"):
+        chunker.chunk_turn("t1", "😀")
 
 
 @pytest.mark.parametrize(

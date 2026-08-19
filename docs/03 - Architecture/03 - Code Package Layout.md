@@ -14,14 +14,16 @@ pure or stateless transformations, and stateful workflows or adapters.
 
 | Package | Responsibility |
 | --- | --- |
-| `domain` | Shared schemas, token counting, decay, and ranking primitives |
-| `persistence` | SQLite access plus transcript and memory stores |
-| `ingest` | Loading, corpus composition, chunking, extraction, and validation |
+| `domain` | Shared schemas, token counting, decay, ranking, and immutable discourse/closure contracts |
+| `persistence` | SQLite access plus transcript, memory, and source-grounded discourse stores |
+| `ingest` | Loading, corpus composition, exact-slice chunking, extraction, validation, and conservative discourse linking |
 | `modeling` | Embedding and local Qwen prefix runtimes |
 | `associations` | Persistent association artifacts, Hebbian and heat reads, consolidation, and transition policy |
 | `search.indexes` | Lexical, vector/hybrid, source-local, and hierarchy retrieval |
 | `search.packing` | Context budgets, scalar handling, and event-aware packet construction |
 | `search.selectors` | Coverage, forced-choice, cross-encoder, and Qwen reranking policies |
+| `search.episodes` | Pluggable event boundaries, bounded refinement, representatives, and source-local temporal expansion |
+| `search.closure` | Query obligations, evidenced relation traversal, revision/conflict semantics, and atomic closure plans |
 | `application` | `MemoryCondenser` composition root and the hosted-provider binding seam |
 | `interfaces` | Long-lived external interfaces, currently the MCP server |
 | `tooling` | Probes, experiment rigs, and Qwen smoke/consolidation commands |
@@ -37,6 +39,8 @@ memory_condense/
 ├── modeling/
 ├── associations/
 ├── search/
+│   ├── closure/
+│   ├── episodes/
 │   ├── indexes/
 │   ├── packing/
 │   └── selectors/
@@ -153,7 +157,7 @@ working in this repository.
 ## Evaluation identity boundary
 
 The reorganization begins a new **implementation epoch v4**. This label is an
-evaluation/provenance epoch and is unrelated to SQLite schema version 9.
+evaluation/provenance epoch and is unrelated to SQLite schema version 11.
 
 `implementation_sha256()` hashes every Python file's package-relative path as
 well as its bytes. Moving a byte-identical implementation therefore changes

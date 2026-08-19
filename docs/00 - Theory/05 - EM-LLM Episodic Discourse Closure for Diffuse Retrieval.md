@@ -1,7 +1,8 @@
-# EM-LLM episodic discourse closure for diffuse retrieval
+# EM-LLM-inspired episodic discourse closure for diffuse retrieval
 
-**Status**: ADOPTED DESIGN — EM-LLM mechanisms selected; externalized,
-source-grounded implementation remains unbuilt
+**Status**: IMPLEMENTED PROVIDER-FREE PROTOTYPE — the general closure path is
+built; autoregressive EM-LLM surprise remains an optional, unevaluated boundary
+strategy
 **Date**: 2026-08-18
 **Applies to**: long conversations whose answer depends on information spread
 across several episodes, especially explanation, diagnosis, recommendation,
@@ -10,17 +11,20 @@ planning, comparison, and status synthesis
 ## Decision
 
 Use the event-formation and temporal-retrieval ideas from
-[EM-LLM](https://em-llm.github.io/) as the front half of the diffuse retrieval
-architecture:
+[EM-LLM](https://em-llm.github.io/) as one interchangeable front end for the
+diffuse retrieval architecture. The closure system does **not** depend on the
+EM-LLM package, its model wrapper, or persistent K/V memory:
 
 ```text
 raw conversation
-  -> surprise-based event boundaries
-  -> graph-refined, source-grounded episodes
-  -> similarity seeds + temporal contiguity
+  -> exact raw chunks
+  -> boundary strategy
+       fixed interval | lexical/embedding change | injected model surprise
+  -> optionally cohesion-refined, source-grounded episodes
+  -> existing hybrid seeds + source-local temporal contiguity
   -> discourse-obligation closure
   -> atomic evidence bundles
-  -> hard-budget, cited answer
+  -> exact full-prompt-proxy cap + evidence packet for a downstream cited answer
 ```
 
 This is an adaptation, not a claim that memory-condense implements EM-LLM's
@@ -33,10 +37,36 @@ token sequence, K/V cache, attention map, residual stream, or activation is
 durable state.
 
 The combined design is called **Episodic Discourse Closure RAG**. EM-LLM gives
-it non-arbitrary event boundaries and a principled temporal recall path.
+us a hypothesis for better-than-arbitrary event boundaries and a principled
+temporal recall path; it is not a required runtime component.
 Grounded discourse closure supplies what ordinary episodic similarity does not:
 cross-episode dependencies, revisions, contradictions, unresolved questions,
 and an explicit proof that the final packet covers the query's obligations.
+
+## Dependency boundary
+
+There are two separate hypotheses:
+
+1. **General closure hypothesis**: source-grounded raw evidence or episodes,
+   typed discourse relations, explicit query obligations, bounded iterative
+   closure, and atomic packing retrieve a sufficient evidence set more
+   reliably than ordinary top-k chunks.
+2. **EM-style segmentation hypothesis**: autoregressive surprise plus bounded
+   cohesion refinement creates better episode boundaries than deterministic,
+   lexical-change, or ordinary-embedding-change controls.
+
+The first hypothesis can be implemented and tested without the second. The
+provider-free implementation therefore includes a fixed-interval detector, a
+lexical/ordinary-embedding change scorer, bounded cohesion refinement, and two
+injection seams. The stateless pairwise `SurpriseScorer` is suitable for local
+change controls; it is not itself an autoregressive `P(x_t | x_<t)` evaluator.
+A true EM-style experiment must externally precompute and freeze a
+full-sequence surprise signal, bind its model and signal identity in the
+experiment artifact, and then pass the numeric sequence through
+`surprise_scores`. The current API does not itself validate a first-class
+surprise-signal receipt. No EM-LLM code is imported, and no K/V
+cache, token IDs, prompt buffer, attention map, residual stream, or activation
+is stored.
 
 ## Why ordinary RAG is insufficient
 
@@ -120,12 +150,12 @@ episode context.
 | Concern | EM-LLM | Episodic Discourse Closure adaptation |
 | --- | --- | --- |
 | Authoritative memory | Past per-layer K/V states | Immutable raw turns, chunks, and exact source spans |
-| Boundary signal | Autoregressive token surprise | Frozen local surprise scorer when available; deterministic/source and embedding-change controls as ablations |
+| Boundary signal | Autoregressive token surprise | Caller-supplied score sequence or stateless adjacent-change scorer; deterministic and embedding-change controls as ablations |
 | Refinement graph | Per-head key similarity | Transient key similarity or source-grounded embedding similarity; persist only boundary receipts and scalar identities |
 | Retrieval unit | K/V event block | Episode containing ordered evidence references |
-| Representatives | Influential tokens per event | Bounded representative chunk/span IDs and index vectors |
-| First retrieval stage | Similarity buffer | Existing lexical/dense/source routes plus episode similarity |
-| Second retrieval stage | Temporal contiguity queue | Source-bounded preceding/following episode expansion with explicit token cost |
+| Representatives | Influential tokens per event | Bounded representative chunk/span IDs plus feature/vector identity hashes; no episode ANN yet |
+| First retrieval stage | Similarity buffer | Caller-supplied lexical/dense/source hits mapped to episodes; no independent episode-similarity index yet |
+| Second retrieval stage | Temporal contiguity queue | Source-bounded preceding/following episode expansion with quotas and distance decay; exact token cost is applied during packing |
 | Long-range relation | Primarily semantic and temporal | Typed discourse relations across episodes |
 | Completion condition | Fixed retrieved-memory budget | Required query obligations closed, or an explicit incomplete reason |
 | Answer evidence | Retrieved hidden state | Verified raw spans only |
@@ -137,33 +167,68 @@ embeddings transiently. Durable state is limited to source IDs, span hashes,
 episode boundaries, scalar scores, index vectors, relation records, and
 receipts. Generated summaries and hidden states never become factual evidence.
 
+## Efficient representation: project, do not replace
+
+The hot retrieval path does not need to carry every rich Python object. A
+future scalable implementation should maintain two representations:
+
+```text
+authoritative object
+  -> stable key + compact vector/scalar projection
+  -> retrieve IDs and graph neighbors
+  -> hydrate exact source objects for finalists
+  -> verify, close, and pack
+```
+
+The index plane can contain stable IDs, vectors, compact scalar features,
+source/ordinal coordinates, and adjacency IDs. These records are disposable
+and reconstructible. The evidence plane retains exact raw spans, role/time
+provenance, discourse membership, content roots, and coverage receipts.
+
+Replacing *all* objects with only vectors and keys would use less memory per
+candidate, but it would also discard the information needed to distinguish a
+revision from a contradiction, prove artifact scope, recover exact citations,
+and verify what reached the answerer. The efficient boundary is therefore a
+vector/key **projection** for routing, not vectors as factual authority. Only
+the small admitted frontier is hydrated into rich immutable objects.
+
 ## Write path: grounded episodes
 
-Every episode belongs to one source timeline and a frozen content snapshot.
-An episode record contains:
+Every episode belongs to one source timeline. Publication returns a separate
+content-bound whole-store snapshot; the episode record itself contains:
 
 - `episode_id`, source ID, first/last turn ordinal, and first/last chunk ID;
 - ordered evidence references with exact span and quote hashes;
-- boundary method, scorer artifact identity, threshold-window identity, and
-  pre/post refinement positions;
-- bounded representative evidence IDs and their index-vector identities;
-- previous/next episode IDs inside the same source; and
-- an immutable receipt hash over all of the above.
+- boundary method, scalar threshold/score values, and pre/post refinement
+  positions;
+- source-local sequence numbers from which previous/next adjacency is derived;
+- an immutable receipt hash over those episode fields and evidence.
 
-Formation is incremental and idempotent:
+Representatives are separately published with their feature/vector identity
+hashes. Scorer, threshold-window, and policy identities can be declared in the
+caller-supplied annotation artifact, but the prototype does not yet derive and
+verify those declarations from the actual runtime strategy objects.
+
+The current provider-free API is a deterministic, idempotent batch publisher:
 
 1. append authoritative turns and chunks;
-2. score only the new bounded window plus enough overlap to reconsider the
-   last open boundary;
-3. propose surprise boundaries;
-4. refine within the bounded source-local window;
+2. have the caller select one source-local batch;
+3. propose boundaries with the configured fixed, change, or injected-surprise strategy;
+4. refine within the bounded source-local window when configured;
 5. validate minimum/maximum episode size and exact source-span hashes;
-6. atomically publish episodes and adjacency; and
+6. atomically publish episodes and representatives; and
 7. advance the graph revision only after chunks and episodes are complete.
 
+The builder partitions every supplied span exactly once, while persistence
+rejects overlapping or out-of-order episodes. Adjacency is derived at read time
+from source-local sequence numbers. Incremental overlap and reconsideration of
+the last open episode are future orchestrator responsibilities; the prototype
+does not claim to manage that streaming policy automatically.
+
 No event may cross unrelated source histories merely because timestamps are
-close. If the semantic scorer fails, deterministic source/session/role
-boundaries remain reconstructible and retrieval falls open to raw chunks.
+close. If a semantic scorer is unavailable, the implemented model-free control
+is fixed-interval segmentation inside one authoritative source. Retrieval
+still falls open to exact raw chunks when episode annotations are missing.
 
 ## Read path: from episodes to closure
 
@@ -188,18 +253,24 @@ the validated program is a routing plan, never answer evidence.
 
 ### Stage B — retrieve episodic seeds
 
-Run existing lexical, dense, source, association, and metadata routes. Map
-direct chunk hits to their episodes and add an episode similarity route over
-bounded representatives. Direct raw hits remain fail-open even if episode
-metadata is missing.
+The caller runs its chosen lexical, dense, source, association, or metadata
+routes and passes their `RetrievalResult` rows into the combined workflow,
+which maps direct chunk hits to episodes. Representatives are stored and
+verified,
+but the prototype does **not** yet have a separately trained episode ANN or an
+independent episode-similarity route. Every admitted direct hit remains a
+bounded, prioritized raw route whether or not it maps to an episode. If a configured
+admission cap omits any direct hit or episode expansion, the exact omitted IDs
+are recorded and the plan cannot claim complete coverage.
 
 ### Stage C — add temporal contiguity
 
 For each strong episode seed, inspect bounded previous/next episodes from the
-same source. Admission is based on new obligation gain, relationship to the
-seed, exact incremental token cost, and a fixed contiguity quota. Temporal
-neighbors are labeled as hypotheses until their spans actually discharge an
-obligation.
+same source. The implemented seed expansion uses fixed previous/next quotas,
+deterministic source order, and distance decay. Obligation gain and exact token
+cost are applied later by closure and atomic packing; they are not yet used to
+rank temporal expansion itself. Temporal neighbors remain routing hypotheses
+until their spans actually discharge an obligation.
 
 This is the external analogue of EM-LLM's contiguity buffer. It prevents a
 matched result from arriving without its nearby setup, but it cannot silently
@@ -220,8 +291,10 @@ addresses       resolves          rejects / accepts
 refers_to       sequence / reply_to
 ```
 
-Expansion occurs only when a relation can satisfy or disambiguate a live
-obligation. A selected decision pulls its revision chain; a selected result
+The bounded best-first walk favors potential obligation gain, but recognized
+core semantic relations may also be traversed without first proving that the
+next edge will satisfy a new obligation. A selected decision pulls its
+revision chain; a selected result
 pulls its tested action/configuration; a selected conflict pulls both sides
 and any resolution; a proposed improvement pulls the constraints and prior
 outcomes that determine whether it is viable.
@@ -229,7 +302,7 @@ outcomes that determine whether it is viable.
 ### Stage E — pack atomic evidence bundles
 
 The final unit of packing is an evidence bundle, not a row. A bundle contains
-the smallest verified set of spans needed to interpret one material claim:
+a verified grouped set of spans needed to interpret one material claim:
 for example, experiment setup + result, old decision + revision, or
 contradiction side A + side B + resolution.
 
@@ -239,34 +312,47 @@ says `budget_impossible`; if the graph cannot find an obligation, it says
 `not_found`; unresolved contradiction yields `conflicted`. Partial evidence is
 never relabeled as complete because the model sounds confident.
 
-## Closure receipt
+## Closure plan and packet receipt
 
-Every answer packet carries a text-free, canonical receipt:
+The immutable `ClosurePlan` records the query program, policy, content-bound
+snapshot, selected artifact, direct and episode routes, optional expansion
+receipt, visited graph objects, evidence atoms and bundles, every obligation
+result, exhaustive-scope witnesses, stopping reason, and completion state. The
+packet `ClosureReceipt` then commits to the plan hash, selected bundle and atom
+IDs, exact rendered-context hash, drop reasons, tokenizer identity, context and
+full-prompt proxy budgets, stopping reason, and zero built-in retained request
+state.
 
-- query-program, policy, tokenizer, snapshot, and graph identities;
-- direct chunk and episode seed IDs;
-- similarity and contiguity admissions with paths and scores;
-- visited discourse units and relations;
-- selected evidence bundles and exact source-span hashes;
-- status of every required and desired obligation;
-- unresolved conflicts, dropped bundles, and reasons;
-- exact context and prompt-token proxy counts;
-- stopping reason; and
-- `complete_claimed`, which is true only when every required obligation and
-  its evidence path is valid under the frozen scope.
+Together these objects prove what the implemented procedure inspected and
+packed, relative to the accepted query program, caller-declared annotation
+artifact, relation semantics, and coverage marks. They do not prove that an
+annotation is semantically correct or that the compiler captured every
+real-world requirement. A
+positive completion additionally requires one explicit annotation artifact,
+a current content-bound source/graph snapshot, an exhaustive artifact-wide
+unit scan, exhaustive bounded-query witnesses, and a finalized coverage
+receipt that includes chunks producing zero semantic rows. Episodes remain an
+optional routing layer: their absence does not block raw/discourse-only
+closure, while a truncated episode expansion does block completion. Otherwise
+evidence is still returned, but completion remains false.
 
-The receipt proves what the retrieval procedure inspected and packed. It does
-not prove that an unknown relation or unannotated source does not exist unless
-the corresponding scope is independently exhaustive.
+Finalizing that receipt also proves that exact chunks cover every
+non-whitespace character of every authoritative turn. A turn committed before
+a failed chunking step, or a partial/gapped chunk set, therefore cannot be
+silently certified as a fully inspected corpus.
 
 ## General-purpose, not engineering-specific
 
 Engineering conversations motivate the first fixture, but no benchmark noun
-belongs in the storage or closure contract. Episode kinds and relation types
-are open strings with a small core vocabulary. Query obligations derive from
-intent and grammatical roles rather than words such as “museum,” “concert,”
-or “deployment.” Unknown content remains retrievable as raw evidence even when
-no semantic unit can be validated.
+belongs in the storage or closure contract. Discourse-unit kinds and relation
+types are open strings with a small core vocabulary. Query obligations derive
+from intent and grammatical roles rather than words such as “museum,”
+“concert,” or “deployment.” The built-in compiler and rule linker are
+conservative English bootstrap implementations; the examples below describe
+the schema's capacity or an injected-linker use, not validated default-stack
+accuracy in every domain. Unknown content remains a bounded raw-evidence
+candidate when no semantic unit can be validated, though final packing may
+drop it when it cannot satisfy an obligation or fit the budget.
 
 The same mechanics cover:
 
@@ -315,34 +401,92 @@ prompt cap, and seed budget. EM-LLM's published LongBench and InfiniteBench
 results justify testing the mechanism; they do not establish performance on
 our conversation workload.
 
-## Smallest implementation tranche
+## Implemented provider-free tranche
 
-1. Add source-grounded episode tables, boundary receipts, and snapshot/high
-   watermark validation. Start with deterministic boundaries plus an injected
-   surprise-score interface.
-2. Add an episode representative index and a source-bounded contiguity route.
-   Return direct chunks, episode seeds, neighbors, paths, and exact costs.
-3. Build a synthetic noisy conversation containing a multi-step experiment,
-   revised decision, unresolved contradiction, and distant constraint. Compare
-   fixed chunks with surprise episodes under the same budget.
-4. Add the discourse-unit/relation store and manual `QueryProgram` fixtures.
-5. Add iterative obligation closure and atomic evidence-bundle packing.
-6. Only then evaluate an automatic semantic linker and LLM query compiler.
+The first mechanical tranche now exists behind opt-in workflow methods. The
+repository is constructed with `MemoryCondenser`, but no episode, linking,
+closure, or packet workflow runs automatically:
 
-This order tests the EM-LLM hypothesis before adding a large extractor. It also
-keeps the locked validation-v3 treatment untouched: the new path is default
-off, starts in implementation epoch v4, and requires its own frozen artifacts
-and evaluation split.
+1. SQLite schema v11 stores immutable annotation artifacts, source-local
+   episodes, representatives, typed units, n-ary relations, exact evidence
+   coordinates, coverage rows (including `no_output`), source/graph revision
+   counters, and content-bound source/graph snapshot roots. Historic receipts
+   from schemas that did not bind content are retired rather than relabeled.
+2. Every evidence span is verified against both its chunk and authoritative
+   turn on write and read. Multiple chunks inside one turn carry an explicit
+   turn-relative position, so random chunk IDs cannot reorder the source.
+3. Episode construction supports fixed intervals, lexical/ordinary-embedding
+   change, adaptive injected surprise, and bounded cohesion refinement. It
+   stores only evidence references, scalar boundary data, and feature hashes.
+4. Caller-supplied retrieval results map to bounded episode seeds and
+   source-local previous/next episodes. Missing or invalid annotations fall back to bounded
+   original raw chunk IDs; every cap or omission is explicit and prevents a
+   false completion claim.
+5. The deterministic query compiler emits eight generic intents and flat
+   obligation sets; the public `QueryProgram` contract can also represent
+   caller-supplied dependency DAGs. The closure engine traverses bounded
+   evidenced relations,
+   handles revision terminals and contradiction/resolution groups, and reports
+   every missing or conflicted obligation instead of fabricating completion.
+6. Atomic evidence bundles are packed with exact union cost. The optional
+   chat-prompt path counts base messages, evidence framing, BPE boundary
+   effects, fixed chat framing, and an output reserve at every beam admission.
+   It never prefix-truncates part of a required bundle.
+7. Offline metrics measure minimal-sufficient-set hit, soft closure,
+   obligation completion, evidence-path recall, revision and contradiction
+   recall, false completion, budget compliance, and authoritative source-span
+   validity from the final packet.
+
+The provider-free end-to-end regression uses a 36-turn noisy engineering
+conversation whose nine necessary facts are spread across the objective,
+current state, constraint, failed experiment, dependency, observation,
+decision revision, and unresolved issue. Ordinary hybrid retrieval at `k=1`
+cannot contain that set. The default rule linker, fixed-interval episodes,
+automatic recommendation program, corpus-scope closure, and atomic packer do
+recover and pack all nine spans deterministically within the exact prompt
+workspace cap, without importing EM-LLM or retaining request-token state. This
+is mechanical evidence that the pipeline composes correctly, not a measured
+accuracy result.
+
+Important prototype limitations remain:
+
+- there is no separately trained episode-representative ANN index; current
+  caller-supplied chunk hits seed episodes;
+- the conservative English rule linker recognizes only explicit cues, so a
+  stronger semantic linker must remain injected and source-validated;
+- linking is a caller-managed batch/rebuild workflow and cannot yet relate a
+  new unit to an existing old unit without supplying the required prior
+  evidence again;
+- transformation identity is declared by the artifact supplied to the
+  workflow rather than derived and attested from every runtime strategy;
+- positive corpus completion requires every artifact unit to fit an
+  exhaustive `max_units + 1` probe, so larger artifacts honestly return
+  incomplete rather than using a scalable proof index;
+- content roots stream the changed corpus/graph once per revision and use only
+  an in-process revision cache, rather than an incremental Merkle structure;
+- an episode-neighbor lookup failure currently degrades to no temporal
+  neighbors rather than carrying a distinct failure code, although corpus
+  completion still depends on the separate exhaustive discourse scope;
+- EM-style autoregressive surprise has not been wired to a frozen model or
+  evaluated against deterministic and embedding-change controls; and
+- an injected scorer or linker is outside the built-in zero-retention proof
+  unless its own implementation is separately certified.
+
+This path keeps the locked validation-v3 treatment untouched. Its workflows
+are opt-in, it belongs to implementation epoch v4, and it requires its own frozen artifacts,
+annotated diffuse benchmark, and matched evaluation before any accuracy claim.
 
 ## Claim boundary
 
-The adopted claim is narrow:
+The implemented claim is narrow:
 
-> Surprise-refined episodes and temporal contiguity are a better front end for
-> diffuse retrieval than arbitrary chunks alone, and they should feed a
-> source-grounded obligation-closure system.
+> A general source-grounded obligation-closure system can consume raw chunks
+> or episodes without persisting transformer token state. EM-style
+> surprise-refined episodes are one optional front end whose value must be
+> established by matched ablation.
 
-That claim is a design hypothesis until the matched ablations above pass.
+The mechanics and invariants are implemented; the accuracy claim remains a
+hypothesis until the matched ablations above pass.
 EM-LLM itself notes important limitations, including non-parametric storage,
 lack of hierarchical events, and lack of long-term consolidation. Our
 discourse graph and existing consolidation work are proposed complements, not

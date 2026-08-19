@@ -64,9 +64,9 @@ def count_chat_prompt_token_proxy(
 
 
 @lru_cache(maxsize=None)
-def tokenizer_proxy_identity(
+def _tokenizer_proxy_identity_items(
     encoding: str = DEFAULT_ENCODING,
-) -> dict[str, str | int]:
+) -> tuple[tuple[str, str | int], ...]:
     """Identify the exact local vocabulary used for token-budget proxies.
 
     Encoding name alone is not a sufficient frozen identity.  The digest walks
@@ -98,7 +98,7 @@ def tokenizer_proxy_identity(
         digest.update(int(rank).to_bytes(8, "big", signed=False))
         digest.update(len(encoded).to_bytes(8, "big", signed=False))
         digest.update(encoded)
-    return {
+    return tuple({
         "schema": PROMPT_TOKEN_PROXY_SCHEMA,
         "implementation": "tiktoken",
         "implementation_version": importlib.metadata.version("tiktoken"),
@@ -106,7 +106,19 @@ def tokenizer_proxy_identity(
         "vocabulary_sha256": digest.hexdigest(),
         "chat_framing_tokens_per_message": CHAT_FRAMING_TOKENS_PER_MESSAGE,
         "chat_framing_tokens_fixed": CHAT_FRAMING_TOKENS_FIXED,
-    }
+    }.items())
+
+
+def tokenizer_proxy_identity(
+    encoding: str = DEFAULT_ENCODING,
+) -> dict[str, str | int]:
+    """Return a fresh mapping for the cached immutable vocabulary identity.
+
+    Callers may safely modify their copy without corrupting identities emitted
+    by later requests.
+    """
+
+    return dict(_tokenizer_proxy_identity_items(encoding))
 
 
 def truncate_to_tokens(

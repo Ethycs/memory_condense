@@ -16,6 +16,7 @@ from memory_condense.application.condenser_contracts import (
     SourceCandidateReranker,
     SourceCompanionSelector,
 )
+from memory_condense.application.discourse_workflow import DiscourseWorkflowMixin
 from memory_condense.application.graph_workflow import GraphWorkflowMixin
 from memory_condense.application.ingest_workflow import IngestWorkflowMixin
 from memory_condense.application.partition_workflow import PartitionWorkflowMixin
@@ -67,6 +68,7 @@ _DIRECT_DATE_QUERY_RE = re.compile(
 class MemoryCondenser(
     IngestWorkflowMixin,
     RetrievalWorkflowMixin,
+    DiscourseWorkflowMixin,
     PartitionWorkflowMixin,
     GraphWorkflowMixin,
     SourceCompanionWorkflowMixin,
@@ -108,6 +110,7 @@ class MemoryCondenser(
             data_dir.mkdir(parents=True, exist_ok=True)
 
         self._db = Database(data_dir / "memory.db", read_only=read_only)
+        self._init_discourse_workflow()
         self._transcript = TranscriptStore(self._db)
         self._chunker = Chunker(
             min_tokens=chunker_min_tokens,

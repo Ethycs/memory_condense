@@ -74,6 +74,16 @@ class TestFreshDatabase:
             "consolidation_access_events",
             "consolidation_nodes",
             "consolidation_edges",
+            "discourse_artifacts",
+            "episodes",
+            "episode_evidence",
+            "episode_representatives",
+            "discourse_units",
+            "discourse_unit_evidence",
+            "discourse_relations",
+            "discourse_relation_members",
+            "discourse_relation_evidence",
+            "discourse_graph_revisions",
             "meta",
         } <= tables
 
@@ -87,6 +97,20 @@ class TestFreshDatabase:
             assert "idx_turns_source" in {
                 row[1] for row in db.execute("PRAGMA index_list(turns)").fetchall()
             }
+
+    def test_turn_ordinal_is_a_unique_global_clock(self, tmp_path):
+        with Database(tmp_path / "ordinal.db") as db:
+            db.execute(
+                "INSERT INTO turns "
+                "(turn_id, role, text, created_at, ordinal) "
+                "VALUES ('t1', 'user', 'one', '2026-08-18', 1)"
+            )
+            with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+                db.execute(
+                    "INSERT INTO turns "
+                    "(turn_id, role, text, created_at, ordinal) "
+                    "VALUES ('t2', 'user', 'two', '2026-08-18', 1)"
+                )
 
     def test_consolidation_edges_distinguish_causal_binding(self, tmp_path):
         with Database(tmp_path / "causal.db") as db:
@@ -209,7 +233,7 @@ class TestSchemaParity:
     schema. The standard's own verification block warns that they drift. These
     tests make drift a test failure rather than a support ticket.
 
-    Compares columns and indexes rather than raw `sqlite_master.sql` text:
+    Compares columns, indexes, and triggers rather than raw `sqlite_master.sql` text:
     `ALTER TABLE ADD COLUMN` and `CREATE TABLE` produce different DDL text for
     the same logical column, so a text comparison would fail on every additive
     migration and teach everyone to ignore it.
@@ -226,6 +250,12 @@ class TestSchemaParity:
                 for row in db.execute(
                     "SELECT name FROM sqlite_master WHERE type='index' "
                     "AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ),
+            "triggers": sorted(
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
                 ).fetchall()
             ),
         }
@@ -258,6 +288,140 @@ class TestSchemaParity:
         with Database(tmp_path / "fresh2.db") as db:
             fresh = self._shape(db)
         assert fresh == self._migrated(tmp_path, v2_sql, "from_v2.db")
+
+    def test_fresh_matches_migrated_from_v9(self, tmp_path):
+        """The immediately preceding production schema reaches exact v10 shape."""
+        from memory_condense.persistence.db import _MIGRATIONS
+
+        path = tmp_path / "from_v9.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(_V1_SCHEMA)
+        for target in range(2, 10):
+            conn.executescript(_MIGRATIONS[target])
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "9"
+        conn.commit()
+        conn.close()
+        with Database(tmp_path / "fresh9.db") as db:
+            fresh = self._shape(db)
+        with Database(path) as db:
+            assert db.schema_version == CURRENT_SCHEMA_VERSION
+            assert self._shape(db) == fresh
+
+
+def test_v10_historical_graph_receipts_are_retired_to_one_v11_baseline(tmp_path):
+    from memory_condense.persistence.db import _MIGRATIONS
+    from memory_condense.persistence.discourse_store import DiscourseStore
+
+    path = tmp_path / "two-v10-publications.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_V1_SCHEMA)
+    for target in range(2, 11):
+        conn.executescript(_MIGRATIONS[target])
+    conn.execute(
+        "INSERT INTO turns "
+        "(turn_id, role, text, source_id, created_at, ordinal) "
+        "VALUES ('t1', 'user', 'source', 'thread', '2026-08-18', 1)"
+    )
+    conn.execute(
+        "INSERT INTO chunks "
+        "(chunk_id, turn_id, text, start_char, end_char, token_count) "
+        "VALUES ('c1', 't1', 'source', 0, 6, 1)"
+    )
+    for index in (1, 2):
+        artifact_id = f"artifact-{index}"
+        conn.execute(
+            "INSERT INTO discourse_artifacts "
+            "(artifact_id, kind, implementation_sha256, policy_sha256, metadata) "
+            "VALUES (?, 'fixture', ?, ?, '{}')",
+            (artifact_id, "a" * 64, "b" * 64),
+        )
+        conn.execute(
+            "INSERT INTO discourse_graph_revisions "
+            "(graph_revision, max_turn_ordinal, chunk_count, schema_version, "
+            "artifact_ids, snapshot_sha256) VALUES (?, 1, 1, 10, ?, ?)",
+            (
+                index,
+                '["artifact-1"]'
+                if index == 1
+                else '["artifact-1","artifact-2"]',
+                str(index) * 64,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    with Database(path) as db:
+        store = DiscourseStore(db)
+        assert db.execute(
+            "SELECT graph_revision FROM discourse_graph_revisions"
+        ).fetchall() == [(3,)]
+        with pytest.raises(KeyError, match="unknown discourse graph revision"):
+            store.snapshot(1)
+        with pytest.raises(KeyError, match="unknown discourse graph revision"):
+            store.snapshot(2)
+        baseline = store.snapshot(3)
+        assert baseline.artifact_ids == ("artifact-1", "artifact-2")
+        assert baseline.source_content_sha256 != "0" * 64
+        assert baseline.graph_content_sha256 != "0" * 64
+
+
+@pytest.mark.parametrize(
+    ("target", "table", "column"),
+    (
+        (3, "memory_items", "content_hash"),
+        (4, "turns", "ordinal"),
+        (11, "episode_evidence", "turn_id"),
+    ),
+)
+def test_failed_post_migration_rolls_back_ddl_and_version_then_reopens(
+    tmp_path,
+    monkeypatch,
+    target,
+    table,
+    column,
+):
+    from memory_condense.persistence import db as db_module
+
+    path = tmp_path / f"failed-post-v{target}.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_V1_SCHEMA)
+    for version in range(2, target):
+        conn.executescript(db_module._MIGRATIONS[version])
+    conn.commit()
+    conn.close()
+
+    original = db_module._POST_MIGRATIONS[target]
+
+    def fail_post(_conn):
+        original(_conn)
+        raise RuntimeError(f"forced v{target} post failure")
+
+    monkeypatch.setitem(db_module._POST_MIGRATIONS, target, fail_post)
+    with pytest.raises(RuntimeError, match=f"forced v{target} post failure"):
+        Database(path)
+
+    raw = sqlite3.connect(str(path))
+    try:
+        assert raw.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == str(target - 1)
+        assert column not in {
+            row[1] for row in raw.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if target == 11:
+            assert raw.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'discourse_revision_state'"
+            ).fetchone() is None
+    finally:
+        raw.close()
+
+    monkeypatch.setitem(db_module._POST_MIGRATIONS, target, original)
+    with Database(path) as db:
+        assert db.schema_version == CURRENT_SCHEMA_VERSION
+        assert column in _column_names(db, table)
 
 
 class TestV4TurnCoordinateBackfill:

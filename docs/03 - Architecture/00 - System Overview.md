@@ -13,7 +13,7 @@ dense index plus BM25, a typed `MemoryItem` store with provenance-enforced
 extraction, exponential energy decay, deterministic reranking, and a
 hard-budgeted `ContextPacker`. An optional staged Qwen3 prefix compiler emits
 compact CAV signatures and sparse QK/OV association edges into SQLite schema
-v7, whose turns also retain document/session source identity and whose live
+v11, whose turns also retain document/session source identity and whose live
 Hebbian projection learns bounded same-turn chunk co-access. Ordinary
 associative reads do not load Qwen; they traverse only external
 IDs and scalars, then hydrate the selected chunks. The core remains
@@ -61,11 +61,11 @@ provider-agnostic, while public common-benchmark validation remains open.
         │   └─────────────┬─────────────┘      │
         ▼                 ▼                    ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ SQLite — db.py: WAL, foreign_keys=ON, schema_version 7 (v1 migrates up)   │
+│ SQLite — db.py: WAL, foreign_keys=ON, schema_version 11 (v1 migrates up)  │
 │   turns(source_id) · chunks(text, embedding, lexical weights, hnsw label) │
 │   chunk_terms(term, chunk_id, tf)          ← BM25 inverted index          │
 │   memory_items(...) · memory_provenance(...) ← mandatory provenance rows  │
-│   CAV/QK/OV artifacts + bounded Hebbian co-access nodes/edges/receipts     │
+│   CAV/QK/OV + Hebbian + episodic discourse artifacts/coverage/receipts    │
 │   meta(schema_version)                                                    │
 │   + hnsw_index.bin  (cache only — rebuildable via rebuild_index())        │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -175,6 +175,19 @@ provider-agnostic, while public common-benchmark validation remains open.
   turn coordinates, and idempotency hashes. Rank-discounted activity remains
   the provider-free fallback. See
   [`03 - Prompt-Driven Systems Consolidation.md`](../00%20-%20Theory/03%20-%20Prompt-Driven%20Systems%20Consolidation.md).
+- **Episodic discourse closure**: schema v11 adds immutable annotation
+  artifacts, source-local episodes and representatives, typed discourse units,
+  evidenced n-ary relations, finalized whole-corpus coverage, and content-bound
+  source/graph snapshots. Exact raw spans are revalidated against chunks and
+  turns, and coverage cannot finalize if any non-whitespace turn content is
+  absent from the chunk layer. An opt-in read path maps caller-supplied
+  hybrid hits to episodes, expands bounded temporal neighbors, closes explicit
+  query obligations over strong source-grounded relations, and atomically
+  packs evidence under context and full-prompt proxy caps. EM-style surprise
+  is optional; fixed and lexical/embedding-change boundaries work without a
+  model. Built-in paths retain zero request-token state; injected strategies
+  require their own certification. See
+  [`05 - EM-LLM Episodic Discourse Closure for Diffuse Retrieval.md`](../00%20-%20Theory/05%20-%20EM-LLM%20Episodic%20Discourse%20Closure%20for%20Diffuse%20Retrieval.md).
 
 ### Causal transition policy — `transition_policy.py`
 
@@ -337,5 +350,5 @@ pixi run python -c "from memory_condense.persistence.db import Database; import 
 git log --oneline -1                            # expect merge f3edc91 on main
 ```
 
-Expect `schema_version 9`. Canonical package ownership and import paths are
+Expect `schema_version 11`. Canonical package ownership and import paths are
 listed in [`03 - Code Package Layout.md`](03%20-%20Code%20Package%20Layout.md).

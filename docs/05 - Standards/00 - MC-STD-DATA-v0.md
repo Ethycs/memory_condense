@@ -147,6 +147,13 @@ pixi run -e dev pytest -q -m "not slow" tests/test_db.py tests/test_memory_store
 pixi run python -c "import sqlite3, tempfile, pathlib; from memory_condense.persistence.db import Database; p=pathlib.Path(tempfile.mkdtemp())/'v.db'; d=Database(p); print(d.schema_version); print(sorted(r[0] for r in d.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")))"
 ```
 
-Expect `9` and a table list containing the transcript, chunk/BM25, memory/provenance, CAV/QK/OV, v7 Hebbian, and v8 consolidation tables; schema v9 adds `consolidation_edges.causal_count`.
+Expect `11` and a table list containing the transcript, chunk/BM25,
+memory/provenance, CAV/QK/OV, v7 Hebbian, v8/v9 consolidation, and v10/v11
+source-grounded discourse tables. Schema v9 adds
+`consolidation_edges.causal_count`; schema v10 adds annotation artifacts,
+episodes, representatives, units, relations, exact evidence-coordinate tables,
+and immutable graph revisions. Schema v11 adds content-bound source/graph
+revision counters, per-artifact chunk coverage (including zero-output rows),
+and authoritative turn-role/time fields on evidence references.
 
 Drift between `_SCHEMA_SQL` and `_MIGRATIONS` is no longer something to catch by hand: `tests/test_db.py::TestSchemaParity` builds a fresh database and a migrated one from both v1 and v2, then asserts they converge on the same tables, columns, and indexes. It compares shape rather than DDL text, because `ALTER TABLE ADD COLUMN` and `CREATE TABLE` render the same logical column differently and a text comparison would fail on every additive migration until everyone learned to ignore it.

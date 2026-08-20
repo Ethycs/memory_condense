@@ -313,6 +313,13 @@ class LongMemEvalDiffuseRetrieval:
         return [dict(message) for message in self.messages]
 
 
+class SupportsLongMemEvalDiffusePacket(Protocol):
+    """Narrow frozen-packet surface accepted by offline measurement."""
+
+    packet: EvidencePacket
+    receipt: LongMemEvalDiffuseQueryReceipt
+
+
 @dataclass(frozen=True, slots=True)
 class LongMemEvalDiffuseMetrics:
     """Post-packet, provider-free LongMemEval answer/source reachability."""
@@ -658,7 +665,7 @@ def _combine_episode_seeds(
 
 
 def measure_longmemeval_diffuse_packet(
-    retrieval: LongMemEvalDiffuseRetrieval,
+    retrieval: SupportsLongMemEvalDiffusePacket,
     *,
     question_id: str,
     gold_answer: str,
@@ -742,6 +749,7 @@ __all__ = [
     "LongMemEvalDiffuseMetrics",
     "LongMemEvalDiffuseQueryReceipt",
     "LongMemEvalDiffuseRetrieval",
+    "SupportsLongMemEvalDiffusePacket",
     "SupportsDiffuseEvidence",
     "measure_longmemeval_diffuse_packet",
     "longmemeval_anchor_sequence_sha256",

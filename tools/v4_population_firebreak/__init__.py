@@ -5,6 +5,11 @@ from .analysis import (
     verify_analysis_treatment_input,
 )
 from .canonical import FirebreakError
+from .scoring import (
+    AnalysisScoringLabel,
+    export_analysis_scoring_label,
+    load_analysis_scoring_label,
+)
 from .treatment import (
     AnalysisTreatmentInput,
     TreatmentQuestion,
@@ -18,13 +23,16 @@ from .verifier import (
 )
 
 __all__ = [
+    "AnalysisScoringLabel",
     "AnalysisTreatmentInput",
     "ExpectedPopulationLock",
     "FirebreakError",
     "PRODUCTION_LOCK",
     "TreatmentQuestion",
     "TreatmentSample",
+    "export_analysis_scoring_label",
     "export_analysis_treatment_input",
+    "load_analysis_scoring_label",
     "load_analysis_treatment_input",
     "verify_analysis_treatment_input",
     "verify_evaluator_firebreak",

@@ -62,6 +62,7 @@ from memory_condense.eval._diffuse_replay_contracts import (
     ReplayObligationResult,
     ReplayScopeWitness,
 )
+from memory_condense.eval._diffuse_replay_packets import VerifiedDiffuseReplayPacket
 from memory_condense.eval.diffuse_longmemeval_analysis import (
     DiffuseLongMemEvalArm,
     LegacyDiffuseCandidates,
@@ -72,6 +73,7 @@ from memory_condense.eval.diffuse_longmemeval_analysis import (
 )
 from memory_condense.eval.diffuse_compilation import DiffuseCompilationPolicy
 from memory_condense.eval.diffuse_longmemeval import (
+    LongMemEvalDiffuseQueryReceipt,
     longmemeval_anchor_sequence_sha256,
     qa_packet_framing,
 )
@@ -117,13 +119,7 @@ from memory_condense.search.packing.evidence_packet import (
 
 
 _MODES = ("fixed_interval", "lexical_embedding", "qwen_head")
-_ARM_FILES = (
-    DERIVED_FINALIZATION_NAME,
-    DERIVED_LEASE_NAME,
-    DERIVED_ORIGIN_NAME,
-    INDEX_NAME,
-    DATABASE_NAME,
-)
+_ARM_FILES = (DERIVED_FINALIZATION_NAME, DERIVED_LEASE_NAME, DERIVED_ORIGIN_NAME, INDEX_NAME, DATABASE_NAME)
 
 
 def _canonical_identity(
@@ -683,13 +679,6 @@ def _verify_compilation_store_coordinates(database: Database, arm) -> None:
             raise RuntimeError("compilation episodes changed their source scope")
 
 
-def _write_manifest(path: Path, receipt: DiffuseLongMemEvalReplayReceipt) -> None:
-    write_new_bytes(
-        path,
-        canonical_json_bytes(receipt.model_dump(mode="json")),
-    )
-
-
 def _verify_reconstructed_query(
     *,
     record: DiffuseReplayQueryRecord,
@@ -702,7 +691,7 @@ def _verify_reconstructed_query(
     question,
     frozen,
     store: DiscourseStore,
-) -> None:
+) -> VerifiedDiffuseReplayPacket:
     """Re-run deterministic closure and packing from text-free coordinates."""
 
     if (
@@ -854,6 +843,17 @@ def _verify_reconstructed_query(
         != record.query_receipt.prompt_token_proxy
     ):
         raise RuntimeError("reconstructed QA prompt differs from the replay record")
+    receipt = LongMemEvalDiffuseQueryReceipt(**record.query_receipt.model_dump(mode="python"))
+    return VerifiedDiffuseReplayPacket(
+        boundary_mode=owned_arm.arm_id,
+        question_ordinal=record.question_ordinal,
+        question_id_sha256=record.question_id_sha256,
+        question_probe_sha256=record.question_probe_sha256,
+        packet=packet,
+        receipt=receipt,
+        _authoritative_span_texts=tuple(
+            (atom.span, store.hydrate_span(atom.span)) for atom in packet.atoms),
+    )
 
 
 def _rehydrate_arm(record: DiffuseReplayArmRecord) -> DiffuseLongMemEvalArm:
@@ -1100,7 +1100,10 @@ def run_diffuse_longmemeval_shared_base_replay(
             **values,
             receipt_sha256=identity_sha256(unsigned),
         )
-        _write_manifest(staging / REPLAY_MANIFEST_NAME, receipt)
+        write_new_bytes(
+            staging / REPLAY_MANIFEST_NAME,
+            canonical_json_bytes(receipt.model_dump(mode="json")),
+        )
         publish_complete_directory(
             staging,
             target,
@@ -1119,18 +1122,14 @@ def run_diffuse_longmemeval_shared_base_replay(
     )
 
 
-def verify_diffuse_longmemeval_replay_package(
+def _verify_diffuse_longmemeval_replay_package(
     path: str | Path,
     *,
     base: VerifiedDiffuseLongMemEvalBase,
     expected_runtime_binding_sha256: str,
+    _packet_sink: list[VerifiedDiffuseReplayPacket] | None = None,
 ) -> DiffuseLongMemEvalReplayReceipt:
-    """Verify deterministic replay against an external base, sample, and runtime.
-
-    Model-generated compilation receipts remain runtime attestations; this
-    verifier binds their outputs to the final DB but does not rerun Qwen.
-    """
-
+    """Verify and optionally retain packets without rerunning Qwen."""
     root = Path(path)
     require_regular_directory(root, "replay package")
     require_exact_children(root, {*_MODES, REPLAY_MANIFEST_NAME}, "replay package")
@@ -1249,7 +1248,7 @@ def verify_diffuse_longmemeval_replay_package(
                 base.frozen_query_inputs,
                 strict=True,
             ):
-                _verify_reconstructed_query(
+                verified_packet = _verify_reconstructed_query(
                     record=record,
                     owned_arm=owned_arm,
                     prompt_cap=base._config.max_prompt_tokens,
@@ -1261,6 +1260,8 @@ def verify_diffuse_longmemeval_replay_package(
                     frozen=frozen,
                     store=store,
                 )
+                if _packet_sink is not None:
+                    _packet_sink.append(verified_packet)
     require_exact_children(root, {*_MODES, REPLAY_MANIFEST_NAME}, "replay package")
     for mode in _MODES:
         require_exact_children(root / mode, set(_ARM_FILES), "replay arm")
@@ -1273,6 +1274,20 @@ def verify_diffuse_longmemeval_replay_package(
     if before != after or manifest_initial != manifest_final:
         raise RuntimeError("replay verification mutated package files")
     return receipt
+
+
+def verify_diffuse_longmemeval_replay_package(
+    path: str | Path,
+    *,
+    base: VerifiedDiffuseLongMemEvalBase,
+    expected_runtime_binding_sha256: str,
+) -> DiffuseLongMemEvalReplayReceipt:
+    """Verify deterministic replay against its external base and runtime."""
+    return _verify_diffuse_longmemeval_replay_package(
+        path,
+        base=base,
+        expected_runtime_binding_sha256=expected_runtime_binding_sha256,
+    )
 
 
 __all__ = [

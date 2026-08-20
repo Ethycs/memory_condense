@@ -11,16 +11,22 @@ import memory_condense.search.episodes.qwen_episode_signal as signal_module
 import tests.test_diffuse_longmemeval_analysis as analysis_fixture
 import tests.test_diffuse_longmemeval_base as base_fixture
 from tests.test_qwen_episode_signals import _FakePrefixLinker
-from memory_condense.domain.discourse import identity_sha256
+from memory_condense.domain.discourse import identity_sha256, quote_sha256
 from memory_condense.eval._diffuse_base_contracts import canonical_json_bytes
 from memory_condense.eval._diffuse_replay_contracts import CanonicalIdentityBody
 from memory_condense.eval.diffuse_longmemeval_replay import (
     run_diffuse_longmemeval_shared_base_replay,
     verify_diffuse_longmemeval_replay_package,
 )
+from memory_condense.eval.diffuse_longmemeval_replay_scoring import (
+    publish_diffuse_longmemeval_posthoc_score,
+    score_diffuse_longmemeval_replay_package,
+    verify_and_reconstruct_diffuse_longmemeval_replay_package,
+)
 from memory_condense.eval.diffuse_longmemeval_runtime import (
     ResidencyPreflightObservation,
 )
+from memory_condense.eval.reproducibility import implementation_sha256
 from memory_condense.search.episodes import QwenAttentionHeadSurpriseScorer
 
 
@@ -272,11 +278,22 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
             replay_root=target,
         )
 
-        assert verify_diffuse_longmemeval_replay_package(
+        reconstructed = verify_and_reconstruct_diffuse_longmemeval_replay_package(
             target,
             base=base,
             expected_runtime_binding_sha256=binding.binding_sha256,
-        ) == receipt
+        )
+        assert reconstructed.receipt == receipt
+        assert tuple(packet.boundary_mode for packet in reconstructed.packets) == (
+            "fixed_interval",
+            "lexical_embedding",
+            "qwen_head",
+        )
+        assert all(
+            packet.hydrate_span(atom.span) == atom.text
+            for packet in reconstructed.packets
+            for atom in packet.packet.atoms
+        )
         assert receipt.launcher_binding_certified is False
         assert receipt.treatment_population_membership_certified is False
         assert receipt.retrieval_input_schema_contains_gold_fields is False
@@ -290,6 +307,86 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
         assert all(text not in manifest for _role, text in sample.turns)
         assert sample.questions[0].retrieval_query not in manifest
         assert sample.questions[0].prompt_question not in manifest
+
+        question = sample.questions[0]
+        gold_marker = "ultraviolet launch badge was amber"
+        source_marker = "source-0"
+        scoring_label = SimpleNamespace(
+            file_sha256=identity_sha256("scoring-label-file"),
+            label_record_sha256=identity_sha256("scoring-label-record"),
+            dataset_sha256=treatment.dataset_sha256,
+            split_manifest_sha256=treatment.split_manifest_sha256,
+            analysis_ordered_question_ids_sha256=(
+                treatment.ordered_question_ids_sha256
+            ),
+            analysis_sample_count=treatment.sample_count,
+            sample_ordinal=treatment.sample_ordinal,
+            sample_id_sha256=receipt.sample_id_sha256,
+            raw_record_sha256=identity_sha256("raw-record"),
+            raw_record_span_sha256=identity_sha256("raw-record-span"),
+            question_id=question.question_id,
+            question_id_sha256=identity_sha256(
+                {"question_id": question.question_id}
+            ),
+            question_text_sha256=quote_sha256(question.retrieval_query),
+            question_probe_sha256=question.probe_sha256,
+            gold_answer=gold_marker,
+            gold_answer_sha256=quote_sha256(gold_marker),
+            evidence_source_ids=(source_marker,),
+            evidence_source_ids_sha256=identity_sha256([source_marker]),
+        )
+        events = []
+        original_reconstruct = replay_module._verify_reconstructed_query
+
+        def observe_reconstruction(**kwargs):
+            packet = original_reconstruct(**kwargs)
+            events.append(("packet", packet.boundary_mode))
+            return packet
+
+        def load_label():
+            assert events == [
+                ("packet", "fixed_interval"),
+                ("packet", "lexical_embedding"),
+                ("packet", "qwen_head"),
+            ]
+            events.append(("label", None))
+            return scoring_label
+
+        with monkeypatch.context() as scoring_patch:
+            scoring_patch.setattr(
+                replay_module,
+                "_verify_reconstructed_query",
+                observe_reconstruction,
+            )
+            report = score_diffuse_longmemeval_replay_package(
+                target,
+                base=base,
+                expected_runtime_binding_sha256=binding.binding_sha256,
+                label_loader=load_label,
+            )
+        serialized_report = canonical_json_bytes(report.model_dump(mode="json"))
+        assert events[-1] == ("label", None)
+        assert len(report.rows) == 3
+        assert all(row.answer_present for row in report.rows)
+        assert all(row.source_span_hash_valid for row in report.rows)
+        assert gold_marker.encode() not in serialized_report
+        assert source_marker.encode() not in serialized_report
+        assert question.question_id.encode() not in serialized_report
+        assert report.claims.label_loader_runtime_certified is False
+        assert report.claims.scorer_runtime_certified is False
+        assert report.claims.independent_rerun_required is True
+        assert report.claims.answer_metric_scope == (
+            "squad_normalized_substring_containment_per_packet_atom"
+        )
+        assert report.claims.raw_gold_persisted_in_report is False
+        assert report.claims.raw_source_ids_persisted_in_report is False
+        assert report.claims.packet_text_persisted_in_report is False
+        assert report.scorer_implementation_sha256 == implementation_sha256()
+        score_path = tmp_path / "posthoc-score.json"
+        publish_diffuse_longmemeval_posthoc_score(score_path, report)
+        assert score_path.read_bytes() == serialized_report
+        with pytest.raises(FileExistsError):
+            publish_diffuse_longmemeval_posthoc_score(score_path, report)
 
         with pytest.raises(RuntimeError, match="another runtime binding"):
             verify_diffuse_longmemeval_replay_package(
@@ -338,12 +435,21 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
         )
         _publish_tampered_manifest(manifest_path, altered_receipt)
         try:
+            label_calls = 0
+
+            def forbidden_label_load():
+                nonlocal label_calls
+                label_calls += 1
+                return scoring_label
+
             with pytest.raises(RuntimeError, match="invalid replay manifest"):
-                verify_diffuse_longmemeval_replay_package(
+                score_diffuse_longmemeval_replay_package(
                     target,
                     base=base,
                     expected_runtime_binding_sha256=binding.binding_sha256,
+                    label_loader=forbidden_label_load,
                 )
+            assert label_calls == 0
         finally:
             manifest_path.write_bytes(original_manifest)
 

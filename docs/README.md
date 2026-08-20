@@ -1,7 +1,7 @@
 # memory_condense — documentation tree
 
 **Status**: Living Document
-**Date**: 2026-08-18 (reconciled against the frozen v3 validation retrieval audit)
+**Date**: 2026-08-20 (adds the design-frozen resident latent-fusion contract)
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
@@ -25,6 +25,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `02 - Implementation/00 - Setup…` | ✅ | 48-test baseline → **366**; hardcoded `dim=1024` bug marked fixed; schema-v2 migration gotcha added |
 | `02 - Implementation/01 - Running the Eval Harness.md` | ✅ | Rewritten for four CLI modes; benchmark data sources + cost warning; sweep is 54 configs, not 48 |
 | `02 - Implementation/03 - Qwen3 Prefix Attention Lab.md` | **experimental / integrated** | Seven-layer Qwen3-8B BF16 prefix, compact persistent CAV/QK/OV artifacts, bounded dual QK/heat reads, source-aware packing, safe admission, and physical pruning; public benchmarking remains open |
+| `02 - Implementation/04 - Episode-Primary Latent Evidence Fusion.md` | **design-frozen / unbuilt resident seam** | Specifies exact query-preserving Qwen atom rows, same-GPU K-latent matched fusion, operation-vs-tensor receipt semantics, extractive output, training isolation, and the route-bearing v2 boundary; no trained or measured fusion result exists |
 | `03 - Architecture/00 - System Overview.md` | ✅ | Diagram and every subsystem rewritten; "there is no condensation yet" was false |
 | `03 - Architecture/01 - Native Hypergraph Memory Plane.md` | **new / proposed** | Event-centric hypergraph for live QK/OV/CAV observations, with the measured pairwise graph retained as a bounded serving projection; no durable request-derived transformer token state (static model/tokenizer assets excluded) |
 | `03 - Architecture/02 - Query-Conditioned Bayesian Coverage Loop.md` | **implemented / prefix measurement pending** | Primary full-width Qwen3-8B layers 0–5 with layer-5 QK/OV transport-affinity grouping; secondary compact-INI classifier; recall-safe coverage ordering and zero durable transformer state |
@@ -60,7 +61,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 docs/
 ├── 00 - Theory/           Retrieval, proof-carrying coverage, associative memory, and episodic closure
 ├── 01 - Design/           The original architecture plan + eval design rationale
-├── 02 - Implementation/   Setup, the four eval modes, and MCP/Claude Code integration
+├── 02 - Implementation/   Setup, eval modes, Qwen labs, and frozen implementation contracts
 ├── 03 - Architecture/     The as-built system map, package layout, and proposed hypergraph memory plane
 ├── 04 - Reference/        External landscape (SimpleMem, Mem0, MemDelta…) + vocabulary
 ├── 05 - Standards/        Normative data contracts (SQLite v2, embedding, memory provenance, formats)
@@ -98,6 +99,7 @@ docs/
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
 - "How do I run the Qwen attention-prefix experiment?" → `02 - Implementation/03 - Qwen3 Prefix Attention Lab.md`.
+- "How will episode retrieval feed the K-latent attention fusion stage?" → `02 - Implementation/04 - Episode-Primary Latent Evidence Fusion.md` — a design-frozen, query-conditioned GPU feature-to-router contract with no trained or measured fusion claim yet.
 - "How do I actually *use* it day to day?" → `02 - Implementation/02 - MCP Integration.md` — the memory system is exposed to Claude Code as an MCP server.
 - "Is this competitive?" → **not established**. `10 - Research Log/18` records the exact 100-question provider-free v3 validation audit: mean evidence-source recall fell to 87.6%, all-source recovery to 82%, and answer accuracy remains unmeasured. The same-budget Mem0 arm is also still open.
 - "What is the large-model attention-head memory idea?" → `00 - Theory/01 - Extracted Attention Heads as Recursive Associative Memory.md` — a **DRAFT** whose first CAV/live-head prototype is implemented, including the full-teacher J-Space implication.

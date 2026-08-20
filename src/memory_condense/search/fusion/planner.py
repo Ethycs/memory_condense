@@ -1,0 +1,556 @@
+"""Build provenance-safe extractive plans over an already packed packet."""
+
+from __future__ import annotations
+
+import math
+import struct
+from collections import deque
+from itertools import combinations
+from typing import Any, Sequence
+
+from memory_condense.domain._discourse_identity import identity_sha256, quote_sha256
+from memory_condense.domain.discourse import ClosurePlan, EvidencePacket
+from memory_condense.search.fusion.feature_batch import NodeFeatureBatch
+from memory_condense.search.fusion.models import (
+    AuthoritativeHyperedge,
+    EvidenceFusionPlan,
+    ExtractiveGroup,
+    FusionAtomRef,
+    FusionCaps,
+    FusionMode,
+    LatentMembership,
+    RouterArchitectureReceipt,
+    RouterStateReceipt,
+)
+from memory_condense.search.fusion.tensor_identity import (
+    CanonicalTensor,
+    canonical_float32_tensor,
+    tensor_shape,
+)
+
+
+def _float32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+
+
+def _validate_packet_plan(packet: EvidencePacket, plan: ClosurePlan) -> None:
+    if not isinstance(packet, EvidencePacket):
+        raise TypeError("packet must be EvidencePacket")
+    if not isinstance(plan, ClosurePlan):
+        raise TypeError("plan must be ClosurePlan")
+    if packet.receipt.plan_sha256 != plan.plan_sha256:
+        raise ValueError("packet receipt does not bind the supplied closure plan")
+
+    plan_atoms = {item.atom_id: item for item in plan.atoms}
+    if len(plan_atoms) != len(plan.atoms):  # pragma: no cover - plan guards this
+        raise ValueError("closure plan atom IDs are not unique")
+    for atom in packet.atoms:
+        planned = plan_atoms.get(atom.atom_id)
+        if planned is None or identity_sha256(atom.identity_payload()) != identity_sha256(
+            planned.identity_payload()
+        ):
+            raise ValueError("packet atom does not exactly match the closure plan")
+
+    plan_bundles = {item.bundle_id: item for item in plan.bundles}
+    selected_atoms = {item.atom_id for item in packet.atoms}
+    for bundle in packet.bundles:
+        planned = plan_bundles.get(bundle.bundle_id)
+        if planned is None or identity_sha256(bundle.identity_payload()) != identity_sha256(
+            planned.identity_payload()
+        ):
+            raise ValueError("packet bundle does not exactly match the closure plan")
+        if any(atom_id not in selected_atoms for atom_id in bundle.atom_ids):
+            raise ValueError("packet bundle references an unselected atom")
+
+
+def _atom_refs(packet: EvidencePacket) -> tuple[FusionAtomRef, ...]:
+    return tuple(
+        FusionAtomRef(
+            atom_id=atom.atom_id,
+            atom_identity_sha256=identity_sha256(atom.identity_payload()),
+            span_identity_sha256=identity_sha256(atom.span.identity_payload()),
+            quote_sha256=atom.span.quote_sha256,
+        )
+        for atom in packet.atoms
+    )
+
+
+def _authoritative_hyperedges(
+    packet: EvidencePacket,
+) -> tuple[AuthoritativeHyperedge, ...]:
+    """Project only the selected bundle hypergraph; infer no relation direction."""
+
+    return tuple(
+        AuthoritativeHyperedge(
+            bundle_id=bundle.bundle_id,
+            atom_ids=bundle.atom_ids,
+            obligation_ids=bundle.obligation_ids,
+            unit_witness_ids=bundle.unit_ids,
+            relation_witness_ids=bundle.relation_ids,
+            required=bundle.required,
+            utility=bundle.utility,
+        )
+        for bundle in packet.bundles
+    )
+
+
+def _adjacency(
+    atom_ids: Sequence[str],
+    hyperedges: Sequence[AuthoritativeHyperedge],
+) -> dict[str, set[str]]:
+    adjacency = {atom_id: set() for atom_id in atom_ids}
+    for edge in hyperedges:
+        for left, right in combinations(edge.atom_ids, 2):
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+    return adjacency
+
+
+def _topology_atom_groups(
+    atom_ids: tuple[str, ...],
+    hyperedges: tuple[AuthoritativeHyperedge, ...],
+    caps: FusionCaps,
+) -> tuple[tuple[ExtractiveGroup, ...], tuple[str, ...], dict[str, int]]:
+    adjacency = _adjacency(atom_ids, hyperedges)
+    source_index = {atom_id: index for index, atom_id in enumerate(atom_ids)}
+    degree = {atom_id: len(neighbors) for atom_id, neighbors in adjacency.items()}
+    unseen = set(atom_ids)
+    ordered_components: list[tuple[str, ...]] = []
+    while unseen:
+        component_start = min(unseen, key=source_index.__getitem__)
+        component: set[str] = set()
+        pending = [component_start]
+        while pending:
+            current = pending.pop()
+            if current in component:
+                continue
+            component.add(current)
+            pending.extend(adjacency[current] - component)
+        unseen -= component
+        medoid = min(
+            component,
+            key=lambda atom_id: (-degree[atom_id], source_index[atom_id]),
+        )
+        traversal: list[str] = []
+        visited = {medoid}
+        frontier: deque[str] = deque((medoid,))
+        while frontier:
+            current = frontier.popleft()
+            traversal.append(current)
+            neighbors = sorted(
+                adjacency[current] - visited,
+                key=lambda atom_id: (-degree[atom_id], source_index[atom_id]),
+            )
+            visited.update(neighbors)
+            frontier.extend(neighbors)
+        # Defensive fallback for a malformed traversal; components are derived
+        # from the same adjacency, so this should normally be empty.
+        traversal.extend(
+            sorted(component - visited, key=source_index.__getitem__)
+        )
+        ordered_components.append(tuple(traversal))
+
+    ordered_components.sort(
+        key=lambda component: min(source_index[item] for item in component)
+    )
+    chunks = [
+        component[start : start + caps.max_group_atoms]
+        for component in ordered_components
+        for start in range(0, len(component), caps.max_group_atoms)
+    ]
+    groups = tuple(
+        ExtractiveGroup(group_index=index, atom_ids=chunk)
+        for index, chunk in enumerate(chunks)
+    )
+    atom_order = tuple(atom_id for chunk in chunks for atom_id in chunk)
+    return groups, atom_order, degree
+
+
+def _preflight_topology(
+    hyperedges: Sequence[AuthoritativeHyperedge],
+    groups: Sequence[ExtractiveGroup],
+    caps: FusionCaps,
+) -> None:
+    if len(hyperedges) > caps.max_hyperedges:
+        raise MemoryError("selected bundle hyperedges exceed max_hyperedges")
+    topology_links = sum(
+        len(edge.atom_ids) * (len(edge.atom_ids) - 1) // 2
+        for edge in hyperedges
+    )
+    if topology_links > caps.max_topology_links:
+        raise MemoryError("selected bundle co-memberships exceed max_topology_links")
+    if len(groups) > caps.max_groups:
+        raise MemoryError("extractive topology groups exceed max_groups")
+
+
+def _preflight_features(
+    node_features: Any,
+    *,
+    atom_count: int,
+    caps: FusionCaps,
+) -> tuple[int, int]:
+    shape = tensor_shape(node_features, label="node_features")
+    if len(shape) != 2:
+        raise ValueError("node_features must have shape [N, D]")
+    nodes, width = shape
+    if nodes != atom_count:
+        raise ValueError("node_features must preserve the exact packet atom set")
+    if nodes < 1 or width < 1:
+        raise ValueError("node_features must have positive N and D")
+    if nodes > caps.max_atoms:
+        raise MemoryError("node feature count exceeds fusion max_atoms")
+    if width > caps.max_hidden_dim:
+        raise MemoryError("node feature width exceeds fusion max_hidden_dim")
+    return nodes, width
+
+
+def _matrix_rows(tensor: CanonicalTensor) -> tuple[tuple[float, ...], ...]:
+    if len(tensor.shape) != 2:
+        raise ValueError("route attention must be a two-dimensional matrix")
+    rows, columns = tensor.shape
+    return tuple(
+        tensor.flat_values[start : start + columns]
+        for start in range(0, rows * columns, columns)
+    )
+
+
+def _validate_attention_rows(
+    rows: Sequence[Sequence[float]],
+    *,
+    label: str,
+) -> None:
+    for row in rows:
+        if any(value < 0.0 or value > 1.0 for value in row):
+            raise ValueError(f"{label} weights must lie in [0, 1]")
+        if not math.isclose(sum(row), 1.0, rel_tol=1e-3, abs_tol=1e-4):
+            raise ValueError(f"{label} rows must be softmax-normalized")
+
+
+def _latent_memberships_and_groups(
+    atom_ids: tuple[str, ...],
+    extraction: CanonicalTensor,
+    reinjection: CanonicalTensor,
+    degree: dict[str, int],
+    caps: FusionCaps,
+) -> tuple[tuple[LatentMembership, ...], tuple[ExtractiveGroup, ...], tuple[str, ...]]:
+    latent_count, atom_count = extraction.shape
+    extraction_rows = _matrix_rows(extraction)
+    reinjection_rows = _matrix_rows(reinjection)
+    _validate_attention_rows(extraction_rows, label="extraction attention")
+    _validate_attention_rows(reinjection_rows, label="reinjection attention")
+    keep = min(caps.max_latent_memberships_per_atom, latent_count)
+    source_index = {atom_id: index for index, atom_id in enumerate(atom_ids)}
+    memberships: list[LatentMembership] = []
+    primary_by_atom: dict[str, LatentMembership] = {}
+    for atom_index, atom_id in enumerate(atom_ids):
+        routes = []
+        for latent_index in range(latent_count):
+            extract_weight = extraction_rows[latent_index][atom_index]
+            reinject_weight = reinjection_rows[atom_index][latent_index]
+            joint = _float32(math.sqrt(extract_weight * reinject_weight))
+            routes.append((joint, latent_index, extract_weight, reinject_weight))
+        routes.sort(key=lambda item: (-item[0], item[1]))
+        retained = tuple(
+            LatentMembership(
+                atom_id=atom_id,
+                latent_index=latent_index,
+                extraction_weight=extract_weight,
+                reinjection_weight=reinject_weight,
+                joint_weight=joint,
+            )
+            for joint, latent_index, extract_weight, reinject_weight in routes[:keep]
+        )
+        memberships.extend(retained)
+        primary_by_atom[atom_id] = retained[0]
+
+    atoms_by_latent: dict[int, list[str]] = {}
+    for atom_id, membership in primary_by_atom.items():
+        atoms_by_latent.setdefault(membership.latent_index, []).append(atom_id)
+    latent_order = sorted(
+        atoms_by_latent,
+        key=lambda latent_index: (
+            -sum(primary_by_atom[item].joint_weight for item in atoms_by_latent[latent_index]),
+            latent_index,
+        ),
+    )
+    grouped_rows: list[tuple[int, tuple[str, ...]]] = []
+    for latent_index in latent_order:
+        ordered = tuple(
+            sorted(
+                atoms_by_latent[latent_index],
+                key=lambda atom_id: (
+                    -primary_by_atom[atom_id].joint_weight,
+                    -degree[atom_id],
+                    source_index[atom_id],
+                ),
+            )
+        )
+        grouped_rows.extend(
+            (latent_index, ordered[start : start + caps.max_group_atoms])
+            for start in range(0, len(ordered), caps.max_group_atoms)
+        )
+    groups = tuple(
+        ExtractiveGroup(
+            group_index=index,
+            atom_ids=group_atoms,
+            latent_index=latent_index,
+        )
+        for index, (latent_index, group_atoms) in enumerate(grouped_rows)
+    )
+    atom_order = tuple(atom_id for group in groups for atom_id in group.atom_ids)
+    return tuple(memberships), groups, atom_order
+
+
+def _matched_input_sha256(
+    *,
+    packet: EvidencePacket,
+    plan: ClosurePlan,
+    caps: FusionCaps,
+    atoms: tuple[FusionAtomRef, ...],
+    hyperedges: tuple[AuthoritativeHyperedge, ...],
+    node_feature_receipt_sha256: str,
+    node_features: CanonicalTensor,
+) -> str:
+    return identity_sha256(
+        {
+            "packet_receipt_sha256": packet.receipt.receipt_sha256,
+            "closure_plan_sha256": plan.plan_sha256,
+            "query_program_sha256": plan.query_program.program_sha256,
+            "query_sha256": quote_sha256(plan.query_program.query),
+            "closure_policy_sha256": plan.policy.policy_sha256,
+            "snapshot_sha256": plan.snapshot.snapshot_sha256,
+            "caps": caps.identity_payload(),
+            "atoms": [item.identity_payload() for item in atoms],
+            "hyperedges": [item.identity_payload() for item in hyperedges],
+            "node_feature_receipt_sha256": node_feature_receipt_sha256,
+            "node_features_sha256": node_features.tensor_sha256,
+        }
+    )
+
+
+def build_evidence_fusion_plan(
+    packet: EvidencePacket,
+    plan: ClosurePlan,
+    *,
+    node_features: NodeFeatureBatch,
+    mode: FusionMode = "topology_only",
+    caps: FusionCaps | None = None,
+    router: Any | None = None,
+) -> EvidenceFusionPlan:
+    """Plan an extractive atom order without changing or generating evidence.
+
+    ``node_features`` must follow the packet's exact atom order.  Both modes
+    bind the same feature tensor so a matched control differs only by whether
+    the exact two-pass latent router is invoked.
+    """
+
+    if not isinstance(packet, EvidencePacket):
+        raise TypeError("packet must be EvidencePacket")
+    if not isinstance(plan, ClosurePlan):
+        raise TypeError("plan must be ClosurePlan")
+    if mode not in {"topology_only", "latent_router"}:
+        raise ValueError("mode must be topology_only or latent_router")
+    active_caps = FusionCaps() if caps is None else caps
+    if type(active_caps) is not FusionCaps:
+        raise TypeError("caps must be FusionCaps")
+    if len(packet.atoms) > active_caps.max_atoms:
+        raise MemoryError("packet atom count exceeds fusion max_atoms")
+    if len(packet.bundles) > active_caps.max_hyperedges:
+        raise MemoryError("packet bundle count exceeds fusion max_hyperedges")
+    raw_topology_links = sum(
+        len(bundle.atom_ids) * (len(bundle.atom_ids) - 1) // 2
+        for bundle in packet.bundles
+    )
+    if raw_topology_links > active_caps.max_topology_links:
+        raise MemoryError("packet bundle co-memberships exceed max_topology_links")
+    _validate_packet_plan(packet, plan)
+    if type(node_features) is not NodeFeatureBatch:
+        raise TypeError("node_features must be an owned NodeFeatureBatch")
+    feature_receipt = node_features.receipt
+    expected_atom_ids = tuple(item.atom_id for item in packet.atoms)
+    if feature_receipt.ordered_atom_ids != expected_atom_ids:
+        raise ValueError("node feature receipt atom order does not match packet")
+    if feature_receipt.query_sha256 != quote_sha256(plan.query_program.query):
+        raise ValueError("node feature receipt query does not match closure query")
+    atom_count, hidden_dim = _preflight_features(
+        node_features.values,
+        atom_count=len(packet.atoms),
+        caps=active_caps,
+    )
+    if feature_receipt.tensor_shape != (atom_count, hidden_dim):
+        raise ValueError("node feature values do not match their sealed receipt")
+    snapshot = node_features.detached_snapshot()
+    features = canonical_float32_tensor(
+        snapshot,
+        label="node_features",
+        retain_values=False,
+    )
+    if (
+        feature_receipt.tensor_sha256 != features.tensor_sha256
+        or feature_receipt.tensor_shape != features.shape
+        or feature_receipt.tensor_dtype != features.dtype
+    ):
+        raise ValueError("node feature values do not match their sealed receipt")
+    atoms = _atom_refs(packet)
+    atom_ids = tuple(item.atom_id for item in atoms)
+    hyperedges = _authoritative_hyperedges(packet)
+    topology_groups, topology_order, degree = _topology_atom_groups(
+        atom_ids,
+        hyperedges,
+        active_caps,
+    )
+    _preflight_topology(hyperedges, topology_groups, active_caps)
+    matched_input = _matched_input_sha256(
+        packet=packet,
+        plan=plan,
+        caps=active_caps,
+        atoms=atoms,
+        hyperedges=hyperedges,
+        node_feature_receipt_sha256=feature_receipt.feature_receipt_sha256,
+        node_features=features,
+    )
+    common = {
+        "packet_receipt_sha256": packet.receipt.receipt_sha256,
+        "closure_plan_sha256": plan.plan_sha256,
+        "query_program_sha256": plan.query_program.program_sha256,
+        "query_sha256": quote_sha256(plan.query_program.query),
+        "closure_policy_sha256": plan.policy.policy_sha256,
+        "snapshot_sha256": plan.snapshot.snapshot_sha256,
+        "matched_input_sha256": matched_input,
+        "caps": active_caps,
+        "atoms": atoms,
+        "hyperedges": hyperedges,
+        "node_features": feature_receipt,
+        "plan_retained_request_tensor_bytes": 0,
+    }
+    if mode == "topology_only":
+        return EvidenceFusionPlan(
+            mode=mode,
+            memberships=(),
+            groups=topology_groups,
+            atom_order=topology_order,
+            **common,
+        )
+
+    if router is None:
+        raise ValueError("latent_router mode requires an exact latent router")
+    from memory_condense.search.fusion.latent_router import LatentEvidenceRouter
+
+    if type(router) is not LatentEvidenceRouter:
+        raise TypeError("latent_router mode requires the owned LatentEvidenceRouter")
+    architecture = getattr(router, "architecture_receipt", None)
+    if type(architecture) is not RouterArchitectureReceipt:
+        raise TypeError("router must expose RouterArchitectureReceipt")
+    if architecture.hidden_dim != hidden_dim:
+        raise ValueError("router hidden_dim does not match node features")
+    if architecture.num_latents > active_caps.max_latents:
+        raise MemoryError("router latent count exceeds fusion max_latents")
+    if architecture.num_latents * atom_count > active_caps.max_route_cells:
+        raise MemoryError("K*N exceeds fusion max_route_cells")
+    if int(getattr(router, "max_atoms", 0)) < atom_count:
+        raise MemoryError("router max_atoms is below the packet atom count")
+    if int(getattr(router, "max_hidden_dim", 0)) < hidden_dim:
+        raise MemoryError("router max_hidden_dim is below the feature width")
+    if int(getattr(router, "max_route_cells", 0)) < architecture.num_latents * atom_count:
+        raise MemoryError("router max_route_cells is below K*N")
+    state_before = getattr(router, "state_receipt", None)
+    if type(state_before) is not RouterStateReceipt:
+        raise TypeError("router must expose RouterStateReceipt")
+    if state_before.parameter_count != architecture.parameter_count:
+        raise ValueError("router state parameter count disagrees with architecture")
+    route_one = getattr(router, "route_one", None)
+    if not callable(route_one):
+        raise TypeError("router must expose route_one(node_features)")
+    routed = route_one(snapshot)
+    from memory_condense.search.fusion.latent_router import LatentRouterForward
+
+    if type(routed) is not LatentRouterForward:
+        raise TypeError("owned router returned an unsupported result")
+    features_after = canonical_float32_tensor(
+        snapshot,
+        label="node_features",
+        retain_values=False,
+    )
+    if features_after.tensor_sha256 != features.tensor_sha256:
+        raise RuntimeError("router mutated the node feature snapshot")
+
+    steered = canonical_float32_tensor(
+        getattr(routed, "steered_nodes", None),
+        label="steered_nodes",
+        retain_values=False,
+    )
+    extraction = canonical_float32_tensor(
+        getattr(routed, "extraction_attention", None),
+        label="extraction_attention",
+    )
+    reinjection = canonical_float32_tensor(
+        getattr(routed, "reinjection_attention", None),
+        label="reinjection_attention",
+    )
+    expected_extraction = (architecture.num_latents, atom_count)
+    if steered.shape != features.shape:
+        raise ValueError("steered node shape must remain [N, D]")
+    if extraction.shape != expected_extraction:
+        raise ValueError("extraction attention must have shape [K, N]")
+    if reinjection.shape != (atom_count, architecture.num_latents):
+        raise ValueError("reinjection attention must have shape [N, K]")
+    memberships, groups, atom_order = _latent_memberships_and_groups(
+        atom_ids,
+        extraction,
+        reinjection,
+        degree,
+        active_caps,
+    )
+    result = EvidenceFusionPlan(
+        mode=mode,
+        memberships=memberships,
+        groups=groups,
+        atom_order=atom_order,
+        router_architecture=architecture,
+        router_state=state_before,
+        steered_features_sha256=steered.tensor_sha256,
+        extraction_matrix_sha256=extraction.tensor_sha256,
+        reinjection_matrix_sha256=reinjection.tensor_sha256,
+        extraction_shape=extraction.shape,
+        reinjection_shape=reinjection.shape,
+        **common,
+    )
+    # No tensor or full matrix is reachable from the sealed result.
+    del routed, steered, extraction, reinjection, features_after, snapshot
+    return result
+
+
+def validate_matched_fusion_pair(
+    topology_only: EvidenceFusionPlan,
+    latent_router: EvidenceFusionPlan,
+) -> str:
+    """Fail unless two plans form a single-factor matched ablation pair."""
+
+    if type(topology_only) is not EvidenceFusionPlan or type(
+        latent_router
+    ) is not EvidenceFusionPlan:
+        raise TypeError("matched fusion values must be EvidenceFusionPlan")
+    if topology_only.mode != "topology_only" or latent_router.mode != "latent_router":
+        raise ValueError("matched pair must be topology_only then latent_router")
+    shared = (
+        "packet_receipt_sha256",
+        "closure_plan_sha256",
+        "query_program_sha256",
+        "query_sha256",
+        "closure_policy_sha256",
+        "snapshot_sha256",
+        "matched_input_sha256",
+        "caps",
+        "atoms",
+        "hyperedges",
+        "node_features",
+    )
+    if any(
+        getattr(topology_only, name) != getattr(latent_router, name)
+        for name in shared
+    ):
+        raise ValueError("fusion plans are not a matched single-factor pair")
+    return topology_only.matched_input_sha256
+
+
+__all__ = ["build_evidence_fusion_plan", "validate_matched_fusion_pair"]

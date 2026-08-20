@@ -60,7 +60,7 @@ def test_source_modules_are_grouped_by_responsibility():
         path.name
         for path in (SRC / "search").iterdir()
         if path.is_dir() and path.name != "__pycache__"
-    } == {"closure", "episodes", "indexes", "packing", "selectors"}
+    } == {"closure", "episodes", "fusion", "indexes", "packing", "selectors"}
 
 
 _WORKFLOW_FACADES = {

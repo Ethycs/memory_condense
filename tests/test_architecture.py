@@ -8,6 +8,7 @@ These tests run on every commit.
 from __future__ import annotations
 
 import ast
+import math
 from pathlib import Path
 
 import pytest
@@ -235,6 +236,74 @@ def test_root_facade_is_lazy_and_resolves_canonical_objects():
 
     with pytest.raises(AttributeError, match="has no attribute"):
         getattr(memory_condense, "not_a_public_symbol")
+
+
+def test_consolidated_public_objects_preserve_legacy_construction():
+    """Object consolidation must not silently break the root facade."""
+
+    from memory_condense import (
+        CandidateAssignment,
+        ConsolidationUpdate,
+        HebbianUpdate,
+    )
+    from memory_condense.domain.discourse import (
+        ClosureScopeWitness,
+        EvidenceObligation,
+        QueryProgram,
+    )
+
+    hebbian = HebbianUpdate(
+        "h",
+        True,
+        concepts_observed=2,
+        edges_reinforced=1,
+        edges_pruned=0,
+    )
+    consolidation = ConsolidationUpdate(
+        "c", True, nodes_observed=3, edges_reinforced=2, edges_pruned=1
+    )
+    assert hebbian.members_observed == hebbian.concepts_observed == 2
+    assert consolidation.members_observed == consolidation.nodes_observed == 3
+
+    assignment = CandidateAssignment(
+        7,
+        "event",
+        "value",
+        None,
+        0.5,
+        0.25,
+        0.25,
+        0.75,
+        -(0.5 * math.log(0.5) + 2 * 0.25 * math.log(0.25)),
+    )
+    assert assignment.candidate_id == 7
+
+    program = QueryProgram(
+        query="status",
+        intent="status",
+        subject_terms=("status",),
+        obligations=(
+            EvidenceObligation(
+                obligation_id="answer",
+                kind="answer_fact",
+                required=True,
+                weight=1.0,
+            ),
+        ),
+    )
+    witness = ClosureScopeWitness(
+        kind="test",
+        subject_id="scope",
+        requested_limit=1,
+        returned_count=1,
+        exhaustive=True,
+    )
+    assert program.identity_payload(include_sha=False) == program.identity_payload(
+        include_receipt=False
+    )
+    assert witness.identity_payload(include_sha=False) == witness.identity_payload(
+        include_receipt=False
+    )
 
 
 @pytest.mark.parametrize(

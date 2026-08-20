@@ -177,7 +177,7 @@ class StoredHeadEdge:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class CoaccessUpdate:
     """Result of one idempotent bounded co-access observation.
 
@@ -190,6 +190,52 @@ class CoaccessUpdate:
     members_observed: int
     edges_reinforced: int
     edges_pruned: int
+
+    def __init__(
+        self,
+        event_id: str,
+        created: bool,
+        members_observed: int | None = None,
+        edges_reinforced: int | None = None,
+        edges_pruned: int | None = None,
+        *,
+        concepts_observed: int | None = None,
+        nodes_observed: int | None = None,
+    ) -> None:
+        """Accept the canonical count and both pre-consolidation spellings.
+
+        ``HebbianUpdate`` and ``ConsolidationUpdate`` remain public aliases of
+        this one value object.  Keeping the legacy keyword spellings here
+        preserves their constructors without restoring duplicate dataclasses.
+        """
+
+        aliases = tuple(
+            value
+            for value in (concepts_observed, nodes_observed)
+            if value is not None
+        )
+        if members_observed is None:
+            if len(aliases) != 1:
+                raise TypeError(
+                    "exactly one observed-member count is required"
+                )
+            members_observed = aliases[0]
+        elif any(value != members_observed for value in aliases):
+            raise ValueError("observed-member count aliases disagree")
+        if edges_reinforced is None or edges_pruned is None:
+            raise TypeError("edge reinforcement and pruning counts are required")
+
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "created", created)
+        object.__setattr__(self, "members_observed", members_observed)
+        object.__setattr__(self, "edges_reinforced", edges_reinforced)
+        object.__setattr__(self, "edges_pruned", edges_pruned)
+
+    @property
+    def concepts_observed(self) -> int:
+        """Hebbian spelling: observed members are conceptual chunks."""
+
+        return self.members_observed
 
     @property
     def nodes_observed(self) -> int:

@@ -42,6 +42,47 @@ class CandidateAssignment(BaseModel):
     p_null: float = Field(default=0.0, ge=0.0, le=1.0)
     answerability: float = Field(default=0.5, ge=0.0, le=1.0)
 
+    def __init__(self, *args: Any, **data: Any) -> None:
+        """Accept the former nine-field positional public constructor.
+
+        The canonical model derives entropy from the normalized posterior, but
+        the old frozen dataclass exposed it as its ninth constructor field.
+        Accepting and checking that value preserves callers without persisting
+        a second, drift-prone copy.
+        """
+
+        legacy_fields = (
+            "candidate_id",
+            "event_key",
+            "answer_value",
+            "timestamp",
+            "p_existing",
+            "p_new",
+            "p_null",
+            "answerability",
+            "entropy",
+        )
+        if args:
+            if len(args) != len(legacy_fields):
+                raise TypeError(
+                    "CandidateAssignment positional construction requires "
+                    "exactly nine values"
+                )
+            duplicates = set(legacy_fields) & set(data)
+            if duplicates:
+                duplicate = sorted(duplicates)[0]
+                raise TypeError(f"multiple values for {duplicate!r}")
+            data.update(zip(legacy_fields, args, strict=True))
+        supplied_entropy = data.pop("entropy", None)
+        super().__init__(**data)
+        if supplied_entropy is not None and not math.isclose(
+            float(supplied_entropy),
+            self.entropy,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("supplied entropy does not match the posterior")
+
     def model_post_init(self, __context: Any) -> None:
         values = [float(self.p_existing), float(self.p_new), float(self.p_null)]
         total = sum(values)

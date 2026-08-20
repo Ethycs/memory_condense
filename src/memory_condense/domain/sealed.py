@@ -61,7 +61,18 @@ class SealedIdentity:
     _SEAL_MISMATCH: ClassVar[str] = "receipt does not match its identity payload"
     _PAYLOAD_EXCLUDE: ClassVar[frozenset[str]] = frozenset()
 
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
+    def identity_payload(
+        self,
+        *,
+        include_receipt: bool = True,
+        include_sha: bool | None = None,
+    ) -> dict[str, Any]:
+        """Return the canonical body, accepting the pre-mixin flag spelling."""
+
+        if include_sha is not None:
+            if include_receipt is not True and include_receipt != include_sha:
+                raise TypeError("include_receipt and include_sha disagree")
+            include_receipt = include_sha
         payload = reflect_payload(self, self._PAYLOAD_EXCLUDE | {self._SEAL_FIELD})
         if include_receipt:
             payload[self._SEAL_FIELD] = getattr(self, self._SEAL_FIELD)

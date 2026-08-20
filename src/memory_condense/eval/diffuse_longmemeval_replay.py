@@ -12,6 +12,10 @@ from pathlib import Path
 
 import memory_condense.eval._diffuse_replay_provider_history as provider_history
 from memory_condense.domain.discourse import identity_sha256
+from memory_condense.eval._diffuse_replay_provider_identity import (
+    _OPERATIONAL_PROVIDER_IDENTITY_V2_MARKER,
+    classify_provider_identity_body,
+)
 from memory_condense.eval._diffuse_base_contracts import (
     DiffuseDerivedFinalization,
     DiffuseDerivedStore,
@@ -75,6 +79,10 @@ from memory_condense.eval.reproducibility import file_sha256
 @dataclass(frozen=True, slots=True)
 class VerifiedBaseLegacyDiffuseInputProvider:
     """Route verified frozen pointers without a false residency assertion."""
+
+    __memory_condense_operational_identity_v2__ = (
+        _OPERATIONAL_PROVIDER_IDENTITY_V2_MARKER
+    )
 
     _verified: VerifiedDiffuseLongMemEvalBase = field(repr=False)
     _delegate: FrozenLegacyDiffuseInputProvider = field(repr=False)
@@ -194,6 +202,51 @@ class VerifiedBaseLegacyDiffuseInputProvider:
         ):
             raise RuntimeError("verified-base provider artifacts changed")
         return self._delegate(condenser, **kwargs)
+
+
+def _owned_provider_identity_payload(
+    provider: VerifiedBaseLegacyDiffuseInputProvider,
+) -> dict[str, object]:
+    """Build v2 only for the exact replay-owned provider facade."""
+
+    if type(provider) is not VerifiedBaseLegacyDiffuseInputProvider:
+        raise TypeError("provider identity requires the exact owned facade")
+    payload = analysis_callable_identity_payload(
+        provider,
+        "verified_base_provider",
+    )
+    try:
+        generation = classify_provider_identity_body(payload)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "verified-base provider implementation identity changed"
+        ) from exc
+    if generation != "operational-v2":
+        raise RuntimeError("verified-base provider did not emit v2 identity")
+    return payload
+
+
+def _historical_provider_comparison_payload(
+    current_v2: dict[str, object],
+) -> dict[str, object]:
+    """Project current controls for the authenticated historical-v1 proof."""
+
+    if classify_provider_identity_body(current_v2) != "operational-v2":
+        raise RuntimeError("current provider identity is not exact v2")
+    return {
+        "implementation_type": (
+            f"{current_v2['implementation_type_module']}."
+            f"{current_v2['implementation_type_qualname']}"
+        ),
+        "implementation": (
+            f"{current_v2['implementation_module']}."
+            f"{current_v2['implementation_qualname']}"
+        ),
+        # Historical compatibility deliberately ignores current code bytes:
+        # reconstruction does not invoke the old execution-time provider.
+        "python_code_sha256": None,
+        "declared_identity": current_v2["declared_identity"],
+    }
 
 
 def certify_replay_launcher(path: str | Path) -> ReplayExecutionIdentity:
@@ -355,9 +408,7 @@ def run_diffuse_longmemeval_shared_base_replay(
         max_sources=binding.runtime.source_router_max_sources,
         rrf_constant=binding.runtime.source_router_rrf_constant,
     )
-    provider_payload = analysis_callable_identity_payload(
-        provider, "verified_base_provider"
-    )
+    provider_payload = _owned_provider_identity_payload(provider)
     provider_identity = canonical_identity(
         provider_payload,
         identity_sha256(provider_payload),
@@ -549,6 +600,7 @@ def _resolve_provider_parameters(
     provider_body = json.loads(
         receipt.verified_base_provider_identity.canonical_identity_json
     )
+    provider_generation = classify_provider_identity_body(provider_body)
     provider_declaration = provider_body["declared_identity"]
     max_sources = int(provider_declaration["max_sources"])
     rrf_constant = int(provider_declaration["rrf_constant"])
@@ -557,22 +609,27 @@ def _resolve_provider_parameters(
         max_sources=max_sources,
         rrf_constant=rrf_constant,
     )
-    expected_provider_payload = analysis_callable_identity_payload(
-        expected_provider,
-        "verified_base_provider",
-    )
+    expected_provider_payload = _owned_provider_identity_payload(expected_provider)
     expected_provider_identity = canonical_identity(
         expected_provider_payload,
         identity_sha256(expected_provider_payload),
     )
-    if receipt.verified_base_provider_identity != expected_provider_identity:
-        # Reconstruction never invokes this execution-time provider. The
-        # optional proof authenticates only the frozen v1 callable identity.
+    if provider_generation == "operational-v2":
+        if receipt.verified_base_provider_identity != expected_provider_identity:
+            raise RuntimeError(
+                "verified-base provider implementation identity changed"
+            )
+    else:
+        # Reconstruction never invokes this execution-time provider. Every v1
+        # identity must be authenticated from its historical execution commit,
+        # even when its location-sensitive digest happens to match this checkout.
         provider_history.require_historical_provider_compatibility(
             historical_provider_identity_proof,
             execution_identity=receipt.execution_identity,
             recorded_identity=receipt.verified_base_provider_identity,
-            current_identity_payload=expected_provider_payload,
+            current_identity_payload=_historical_provider_comparison_payload(
+                expected_provider_payload
+            ),
         )
     return max_sources, rrf_constant
 

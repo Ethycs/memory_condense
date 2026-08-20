@@ -34,6 +34,10 @@ from memory_condense.domain.discourse import (
 from memory_condense.eval.benchmark import (
     BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
 )
+from memory_condense.eval._diffuse_replay_provider_identity import (
+    _OPERATIONAL_PROVIDER_IDENTITY_V2_MARKER,
+    build_provider_identity_v2,
+)
 from memory_condense.eval.diffuse_compilation import (
     DiffuseCompilationPolicy,
     DiffuseCompilationReceipt,
@@ -129,14 +133,13 @@ def analysis_callable_identity_payload(
     value: object,
     label: str,
 ) -> dict[str, object]:
-    """Bind the callable implementation without evaluating captured state.
+    """Bind callable code, using operational v2 only for a direct opt-in.
 
     A callable may expose ``analysis_identity_payload()`` to bind immutable
-    instance configuration.  The fallback binds its concrete implementation
-    and marshalled Python code.  Closure contents are deliberately not read:
-    retrieval cannot accidentally inspect benchmark gold hidden in a caller's
-    scope, while the exact returned anchors and source scope are bound
-    separately by :class:`LegacyDiffuseInputReceipt`.
+    instance configuration. Unmarked callables retain the historical v1
+    identity exactly. A class that directly owns the private v2 marker is
+    instead hashed by the harness from its actual callable code; it cannot
+    author its own code digest. Unknown or inherited markers fail closed.
     """
 
     if not callable(value):
@@ -154,6 +157,24 @@ def analysis_callable_identity_payload(
                 f"{label}.analysis_identity_payload must return a mapping"
             )
         declared = dict(raw_declared)
+
+    marker_name = "__memory_condense_operational_identity_v2__"
+    missing_marker = object()
+    callable_type = type(value)
+    marker = inspect.getattr_static(
+        callable_type,
+        marker_name,
+        missing_marker,
+    )
+    direct_marker = vars(callable_type).get(marker_name, missing_marker)
+    if marker is _OPERATIONAL_PROVIDER_IDENTITY_V2_MARKER:
+        if direct_marker is not _OPERATIONAL_PROVIDER_IDENTITY_V2_MARKER:
+            raise TypeError(f"{label} must own its v2 identity marker directly")
+        if declared is None:
+            raise TypeError(f"{label} v2 identity requires a declaration")
+        return build_provider_identity_v2(value, declared, label=label)
+    if marker is not missing_marker:
+        raise ValueError(f"{label} has an unsupported identity version marker")
 
     target = getattr(value, "__func__", value)
     if not inspect.isfunction(target):

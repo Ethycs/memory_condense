@@ -19,6 +19,9 @@ from memory_condense.eval.diffuse_compilation import (
     DiffuseCompilationReceipt,
     DiffuseSourceCompilationReceipt,
 )
+from memory_condense.eval._diffuse_replay_provider_identity import (
+    classify_provider_identity_body,
+)
 from memory_condense.eval.diffuse_longmemeval_analysis import (
     DIFFUSE_ANALYSIS_PHASE_FORMAT,
     DiffuseLongMemEvalAnalysisQueryReceipt,
@@ -458,6 +461,7 @@ def validate_replay_crosslinks(receipt) -> None:
     """Validate exact runtime, phase, policy, and matched-probe joins."""
 
     provider_outer = _body(receipt.verified_base_provider_identity)
+    classify_provider_identity_body(provider_outer)
     provider = provider_outer["declared_identity"]
     first_queries = receipt.arms[0].queries
     frozen_receipts = [item.frozen_input.identity_sha256 for item in first_queries]

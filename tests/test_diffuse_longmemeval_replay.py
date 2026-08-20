@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,10 @@ from tests.test_qwen_episode_signals import _FakePrefixLinker
 from memory_condense.domain.discourse import identity_sha256, quote_sha256
 from memory_condense.eval._diffuse_base_contracts import canonical_json_bytes
 from memory_condense.eval._diffuse_replay_contracts import CanonicalIdentityBody
+from memory_condense.eval._diffuse_replay_provider_identity import (
+    PROVIDER_IDENTITY_SCHEMA,
+    classify_provider_identity_body,
+)
 from memory_condense.eval.diffuse_longmemeval_replay import (
     run_diffuse_longmemeval_shared_base_replay,
     verify_and_reconstruct_diffuse_longmemeval_replay_package,
@@ -310,6 +315,80 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
             expected_runtime_binding_sha256=binding.binding_sha256,
         )
         assert reconstructed.receipt == receipt
+        provider_body = json.loads(
+            receipt.verified_base_provider_identity.canonical_identity_json
+        )
+        assert classify_provider_identity_body(provider_body) == "operational-v2"
+        assert provider_body["schema"] == PROVIDER_IDENTITY_SCHEMA
+        provider_sha256 = receipt.verified_base_provider_identity.identity_sha256
+        assert all(
+            json.loads(query.analysis_query.canonical_identity_json)[
+                "legacy_input_provider_identity_sha256"
+            ]
+            == provider_sha256
+            for arm in receipt.arms
+            for query in arm.queries
+        )
+        legacy_payload = replay_module._historical_provider_comparison_payload(
+            provider_body
+        )
+        legacy_payload["python_code_sha256"] = "0" * 64
+        legacy_identity = replay_module.canonical_identity(
+            legacy_payload,
+            identity_sha256(legacy_payload),
+        )
+        legacy_receipt = receipt.model_copy(
+            update={"verified_base_provider_identity": legacy_identity}
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="provider implementation identity changed",
+        ):
+            replay_module._resolve_provider_parameters(
+                legacy_receipt,
+                base,
+                historical_provider_identity_proof=None,
+            )
+        with pytest.raises(ValueError, match="must be lowercase"):
+            replace(
+                reconstructed,
+                manifest_file_sha256=(
+                    reconstructed.manifest_file_sha256.upper()
+                ),
+            )
+
+        class DigestImposter:
+            def __str__(self) -> str:
+                return reconstructed.manifest_file_sha256
+
+            def __eq__(self, other: object) -> bool:
+                del other
+                return True
+
+        with pytest.raises(ValueError, match="must be lowercase"):
+            replace(
+                reconstructed,
+                manifest_file_sha256=DigestImposter(),  # type: ignore[arg-type]
+            )
+        provider_call = (
+            replay_module.VerifiedBaseLegacyDiffuseInputProvider.__call__
+        )
+        relocated_code = provider_call.__code__.replace(
+            co_filename="Z:/another-checkout/replay.py",
+            co_firstlineno=provider_call.__code__.co_firstlineno + 200,
+            co_linetable=b"",
+        )
+        with monkeypatch.context() as location_only_change:
+            location_only_change.setattr(
+                provider_call,
+                "__code__",
+                relocated_code,
+            )
+            assert verify_diffuse_longmemeval_replay_package(
+                target,
+                base=base,
+                expected_runtime_binding_sha256=binding.binding_sha256,
+            ) == receipt
         assert tuple(packet.boundary_mode for packet in reconstructed.packets) == (
             "fixed_interval",
             "lexical_embedding",
@@ -347,7 +426,7 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
         def shifted_provider_identity(value, label):
             payload = original_callable_identity(value, label)
             if label == "verified_base_provider":
-                payload["python_code_sha256"] = "0" * 64
+                payload["operational_code_sha256"] = "0" * 64
             return payload
 
         with monkeypatch.context() as strict_provider_patch:
@@ -355,6 +434,30 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
                 replay_module,
                 "analysis_callable_identity_payload",
                 shifted_provider_identity,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="provider implementation identity changed",
+            ):
+                verify_diffuse_longmemeval_replay_package(
+                    target,
+                    base=base,
+                    expected_runtime_binding_sha256=binding.binding_sha256,
+                )
+
+        def changed_provider_controls(value, label):
+            payload = original_callable_identity(value, label)
+            if label == "verified_base_provider":
+                declaration = dict(payload["declared_identity"])
+                declaration["rrf_constant"] += 1
+                payload["declared_identity"] = declaration
+            return payload
+
+        with monkeypatch.context() as changed_control_patch:
+            changed_control_patch.setattr(
+                replay_module,
+                "analysis_callable_identity_payload",
+                changed_provider_controls,
             )
             with pytest.raises(
                 RuntimeError,

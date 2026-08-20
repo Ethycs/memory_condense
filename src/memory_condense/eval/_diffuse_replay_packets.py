@@ -70,7 +70,11 @@ class VerifiedDiffuseReplayPackage:
     packets: tuple[VerifiedDiffuseReplayPacket, ...] = field(repr=False)
 
     def __post_init__(self) -> None:
-        sha256_digest(self.manifest_file_sha256, "replay manifest file SHA-256")
+        if type(self.manifest_file_sha256) is not str or sha256_digest(
+            self.manifest_file_sha256,
+            "replay manifest file SHA-256",
+        ) != self.manifest_file_sha256:
+            raise ValueError("replay manifest file SHA-256 must be lowercase")
         expected = tuple(
             (
                 arm.boundary_mode,

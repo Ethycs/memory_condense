@@ -25,6 +25,9 @@ from memory_condense.eval._diffuse_base_contracts import (
     DiffuseDerivedOrigin,
     DiffuseQueryInputManifest,
 )
+from memory_condense.eval._diffuse_replay_provider_identity import (
+    classify_provider_identity_body,
+)
 from memory_condense.eval.diffuse_longmemeval import (
     DIFFUSE_QUERY_RECEIPT_FORMAT,
     LongMemEvalDiffuseQueryReceipt,
@@ -1073,14 +1076,7 @@ class DiffuseLongMemEvalReplayReceipt(_FrozenModel):
         provider_body = json.loads(
             self.verified_base_provider_identity.canonical_identity_json
         )
-        _require_keys(
-            provider_body,
-            {
-                "implementation_type", "implementation", "python_code_sha256",
-                "declared_identity",
-            },
-            "verified-base provider callable",
-        )
+        classify_provider_identity_body(provider_body)
         declared = provider_body.get("declared_identity")
         if not isinstance(declared, dict):
             raise ValueError("verified-base provider lacks a declared identity")

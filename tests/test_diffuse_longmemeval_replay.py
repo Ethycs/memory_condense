@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import inspect
 import json
 from types import SimpleNamespace
 
 import pytest
 
+import memory_condense.eval._diffuse_replay_reconstruction as replay_reconstruction
 import memory_condense.eval.diffuse_longmemeval_replay as replay_module
 import memory_condense.search.episodes.representative_retrieval as rep_module
 import memory_condense.search.episodes.qwen_episode_signal as signal_module
@@ -16,12 +18,12 @@ from memory_condense.eval._diffuse_base_contracts import canonical_json_bytes
 from memory_condense.eval._diffuse_replay_contracts import CanonicalIdentityBody
 from memory_condense.eval.diffuse_longmemeval_replay import (
     run_diffuse_longmemeval_shared_base_replay,
+    verify_and_reconstruct_diffuse_longmemeval_replay_package,
     verify_diffuse_longmemeval_replay_package,
 )
 from memory_condense.eval.diffuse_longmemeval_replay_scoring import (
     publish_diffuse_longmemeval_posthoc_score,
     score_diffuse_longmemeval_replay_package,
-    verify_and_reconstruct_diffuse_longmemeval_replay_package,
 )
 from memory_condense.eval.diffuse_longmemeval_runtime import (
     ResidencyPreflightObservation,
@@ -208,6 +210,30 @@ def test_resident_replay_normalizes_default_cuda_device():
     replay_module._require_resident_cuda_pair(binding)
 
 
+def test_replay_verifier_facades_keep_strict_and_explicit_signatures():
+    strict = inspect.signature(verify_diffuse_longmemeval_replay_package)
+    assert tuple(strict.parameters) == (
+        "path",
+        "base",
+        "expected_runtime_binding_sha256",
+    )
+    reconstructed = inspect.signature(
+        verify_and_reconstruct_diffuse_longmemeval_replay_package
+    )
+    assert tuple(reconstructed.parameters) == (
+        "path",
+        "base",
+        "expected_runtime_binding_sha256",
+        "historical_provider_identity_proof",
+    )
+    assert (
+        reconstructed.parameters[
+            "historical_provider_identity_proof"
+        ].default
+        is None
+    )
+
+
 def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
     tmp_path,
     monkeypatch,
@@ -289,6 +315,33 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
             "lexical_embedding",
             "qwen_head",
         )
+        manifest_path = target / "replay-manifest.json"
+        original_manifest = manifest_path.read_bytes()
+        original_reconstruct_package = replay_module._reconstruct_replay_package
+
+        def mutate_manifest_after_internal_return(*args, **kwargs):
+            package = original_reconstruct_package(*args, **kwargs)
+            manifest_path.write_bytes(original_manifest + b" ")
+            return package
+
+        try:
+            with monkeypatch.context() as swap_after_reconstruction:
+                swap_after_reconstruction.setattr(
+                    replay_module,
+                    "_reconstruct_replay_package",
+                    mutate_manifest_after_internal_return,
+                )
+                with pytest.raises(
+                    RuntimeError,
+                    match="changed after packet reconstruction",
+                ):
+                    verify_and_reconstruct_diffuse_longmemeval_replay_package(
+                        target,
+                        base=base,
+                        expected_runtime_binding_sha256=binding.binding_sha256,
+                    )
+        finally:
+            manifest_path.write_bytes(original_manifest)
         original_callable_identity = replay_module.analysis_callable_identity_payload
 
         def shifted_provider_identity(value, label):
@@ -359,7 +412,7 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
             evidence_source_ids_sha256=identity_sha256([source_marker]),
         )
         events = []
-        original_reconstruct = replay_module._verify_reconstructed_query
+        original_reconstruct = replay_reconstruction._verify_reconstructed_query
 
         def observe_reconstruction(**kwargs):
             packet = original_reconstruct(**kwargs)
@@ -377,7 +430,7 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
 
         with monkeypatch.context() as scoring_patch:
             scoring_patch.setattr(
-                replay_module,
+                replay_reconstruction,
                 "_verify_reconstructed_query",
                 observe_reconstruction,
             )
@@ -430,8 +483,6 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
         finally:
             unexpected.unlink()
 
-        manifest_path = target / "replay-manifest.json"
-        original_manifest = manifest_path.read_bytes()
         first_arm = receipt.arms[0]
         first_query = first_arm.queries[0]
         altered_legacy = _resign_canonical(

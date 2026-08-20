@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from memory_condense.domain.discourse import EvidencePacket, EvidenceSpan, quote_sha256
+from memory_condense.eval._diffuse_replay_contracts import (
+    DiffuseLongMemEvalReplayReceipt,
+)
 from memory_condense.eval._identity import exact_int, sha256_digest
 from memory_condense.eval.diffuse_longmemeval import LongMemEvalDiffuseQueryReceipt
 
@@ -58,4 +61,43 @@ class VerifiedDiffuseReplayPacket:
         raise KeyError("span is outside this verified replay packet")
 
 
-__all__ = ["ReplayBoundaryMode", "VerifiedDiffuseReplayPacket"]
+@dataclass(frozen=True, slots=True)
+class VerifiedDiffuseReplayPackage:
+    """One replay receipt and the exact packets reconstructed from its stores."""
+
+    receipt: DiffuseLongMemEvalReplayReceipt
+    manifest_file_sha256: str
+    packets: tuple[VerifiedDiffuseReplayPacket, ...] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        sha256_digest(self.manifest_file_sha256, "replay manifest file SHA-256")
+        expected = tuple(
+            (
+                arm.boundary_mode,
+                query.question_ordinal,
+                query.question_id_sha256,
+                query.question_probe_sha256,
+                query.query_receipt.receipt_sha256,
+            )
+            for arm in self.receipt.arms
+            for query in arm.queries
+        )
+        observed = tuple(
+            (
+                packet.boundary_mode,
+                packet.question_ordinal,
+                packet.question_id_sha256,
+                packet.question_probe_sha256,
+                packet.receipt.receipt_sha256,
+            )
+            for packet in self.packets
+        )
+        if observed != expected:
+            raise ValueError("reconstructed packets do not exactly cover the replay")
+
+
+__all__ = [
+    "ReplayBoundaryMode",
+    "VerifiedDiffuseReplayPackage",
+    "VerifiedDiffuseReplayPacket",
+]

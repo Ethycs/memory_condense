@@ -7,9 +7,7 @@ boundary; benchmark answers and source IDs remain transient scorer inputs.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -21,24 +19,24 @@ from memory_condense.eval._diffuse_base_contracts import (
     canonical_json_bytes,
     write_new_bytes,
 )
+from memory_condense.eval._diffuse_replay_contracts import (
+    DiffuseLongMemEvalReplayReceipt,
+)
 from memory_condense.eval._diffuse_replay_packets import (
+    VerifiedDiffuseReplayPackage,
     VerifiedDiffuseReplayPacket,
 )
 from memory_condense.eval._diffuse_replay_provider_history import (
     HistoricalProviderIdentityProof,
-)
-from memory_condense.eval._diffuse_replay_contracts import (
-    DiffuseLongMemEvalReplayReceipt,
 )
 from memory_condense.eval.diffuse_longmemeval import (
     LongMemEvalDiffuseMetrics,
     measure_longmemeval_diffuse_packet,
 )
 from memory_condense.eval.diffuse_longmemeval_replay import (
-    REPLAY_MANIFEST_NAME,
-    _verify_diffuse_longmemeval_replay_package,
+    verify_and_reconstruct_diffuse_longmemeval_replay_package,
 )
-from memory_condense.eval.reproducibility import file_sha256, implementation_sha256
+from memory_condense.eval.reproducibility import implementation_sha256
 
 
 POSTHOC_REPORT_FORMAT = "memory-condense-longmemeval-replay-posthoc-score-v1"
@@ -67,41 +65,6 @@ class SupportsAnalysisScoringLabel(Protocol):
     gold_answer_sha256: str
     evidence_source_ids: tuple[str, ...]
     evidence_source_ids_sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class VerifiedDiffuseReplayPackage:
-    """A receipt plus every packet reconstructed by its exact verifier pass."""
-
-    receipt: DiffuseLongMemEvalReplayReceipt
-    manifest_file_sha256: str
-    packets: tuple[VerifiedDiffuseReplayPacket, ...] = field(repr=False)
-
-    def __post_init__(self) -> None:
-        _require_sha256(self.manifest_file_sha256, "replay manifest file SHA-256")
-        expected = tuple(
-            (
-                arm.boundary_mode,
-                query.question_ordinal,
-                query.question_id_sha256,
-                query.question_probe_sha256,
-                query.query_receipt.receipt_sha256,
-            )
-            for arm in self.receipt.arms
-            for query in arm.queries
-        )
-        observed = tuple(
-            (
-                packet.boundary_mode,
-                packet.question_ordinal,
-                packet.question_id_sha256,
-                packet.question_probe_sha256,
-                packet.receipt.receipt_sha256,
-            )
-            for packet in self.packets
-        )
-        if observed != expected:
-            raise ValueError("reconstructed packets do not exactly cover the replay")
 
 
 class _FrozenModel(BaseModel):
@@ -233,37 +196,6 @@ class DiffuseReplayPosthocScoreReport(_FrozenModel):
         if self.receipt_sha256 != expected:
             raise ValueError("post-hoc score report digest differs from its body")
         return self
-
-
-def verify_and_reconstruct_diffuse_longmemeval_replay_package(
-    path: str | Path,
-    *,
-    base: VerifiedDiffuseLongMemEvalBase,
-    expected_runtime_binding_sha256: str,
-    historical_provider_identity_proof: HistoricalProviderIdentityProof | None = None,
-) -> VerifiedDiffuseReplayPackage:
-    """Run the authoritative verifier once and retain its exact packet outputs."""
-
-    packets: list[VerifiedDiffuseReplayPacket] = []
-    receipt = _verify_diffuse_longmemeval_replay_package(
-        path,
-        base=base,
-        expected_runtime_binding_sha256=expected_runtime_binding_sha256,
-        _packet_sink=packets,
-        _provider_identity_proof=historical_provider_identity_proof,
-    )
-    # The verifier proved canonical equality and stability for its full pass;
-    # bind a fresh physical-file read as well, rejecting an intervening change.
-    manifest_payload = canonical_json_bytes(receipt.model_dump(mode="json"))
-    expected_manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
-    manifest_file_sha256 = file_sha256(Path(path) / REPLAY_MANIFEST_NAME)
-    if manifest_file_sha256 != expected_manifest_sha256:
-        raise RuntimeError("replay manifest changed after packet reconstruction")
-    return VerifiedDiffuseReplayPackage(
-        receipt=receipt,
-        manifest_file_sha256=manifest_file_sha256,
-        packets=tuple(packets),
-    )
 
 
 def score_diffuse_longmemeval_replay_package(

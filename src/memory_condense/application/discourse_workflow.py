@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from memory_condense.domain.discourse import (
     ClosurePlan,
@@ -690,6 +690,9 @@ class DiscourseWorkflowMixin:
         artifact_id: str | None = None,
         expansion_receipt_sha256: str | None = None,
         expansion_exhaustive: bool | None = None,
+        routing_scope: Literal[
+            "artifact_global", "seeded_graph"
+        ] = "artifact_global",
     ) -> ClosurePlan:
         """Retrieve bounded evidence closure only from caller-provided seeds."""
 
@@ -712,6 +715,7 @@ class DiscourseWorkflowMixin:
             artifact_id=selected_artifact,
             expansion_receipt_sha256=expansion_receipt_sha256,
             expansion_exhaustive=expansion_exhaustive,
+            routing_scope=routing_scope,
         )
 
     def _resolve_discourse_artifact(self, artifact_id: str | None) -> str | None:

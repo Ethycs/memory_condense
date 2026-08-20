@@ -361,6 +361,46 @@ class _MemoryGraph:
         )
 
 
+class _OverReturningGraph(_MemoryGraph):
+    """Protocol adversary that leaks one unrelated same-artifact row."""
+
+    def __init__(self, overreturn: str) -> None:
+        super().__init__()
+        self.overreturn = overreturn
+
+    def evidence_for_chunks(self, chunk_ids):
+        values = super().evidence_for_chunks(chunk_ids)
+        if self.overreturn != "span":
+            return values
+        requested = set(chunk_ids)
+        outside = next(key for key in self.chunks if key not in requested)
+        return (*values, self._span(outside))
+
+    def units_for_chunks(self, chunk_ids, **kwargs):
+        values = super().units_for_chunks(chunk_ids, **kwargs)
+        if self.overreturn != "unit":
+            return values
+        requested = set(chunk_ids)
+        outside = next(
+            unit
+            for unit in self.units.values()
+            if not any(span.chunk_id in requested for span in unit.evidence)
+        )
+        return (*values, outside)
+
+    def relations_for_chunks(self, chunk_ids, **kwargs):
+        values = super().relations_for_chunks(chunk_ids, **kwargs)
+        if self.overreturn != "relation":
+            return values
+        requested = set(chunk_ids)
+        outside = next(
+            relation
+            for relation in self.relations.values()
+            if not any(span.chunk_id in requested for span in relation.evidence)
+        )
+        return (*values, outside)
+
+
 def _connected_graph(*, reverse_reads: bool = False) -> tuple[_MemoryGraph, EpisodeSeed]:
     graph = _MemoryGraph(reverse_reads=reverse_reads)
     state = graph.add_chunk("c-state", "Request throughput is presently below target.", 10)
@@ -1554,3 +1594,110 @@ def test_zero_artifact_snapshot_still_allows_raw_only_fail_open():
     plan = close_evidence(graph, "What evidence survives?", direct_chunk_ids=("raw",))
     assert [atom.span.chunk_id for atom in plan.atoms] == ["raw"]
     assert plan.visited_unit_ids == ()
+
+
+def test_seeded_graph_blocks_global_bypass_but_uses_all_seed_episode_chunks():
+    graph = _MemoryGraph()
+    anchor = graph.add_chunk("seed-anchor", "A bounded episode begins here.", 1)
+    local = graph.add_chunk(
+        "seed-local",
+        "The launch code inside the selected episode is amber.",
+        2,
+    )
+    outside = graph.add_chunk(
+        "global-bypass",
+        "The launch code outside the selected episode is violet.",
+        3,
+        source_id="source-b",
+    )
+    graph.add_episode("selected-episode", 0, (anchor, local))
+    graph.add_unit("local-answer", "fact", "launch code amber", local)
+    graph.add_unit("global-answer", "fact", "launch code violet", outside)
+    seed = EpisodeSeed(
+        "selected-episode",
+        anchor.chunk_id,
+        1.0,
+        "representative",
+    )
+    policy = ClosurePolicy(max_episode_neighbors=0)
+
+    legacy = close_evidence(
+        graph,
+        "What is the launch code?",
+        seeds=(seed,),
+        policy=policy,
+    )
+    explicit_legacy = close_evidence(
+        graph,
+        "What is the launch code?",
+        seeds=(seed,),
+        policy=policy,
+        routing_scope="artifact_global",
+    )
+    seeded = close_evidence(
+        graph,
+        "What is the launch code?",
+        seeds=(seed,),
+        policy=policy,
+        routing_scope="seeded_graph",
+    )
+
+    assert legacy.plan_sha256 == explicit_legacy.plan_sha256
+    assert "global-answer" in legacy.visited_unit_ids
+    assert "local-answer" in seeded.visited_unit_ids
+    assert "global-answer" not in seeded.visited_unit_ids
+    assert "seed-local" in {atom.span.chunk_id for atom in seeded.atoms}
+    scope = next(
+        item
+        for item in seeded.scope_witnesses
+        if item.kind == "closure_routing_scope"
+    )
+    assert scope.subject_id == "seeded_graph"
+    assert scope.requested_limit == policy.max_frontier * 2
+    assert scope.exhaustive is False
+    assert scope.detail["artifact_global_routes_admitted"] is False
+    assert not any(
+        item.kind == "artifact_unit_scan" for item in seeded.scope_witnesses
+    )
+    assert seeded.complete_claimed is False
+
+    with pytest.raises(ValueError, match="routing_scope"):
+        close_evidence(
+            graph,
+            "What is the launch code?",
+            seeds=(seed,),
+            routing_scope=object(),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("overreturn", "message"),
+    (
+        ("span", "unrequested chunk"),
+        ("unit", "unit is not grounded"),
+        ("relation", "relation is not grounded"),
+    ),
+)
+def test_seeded_graph_rejects_overreturned_chunk_scope(overreturn, message):
+    graph = _OverReturningGraph(overreturn)
+    anchor = graph.add_chunk("selected", "Selected episode evidence.", 1)
+    outside = graph.add_chunk("outside", "Unrelated same-artifact evidence.", 2)
+    graph.add_episode("selected-episode", 0, (anchor,))
+    graph.add_unit("selected-unit", "fact", "selected evidence", anchor)
+    graph.add_unit("outside-unit", "fact", "unrelated evidence", outside)
+    graph.add_relation(
+        "outside-relation",
+        "supports",
+        (("outside-unit", "evidence"), ("selected-unit", "claim")),
+        outside,
+    )
+    seed = EpisodeSeed("selected-episode", anchor.chunk_id, 1.0, "representative")
+
+    with pytest.raises(ValueError, match=message):
+        close_evidence(
+            graph,
+            "What is the selected evidence?",
+            seeds=(seed,),
+            policy=ClosurePolicy(max_episode_neighbors=0),
+            routing_scope="seeded_graph",
+        )

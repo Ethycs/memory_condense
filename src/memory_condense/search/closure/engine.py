@@ -18,7 +18,10 @@ from memory_condense.domain.discourse import (
 )
 from memory_condense.search.closure.bundles import assemble_bundles
 from memory_condense.search.closure.request import (
+    ClosureRoutingScope,
     bound_closure_inputs,
+    closure_routing_scope,
+    closure_routing_witness,
     resolve_artifact_id,
     resolve_program,
 )
@@ -26,6 +29,8 @@ from memory_condense.search.closure.results import completion, obligation_result
 from memory_condense.search.closure.scope_scan import (
     PROBE_OVERFLOW_MESSAGE,
     scan_artifact_units,
+    validate_chunk_scoped_rows,
+    validate_requested_spans,
 )
 from memory_condense.search.closure.semantics import (
     relation_confers_subject_connection,
@@ -101,9 +106,11 @@ class EvidenceClosureEngine:
         artifact_id: str | None = None,
         expansion_receipt_sha256: str | None = None,
         expansion_exhaustive: bool | None = None,
+        routing_scope: ClosureRoutingScope = "artifact_global",
     ) -> ClosurePlan:
         """Close the query's obligations over bounded episodic graph routes."""
 
+        active_routing_scope = closure_routing_scope(routing_scope)
         program = resolve_program(query, query_program)
         bounded_inputs = bound_closure_inputs(
             seeds,
@@ -134,6 +141,7 @@ class EvidenceClosureEngine:
             for span in self.store.evidence_for_chunks(raw_chunk_ids)
             if program.as_of_ordinal is None or span.ordinal <= program.as_of_ordinal
         )
+        validate_requested_spans(raw_spans, raw_chunk_ids)
         if selected_artifact_id is None:
             walk = _Walk({}, [], {}, [], {}, [], set())
             unit_routes: dict[str, _UnitRoute] = {}
@@ -144,8 +152,17 @@ class EvidenceClosureEngine:
                 program=program,
                 artifact_id=selected_artifact_id,
                 snapshot=snapshot,
+                routing_scope=active_routing_scope,
             ).run(seeds=normalized_seeds, raw_chunk_ids=raw_chunk_ids)
         walk.scope_witnesses.extend(bounded_inputs.scope_witnesses)
+        routing_witness = closure_routing_witness(
+            active_routing_scope,
+            normalized_seeds,
+            normalized_direct_chunk_ids,
+            limit=self.policy.max_frontier,
+        )
+        if routing_witness is not None:
+            walk.scope_witnesses.append(routing_witness)
         if expansion_receipt_sha256 is not None:
             _record_witness(
                 walk,
@@ -254,7 +271,8 @@ class _ClosureWalk:
     """
 
     __slots__ = (
-        "artifact_id", "policy", "program", "routes", "snapshot", "store", "walk",
+        "artifact_id", "policy", "program", "routes", "routing_scope",
+        "snapshot", "store", "walk",
     )
 
     def __init__(
@@ -265,12 +283,14 @@ class _ClosureWalk:
         program: QueryProgram,
         artifact_id: str,
         snapshot: DiscourseSnapshot,
+        routing_scope: ClosureRoutingScope,
     ) -> None:
         self.store = store
         self.policy = policy
         self.program = program
         self.artifact_id = artifact_id
         self.snapshot = snapshot
+        self.routing_scope = routing_scope
         self.walk = _Walk({}, [], {}, [], {}, [], set())
         self.routes: dict[str, _UnitRoute] = {}
 
@@ -282,7 +302,11 @@ class _ClosureWalk:
     ) -> tuple[_Walk, dict[str, _UnitRoute]]:
         """Execute the walk once and return its state plus the offered routes."""
 
-        global_units = self._scan_artifact_scope()
+        global_units = (
+            self._scan_artifact_scope()
+            if self.routing_scope == "artifact_global"
+            else ()
+        )
         trusted_chunks, neighbor_chunks = self._seed(seeds, raw_chunk_ids)
         self._seed_unit_routes(global_units, trusted_chunks, neighbor_chunks)
         pending_direct = self._direct_relations(trusted_chunks)
@@ -636,9 +660,10 @@ class _ClosureWalk:
     ) -> None:
         """Offer hop-0 routes from scope matches and seed-evidenced chunks."""
 
-        for unit in global_units:
-            if unit_obligation_ids(unit, self.program, connected=False):
-                _offer_route(self.routes, unit, hop=0, route_rank=3, connected=True)
+        if self.routing_scope == "artifact_global":
+            for unit in global_units:
+                if unit_obligation_ids(unit, self.program, connected=False):
+                    _offer_route(self.routes, unit, hop=0, route_rank=3, connected=True)
         candidate_limit = self.policy.max_units + 1
         for unit in self._units_for_chunks(
             trusted_chunks,
@@ -671,6 +696,7 @@ class _ClosureWalk:
             if len(probed) > limit:
                 raise ValueError(PROBE_OVERFLOW_MESSAGE)
             _validate_artifacts(probed, self.artifact_id, "unit")
+            validate_chunk_scoped_rows(probed, chunks, kind="unit")
             ordered = sorted(
                 probed,
                 key=lambda unit: unit_priority(
@@ -721,6 +747,7 @@ class _ClosureWalk:
             if len(probed) > relation_probe_limit:
                 raise ValueError(PROBE_OVERFLOW_MESSAGE)
             _validate_artifacts(probed, self.artifact_id, "relation")
+            validate_chunk_scoped_rows(probed, trusted_chunks, kind="relation")
             valid: list[DiscourseRelation] = []
             for relation in probed:
                 try:
@@ -1060,6 +1087,7 @@ def close_evidence(
     expansion_receipt_sha256: str | None = None,
     expansion_exhaustive: bool | None = None,
     policy: ClosurePolicy | None = None,
+    routing_scope: ClosureRoutingScope = "artifact_global",
 ) -> ClosurePlan:
     """Functional facade for one bounded closure request."""
 
@@ -1071,6 +1099,7 @@ def close_evidence(
         artifact_id=artifact_id,
         expansion_receipt_sha256=expansion_receipt_sha256,
         expansion_exhaustive=expansion_exhaustive,
+        routing_scope=routing_scope,
     )
 
 
@@ -1255,4 +1284,4 @@ def _as_of_relation(relation: DiscourseRelation, program: QueryProgram) -> bool:
     return program.as_of_ordinal is None or relation.created_ordinal <= program.as_of_ordinal
 
 
-__all__ = ["EvidenceClosureEngine", "close_evidence"]
+__all__ = ["ClosureRoutingScope", "EvidenceClosureEngine", "close_evidence"]

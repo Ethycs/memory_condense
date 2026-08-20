@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Literal, Protocol
 
 from memory_condense.domain._tokenizer import count_chat_prompt_token_proxy
 from memory_condense.domain.discourse import (
@@ -55,6 +55,23 @@ from memory_condense.search.episodes import (
 DIFFUSE_QUERY_RECEIPT_FORMAT = (
     "memory-condense-longmemeval-diffuse-query-receipt-v1"
 )
+DiffuseEpisodicRoute = Literal["legacy_union", "episode_primary"]
+
+
+def _diffuse_episodic_route(value: object) -> DiffuseEpisodicRoute:
+    """Validate the closed live-route choice without changing legacy bytes."""
+
+    if type(value) is not str:
+        raise ValueError(
+            "episodic_route must be 'legacy_union' or 'episode_primary'"
+        )
+    if value == "legacy_union":
+        return "legacy_union"
+    if value == "episode_primary":
+        return "episode_primary"
+    raise ValueError(
+        "episodic_route must be 'legacy_union' or 'episode_primary'"
+    )
 
 
 class SupportsDiffuseEvidence(Protocol):
@@ -88,6 +105,9 @@ class SupportsDiffuseEvidence(Protocol):
         artifact_id: str | None = None,
         expansion_receipt_sha256: str | None = None,
         expansion_exhaustive: bool | None = None,
+        routing_scope: Literal[
+            "artifact_global", "seeded_graph"
+        ] = "artifact_global",
     ) -> ClosurePlan: ...
 
     def pack_discourse_evidence(
@@ -362,6 +382,7 @@ def retrieve_longmemeval_diffuse_packet(
     representative_linker: NestedEpisodeLinker | None = None,
     representative_policy: EpisodeRepresentativeRetrievalPolicy | None = None,
     require_owned_representative_runtime: bool = False,
+    episodic_route: DiffuseEpisodicRoute = "legacy_union",
     closure_policy: ClosurePolicy | None = None,
     query_program: QueryProgram | None = None,
 ) -> LongMemEvalDiffuseRetrieval:
@@ -380,6 +401,16 @@ def retrieve_longmemeval_diffuse_packet(
     normalized_artifact = str(artifact_id).strip()
     if not normalized_query or not normalized_prompt_question or not normalized_artifact:
         raise ValueError("query, prompt question, and artifact_id must be non-empty")
+    active_episodic_route = _diffuse_episodic_route(episodic_route)
+    if active_episodic_route == "episode_primary":
+        if source_candidate_scope is None:
+            raise ValueError(
+                "episode-primary routing requires a source candidate scope"
+            )
+        if representative_linker is None or representative_policy is None:
+            raise ValueError(
+                "episode-primary routing requires representative retrieval"
+            )
     context_cap = exact_int(max_context_tokens, "max_context_tokens", minimum=0)
     prompt_cap = exact_int(max_prompt_tokens, "max_prompt_tokens", minimum=0)
     reserve = exact_int(
@@ -404,9 +435,19 @@ def retrieve_longmemeval_diffuse_packet(
             artifact_id=normalized_artifact,
         )
 
-    expansion = condenser.expand_discourse_episode_seeds(
-        exact_anchors,
-        policy=active_episode_policy,
+    # The v1 result schema still carries this field. Episode-primary records
+    # an explicit empty plan instead of executing the inactive legacy route.
+    expansion = (
+        EpisodeRetrievalPlan(
+            policy_sha256=active_episode_policy.policy_sha256,
+            seeds=(),
+            direct_fallbacks=(),
+        )
+        if active_episodic_route == "episode_primary"
+        else condenser.expand_discourse_episode_seeds(
+            exact_anchors,
+            policy=active_episode_policy,
+        )
     )
     expansion_exhaustive = not (
         expansion.truncated_episode_ids
@@ -466,12 +507,32 @@ def retrieve_longmemeval_diffuse_packet(
         ):
             raise ValueError("representative linker runtime is not certified")
 
-    combined_seeds = _combine_episode_seeds(
-        expansion.seeds,
-        () if representative_expansion is None else representative_expansion.seeds,
-    )
-    combined_expansion_sha256 = identity_sha256(
-        {
+    if active_episodic_route == "episode_primary":
+        if representative_expansion is None:  # pragma: no cover - guarded above
+            raise RuntimeError("episode-primary representative retrieval did not run")
+        if not representative_expansion.seeds:
+            raise RuntimeError(
+                "episode-primary routing produced no representative episode seeds"
+            )
+        combined_seeds = tuple(representative_expansion.seeds)
+        active_direct_chunk_ids: tuple[str, ...] = ()
+        combined_payload: dict[str, object] = {
+            "episodic_route": active_episodic_route,
+            "direct_expansion_receipt_sha256": expansion.receipt_sha256,
+            "representative_expansion_receipt_sha256": (
+                representative_expansion.receipt_sha256
+            ),
+            "seeds": [_episode_seed_payload(seed) for seed in combined_seeds],
+            "direct_chunk_ids": [],
+        }
+    else:
+        combined_seeds = _combine_episode_seeds(
+            expansion.seeds,
+            () if representative_expansion is None else representative_expansion.seeds,
+        )
+        active_direct_chunk_ids = expansion.direct_chunk_ids
+        # Keep this exact legacy projection byte-compatible with v1 replay.
+        combined_payload = {
             "direct_expansion_receipt_sha256": expansion.receipt_sha256,
             "representative_expansion_receipt_sha256": (
                 None
@@ -479,31 +540,43 @@ def retrieve_longmemeval_diffuse_packet(
                 else representative_expansion.receipt_sha256
             ),
             "seeds": [_episode_seed_payload(seed) for seed in combined_seeds],
-            "direct_chunk_ids": list(expansion.direct_chunk_ids),
+            "direct_chunk_ids": list(active_direct_chunk_ids),
         }
-    )
+    combined_expansion_sha256 = identity_sha256(combined_payload)
     representative_exhaustive = (
         None
         if representative_expansion is None
         else representative_expansion.candidate_scope_exhaustive
     )
-    combined_expansion_exhaustive = bool(
-        expansion_exhaustive
-        and (
-            representative_exhaustive
-            if representative_exhaustive is not None
-            else True
+    combined_expansion_exhaustive = (
+        bool(representative_exhaustive)
+        if active_episodic_route == "episode_primary"
+        else bool(
+            expansion_exhaustive
+            and (
+                representative_exhaustive
+                if representative_exhaustive is not None
+                else True
+            )
         )
+    )
+    # Do not expose the new keyword to legacy structural implementations.
+    # The empty keyword expansion keeps their exact pre-v2 call shape intact.
+    routing_kwargs = (
+        {"routing_scope": "seeded_graph"}
+        if active_episodic_route == "episode_primary"
+        else {}
     )
     plan = condenser.close_discourse_evidence(
         normalized_query,
         query_program=query_program,
         seeds=combined_seeds,
-        direct_chunk_ids=expansion.direct_chunk_ids,
+        direct_chunk_ids=active_direct_chunk_ids,
         policy=closure_policy,
         artifact_id=normalized_artifact,
         expansion_receipt_sha256=combined_expansion_sha256,
         expansion_exhaustive=combined_expansion_exhaustive,
+        **routing_kwargs,
     )
     if plan.expansion_receipt_sha256 != combined_expansion_sha256:
         raise RuntimeError("closure plan does not bind the combined expansion")
@@ -746,6 +819,7 @@ def measure_longmemeval_diffuse_packet(
 
 __all__ = [
     "DIFFUSE_QUERY_RECEIPT_FORMAT",
+    "DiffuseEpisodicRoute",
     "LongMemEvalDiffuseMetrics",
     "LongMemEvalDiffuseQueryReceipt",
     "LongMemEvalDiffuseRetrieval",

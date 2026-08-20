@@ -80,6 +80,17 @@ class _NoSearchFacade:
         return self._condenser.pack_discourse_evidence(*args, **kwargs)
 
 
+class _LegacyNoRoutingFacade(_NoSearchFacade):
+    def close_discourse_evidence(self, *args, **kwargs):
+        assert "routing_scope" not in kwargs
+        return super().close_discourse_evidence(*args, **kwargs)
+
+
+class _NoDirectExpansionFacade(_NoSearchFacade):
+    def expand_discourse_episode_seeds(self, *_args, **_kwargs):
+        raise AssertionError("episode-primary executed the inactive direct route")
+
+
 class _SelectEpisodeLinker:
     max_candidates = 8
 
@@ -105,6 +116,30 @@ class _SelectEpisodeLinker:
         )
         return NestedMemoryInspection(
             hits=(hit,)[:top_k],
+            passes=1,
+            max_workspace_candidates=1,
+            max_workspace_tokens=64,
+            total_candidate_inspections=1,
+        )
+
+
+class _EmptyEpisodeLinker:
+    max_candidates = 8
+
+    def inspect_nested(
+        self,
+        _query,
+        _groups,
+        *,
+        beam_per_group,
+        top_k,
+        score_mode,
+    ):
+        assert beam_per_group == 2
+        assert top_k > 0
+        assert score_mode == "qk_ov"
+        return NestedMemoryInspection(
+            hits=(),
             passes=1,
             max_workspace_candidates=1,
             max_workspace_tokens=64,
@@ -178,6 +213,50 @@ def _publish_fixture(condenser: MemoryCondenser):
     return artifact, ingested, chunks
 
 
+def _publish_episode_primary_fixture(condenser: MemoryCondenser):
+    direct_turn, direct_chunks = condenser.ingest(
+        "user",
+        "The Atlas target value in this obsolete note is forty percent.",
+        source_id="direct-source",
+    )
+    target_turn, target_chunks = condenser.ingest(
+        "user",
+        "The Atlas target value in the selected episode is ninety five percent.",
+        source_id="target-source",
+    )
+    artifact = _artifact()
+    builder = EpisodeBuilder(
+        min_size=1,
+        max_size=1,
+        detector=FixedIntervalBoundaryDetector(interval=1),
+    )
+    for chunk in (direct_chunks[0], target_chunks[0]):
+        condenser.build_and_publish_discourse_episodes(
+            artifact,
+            (chunk.chunk_id,),
+            builder=builder,
+            embeddings={chunk.chunk_id: chunk.embedding},
+            representative_limit=1,
+        )
+        # Separate calls prevent a graph relation from connecting the two
+        # independently routed sources during this routing-boundary test.
+        condenser.link_and_publish_discourse(
+            artifact,
+            chunk_ids=(chunk.chunk_id,),
+        )
+    condenser.finalize_episode_coverage(artifact.artifact_id)
+    condenser.finalize_discourse_coverage(artifact.artifact_id)
+    episode_ids = condenser.discourse.episode_ids_for_chunks(
+        (direct_chunks[0].chunk_id, target_chunks[0].chunk_id),
+        artifact_id=artifact.artifact_id,
+    )
+    return (
+        artifact,
+        (direct_turn, direct_chunks[0], episode_ids[direct_chunks[0].chunk_id]),
+        (target_turn, target_chunks[0], episode_ids[target_chunks[0].chunk_id]),
+    )
+
+
 def test_gold_blind_bridge_reuses_anchors_and_packs_exact_final_prompt(tmp_path):
     with _condenser(tmp_path / "diffuse") as condenser:
         artifact, ingested, chunks = _publish_fixture(condenser)
@@ -194,7 +273,7 @@ def test_gold_blind_bridge_reuses_anchors_and_packs_exact_final_prompt(tmp_path)
         # This facade has no search method. The bridge must consume the exact
         # already-ranked row rather than issue a gold-influenced second query.
         retrieval = retrieve_longmemeval_diffuse_packet(
-            _NoSearchFacade(condenser),
+            _LegacyNoRoutingFacade(condenser),
             query=query,
             prompt_question=(
                 "[Question asked at 2026/08/19 (Wed) 09:00]\n" + query
@@ -417,3 +496,174 @@ def test_representative_discovery_is_bound_into_final_packet_receipt(tmp_path):
         assert retrieval.plan.expansion_receipt_sha256 == (
             retrieval.receipt.combined_expansion_sha256
         )
+
+
+def test_episode_primary_uses_only_representative_seeds_and_bounded_state(
+    tmp_path,
+):
+    with _condenser(tmp_path / "episode-primary") as condenser:
+        artifact, direct, target = _publish_episode_primary_fixture(condenser)
+        direct_turn, direct_chunk, direct_episode_id = direct
+        _target_turn, target_chunk, target_episode_id = target
+        query = "What is the Atlas target value?"
+        anchors = (
+            RetrievalResult(
+                chunk=direct_chunk,
+                turn=direct_turn,
+                score=0.99,
+                route="frozen_direct_anchor",
+            ),
+        )
+        source_scope = condenser.route_discourse_episode_sources(
+            query,
+            anchors,
+            artifact_id=artifact.artifact_id,
+            max_sources=2,
+        )
+
+        retrieval = retrieve_longmemeval_diffuse_packet(
+            _NoDirectExpansionFacade(condenser),
+            query=query,
+            anchors=anchors,
+            artifact_id=artifact.artifact_id,
+            max_context_tokens=512,
+            max_prompt_tokens=1000,
+            episode_policy=EpisodeRetrievalPolicy(
+                artifact_id=artifact.artifact_id,
+                previous_episodes=0,
+                next_episodes=0,
+            ),
+            source_candidate_scope=source_scope,
+            representative_linker=_SelectEpisodeLinker(target_episode_id),
+            representative_policy=EpisodeRepresentativeRetrievalPolicy(
+                artifact_id=artifact.artifact_id,
+                max_source_groups=2,
+                max_episodes_per_source=1,
+                max_total_episodes=2,
+                top_k=1,
+                group_size=2,
+            ),
+            episodic_route="episode_primary",
+        )
+
+        # The v1 result shape remains present, but the inactive direct route
+        # is represented by an empty plan and is never executed.
+        assert retrieval.expansion.seeds == ()
+        assert retrieval.expansion.direct_chunk_ids == ()
+        assert tuple(seed.episode_id for seed in retrieval.plan.seeds) == (
+            target_episode_id,
+        )
+        assert retrieval.plan.direct_chunk_ids == ()
+        assert retrieval.plan.visited_episode_ids == (target_episode_id,)
+        assert direct_episode_id not in retrieval.plan.visited_episode_ids
+        assert target_chunk.chunk_id in {
+            atom.span.chunk_id for atom in retrieval.plan.atoms
+        }
+        assert direct_chunk.chunk_id not in {
+            atom.span.chunk_id for atom in retrieval.plan.atoms
+        }
+        assert "ninety five percent" in retrieval.packet.context
+        assert "forty percent" not in retrieval.packet.context
+
+        scope_witness = next(
+            witness
+            for witness in retrieval.plan.scope_witnesses
+            if witness.kind == "closure_routing_scope"
+        )
+        assert scope_witness.subject_id == "seeded_graph"
+        assert scope_witness.exhaustive is False
+        assert scope_witness.detail["artifact_global_routes_admitted"] is False
+        assert retrieval.plan.expansion_receipt_sha256 == (
+            retrieval.receipt.combined_expansion_sha256
+        )
+        assert retrieval.receipt.combined_expansion_sha256 != (
+            retrieval.expansion.receipt_sha256
+        )
+        assert retrieval.receipt.representative_seed_episode_ids == (
+            target_episode_id,
+        )
+        assert retrieval.receipt.representative_scope_exhaustive is True
+        assert retrieval.receipt.closure_scope_exhaustive is False
+        assert len(retrieval.plan.atoms) == 1
+        assert len(retrieval.plan.seeds) <= retrieval.plan.policy.max_frontier
+        assert len(retrieval.plan.visited_unit_ids) <= retrieval.plan.policy.max_units
+        assert len(retrieval.plan.visited_relation_ids) <= (
+            retrieval.plan.policy.max_relations
+        )
+        assert len(retrieval.plan.bundles) <= retrieval.plan.policy.max_bundles
+        assert all(
+            witness.requested_limit is None
+            or witness.returned_count <= witness.requested_limit
+            for witness in retrieval.plan.scope_witnesses
+        )
+        assert (
+            retrieval.representative_expansion is not None
+            and retrieval.representative_expansion.returned_plan_transformer_state_bytes
+            == 0
+        )
+        assert retrieval.receipt.packet_retained_request_token_state_bytes == 0
+        assert retrieval.receipt.store_retained_request_token_state_bytes == 0
+
+
+def test_episode_primary_fails_closed_when_representative_route_is_empty(tmp_path):
+    with _condenser(tmp_path / "episode-primary-empty") as condenser:
+        artifact, direct, _target = _publish_episode_primary_fixture(condenser)
+        direct_turn, direct_chunk, direct_episode_id = direct
+        query = "What is the Atlas target value?"
+        anchors = (
+            RetrievalResult(
+                chunk=direct_chunk,
+                turn=direct_turn,
+                score=0.99,
+                route="frozen_direct_anchor",
+            ),
+        )
+        source_scope = condenser.route_discourse_episode_sources(
+            query,
+            anchors,
+            artifact_id=artifact.artifact_id,
+            max_sources=2,
+        )
+        assert condenser.expand_discourse_episode_seeds(
+            anchors,
+            policy=EpisodeRetrievalPolicy(
+                artifact_id=artifact.artifact_id,
+                previous_episodes=0,
+                next_episodes=0,
+            ),
+        ).seeds[0].episode_id == direct_episode_id
+
+        with pytest.raises(
+            RuntimeError,
+            match="produced no representative episode seeds",
+        ):
+            retrieve_longmemeval_diffuse_packet(
+                _NoDirectExpansionFacade(condenser),
+                query=query,
+                anchors=anchors,
+                artifact_id=artifact.artifact_id,
+                max_context_tokens=512,
+                max_prompt_tokens=1000,
+                source_candidate_scope=source_scope,
+                representative_linker=_EmptyEpisodeLinker(),
+                representative_policy=EpisodeRepresentativeRetrievalPolicy(
+                    artifact_id=artifact.artifact_id,
+                    max_source_groups=2,
+                    max_episodes_per_source=1,
+                    max_total_episodes=2,
+                    top_k=1,
+                    group_size=2,
+                ),
+                episodic_route="episode_primary",
+            )
+
+        with pytest.raises(ValueError, match="episodic_route"):
+            retrieve_longmemeval_diffuse_packet(
+                _NoSearchFacade(condenser),
+                query=query,
+                anchors=anchors,
+                artifact_id=artifact.artifact_id,
+                max_context_tokens=512,
+                max_prompt_tokens=1000,
+                episodic_route=object(),  # type: ignore[arg-type]
+            )

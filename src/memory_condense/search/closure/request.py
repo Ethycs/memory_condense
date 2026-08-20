@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from memory_condense.domain.discourse import (
     ClosureScopeWitness,
@@ -12,6 +13,42 @@ from memory_condense.domain.discourse import (
     QueryProgram,
 )
 from memory_condense.search.closure.compiler import compile_query_program
+
+
+ClosureRoutingScope = Literal["artifact_global", "seeded_graph"]
+
+
+def closure_routing_scope(value: object) -> ClosureRoutingScope:
+    """Validate the closed routing scope without coercing caller values."""
+
+    if type(value) is not str or value not in {"artifact_global", "seeded_graph"}:
+        raise ValueError("routing_scope must be 'artifact_global' or 'seeded_graph'")
+    return value  # type: ignore[return-value]
+
+
+def closure_routing_witness(
+    routing_scope: ClosureRoutingScope,
+    seeds: Sequence[EpisodeSeed],
+    direct_chunk_ids: Sequence[str],
+    *,
+    limit: int,
+) -> ClosureScopeWitness | None:
+    """Describe the intentionally non-global seeded route."""
+
+    if routing_scope == "artifact_global":
+        return None
+    return ClosureScopeWitness(
+        kind="closure_routing_scope",
+        subject_id=routing_scope,
+        requested_limit=limit * 2,
+        returned_count=len(seeds) + len(direct_chunk_ids),
+        exhaustive=False,
+        detail={
+            "artifact_global_routes_admitted": False,
+            "seed_count": len(seeds),
+            "direct_chunk_count": len(direct_chunk_ids),
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +194,10 @@ def resolve_artifact_id(
 
 __all__ = [
     "BoundedClosureInputs",
+    "ClosureRoutingScope",
     "bound_closure_inputs",
+    "closure_routing_scope",
+    "closure_routing_witness",
     "normalize_seeds",
     "resolve_artifact_id",
     "resolve_program",

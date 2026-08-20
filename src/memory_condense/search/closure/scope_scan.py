@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import bisect
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from memory_condense.domain.discourse import (
+    DiscourseRelation,
     DiscourseUnit,
+    EvidenceSpan,
     QueryProgram,
 )
 from memory_condense.domain.discourse_routing import DiscourseUnitRoute
@@ -18,6 +21,33 @@ from memory_condense.search.closure.store import EvidenceClosureStore
 
 #: Shared invariant message for any store probe returning more than requested.
 PROBE_OVERFLOW_MESSAGE = "store returned more results than the requested probe limit"
+
+
+def validate_requested_spans(
+    spans: Sequence[EvidenceSpan],
+    chunk_ids: Sequence[str],
+) -> None:
+    """Reject raw evidence returned for a chunk the caller did not request."""
+
+    requested = set(chunk_ids)
+    if any(span.chunk_id not in requested for span in spans):
+        raise ValueError("chunk evidence contains an unrequested chunk")
+
+
+def validate_chunk_scoped_rows(
+    rows: Sequence[DiscourseUnit | DiscourseRelation],
+    chunk_ids: Sequence[str],
+    *,
+    kind: str,
+) -> None:
+    """Require every indexed graph row to intersect the requested chunks."""
+
+    requested = set(chunk_ids)
+    if any(
+        not any(span.chunk_id in requested for span in row.evidence)
+        for row in rows
+    ):
+        raise ValueError(f"{kind} is not grounded in the requested chunks")
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,4 +160,9 @@ def scan_artifact_units(
     )
 
 
-__all__ = ["ArtifactUnitScan", "scan_artifact_units"]
+__all__ = [
+    "ArtifactUnitScan",
+    "scan_artifact_units",
+    "validate_chunk_scoped_rows",
+    "validate_requested_spans",
+]

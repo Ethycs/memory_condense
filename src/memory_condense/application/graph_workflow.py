@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
 from memory_condense.application.condenser_contracts import (
@@ -46,6 +47,153 @@ def _round_robin_unique(
         seen=seen,
         stop_on_stall=stop_on_stall,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _GraphSearchParams:
+    """Validated tunables for one ``search_hybrid_graph`` invocation.
+
+    The public keyword surface stays on the method; this object centralizes
+    the cross-parameter validation and travels into the phase helpers so
+    they do not each take a dozen loose arguments.
+    """
+
+    k: int
+    neighbor_radius: int
+    neighbor_slots: int
+    neighbor_direction: str
+    source_slots: int
+    source_candidate_pool: int
+    source_activation_k: int | None
+    query_facet_retrieval: bool
+    query_facet_slots: int
+    query_facet_max: int
+    role_aware_retrieval: bool
+    role_user_weight: float
+    role_assistant_weight: float
+    role_system_weight: float
+    multi_fact_source_diversity: bool
+    source_tfisf_activation: bool
+    source_tfisf_slots: int
+    source_hsc_activation: bool
+    source_hsc_slots: int
+    source_hsc_hops: int
+    source_hsc_chunk_slots: int
+    source_partition_routing: bool
+    source_partition_slots: int
+    source_partition_separator: str
+    source_local_search: bool
+    use_source_reranker: bool
+    use_attention_feedback: bool
+    feedback_slots: int
+    feedback_seed_slots: int
+    feedback_evidence_tokens: int
+    feedback_query_tokens: int
+    ef_search: int
+    candidates: int
+    alpha: float
+
+    def __post_init__(self) -> None:
+        if (
+            self.neighbor_radius < 0
+            or self.neighbor_slots < 0
+            or self.source_slots < 0
+        ):
+            raise ValueError("graph retrieval bounds must be non-negative")
+        if self.use_attention_feedback and (
+            self.feedback_slots < 0 or self.feedback_slots > self.source_slots
+        ):
+            raise ValueError("feedback_slots must lie in [0, source_slots]")
+        if self.feedback_seed_slots < 1:
+            raise ValueError("feedback_seed_slots must be positive")
+        if self.feedback_evidence_tokens < 1 or self.feedback_query_tokens < 1:
+            raise ValueError("feedback token caps must be positive")
+        if self.neighbor_direction not in {"both", "previous", "next"}:
+            raise ValueError("invalid neighbor_direction")
+        if self.source_candidate_pool < self.k:
+            raise ValueError("source_candidate_pool must be at least k")
+        if self.query_facet_slots < 0 or (
+            self.query_facet_retrieval
+            and self.query_facet_slots > self.source_slots
+        ):
+            raise ValueError("query_facet_slots must lie in [0, source_slots]")
+        if self.query_facet_max < 1:
+            raise ValueError("query_facet_max must be positive")
+        if min(
+            self.role_user_weight,
+            self.role_assistant_weight,
+            self.role_system_weight,
+        ) < 0.0:
+            raise ValueError("role weights must be non-negative")
+        if self.source_tfisf_slots < 1:
+            raise ValueError("source_tfisf_slots must be positive")
+        if self.source_hsc_slots < 1 or self.source_hsc_hops < 1:
+            raise ValueError("source HSC slots and hops must be positive")
+        if self.source_hsc_activation and (
+            self.source_hsc_chunk_slots < 1
+            or self.source_hsc_chunk_slots > self.source_slots
+        ):
+            raise ValueError(
+                "source_hsc_chunk_slots must lie in [1, source_slots]"
+            )
+        if (
+            self.query_facet_retrieval
+            and self.source_hsc_activation
+            and self.query_facet_slots + self.source_hsc_chunk_slots
+            > self.source_slots
+        ):
+            raise ValueError("facet and HSC reserves cannot exceed source_slots")
+        activation_k = self.activation_k
+        if activation_k < self.k or activation_k > self.source_candidate_pool:
+            raise ValueError("source_activation_k must be between k and the pool")
+        if self.use_source_reranker and not self.source_local_search:
+            raise ValueError("source reranking requires source_local_search")
+        if self.use_attention_feedback and not self.source_local_search:
+            raise ValueError("attention feedback requires source_local_search")
+        if self.use_source_reranker and self.use_attention_feedback:
+            raise ValueError("reranking and attention feedback are separate arms")
+        if self.source_partition_routing and self.source_partition_slots < 1:
+            raise ValueError("source_partition_slots must be positive")
+        if self.source_partition_routing and not self.source_partition_separator:
+            raise ValueError("source_partition_separator must be non-empty")
+
+    @property
+    def activation_k(self) -> int:
+        return (
+            self.k
+            if self.source_activation_k is None
+            else self.source_activation_k
+        )
+
+    @property
+    def pool_size(self) -> int:
+        return max(self.k, self.source_candidate_pool)
+
+    def role_weighted(
+        self, text: str, results: list[RetrievalResult]
+    ) -> list[RetrievalResult]:
+        """Apply role weighting when enabled; identity otherwise."""
+        if not self.role_aware_retrieval:
+            return results
+        return role_aware_results(
+            text,
+            results,
+            user_weight=self.role_user_weight,
+            assistant_weight=self.role_assistant_weight,
+            system_weight=self.role_system_weight,
+        )
+
+
+@dataclass(slots=True)
+class _PartitionRouting:
+    """State one partition-routed scan carries to the final snapshot binding."""
+
+    routed_source_ids: list[str] | None = None
+    partition_ids: list[str] = field(default_factory=list)
+    candidates: list[RetrievalResult] = field(default_factory=list)
+    report: dict[str, Any] = field(default_factory=dict)
+    routing_turn: int | None = None
+    content_high_watermark: int | None = None
 
 
 def _accumulate_source_activation(
@@ -116,51 +264,42 @@ class GraphWorkflowMixin:
         self._active_partition_routing_snapshot = None
         if k <= 0:
             return []
-        if neighbor_radius < 0 or neighbor_slots < 0 or source_slots < 0:
-            raise ValueError("graph retrieval bounds must be non-negative")
-        if use_attention_feedback and (
-            feedback_slots < 0 or feedback_slots > source_slots
-        ):
-            raise ValueError("feedback_slots must lie in [0, source_slots]")
-        if feedback_seed_slots < 1:
-            raise ValueError("feedback_seed_slots must be positive")
-        if feedback_evidence_tokens < 1 or feedback_query_tokens < 1:
-            raise ValueError("feedback token caps must be positive")
-        if neighbor_direction not in {"both", "previous", "next"}:
-            raise ValueError("invalid neighbor_direction")
-        if source_candidate_pool < k:
-            raise ValueError("source_candidate_pool must be at least k")
-        if query_facet_slots < 0 or (
-            query_facet_retrieval and query_facet_slots > source_slots
-        ):
-            raise ValueError("query_facet_slots must lie in [0, source_slots]")
-        if query_facet_max < 1:
-            raise ValueError("query_facet_max must be positive")
-        if min(role_user_weight, role_assistant_weight, role_system_weight) < 0.0:
-            raise ValueError("role weights must be non-negative")
-        if source_tfisf_slots < 1:
-            raise ValueError("source_tfisf_slots must be positive")
-        if source_hsc_slots < 1 or source_hsc_hops < 1:
-            raise ValueError("source HSC slots and hops must be positive")
-        if source_hsc_activation and (
-            source_hsc_chunk_slots < 1 or source_hsc_chunk_slots > source_slots
-        ):
-            raise ValueError("source_hsc_chunk_slots must lie in [1, source_slots]")
-        if (
-            query_facet_retrieval
-            and source_hsc_activation
-            and query_facet_slots + source_hsc_chunk_slots > source_slots
-        ):
-            raise ValueError("facet and HSC reserves cannot exceed source_slots")
-        activation_k = k if source_activation_k is None else source_activation_k
-        if activation_k < k or activation_k > source_candidate_pool:
-            raise ValueError("source_activation_k must be between k and the pool")
-        if use_source_reranker and not source_local_search:
-            raise ValueError("source reranking requires source_local_search")
-        if use_attention_feedback and not source_local_search:
-            raise ValueError("attention feedback requires source_local_search")
-        if use_source_reranker and use_attention_feedback:
-            raise ValueError("reranking and attention feedback are separate arms")
+        params = _GraphSearchParams(
+            k=k,
+            neighbor_radius=neighbor_radius,
+            neighbor_slots=neighbor_slots,
+            neighbor_direction=neighbor_direction,
+            source_slots=source_slots,
+            source_candidate_pool=source_candidate_pool,
+            source_activation_k=source_activation_k,
+            query_facet_retrieval=query_facet_retrieval,
+            query_facet_slots=query_facet_slots,
+            query_facet_max=query_facet_max,
+            role_aware_retrieval=role_aware_retrieval,
+            role_user_weight=role_user_weight,
+            role_assistant_weight=role_assistant_weight,
+            role_system_weight=role_system_weight,
+            multi_fact_source_diversity=multi_fact_source_diversity,
+            source_tfisf_activation=source_tfisf_activation,
+            source_tfisf_slots=source_tfisf_slots,
+            source_hsc_activation=source_hsc_activation,
+            source_hsc_slots=source_hsc_slots,
+            source_hsc_hops=source_hsc_hops,
+            source_hsc_chunk_slots=source_hsc_chunk_slots,
+            source_partition_routing=source_partition_routing,
+            source_partition_slots=source_partition_slots,
+            source_partition_separator=source_partition_separator,
+            source_local_search=source_local_search,
+            use_source_reranker=use_source_reranker,
+            use_attention_feedback=use_attention_feedback,
+            feedback_slots=feedback_slots,
+            feedback_seed_slots=feedback_seed_slots,
+            feedback_evidence_tokens=feedback_evidence_tokens,
+            feedback_query_tokens=feedback_query_tokens,
+            ef_search=ef_search,
+            candidates=candidates,
+            alpha=alpha,
+        )
         if (
             use_attention_feedback
             and self._source_candidate_reranker is None
@@ -168,109 +307,19 @@ class GraphWorkflowMixin:
             raise RuntimeError(
                 "attention feedback requested but no Qwen controller is attached"
             )
-        if source_partition_routing and source_partition_slots < 1:
-            raise ValueError("source_partition_slots must be positive")
-        if source_partition_routing and not source_partition_separator:
-            raise ValueError("source_partition_separator must be non-empty")
 
         self.last_partition_routing_report = {}
-
-        def apply_role_weights(
-            text: str, results: list[RetrievalResult]
-        ) -> list[RetrievalResult]:
-            return role_aware_results(
-                text,
-                results,
-                user_weight=role_user_weight,
-                assistant_weight=role_assistant_weight,
-                system_weight=role_system_weight,
-            )
+        activation_k = params.activation_k
 
         query_embedding = self._embedder.embed_query(query)
-        pool_size = max(k, source_candidate_pool)
-        routed_source_ids: list[str] | None = None
-        active_partition_routing_turn: int | None = None
-        active_partition_content_high_watermark: int | None = None
-        partition_ids: list[str] = []
-        active_partition_candidates: list[RetrievalResult] = []
-        active_partition_report: dict[str, Any] = {}
-        if source_partition_routing:
-            coarse_pool = self.search_hybrid_from_embedding(
-                query,
-                query_embedding,
-                k=pool_size,
-                ef_search=ef_search,
-                candidates=max(candidates, pool_size),
-                alpha=alpha,
-            )
-            if role_aware_retrieval:
-                coarse_pool = apply_role_weights(query, coarse_pool)
-            partition_ranking = source_partition_ranking(
-                coarse_pool,
-                separator=source_partition_separator,
-            )
-            partition_ids = [
-                str(item["partition"])
-                for item in partition_ranking[:source_partition_slots]
-            ]
-            # Bind the complete scan to the database generation immediately
-            # before resolving its immutable source set.  A concurrent append
-            # anywhere in the remainder of the route invalidates completeness
-            # instead of allowing a stale scan report to reach the packer.
-            active_partition_routing_turn = self._transcript.current_turn()
-            active_partition_content_high_watermark = (
-                self._content_high_watermark()
-            )
-            routed_source_ids = self._retriever.source_ids_in_partitions(
-                partition_ids,
-                separator=source_partition_separator,
-            )
-            (
-                active_partition_candidates,
-                active_partition_report,
-            ) = self._scan_active_partition_frontier(
-                query,
-                query_embedding,
-                partition_ids,
-                routed_source_ids,
-                separator=source_partition_separator,
-            )
-            pool = self._retriever.hybrid_query_sources(
-                query,
-                query_embedding,
-                routed_source_ids,
-                k=pool_size,
-                candidates_per_source=source_candidate_pool,
-                alpha=alpha,
-            )
-            self.last_partition_routing_report = {
-                "coarse_candidates": len(coarse_pool),
-                "selected_partitions": partition_ids,
-                "partition_ranking": partition_ranking,
-                "routed_sources": len(routed_source_ids),
-                "routed_candidates": len(pool),
-                **active_partition_report,
-            }
-            anchors = pool[:k]
-        else:
-            anchors = self.search_hybrid_from_embedding(
-                query,
-                query_embedding,
-                k=k,
-                ef_search=ef_search,
-                candidates=candidates,
-                alpha=alpha,
-            )
-            pool = self.search_hybrid_from_embedding(
-                query,
-                query_embedding,
-                k=pool_size,
-                ef_search=ef_search,
-                candidates=max(candidates, pool_size),
-                alpha=alpha,
-            )
+        pool, anchors, routing = self._route_partitions(
+            query, query_embedding, params
+        )
+        routed_source_ids = routing.routed_source_ids
+        partition_ids = routing.partition_ids
+        active_partition_report = routing.report
         if role_aware_retrieval:
-            pool = apply_role_weights(query, pool)
+            pool = params.role_weighted(query, pool)
             anchors = pool[:k]
         use_source_diversity = (
             multi_fact_source_diversity and is_multi_fact_query(query)
@@ -290,115 +339,24 @@ class GraphWorkflowMixin:
             ),
         }
 
-        concept_results: list[RetrievalResult] = []
-        concept_member_results: list[RetrievalResult] = []
-        concept_name: str | None = None
-        if (
-            use_source_diversity
-            and routed_source_ids
-            and self._source_concept_artifact_id is not None
-        ):
-            artifact = self._associations.get_artifact(
-                self._source_concept_artifact_id
-            )
-            if artifact is not None and artifact.concept_names:
-                concept_name = (
-                    "autobiographical_completed_event"
-                    if "autobiographical_completed_event" in artifact.concept_names
-                    else artifact.concept_names[0]
-                )
-                member_hits = self._associations.concept_members(
-                    artifact.artifact_id,
-                    concept_name,
-                    top_k=max(source_slots * 4, source_slots),
-                    source_ids=routed_source_ids,
-                    unique_sources=True,
-                )
-                concept_member_results = [
-                    hydrated.model_copy(update={"route": "cav_concept_member"})
-                    for hit in member_hits
-                    if (
-                        hydrated := self._retriever.hydrate_chunk(
-                            hit.chunk_id,
-                            score=hit.score,
-                            route="cav_concept_member",
-                        )
-                    )
-                    is not None
-                ]
-                concept_source_ids = [
-                    hit.source_id for hit in member_hits if hit.source_id is not None
-                ]
-                if concept_source_ids:
-                    concept_results = self._retriever.hybrid_query_sources(
-                        query,
-                        query_embedding,
-                        concept_source_ids,
-                        k=max(source_slots, k),
-                        candidates_per_source=source_candidate_pool,
-                        alpha=alpha,
-                    )
-                    if role_aware_retrieval:
-                        concept_results = apply_role_weights(query, concept_results)
-                    concept_results = source_diverse_results(concept_results)
-        self.last_source_diversity_report.update(
-            {
-                "concept_activation": concept_name,
-                "concept_candidates": len(concept_results),
-                "concept_members": len(concept_member_results),
-            }
+        (
+            concept_results,
+            concept_member_results,
+            concept_name,
+        ) = self._concept_activation(
+            query,
+            query_embedding,
+            params,
+            routed_source_ids=routed_source_ids,
+            use_source_diversity=use_source_diversity,
         )
 
-        facets = (
-            query_facets(query, max_facets=query_facet_max)
-            if query_facet_retrieval and query_facet_slots
-            else []
+        facet_results = self._facet_candidates(
+            query,
+            params,
+            routed_source_ids=routed_source_ids,
+            anchors=anchors,
         )
-        facet_groups: list[list[RetrievalResult]] = []
-        if facets:
-            per_facet = max(
-                2,
-                2 * ((query_facet_slots + len(facets) - 1) // len(facets)),
-            )
-            for facet in facets:
-                facet_embedding = self._embedder.embed_query(facet)
-                if routed_source_ids is not None:
-                    facet_pool = self._retriever.hybrid_query_sources(
-                        facet,
-                        facet_embedding,
-                        routed_source_ids,
-                        k=per_facet,
-                        candidates_per_source=source_candidate_pool,
-                        alpha=alpha,
-                    )
-                else:
-                    facet_pool = self.search_hybrid_from_embedding(
-                        facet,
-                        facet_embedding,
-                        k=per_facet,
-                        ef_search=ef_search,
-                        candidates=max(candidates, per_facet),
-                        alpha=alpha,
-                    )
-                if role_aware_retrieval:
-                    facet_pool = apply_role_weights(facet, facet_pool)
-                facet_groups.append(facet_pool)
-
-        facet_results = [
-            result.model_copy(update={"route": "query_facet"})
-            for result in _round_robin_unique(
-                facet_groups,
-                query_facet_slots,
-                {result.chunk.chunk_id for result in anchors},
-                stop_on_stall=False,
-            )
-        ]
-        self.last_query_facet_report = {
-            "enabled": query_facet_retrieval,
-            "facets": len(facets),
-            "reserved_slots": query_facet_slots if facets else 0,
-            "candidates_added": len(facet_results),
-        }
         expanded = self.expand_source_neighbors(
             anchors,
             radius=neighbor_radius,
@@ -484,6 +442,80 @@ class GraphWorkflowMixin:
         regular_source_slots = source_slots - len(facet_results) - (
             source_hsc_chunk_slots if source_hsc_activation else 0
         )
+        (
+            concept_partition_results,
+            concept_coverage_reserve,
+        ) = self._concept_partition_coverage(
+            query,
+            params,
+            concept_name=concept_name,
+            partition_ids=partition_ids,
+            regular_source_slots=regular_source_slots,
+        )
+        source_extras = self._source_local_extras(
+            query,
+            query_embedding,
+            params,
+            pool=pool,
+            seen=seen,
+            anchor_by_source=anchor_by_source,
+            source_scores=source_scores,
+            regular_source_slots=regular_source_slots,
+            use_source_diversity=use_source_diversity,
+            concept_member_results=concept_member_results,
+            concept_partition_results=concept_partition_results,
+            concept_coverage_reserve=concept_coverage_reserve,
+        )
+        hsc_extras: list[RetrievalResult] = []
+        if source_hsc_activation and hsc_source_ids:
+            hsc_extras = self._retriever.hybrid_query_sources(
+                query,
+                query_embedding,
+                hsc_source_ids,
+                k=source_hsc_chunk_slots,
+                candidates_per_source=source_candidate_pool,
+                alpha=alpha,
+                source_scores=hsc_source_scores,
+                anchor_chunk_ids=hsc_anchor_by_source,
+                exclude_chunk_ids=tuple(
+                    {
+                        *seen,
+                        *(result.chunk.chunk_id for result in source_extras),
+                    }
+                ),
+            )
+            hsc_extras = [
+                result.model_copy(update={"route": "hsc_contraction"})
+                for result in hsc_extras
+            ]
+            hsc_extras = params.role_weighted(query, hsc_extras)
+            if use_source_diversity:
+                hsc_extras = source_diverse_results(hsc_extras)
+        source_extras = [*source_extras, *hsc_extras]
+
+        if use_attention_feedback and feedback_slots:
+            source_extras = self._attention_feedback(
+                query,
+                query_embedding,
+                params,
+                anchors=anchors,
+                facet_results=facet_results,
+                neighbors=neighbors,
+                source_extras=source_extras,
+            )
+        baseline = [*anchors, *facet_results, *neighbors, *source_extras]
+        return self._bind_active_partition(query, baseline, anchors, routing)
+
+    def _concept_partition_coverage(
+        self,
+        query: str,
+        params: _GraphSearchParams,
+        *,
+        concept_name: str | None,
+        partition_ids: list[str],
+        regular_source_slots: int,
+    ) -> tuple[list[RetrievalResult], int]:
+        """Reserve concept-member coverage inside the top two partitions."""
         concept_partition_results: list[RetrievalResult] = []
         concept_coverage_reserve = 0
         if (
@@ -508,7 +540,7 @@ class GraphWorkflowMixin:
                     continue
                 partition_sources = self._retriever.source_ids_in_partitions(
                     [partition_id],
-                    separator=source_partition_separator,
+                    separator=params.source_partition_separator,
                 )
                 hits = self._associations.concept_members(
                     self._source_concept_artifact_id,
@@ -537,11 +569,34 @@ class GraphWorkflowMixin:
                     ),
                 }
             )
-        if source_local_search:
-            if use_source_reranker and self._source_candidate_reranker is None:
+        return concept_partition_results, concept_coverage_reserve
+
+    def _source_local_extras(
+        self,
+        query: str,
+        query_embedding,
+        params: _GraphSearchParams,
+        *,
+        pool: list[RetrievalResult],
+        seen: set[str],
+        anchor_by_source: dict[str, str],
+        source_scores: dict[str, float],
+        regular_source_slots: int,
+        use_source_diversity: bool,
+        concept_member_results: list[RetrievalResult],
+        concept_partition_results: list[RetrievalResult],
+        concept_coverage_reserve: int,
+    ) -> list[RetrievalResult]:
+        """Fill the regular source slots, optionally reranked.
+
+        The fallback (non-local) branch records its picks in ``seen`` in
+        place so the later HSC exclusion set stays complete.
+        """
+        if params.source_local_search:
+            if params.use_source_reranker and self._source_candidate_reranker is None:
                 raise RuntimeError("source reranking requested but no reranker is attached")
             result_limit = regular_source_slots
-            if use_source_reranker:
+            if params.use_source_reranker:
                 result_limit = max(
                     result_limit,
                     self._source_candidate_reranker.candidate_pool,
@@ -551,17 +606,16 @@ class GraphWorkflowMixin:
                 query_embedding,
                 list(anchor_by_source),
                 k=result_limit,
-                candidates_per_source=source_candidate_pool,
-                alpha=alpha,
+                candidates_per_source=params.source_candidate_pool,
+                alpha=params.alpha,
                 source_scores=source_scores,
                 anchor_chunk_ids=anchor_by_source,
                 exclude_chunk_ids=tuple(seen),
             )
-            if role_aware_retrieval:
-                source_extras = apply_role_weights(query, source_extras)
+            source_extras = params.role_weighted(query, source_extras)
             if use_source_diversity:
                 source_extras = source_diverse_results(source_extras)
-            if use_source_reranker:
+            if params.use_source_reranker:
                 rerank_candidates = source_extras
                 if use_source_diversity:
                     # Set queries need a safe scalar control plus attention
@@ -570,10 +624,10 @@ class GraphWorkflowMixin:
                     # source routes; broader activation is visible only to the
                     # Qwen reserve and cannot evict this protected prefix.
                     protected_activation_k = min(
-                        activation_k,
-                        source_slots
-                        + (source_tfisf_slots if source_tfisf_activation else 0)
-                        + (source_hsc_slots if source_hsc_activation else 0)
+                        params.activation_k,
+                        params.source_slots
+                        + (params.source_tfisf_slots if params.source_tfisf_activation else 0)
+                        + (params.source_hsc_slots if params.source_hsc_activation else 0)
                         + 1,
                     )
                     protected_anchor_by_source: dict[str, str] = {}
@@ -588,14 +642,13 @@ class GraphWorkflowMixin:
                         query_embedding,
                         list(protected_anchor_by_source),
                         k=regular_source_slots,
-                        candidates_per_source=source_candidate_pool,
-                        alpha=alpha,
+                        candidates_per_source=params.source_candidate_pool,
+                        alpha=params.alpha,
                         source_scores=protected_source_scores,
                         anchor_chunk_ids=protected_anchor_by_source,
                         exclude_chunk_ids=tuple(seen),
                     )
-                    if role_aware_retrieval:
-                        protected_extras = apply_role_weights(query, protected_extras)
+                    protected_extras = params.role_weighted(query, protected_extras)
                     protected_extras = source_diverse_results(protected_extras)
                     protected_ids = {
                         result.chunk.chunk_id for result in protected_extras
@@ -676,309 +729,525 @@ class GraphWorkflowMixin:
                 seen.add(result.chunk.chunk_id)
                 if len(source_extras) >= regular_source_slots:
                     break
+        return source_extras
 
-        hsc_extras: list[RetrievalResult] = []
-        if source_hsc_activation and hsc_source_ids:
-            hsc_extras = self._retriever.hybrid_query_sources(
-                query,
-                query_embedding,
-                hsc_source_ids,
-                k=source_hsc_chunk_slots,
-                candidates_per_source=source_candidate_pool,
-                alpha=alpha,
-                source_scores=hsc_source_scores,
-                anchor_chunk_ids=hsc_anchor_by_source,
-                exclude_chunk_ids=tuple(
-                    {
-                        *seen,
-                        *(result.chunk.chunk_id for result in source_extras),
-                    }
-                ),
+    def _concept_activation(
+        self,
+        query: str,
+        query_embedding,
+        params: _GraphSearchParams,
+        *,
+        routed_source_ids: list[str] | None,
+        use_source_diversity: bool,
+    ) -> tuple[list[RetrievalResult], list[RetrievalResult], str | None]:
+        """Activate CAV concept members inside the routed sources."""
+        concept_results: list[RetrievalResult] = []
+        concept_member_results: list[RetrievalResult] = []
+        concept_name: str | None = None
+        if (
+            use_source_diversity
+            and routed_source_ids
+            and self._source_concept_artifact_id is not None
+        ):
+            artifact = self._associations.get_artifact(
+                self._source_concept_artifact_id
             )
-            hsc_extras = [
-                result.model_copy(update={"route": "hsc_contraction"})
-                for result in hsc_extras
-            ]
-            if role_aware_retrieval:
-                hsc_extras = apply_role_weights(query, hsc_extras)
-            if use_source_diversity:
-                hsc_extras = source_diverse_results(hsc_extras)
-        source_extras = [*source_extras, *hsc_extras]
-
-        if use_attention_feedback and feedback_slots:
-            # Sample every first-round route instead of letting the longest
-            # route monopolize the Qwen workspace. IDs/scalars cross rounds;
-            # request-token state does not.
-            attention_candidates = _round_robin_unique(
-                [
-                    list(anchors),
-                    list(facet_results),
-                    list(neighbors),
-                    list(source_extras),
-                ],
-                self._source_candidate_reranker.candidate_pool,
-                set(),
-                stop_on_stall=True,
-            )
-
-            seeds = self._source_candidate_reranker.select(
-                query,
-                attention_candidates,
-                top_k=feedback_seed_slots,
-            )
-            initial_report = self._source_candidate_reranker.last_report
-            feedback_source_ids: list[str] = []
-            feedback_source_scores: dict[str, float] = {}
-            feedback_anchor_by_source: dict[str, str] = {}
-            for seed in seeds:
-                if seed.turn is None:
-                    continue
-                source_id = seed.source_key
-                if source_id not in feedback_source_scores:
-                    feedback_source_ids.append(source_id)
-                    feedback_anchor_by_source[source_id] = seed.chunk.chunk_id
-                feedback_source_scores[source_id] = max(
-                    feedback_source_scores.get(source_id, 0.0),
-                    float(seed.association_score or 0.0),
+            if artifact is not None and artifact.concept_names:
+                concept_name = (
+                    "autobiographical_completed_event"
+                    if "autobiographical_completed_event" in artifact.concept_names
+                    else artifact.concept_names[0]
                 )
-
-            activation_pieces = [
-                f"Original question: {truncate_to_tokens(query, 96)}",
-                "Attended evidence:",
-                *[
-                    truncate_to_tokens(seed.chunk.text, feedback_evidence_tokens)
-                    for seed in seeds
-                ],
-            ]
-            activation_window = truncate_to_tokens(
-                "\n".join(activation_pieces),
-                feedback_query_tokens,
-            )
-            feedback_results: list[RetrievalResult] = []
-            combined_report = None
-            if feedback_source_ids:
-                initial_ids = {
-                    result.chunk.chunk_id
-                    for result in [*anchors, *neighbors, *source_extras]
-                }
-                second_pool = self._retriever.hybrid_query_sources(
-                    query,
-                    query_embedding,
-                    feedback_source_ids,
-                    k=self._source_candidate_reranker.candidate_pool,
-                    candidates_per_source=source_candidate_pool,
-                    alpha=alpha,
-                    source_scores=feedback_source_scores,
-                    anchor_chunk_ids=feedback_anchor_by_source,
-                    exclude_chunk_ids=tuple(initial_ids),
+                member_hits = self._associations.concept_members(
+                    artifact.artifact_id,
+                    concept_name,
+                    top_k=max(params.source_slots * 4, params.source_slots),
+                    source_ids=routed_source_ids,
+                    unique_sources=True,
                 )
-                activation_selected = self._source_candidate_reranker.select(
-                    activation_window,
-                    second_pool,
-                    top_k=feedback_slots,
-                )
-                combined_report = self._source_candidate_reranker.last_report
-                activation_ids = {
-                    result.chunk.chunk_id for result in activation_selected
-                }
-                feedback_results = [
-                    result.model_copy(update={"route": "qwen_activation_feedback"})
-                    for result in activation_selected
+                concept_member_results = [
+                    hydrated.model_copy(update={"route": "cav_concept_member"})
+                    for hit in member_hits
+                    if (
+                        hydrated := self._retriever.hydrate_chunk(
+                            hit.chunk_id,
+                            score=hit.score,
+                            route="cav_concept_member",
+                        )
+                    )
+                    is not None
                 ]
-                for result in second_pool:
-                    if len(feedback_results) >= feedback_slots:
-                        break
-                    if result.chunk.chunk_id in activation_ids:
-                        continue
-                    feedback_results.append(
-                        result.model_copy(update={"route": "feedback_scalar_fill"})
+                concept_source_ids = [
+                    hit.source_id for hit in member_hits if hit.source_id is not None
+                ]
+                if concept_source_ids:
+                    concept_results = self._retriever.hybrid_query_sources(
+                        query,
+                        query_embedding,
+                        concept_source_ids,
+                        k=max(params.source_slots, params.k),
+                        candidates_per_source=params.source_candidate_pool,
+                        alpha=params.alpha,
                     )
+                    concept_results = params.role_weighted(query, concept_results)
+                    concept_results = source_diverse_results(concept_results)
+        self.last_source_diversity_report.update(
+            {
+                "concept_activation": concept_name,
+                "concept_candidates": len(concept_results),
+                "concept_members": len(concept_member_results),
+            }
+        )
+        return concept_results, concept_member_results, concept_name
 
-            protected_source_count = max(0, source_slots - feedback_slots)
-            selected_source = list(source_extras[:protected_source_count])
-            selected_ids = {result.chunk.chunk_id for result in selected_source}
-            for result in feedback_results:
-                if len(selected_source) >= source_slots:
-                    break
-                if result.chunk.chunk_id in selected_ids:
-                    continue
-                selected_source.append(result)
-                selected_ids.add(result.chunk.chunk_id)
-            for result in source_extras[protected_source_count:]:
-                if len(selected_source) >= source_slots:
-                    break
-                if result.chunk.chunk_id in selected_ids:
-                    continue
-                selected_source.append(result)
-                selected_ids.add(result.chunk.chunk_id)
-            source_extras = selected_source
-            initial_stats = (
-                initial_report.model_dump() if initial_report is not None else {}
+    def _facet_candidates(
+        self,
+        query: str,
+        params: _GraphSearchParams,
+        *,
+        routed_source_ids: list[str] | None,
+        anchors: list[RetrievalResult],
+    ) -> list[RetrievalResult]:
+        """Reserve slots for per-facet retrieval on multi-facet queries."""
+        facets = (
+            query_facets(query, max_facets=params.query_facet_max)
+            if params.query_facet_retrieval and params.query_facet_slots
+            else []
+        )
+        facet_groups: list[list[RetrievalResult]] = []
+        if facets:
+            per_facet = max(
+                2,
+                2 * ((params.query_facet_slots + len(facets) - 1) // len(facets)),
             )
-            combined_stats = (
-                combined_report.model_dump() if combined_report is not None else {}
-            )
-            self.last_source_rerank_report = dict(combined_stats)
-            self.last_source_rerank_report.update(
-                {
-                    "passes": int(initial_stats.get("passes", 0))
-                    + int(combined_stats.get("passes", 0)),
-                    "total_candidate_inspections": int(
-                        initial_stats.get("total_candidate_inspections", 0)
+            for facet in facets:
+                facet_embedding = self._embedder.embed_query(facet)
+                if routed_source_ids is not None:
+                    facet_pool = self._retriever.hybrid_query_sources(
+                        facet,
+                        facet_embedding,
+                        routed_source_ids,
+                        k=per_facet,
+                        candidates_per_source=params.source_candidate_pool,
+                        alpha=params.alpha,
                     )
-                    + int(combined_stats.get("total_candidate_inspections", 0)),
-                    "max_workspace_candidates": max(
-                        int(initial_stats.get("max_workspace_candidates", 0)),
-                        int(combined_stats.get("max_workspace_candidates", 0)),
-                    ),
-                    "max_workspace_tokens": max(
-                        int(initial_stats.get("max_workspace_tokens", 0)),
-                        int(combined_stats.get("max_workspace_tokens", 0)),
-                    ),
-                    "qwen_candidates_added": int(
-                        initial_stats.get("qwen_candidates_added", 0)
+                else:
+                    facet_pool = self.search_hybrid_from_embedding(
+                        facet,
+                        facet_embedding,
+                        k=per_facet,
+                        ef_search=params.ef_search,
+                        candidates=max(params.candidates, per_facet),
+                        alpha=params.alpha,
                     )
-                    + int(combined_stats.get("qwen_candidates_added", 0)),
-                }
+                facet_pool = params.role_weighted(facet, facet_pool)
+                facet_groups.append(facet_pool)
+
+        facet_results = [
+            result.model_copy(update={"route": "query_facet"})
+            for result in _round_robin_unique(
+                facet_groups,
+                params.query_facet_slots,
+                {result.chunk.chunk_id for result in anchors},
+                stop_on_stall=False,
             )
-            self.last_source_rerank_report.update(
-                {
-                    "feedback_rounds": 1,
-                    "feedback_seed_sources": len(feedback_source_ids),
-                    "feedback_candidates_added": sum(
-                        result.route in {
-                            "qwen_activation_feedback",
-                            "feedback_scalar_fill",
-                        }
-                        for result in source_extras
-                    ),
-                    "feedback_activation_candidates": sum(
-                        result.route == "qwen_activation_feedback"
-                        for result in source_extras
-                    ),
-                    "feedback_query_tokens": count_tokens(activation_window),
-                }
-            )
-        baseline = [*anchors, *facet_results, *neighbors, *source_extras]
+        ]
+        self.last_query_facet_report = {
+            "enabled": params.query_facet_retrieval,
+            "facets": len(facets),
+            "reserved_slots": params.query_facet_slots if facets else 0,
+            "candidates_added": len(facet_results),
+        }
+        return facet_results
+
+    def _bind_active_partition(
+        self,
+        query: str,
+        baseline: list[RetrievalResult],
+        anchors: list[RetrievalResult],
+        routing: _PartitionRouting,
+    ) -> list[RetrievalResult]:
+        """Admit the scanned partition candidates and seal the snapshot.
+
+        Returns the final frontier.  A transcript or content change since
+        the routed scan invalidates completeness instead of sealing a
+        stale snapshot.
+        """
         output = baseline
-        if active_partition_report.get("active_partition_scan_status") == "applied":
-            output, admission = self._admit_active_partition_candidates(
-                baseline,
-                active_partition_candidates,
-                anchor_chunk_ids={result.chunk.chunk_id for result in anchors},
-                semantic_complete=bool(
-                    active_partition_report.get(
-                        "active_partition_semantically_complete",
-                        False,
-                    )
-                ),
-            )
-            scan_truncated = int(
-                active_partition_report.get(
-                    "active_partition_candidates_truncated",
-                    0,
+        report = routing.report
+        if report.get("active_partition_scan_status") != "applied":
+            return output
+        output, admission = self._admit_active_partition_candidates(
+            baseline,
+            routing.candidates,
+            anchor_chunk_ids={result.chunk.chunk_id for result in anchors},
+            semantic_complete=bool(
+                report.get(
+                    "active_partition_semantically_complete",
+                    False,
                 )
+            ),
+        )
+        scan_truncated = int(
+            report.get(
+                "active_partition_candidates_truncated",
+                0,
             )
-            total_truncated = scan_truncated + int(
-                admission["active_partition_candidates_truncated"]
-            )
-            admission["active_partition_candidates_truncated"] = total_truncated
-            if total_truncated:
-                active_partition_report[
-                    "active_partition_semantically_complete"
-                ] = False
-                active_partition_report[
-                    "selected_scope_structurally_complete"
-                ] = False
-                active_partition_report["global_semantic_complete"] = False
-            active_partition_report.update(admission)
-            self.last_partition_routing_report.update(active_partition_report)
+        )
+        total_truncated = scan_truncated + int(
+            admission["active_partition_candidates_truncated"]
+        )
+        admission["active_partition_candidates_truncated"] = total_truncated
+        if total_truncated:
+            report[
+                "active_partition_semantically_complete"
+            ] = False
+            report[
+                "selected_scope_structurally_complete"
+            ] = False
+            report["global_semantic_complete"] = False
+        report.update(admission)
+        self.last_partition_routing_report.update(report)
 
-            frontier_ids = tuple(result.chunk.chunk_id for result in output)
-            frontier_routes = tuple(str(result.route or "") for result in output)
-            active_frontier_rows = tuple(
-                sorted(
-                    (result.chunk.chunk_id, str(result.route or ""))
-                    for result in output
-                    if str(result.route or "").casefold().startswith(
-                        "active_partition_"
-                    )
+        frontier_ids = tuple(result.chunk.chunk_id for result in output)
+        frontier_routes = tuple(str(result.route or "") for result in output)
+        active_frontier_rows = tuple(
+            sorted(
+                (result.chunk.chunk_id, str(result.route or ""))
+                for result in output
+                if str(result.route or "").casefold().startswith(
+                    "active_partition_"
                 )
             )
-            transcript_turn = self._transcript.current_turn()
-            content_high_watermark = self._content_high_watermark()
-            if (
-                transcript_turn != active_partition_routing_turn
-                or content_high_watermark
-                != active_partition_content_high_watermark
-            ):
-                invalidated_reason = (
-                    "transcript_advanced_during_route"
-                    if transcript_turn != active_partition_routing_turn
-                    else "content_changed_during_route"
-                )
-                active_partition_report.update(
-                    {
-                        "active_partition_scan_status": "invalidated",
-                        "active_partition_exhaustive": False,
-                        "active_partition_semantically_complete": False,
-                        "selected_scope_structurally_complete": False,
-                        "global_semantic_complete": False,
-                        "active_partition_snapshot_invalidated_reason": (
-                            invalidated_reason
-                        ),
-                    }
-                )
-                self.last_partition_routing_report.update(
-                    {
-                        **active_partition_report,
-                        "active_partition_snapshot_validated": False,
-                    }
-                )
-                return output
-
-            query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
-            source_set_sha256 = hashlib.sha256(
-                "\0".join(routed_source_ids or ()).encode("utf-8")
-            ).hexdigest()
-            identity_payload = "\0".join(
-                [
-                    query_sha256,
-                    str(transcript_turn),
-                    str(content_high_watermark),
-                    source_set_sha256,
-                    *partition_ids,
-                    *frontier_ids,
-                    *frontier_routes,
-                ]
+        )
+        transcript_turn = self._transcript.current_turn()
+        content_high_watermark = self._content_high_watermark()
+        if (
+            transcript_turn != routing.routing_turn
+            or content_high_watermark
+            != routing.content_high_watermark
+        ):
+            invalidated_reason = (
+                "transcript_advanced_during_route"
+                if transcript_turn != routing.routing_turn
+                else "content_changed_during_route"
             )
-            routing_identity = hashlib.sha256(
-                identity_payload.encode("utf-8")
-            ).hexdigest()
-            # ``active_partition_candidates_truncated`` already carries
-            # ``total_truncated`` — the admission update above wrote it into
-            # the report before this binding.
-            self._active_partition_routing_snapshot = (
-                _ActivePartitionRoutingSnapshot.from_report(
-                    active_partition_report,
-                    routing_identity=routing_identity,
-                    query_sha256=query_sha256,
-                    transcript_turn=transcript_turn,
-                    content_high_watermark=content_high_watermark,
-                    selected_partitions=tuple(partition_ids),
-                    routed_source_ids=tuple(routed_source_ids or ()),
-                    frontier_chunk_ids=frontier_ids,
-                    frontier_routes=frontier_routes,
-                    active_frontier_rows=active_frontier_rows,
-                )
+            report.update(
+                {
+                    "active_partition_scan_status": "invalidated",
+                    "active_partition_exhaustive": False,
+                    "active_partition_semantically_complete": False,
+                    "selected_scope_structurally_complete": False,
+                    "global_semantic_complete": False,
+                    "active_partition_snapshot_invalidated_reason": (
+                        invalidated_reason
+                    ),
+                }
             )
             self.last_partition_routing_report.update(
                 {
-                    "active_partition_routing_identity": routing_identity,
+                    **report,
                     "active_partition_snapshot_validated": False,
                 }
             )
+            return output
+
+        query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        source_set_sha256 = hashlib.sha256(
+            "\0".join(routing.routed_source_ids or ()).encode("utf-8")
+        ).hexdigest()
+        identity_payload = "\0".join(
+            [
+                query_sha256,
+                str(transcript_turn),
+                str(content_high_watermark),
+                source_set_sha256,
+                *routing.partition_ids,
+                *frontier_ids,
+                *frontier_routes,
+            ]
+        )
+        routing_identity = hashlib.sha256(
+            identity_payload.encode("utf-8")
+        ).hexdigest()
+        # ``active_partition_candidates_truncated`` already carries
+        # ``total_truncated`` — the admission update above wrote it into
+        # the report before this binding.
+        self._active_partition_routing_snapshot = (
+            _ActivePartitionRoutingSnapshot.from_report(
+                report,
+                routing_identity=routing_identity,
+                query_sha256=query_sha256,
+                transcript_turn=transcript_turn,
+                content_high_watermark=content_high_watermark,
+                selected_partitions=tuple(routing.partition_ids),
+                routed_source_ids=tuple(routing.routed_source_ids or ()),
+                frontier_chunk_ids=frontier_ids,
+                frontier_routes=frontier_routes,
+                active_frontier_rows=active_frontier_rows,
+            )
+        )
+        self.last_partition_routing_report.update(
+            {
+                "active_partition_routing_identity": routing_identity,
+                "active_partition_snapshot_validated": False,
+            }
+        )
         return output
+
+    def _route_partitions(
+        self,
+        query: str,
+        query_embedding,
+        params: _GraphSearchParams,
+    ) -> tuple[
+        list[RetrievalResult], list[RetrievalResult], _PartitionRouting
+    ]:
+        """Resolve the candidate pool and anchors, optionally partition-routed."""
+        routing = _PartitionRouting()
+        if not params.source_partition_routing:
+            anchors = self.search_hybrid_from_embedding(
+                query,
+                query_embedding,
+                k=params.k,
+                ef_search=params.ef_search,
+                candidates=params.candidates,
+                alpha=params.alpha,
+            )
+            pool = self.search_hybrid_from_embedding(
+                query,
+                query_embedding,
+                k=params.pool_size,
+                ef_search=params.ef_search,
+                candidates=max(params.candidates, params.pool_size),
+                alpha=params.alpha,
+            )
+            return pool, anchors, routing
+
+        coarse_pool = self.search_hybrid_from_embedding(
+            query,
+            query_embedding,
+            k=params.pool_size,
+            ef_search=params.ef_search,
+            candidates=max(params.candidates, params.pool_size),
+            alpha=params.alpha,
+        )
+        coarse_pool = params.role_weighted(query, coarse_pool)
+        partition_ranking = source_partition_ranking(
+            coarse_pool,
+            separator=params.source_partition_separator,
+        )
+        routing.partition_ids = [
+            str(item["partition"])
+            for item in partition_ranking[: params.source_partition_slots]
+        ]
+        # Bind the complete scan to the database generation immediately
+        # before resolving its immutable source set.  A concurrent append
+        # anywhere in the remainder of the route invalidates completeness
+        # instead of allowing a stale scan report to reach the packer.
+        routing.routing_turn = self._transcript.current_turn()
+        routing.content_high_watermark = self._content_high_watermark()
+        routing.routed_source_ids = self._retriever.source_ids_in_partitions(
+            routing.partition_ids,
+            separator=params.source_partition_separator,
+        )
+        routing.candidates, routing.report = (
+            self._scan_active_partition_frontier(
+                query,
+                query_embedding,
+                routing.partition_ids,
+                routing.routed_source_ids,
+                separator=params.source_partition_separator,
+            )
+        )
+        pool = self._retriever.hybrid_query_sources(
+            query,
+            query_embedding,
+            routing.routed_source_ids,
+            k=params.pool_size,
+            candidates_per_source=params.source_candidate_pool,
+            alpha=params.alpha,
+        )
+        self.last_partition_routing_report = {
+            "coarse_candidates": len(coarse_pool),
+            "selected_partitions": routing.partition_ids,
+            "partition_ranking": partition_ranking,
+            "routed_sources": len(routing.routed_source_ids),
+            "routed_candidates": len(pool),
+            **routing.report,
+        }
+        return pool, pool[: params.k], routing
+
+    def _attention_feedback(
+        self,
+        query: str,
+        query_embedding,
+        params: _GraphSearchParams,
+        *,
+        anchors: list[RetrievalResult],
+        facet_results: list[RetrievalResult],
+        neighbors: list[RetrievalResult],
+        source_extras: list[RetrievalResult],
+    ) -> list[RetrievalResult]:
+        """Run the two-round Qwen activation-feedback pass.
+
+        Returns the feedback-blended source extras and publishes the
+        merged reranker report on ``last_source_rerank_report``.
+        """
+        # Sample every first-round route instead of letting the longest
+        # route monopolize the Qwen workspace. IDs/scalars cross rounds;
+        # request-token state does not.
+        attention_candidates = _round_robin_unique(
+            [
+                list(anchors),
+                list(facet_results),
+                list(neighbors),
+                list(source_extras),
+            ],
+            self._source_candidate_reranker.candidate_pool,
+            set(),
+            stop_on_stall=True,
+        )
+
+        seeds = self._source_candidate_reranker.select(
+            query,
+            attention_candidates,
+            top_k=params.feedback_seed_slots,
+        )
+        initial_report = self._source_candidate_reranker.last_report
+        feedback_source_ids: list[str] = []
+        feedback_source_scores: dict[str, float] = {}
+        feedback_anchor_by_source: dict[str, str] = {}
+        for seed in seeds:
+            if seed.turn is None:
+                continue
+            source_id = seed.source_key
+            if source_id not in feedback_source_scores:
+                feedback_source_ids.append(source_id)
+                feedback_anchor_by_source[source_id] = seed.chunk.chunk_id
+            feedback_source_scores[source_id] = max(
+                feedback_source_scores.get(source_id, 0.0),
+                float(seed.association_score or 0.0),
+            )
+
+        activation_pieces = [
+            f"Original question: {truncate_to_tokens(query, 96)}",
+            "Attended evidence:",
+            *[
+                truncate_to_tokens(seed.chunk.text, params.feedback_evidence_tokens)
+                for seed in seeds
+            ],
+        ]
+        activation_window = truncate_to_tokens(
+            "\n".join(activation_pieces),
+            params.feedback_query_tokens,
+        )
+        feedback_results: list[RetrievalResult] = []
+        combined_report = None
+        if feedback_source_ids:
+            initial_ids = {
+                result.chunk.chunk_id
+                for result in [*anchors, *neighbors, *source_extras]
+            }
+            second_pool = self._retriever.hybrid_query_sources(
+                query,
+                query_embedding,
+                feedback_source_ids,
+                k=self._source_candidate_reranker.candidate_pool,
+                candidates_per_source=params.source_candidate_pool,
+                alpha=params.alpha,
+                source_scores=feedback_source_scores,
+                anchor_chunk_ids=feedback_anchor_by_source,
+                exclude_chunk_ids=tuple(initial_ids),
+            )
+            activation_selected = self._source_candidate_reranker.select(
+                activation_window,
+                second_pool,
+                top_k=params.feedback_slots,
+            )
+            combined_report = self._source_candidate_reranker.last_report
+            activation_ids = {
+                result.chunk.chunk_id for result in activation_selected
+            }
+            feedback_results = [
+                result.model_copy(update={"route": "qwen_activation_feedback"})
+                for result in activation_selected
+            ]
+            for result in second_pool:
+                if len(feedback_results) >= params.feedback_slots:
+                    break
+                if result.chunk.chunk_id in activation_ids:
+                    continue
+                feedback_results.append(
+                    result.model_copy(update={"route": "feedback_scalar_fill"})
+                )
+
+        protected_source_count = max(0, params.source_slots - params.feedback_slots)
+        selected_source = list(source_extras[:protected_source_count])
+        selected_ids = {result.chunk.chunk_id for result in selected_source}
+        for result in feedback_results:
+            if len(selected_source) >= params.source_slots:
+                break
+            if result.chunk.chunk_id in selected_ids:
+                continue
+            selected_source.append(result)
+            selected_ids.add(result.chunk.chunk_id)
+        for result in source_extras[protected_source_count:]:
+            if len(selected_source) >= params.source_slots:
+                break
+            if result.chunk.chunk_id in selected_ids:
+                continue
+            selected_source.append(result)
+            selected_ids.add(result.chunk.chunk_id)
+        source_extras = selected_source
+        initial_stats = (
+            initial_report.model_dump() if initial_report is not None else {}
+        )
+        combined_stats = (
+            combined_report.model_dump() if combined_report is not None else {}
+        )
+        self.last_source_rerank_report = dict(combined_stats)
+        self.last_source_rerank_report.update(
+            {
+                "passes": int(initial_stats.get("passes", 0))
+                + int(combined_stats.get("passes", 0)),
+                "total_candidate_inspections": int(
+                    initial_stats.get("total_candidate_inspections", 0)
+                )
+                + int(combined_stats.get("total_candidate_inspections", 0)),
+                "max_workspace_candidates": max(
+                    int(initial_stats.get("max_workspace_candidates", 0)),
+                    int(combined_stats.get("max_workspace_candidates", 0)),
+                ),
+                "max_workspace_tokens": max(
+                    int(initial_stats.get("max_workspace_tokens", 0)),
+                    int(combined_stats.get("max_workspace_tokens", 0)),
+                ),
+                "qwen_candidates_added": int(
+                    initial_stats.get("qwen_candidates_added", 0)
+                )
+                + int(combined_stats.get("qwen_candidates_added", 0)),
+            }
+        )
+        self.last_source_rerank_report.update(
+            {
+                "feedback_rounds": 1,
+                "feedback_seed_sources": len(feedback_source_ids),
+                "feedback_candidates_added": sum(
+                    result.route in {
+                        "qwen_activation_feedback",
+                        "feedback_scalar_fill",
+                    }
+                    for result in source_extras
+                ),
+                "feedback_activation_candidates": sum(
+                    result.route == "qwen_activation_feedback"
+                    for result in source_extras
+                ),
+                "feedback_query_tokens": count_tokens(activation_window),
+            }
+        )
+        return source_extras
 
     def search_hybrid_neighbors(
         self,

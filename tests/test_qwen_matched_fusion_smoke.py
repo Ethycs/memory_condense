@@ -7,6 +7,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from memory_condense.domain.discourse import ClosurePlan, EvidencePacket
 from memory_condense.modeling.qwen_prefix import (
     DEFAULT_MODEL_ID,
@@ -195,6 +197,189 @@ def test_runner_preflights_memory_before_loading_and_calls_only_public_builder()
     assert "torch.float16" in ast.get_source_segment(
         SOURCE_PATH.read_text(encoding="utf-8"), preflight
     )
+    preflight_source = ast.get_source_segment(
+        SOURCE_PATH.read_text(encoding="utf-8"), preflight
+    )
+    assert preflight_source is not None
+    assert "_require_cublas_workspace_clearer(torch)" in preflight_source
+
+
+def test_cublas_clearer_requires_the_exact_owned_torch_builtin() -> None:
+    torch = pytest.importorskip("torch")
+    clearer = smoke._require_cublas_workspace_clearer(torch)
+    assert inspect.isbuiltin(clearer)
+    assert clearer.__module__ == "torch._C"
+    assert clearer.__name__ == "_cuda_clearCublasWorkspaces"
+    assert clearer.__self__ is torch._C
+
+    helper_source = inspect.getsource(smoke._require_cublas_workspace_clearer)
+    for required in (
+        "inspect.isbuiltin",
+        '"__module__"',
+        '"torch._C"',
+        '"__name__"',
+        '"__self__"',
+        "is not extension",
+    ):
+        assert required in helper_source
+
+
+def test_missing_or_foreign_cublas_clearer_fails_closed() -> None:
+    class MissingTorch:
+        _C = object()
+
+    class ForeignExtension:
+        def _cuda_clearCublasWorkspaces(self) -> None:
+            return None
+
+    class ForeignTorch:
+        _C = ForeignExtension()
+
+    with pytest.raises(RuntimeError, match="exact cuBLAS workspace clearer"):
+        smoke._require_cublas_workspace_clearer(MissingTorch())
+    with pytest.raises(RuntimeError, match="exact cuBLAS workspace clearer"):
+        smoke._require_cublas_workspace_clearer(ForeignTorch())
+
+
+def test_cublas_clearer_drift_failure_and_return_value_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def captured() -> None:
+        return None
+
+    def replacement() -> None:
+        return None
+
+    monkeypatch.setattr(
+        smoke,
+        "_require_cublas_workspace_clearer",
+        lambda _torch: replacement,
+    )
+    with pytest.raises(RuntimeError, match="changed during smoke"):
+        smoke._clear_cublas_workspaces(object(), captured)
+
+    def throwing() -> None:
+        raise ValueError("synthetic clear failure")
+
+    monkeypatch.setattr(
+        smoke,
+        "_require_cublas_workspace_clearer",
+        lambda _torch: throwing,
+    )
+    with pytest.raises(RuntimeError, match="workspace clear failed"):
+        smoke._clear_cublas_workspaces(object(), throwing)
+
+    def returning() -> int:
+        return 1
+
+    monkeypatch.setattr(
+        smoke,
+        "_require_cublas_workspace_clearer",
+        lambda _torch: returning,
+    )
+    with pytest.raises(RuntimeError, match="clearer returned a value"):
+        smoke._clear_cublas_workspaces(object(), returning)
+
+
+def test_retained_or_unexpectedly_released_cuda_allocation_fails_closed() -> None:
+    baseline = {
+        "resident_allocated": 100,
+        "resident_reserved": 200,
+        "raw_allocated": 130,
+        "raw_reserved": 260,
+        "post_clear_reserved": 240,
+    }
+    smoke._assert_no_retained_cuda_allocation(
+        **baseline,
+        post_clear_allocated=100,
+    )
+    with pytest.raises(RuntimeError) as retained:
+        smoke._assert_no_retained_cuda_allocation(
+            **baseline,
+            post_clear_allocated=101,
+        )
+    assert "raw_allocated_delta_bytes=30" in str(retained.value)
+    assert "raw_reserved_delta_bytes=60" in str(retained.value)
+    assert "post_clear_allocated_delta_bytes=1" in str(retained.value)
+    assert "post_clear_reserved_delta_bytes=40" in str(retained.value)
+    with pytest.raises(RuntimeError, match="normalized resident baseline"):
+        smoke._assert_no_retained_cuda_allocation(
+            **baseline,
+            post_clear_allocated=99,
+        )
+
+
+def test_cublas_normalization_surrounds_only_the_measured_builder() -> None:
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    runner = _function(tree, "run_qwen_matched_fusion_smoke")
+    runner_source = ast.get_source_segment(source, runner)
+    assert runner_source is not None
+    assert runner_source.count("_clear_cublas_workspaces(") == 2
+
+    router_setup = runner_source.index("router_setup_seconds =")
+    prebaseline_sync = runner_source.index(
+        "torch.cuda.synchronize(device)", router_setup
+    )
+    prebaseline_clear = runner_source.index(
+        "_clear_cublas_workspaces(torch, cublas_workspace_clearer)",
+        prebaseline_sync,
+    )
+    prebaseline_post_sync = runner_source.index(
+        "torch.cuda.synchronize(device)", prebaseline_clear
+    )
+    resident_allocated = runner_source.index(
+        "resident_allocated_before_builder =", prebaseline_post_sync
+    )
+    resident_reserved = runner_source.index(
+        "resident_reserved_before_builder =", resident_allocated
+    )
+    reset_peak = runner_source.index("reset_peak_memory_stats", resident_reserved)
+    builder = runner_source.index("pair = build_qwen_matched_fusion_pair(", reset_peak)
+    raw_allocated = runner_source.index("raw_allocated_after_builder =", builder)
+    raw_reserved = runner_source.index("raw_reserved_after_builder =", raw_allocated)
+    operation_peak = runner_source.index("operation_peak_allocated =", raw_reserved)
+    postraw_sync = runner_source.index(
+        "torch.cuda.synchronize(device)", operation_peak
+    )
+    postbuilder_clear = runner_source.index(
+        "_clear_cublas_workspaces(torch, cublas_workspace_clearer)",
+        postraw_sync,
+    )
+    postclear_sync = runner_source.index(
+        "torch.cuda.synchronize(device)", postbuilder_clear
+    )
+    postclear_allocated = runner_source.index(
+        "post_clear_allocated =", postclear_sync
+    )
+    postclear_reserved = runner_source.index(
+        "post_clear_reserved =", postclear_allocated
+    )
+    allocation_gate = runner_source.index(
+        "_assert_no_retained_cuda_allocation(", postclear_reserved
+    )
+    assert (
+        router_setup
+        < prebaseline_sync
+        < prebaseline_clear
+        < prebaseline_post_sync
+        < resident_allocated
+        < resident_reserved
+        < reset_peak
+        < builder
+        < raw_allocated
+        < raw_reserved
+        < operation_peak
+        < postraw_sync
+        < postbuilder_clear
+        < postclear_sync
+        < postclear_allocated
+        < postclear_reserved
+        < allocation_gate
+    )
+    measured_section = runner_source[builder:allocation_gate]
+    assert "gc.collect()" not in measured_section
+    assert "empty_cache()" not in measured_section
 
 
 def test_success_checks_cover_claims_gate_stability_and_tensor_absence() -> None:
@@ -268,9 +453,23 @@ def test_runner_finally_closes_and_releases_without_certifying_measurements() ->
     assert "observed_fusion_seconds" in source
     assert "observed_cuda_allocated_bytes_before_load" in source
     assert "observed_cuda_allocated_bytes_before_builder" in source
+    assert "observed_cuda_reserved_bytes_before_builder" in source
     assert "observed_cuda_allocated_bytes_after_builder" in source
+    assert "observed_cuda_reserved_bytes_after_builder" in source
+    assert "observed_raw_cuda_allocated_bytes_after_builder" in source
+    assert "observed_raw_cuda_reserved_bytes_after_builder" in source
+    assert "observed_raw_cuda_allocated_delta_bytes_after_builder" in source
+    assert "observed_raw_cuda_reserved_delta_bytes_after_builder" in source
+    assert "observed_cuda_allocated_bytes_after_cublas_clear" in source
+    assert "observed_cuda_reserved_bytes_after_cublas_clear" in source
+    assert "observed_cuda_allocated_delta_bytes_after_cublas_clear" in source
+    assert "observed_cuda_reserved_delta_bytes_after_cublas_clear" in source
     assert "observed_operation_peak_cuda_allocated_bytes" in source
-    assert "allocated_after_builder <= resident_allocated_before_builder" in source
+    assert (
+        '"post_cublas_clear_allocated_equals_normalized_resident_v1"'
+        in source
+    )
+    assert '"torch._C._cuda_clearCublasWorkspaces"' in source
     assert "certified" not in source.casefold().replace("uncertified", "")
 
 

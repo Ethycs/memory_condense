@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import sys
 import time
@@ -65,6 +66,7 @@ _DEVICE = "cuda:0"
 _DTYPE_NAME = "float16"
 _TORCH_DTYPE_NAME = "torch.float16"
 _MIN_FREE_CUDA_BYTES = 3 * 1024**3
+_CUBLAS_WORKSPACE_CLEAR_NAME = "_cuda_clearCublasWorkspaces"
 _PINNED_PREFIX_CHECKPOINT_SHA256 = (
     "76273516aa6924b12344d5e83daa485b66459b663c745cb3b9ef51cc17c7440d"
 )
@@ -512,7 +514,58 @@ def _assert_success(
     _require(all(text not in encoded for text in request_text), "public pair retained request text")
 
 
-def _preflight_cuda(torch: Any) -> tuple[Any, int, int, int]:
+def _require_cublas_workspace_clearer(torch: Any) -> Any:
+    extension = getattr(torch, "_C", None)
+    clearer = getattr(extension, _CUBLAS_WORKSPACE_CLEAR_NAME, None)
+    if (
+        not callable(clearer)
+        or not inspect.isbuiltin(clearer)
+        or getattr(clearer, "__module__", None) != "torch._C"
+        or getattr(clearer, "__name__", None) != _CUBLAS_WORKSPACE_CLEAR_NAME
+        or getattr(clearer, "__self__", None) is not extension
+    ):
+        raise RuntimeError(
+            "matched-fusion smoke requires Torch's exact cuBLAS workspace clearer"
+        )
+    return clearer
+
+
+def _clear_cublas_workspaces(torch: Any, expected_clearer: Any) -> None:
+    current = _require_cublas_workspace_clearer(torch)
+    if current is not expected_clearer:
+        raise RuntimeError("Torch's cuBLAS workspace clearer changed during smoke")
+    try:
+        result = current()
+    except Exception as exc:
+        raise RuntimeError("Torch's cuBLAS workspace clear failed") from exc
+    if result is not None:
+        raise RuntimeError("Torch's cuBLAS workspace clearer returned a value")
+
+
+def _assert_no_retained_cuda_allocation(
+    *,
+    resident_allocated: int,
+    resident_reserved: int,
+    raw_allocated: int,
+    raw_reserved: int,
+    post_clear_allocated: int,
+    post_clear_reserved: int,
+) -> None:
+    raw_allocated_delta = raw_allocated - resident_allocated
+    raw_reserved_delta = raw_reserved - resident_reserved
+    post_clear_allocated_delta = post_clear_allocated - resident_allocated
+    post_clear_reserved_delta = post_clear_reserved - resident_reserved
+    if post_clear_allocated != resident_allocated:
+        raise RuntimeError(
+            "post-operation CUDA allocation did not equal normalized resident baseline "
+            f"(raw_allocated_delta_bytes={raw_allocated_delta}, "
+            f"raw_reserved_delta_bytes={raw_reserved_delta}, "
+            f"post_clear_allocated_delta_bytes={post_clear_allocated_delta}, "
+            f"post_clear_reserved_delta_bytes={post_clear_reserved_delta})"
+        )
+
+
+def _preflight_cuda(torch: Any) -> tuple[Any, int, int, int, Any]:
     device = torch.device(_DEVICE)
     if device.type != "cuda" or device.index != 0 or str(device) != _DEVICE:
         raise RuntimeError("matched-fusion smoke requires canonical indexed cuda:0")
@@ -520,6 +573,7 @@ def _preflight_cuda(torch: Any) -> tuple[Any, int, int, int]:
         raise RuntimeError("matched-fusion smoke requires CUDA device 0")
     if str(getattr(torch, "float16", None)) != _TORCH_DTYPE_NAME:
         raise RuntimeError("matched-fusion smoke requires canonical torch.float16")
+    cublas_workspace_clearer = _require_cublas_workspace_clearer(torch)
     free_bytes, total_bytes = (
         int(value) for value in torch.cuda.mem_get_info(device)
     )
@@ -528,7 +582,13 @@ def _preflight_cuda(torch: Any) -> tuple[Any, int, int, int]:
             "matched-fusion smoke requires at least 3 GiB of free CUDA memory"
         )
     baseline_allocated = int(torch.cuda.memory_allocated(device))
-    return device, free_bytes, total_bytes, baseline_allocated
+    return (
+        device,
+        free_bytes,
+        total_bytes,
+        baseline_allocated,
+        cublas_workspace_clearer,
+    )
 
 
 def run_qwen_matched_fusion_smoke(
@@ -539,7 +599,13 @@ def run_qwen_matched_fusion_smoke(
     import torch
 
     expected_checkpoint = _expected_checkpoint_sha256()
-    device, free_bytes, total_bytes, baseline_allocated = _preflight_cuda(torch)
+    (
+        device,
+        free_bytes,
+        total_bytes,
+        baseline_allocated,
+        cublas_workspace_clearer,
+    ) = _preflight_cuda(torch)
     packet, plan = _synthetic_packet_and_plan()
     caps = _fusion_caps()
     feature_caps = _feature_caps()
@@ -579,8 +645,14 @@ def run_qwen_matched_fusion_smoke(
         torch.cuda.synchronize(device)
         router_setup_seconds = time.perf_counter() - router_started
 
+        torch.cuda.synchronize(device)
+        _clear_cublas_workspaces(torch, cublas_workspace_clearer)
+        torch.cuda.synchronize(device)
         resident_allocated_before_builder = int(
             torch.cuda.memory_allocated(device)
+        )
+        resident_reserved_before_builder = int(
+            torch.cuda.memory_reserved(device)
         )
         torch.cuda.reset_peak_memory_stats(device)
         fusion_started = time.perf_counter()
@@ -594,11 +666,21 @@ def run_qwen_matched_fusion_smoke(
         )
         torch.cuda.synchronize(device)
         fusion_seconds = time.perf_counter() - fusion_started
-        allocated_after_builder = int(torch.cuda.memory_allocated(device))
+        raw_allocated_after_builder = int(torch.cuda.memory_allocated(device))
+        raw_reserved_after_builder = int(torch.cuda.memory_reserved(device))
         operation_peak_allocated = int(torch.cuda.max_memory_allocated(device))
-        _require(
-            allocated_after_builder <= resident_allocated_before_builder,
-            "matched-fusion builder retained CUDA tensor allocation",
+        torch.cuda.synchronize(device)
+        _clear_cublas_workspaces(torch, cublas_workspace_clearer)
+        torch.cuda.synchronize(device)
+        post_clear_allocated = int(torch.cuda.memory_allocated(device))
+        post_clear_reserved = int(torch.cuda.memory_reserved(device))
+        _assert_no_retained_cuda_allocation(
+            resident_allocated=resident_allocated_before_builder,
+            resident_reserved=resident_reserved_before_builder,
+            raw_allocated=raw_allocated_after_builder,
+            raw_reserved=raw_reserved_after_builder,
+            post_clear_allocated=post_clear_allocated,
+            post_clear_reserved=post_clear_reserved,
         )
         _assert_success(
             pair,
@@ -618,6 +700,12 @@ def run_qwen_matched_fusion_smoke(
                 "format": "qwen_matched_fusion_local_diagnostic_v1",
                 "diagnostic_non_artifact": True,
                 "performance_attested": False,
+                "retained_request_cuda_allocation_metric": (
+                    "post_cublas_clear_allocated_equals_normalized_resident_v1"
+                ),
+                "cuda_workspace_normalizer": (
+                    "torch._C._cuda_clearCublasWorkspaces"
+                ),
                 "model_id": _MODEL_ID,
                 "model_revision": _MODEL_REVISION,
                 "checkpoint_sha256": expected_checkpoint,
@@ -642,8 +730,39 @@ def run_qwen_matched_fusion_smoke(
                 "observed_cuda_allocated_bytes_before_builder": (
                     resident_allocated_before_builder
                 ),
+                "observed_cuda_reserved_bytes_before_builder": (
+                    resident_reserved_before_builder
+                ),
                 "observed_cuda_allocated_bytes_after_builder": (
-                    allocated_after_builder
+                    raw_allocated_after_builder
+                ),
+                "observed_cuda_reserved_bytes_after_builder": (
+                    raw_reserved_after_builder
+                ),
+                "observed_raw_cuda_allocated_bytes_after_builder": (
+                    raw_allocated_after_builder
+                ),
+                "observed_raw_cuda_reserved_bytes_after_builder": (
+                    raw_reserved_after_builder
+                ),
+                "observed_raw_cuda_allocated_delta_bytes_after_builder": (
+                    raw_allocated_after_builder
+                    - resident_allocated_before_builder
+                ),
+                "observed_raw_cuda_reserved_delta_bytes_after_builder": (
+                    raw_reserved_after_builder - resident_reserved_before_builder
+                ),
+                "observed_cuda_allocated_bytes_after_cublas_clear": (
+                    post_clear_allocated
+                ),
+                "observed_cuda_reserved_bytes_after_cublas_clear": (
+                    post_clear_reserved
+                ),
+                "observed_cuda_allocated_delta_bytes_after_cublas_clear": (
+                    post_clear_allocated - resident_allocated_before_builder
+                ),
+                "observed_cuda_reserved_delta_bytes_after_cublas_clear": (
+                    post_clear_reserved - resident_reserved_before_builder
                 ),
                 "observed_operation_peak_cuda_allocated_bytes": (
                     operation_peak_allocated

@@ -9,6 +9,12 @@ from pathlib import Path
 
 import pytest
 
+from memory_condense.domain._discourse_identity import identity_sha256, quote_sha256
+from memory_condense.domain._tokenizer import (
+    count_chat_prompt_token_proxy,
+    count_tokens,
+    tokenizer_proxy_identity,
+)
 from memory_condense.domain.discourse import ClosurePlan, EvidencePacket
 from memory_condense.modeling.qwen_prefix import (
     DEFAULT_MODEL_ID,
@@ -16,6 +22,7 @@ from memory_condense.modeling.qwen_prefix import (
     expected_prefix_checkpoint_sha256,
 )
 from memory_condense.tooling import qwen_matched_fusion_smoke as smoke
+from memory_condense.search.packing.evidence_packet import render_evidence_context
 
 
 SOURCE_PATH = Path(smoke.__file__)
@@ -76,7 +83,75 @@ def test_synthetic_inputs_are_exact_route_agnostic_n2_one_bundle() -> None:
         atom.span.source_id == "qwen-matched-fusion-smoke"
         for atom in packet.atoms
     )
+    assert packet.context == render_evidence_context(plan.atoms, plan.bundles)
+    assert packet.receipt.context_sha256 == quote_sha256(packet.context)
+    assert packet.receipt.context_token_proxy == count_tokens(
+        packet.context,
+        encoding=smoke._ENCODING,
+    )
+    assert packet.receipt.max_context_token_proxy == smoke._MAX_CONTEXT_TOKENS == 256
+    tokenizer_body = tokenizer_proxy_identity(smoke._ENCODING)
+    assert packet.receipt.tokenizer_identity == (
+        f"{tokenizer_body['encoding']}:{identity_sha256(tokenizer_body)}"
+    )
+    base_messages = smoke._synthetic_base_messages(plan)
+    assert base_messages == (
+        {"role": "system", "content": smoke._PROMPT_SYSTEM_MESSAGE},
+        {"role": "user", "content": plan.query_program.query},
+    )
+    prompt_messages = (
+        *base_messages,
+        {
+            "role": smoke._EVIDENCE_MESSAGE_ROLE,
+            "content": (
+                smoke._EVIDENCE_PREFIX
+                + packet.context
+                + smoke._EVIDENCE_SUFFIX
+            ),
+        },
+    )
+    prompt_tokens = count_chat_prompt_token_proxy(
+        prompt_messages,
+        encoding=smoke._ENCODING,
+    )
+    assert packet.receipt.base_messages_sha256 == identity_sha256(
+        list(base_messages)
+    )
+    assert packet.receipt.evidence_message_role == smoke._EVIDENCE_MESSAGE_ROLE
+    assert packet.receipt.evidence_prefix_sha256 == quote_sha256(
+        smoke._EVIDENCE_PREFIX
+    )
+    assert packet.receipt.evidence_suffix_sha256 == quote_sha256(
+        smoke._EVIDENCE_SUFFIX
+    )
+    assert packet.receipt.prompt_messages_sha256 == identity_sha256(
+        list(prompt_messages)
+    )
+    assert packet.receipt.prompt_token_proxy == prompt_tokens == 181
+    assert packet.receipt.responder_output_token_reserve == 64
+    assert packet.receipt.prompt_workspace_token_proxy == prompt_tokens + 64 == 245
+    assert packet.receipt.max_prompt_token_proxy == smoke._MAX_PROMPT_TOKENS == 512
     assert not hasattr(plan, "gold")
+
+
+def test_synthetic_packet_uses_one_public_full_prompt_packer() -> None:
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = _function(tree, "_synthetic_packet_and_plan")
+    call_names = [
+        _call_name(node)
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Call)
+    ]
+    assert call_names.count("pack_evidence_plan") == 1
+    assert "ClosureReceipt" not in ast.get_source_segment(source, helper)
+    assert (
+        smoke._ENCODING,
+        smoke._MAX_CONTEXT_TOKENS,
+        smoke._MAX_PROMPT_TOKENS,
+        smoke._OUTPUT_TOKEN_RESERVE,
+        smoke._EVIDENCE_MESSAGE_ROLE,
+    ) == ("cl100k_base", 256, 512, 64, "system")
 
 
 def test_smoke_caps_are_the_frozen_real_checkpoint_profile() -> None:
@@ -143,17 +218,23 @@ def test_public_runner_has_no_runtime_or_receipt_injection_surface() -> None:
     calls = [node for node in ast.walk(runner) if isinstance(node, ast.Call)]
     call_names = [_call_name(call) for call in calls]
     assert call_names.count("build_qwen_matched_fusion_pair") == 1
+    assert call_names.count("render_matched_fusion_contexts") == 1
     assert "run_execution_smoke" not in call_names
     assert "_run_feature_execution_smoke" not in call_names
     assert "build_evidence_fusion_plan" not in call_names
     assert "validate_matched_fusion_pair" not in call_names
+    assert "_render_structural_matched_contexts" not in call_names
+    assert "_arm_receipt" not in call_names
+    assert "FusionRenderArmReceipt" not in call_names
+    assert "MatchedFusionRenderReceipt" not in call_names
+    assert "RenderedFusionContext" not in call_names
+    assert "MatchedFusionContexts" not in call_names
     assert "factory" not in source.casefold()
-    assert "fallback" not in source.casefold()
     assert "corpus" not in source.casefold()
     assert "gold" not in source.casefold()
 
 
-def test_runner_preflights_memory_before_loading_and_calls_only_public_builder() -> None:
+def test_runner_preflights_memory_and_calls_only_public_builder_and_renderer() -> None:
     tree = ast.parse(SOURCE_PATH.read_text(encoding="utf-8"))
     runner = _function(tree, "run_qwen_matched_fusion_smoke")
     named_calls = [
@@ -172,11 +253,21 @@ def test_runner_preflights_memory_before_loading_and_calls_only_public_builder()
         lines_by_name["LatentEvidenceRouter"]
     )
     assert len(lines_by_name["build_qwen_matched_fusion_pair"]) == 1
+    assert len(lines_by_name["render_matched_fusion_contexts"]) == 1
     assert min(lines_by_name["seal_for_inference"]) < min(
         lines_by_name["build_qwen_matched_fusion_pair"]
     )
     assert min(lines_by_name["reset_peak_memory_stats"]) < min(
         lines_by_name["build_qwen_matched_fusion_pair"]
+    )
+    assert max(lines_by_name["_assert_no_retained_cuda_allocation"]) < min(
+        lines_by_name["_assert_success"]
+    )
+    assert max(lines_by_name["_assert_success"]) < min(
+        lines_by_name["render_matched_fusion_contexts"]
+    )
+    assert max(lines_by_name["render_matched_fusion_contexts"]) < min(
+        lines_by_name["_assert_render_success"]
     )
 
     preflight = _function(tree, "_preflight_cuda")
@@ -425,6 +516,61 @@ def test_success_checks_cover_claims_gate_stability_and_tensor_absence() -> None
         assert required in success_source
 
 
+def test_render_success_checks_exact_public_output_without_fabricated_receipts() -> None:
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    render_success = _function(tree, "_assert_render_success")
+    render_source = ast.get_source_segment(source, render_success)
+    assert render_source is not None
+    for required in (
+        "MatchedFusionContexts",
+        "packet_receipt_sha256",
+        "matched_pair_sha256",
+        "fusion_plan_sha256",
+        "render_receipt_sha256",
+        "renderer_implementation_sha256",
+        "prompt_frame_sha256",
+        "memory-condense-evidence-prompt-frame-v1",
+        "tokenizer_identity",
+        "base_messages_sha256",
+        "evidence_message_role",
+        "evidence_prefix_sha256",
+        "evidence_suffix_sha256",
+        "max_prompt_token_proxy",
+        "responder_output_token_reserve",
+        "pair_wide_fallback_applied",
+        "plan_applied",
+        "context_cap_compliant",
+        "prompt_cap_compliant",
+        "exact_atom_set_preserved",
+        "exact_bundle_set_preserved",
+        "exact_evidence_bytes_preserved",
+        "retained_request_tensor_bytes",
+        "resident_values_sha256",
+        "resident_atom_order_sha256",
+        "render_evidence_context",
+        "render_grouped_evidence_context",
+        "count_tokens",
+        "count_chat_prompt_token_proxy",
+        "prompt_messages_sha256",
+        "prompt_workspace_token_proxy",
+        "qwen_forward_count",
+        "router_forward_count",
+        "_contains_tensor",
+        "identity_payload",
+        "bundle_id",
+        "obligation_ids",
+        "source_id",
+        "chunk_id",
+        "turn_id",
+    ):
+        assert required in render_source
+    assert "FusionRenderArmReceipt(" not in render_source
+    assert "MatchedFusionRenderReceipt(" not in render_source
+    assert "RenderedFusionContext(" not in render_source
+    assert "MatchedFusionContexts(" not in render_source
+
+
 def test_runner_finally_closes_and_releases_without_certifying_measurements() -> None:
     source = SOURCE_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -437,6 +583,7 @@ def test_runner_finally_closes_and_releases_without_certifying_measurements() ->
         for node in body
     )
     for required in (
+        "rendered = None",
         "pair = None",
         "router = None",
         "provider.close()",
@@ -450,6 +597,15 @@ def test_runner_finally_closes_and_releases_without_certifying_measurements() ->
         assert required in finalizer_source
     assert '"diagnostic_non_artifact": True' in source
     assert '"performance_attested": False' in source
+    assert '"format": "qwen_matched_fusion_local_diagnostic_v2"' in source
+    assert "matched_render_sha256" in source
+    assert "renderer_implementation_sha256" in source
+    assert "render_prompt_frame_sha256" in source
+    assert "topology_render_receipt_sha256" in source
+    assert "latent_render_receipt_sha256" in source
+    assert "render_pair_wide_fallback_applied" in source
+    assert "observed_render_seconds" not in source
+    assert "render_seconds" not in source
     assert "observed_fusion_seconds" in source
     assert "observed_cuda_allocated_bytes_before_load" in source
     assert "observed_cuda_allocated_bytes_before_builder" in source

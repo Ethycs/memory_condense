@@ -34,6 +34,15 @@ from memory_condense.search.fusion.qwen_features import QwenAtomFeatureProvider
 from memory_condense.search.fusion.qwen_matched import (
     build_qwen_matched_fusion_pair,
 )
+from memory_condense.search.fusion.render_models import (
+    FusionRenderArmReceipt,
+    MatchedFusionContexts,
+    MatchedFusionRenderReceipt,
+    RenderedFusionContext,
+)
+from memory_condense.search.fusion.renderer import (
+    render_matched_fusion_contexts,
+)
 from memory_condense.search.fusion.resident_models import (
     MatchedEvidenceFusionPair,
     MatchedEvidenceFusionPairReceipt,
@@ -49,11 +58,14 @@ __all__ = [
     "ExtractiveGroup",
     "FusionAtomRef",
     "FusionCaps",
+    "FusionRenderArmReceipt",
     "FusionMode",
     "LatentEvidenceRouter",
     "LatentMembership",
     "MatchedEvidenceFusionPair",
     "MatchedEvidenceFusionPairReceipt",
+    "MatchedFusionContexts",
+    "MatchedFusionRenderReceipt",
     "LatentRouterForward",
     "NodeFeatureBatch",
     "NodeFeatureReceipt",
@@ -69,7 +81,9 @@ __all__ = [
     "QwenResidentFusionOperationReceipt",
     "ResidentEvidenceFusionPlan",
     "ResidentRouterRuntimeReceipt",
+    "RenderedFusionContext",
     "build_evidence_fusion_plan",
     "build_qwen_matched_fusion_pair",
+    "render_matched_fusion_contexts",
     "validate_matched_fusion_pair",
 ]

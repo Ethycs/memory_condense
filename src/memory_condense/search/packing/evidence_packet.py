@@ -18,6 +18,7 @@ from memory_condense.domain.discourse import (
     EvidenceAtom,
     EvidenceBundle,
     EvidencePacket,
+    EvidenceSpan,
     QueryProgram,
     evidence_span_sort_key,
     identity_sha256,
@@ -41,17 +42,61 @@ class _BeamState:
 
 
 @dataclass(frozen=True, slots=True)
-class _PromptBudget:
-    base_messages: tuple[dict[str, str], ...]
+class EvidencePromptBudget:
+    base_messages: tuple[tuple[str, str], ...]
     evidence_message_role: str
     evidence_prefix: str
     evidence_suffix: str
     max_prompt_tokens: int
     output_token_reserve: int
 
+    def __post_init__(self) -> None:
+        if type(self.base_messages) is not tuple or any(
+            type(message) is not tuple
+            or len(message) != 2
+            or any(type(value) is not str for value in message)
+            for message in self.base_messages
+        ):
+            raise TypeError(
+                "base_messages must be an exact tuple of (role, content) strings"
+            )
+        if any(
+            not role or role != role.strip()
+            for role, _content in self.base_messages
+        ):
+            raise ValueError("base message roles must be non-empty and unpadded")
+        for name in (
+            "evidence_message_role",
+            "evidence_prefix",
+            "evidence_suffix",
+        ):
+            if type(getattr(self, name)) is not str:
+                raise TypeError(f"{name} must be an exact string")
+        if (
+            not self.evidence_message_role
+            or self.evidence_message_role != self.evidence_message_role.strip()
+        ):
+            raise ValueError(
+                "evidence_message_role must be non-empty and unpadded"
+            )
+        for name in ("max_prompt_tokens", "output_token_reserve"):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an exact integer")
+            object.__setattr__(
+                self,
+                name,
+                exact_int(value, name, minimum=0),
+            )
+
     def messages(self, context: str) -> tuple[dict[str, str], ...]:
+        if type(context) is not str:
+            raise TypeError("prompt context must be an exact string")
         return (
-            *self.base_messages,
+            *(
+                {"role": role, "content": content}
+                for role, content in self.base_messages
+            ),
             {
                 "role": self.evidence_message_role,
                 "content": self.evidence_prefix + context + self.evidence_suffix,
@@ -66,7 +111,12 @@ class _PromptBudget:
 
     @property
     def base_messages_sha256(self) -> str:
-        return identity_sha256(list(self.base_messages))
+        return identity_sha256(
+            [
+                {"role": role, "content": content}
+                for role, content in self.base_messages
+            ]
+        )
 
     @property
     def evidence_prefix_sha256(self) -> str:
@@ -110,33 +160,119 @@ def _bundle_labels(
     return labels, {key: tuple(value) for key, value in atom_bundles.items()}
 
 
+def _validate_render_inputs(
+    atoms: tuple[EvidenceAtom, ...],
+    bundles: tuple[EvidenceBundle, ...],
+) -> None:
+    for atom in atoms:
+        if type(atom) is not EvidenceAtom:
+            raise TypeError("renderer atoms must be exact EvidenceAtom values")
+        if type(atom.span) is not EvidenceSpan:
+            raise TypeError("renderer atom spans must be exact EvidenceSpan values")
+        for name, value in (
+            ("atom_id", atom.atom_id),
+            ("text", atom.text),
+            ("label", atom.label),
+        ):
+            if type(value) is not str:
+                raise TypeError(f"renderer atom {name} must be an exact string")
+        for name, value in (
+            ("role", atom.role),
+            ("created_at", atom.created_at),
+            ("source_id", atom.span.source_id),
+            ("turn_id", atom.span.turn_id),
+            ("span_role", atom.span.role),
+            ("span_created_at", atom.span.created_at),
+        ):
+            if value is not None and type(value) is not str:
+                raise TypeError(
+                    f"renderer atom {name} must be an exact optional string"
+                )
+        for name, value in (
+            ("start_char", atom.span.start_char),
+            ("end_char", atom.span.end_char),
+            ("ordinal", atom.span.ordinal),
+            ("turn_start_char", atom.span.turn_start_char),
+        ):
+            if type(value) is not int:
+                raise TypeError(f"renderer atom {name} must be an exact integer")
+        for name, value in (
+            ("chunk_id", atom.span.chunk_id),
+            ("quote_sha256", atom.span.quote_sha256),
+        ):
+            if type(value) is not str:
+                raise TypeError(f"renderer span {name} must be an exact string")
+    for bundle in bundles:
+        if type(bundle) is not EvidenceBundle:
+            raise TypeError("renderer bundles must be exact EvidenceBundle values")
+        if type(bundle.bundle_id) is not str:
+            raise TypeError("renderer bundle IDs must be exact strings")
+        for name in (
+            "atom_ids",
+            "obligation_ids",
+            "unit_ids",
+            "relation_ids",
+        ):
+            values = getattr(bundle, name)
+            if type(values) is not tuple or any(
+                type(value) is not str for value in values
+            ):
+                raise TypeError(
+                    f"renderer bundle {name} must be an exact tuple of strings"
+                )
+
+
 def render_evidence_context(
     atoms: Sequence[EvidenceAtom],
     bundles: Sequence[EvidenceBundle],
 ) -> str:
     """Render one deduplicated packet while preserving bundle membership."""
-    if not atoms:
+    normalized_atoms = tuple(atoms)
+    normalized_bundles = tuple(bundles)
+    _validate_render_inputs(normalized_atoms, normalized_bundles)
+    ordered = tuple(sorted(normalized_atoms, key=_atom_sort_key))
+    groups = () if not ordered else (ordered,)
+    return _render_evidence_groups(
+        groups,
+        normalized_bundles,
+        group_headings=False,
+    )
+
+
+def _render_evidence_groups(
+    atom_groups: tuple[tuple[EvidenceAtom, ...], ...],
+    bundles: tuple[EvidenceBundle, ...],
+    *,
+    group_headings: bool,
+) -> str:
+    """Shared byte grammar for canonical and explicit grouped rendering."""
+    if not atom_groups:
         return ""
     labels, atom_bundles = _bundle_labels(bundles)
     lines = [_HEADER.rstrip("\n")]
-    for index, atom in enumerate(sorted(atoms, key=_atom_sort_key), 1):
-        fields = [f"E{index}"]
-        memberships = atom_bundles.get(atom.atom_id, ())
-        if memberships:
-            fields.append(f"bundles={','.join(memberships)}")
-        fields.extend(
-            (
-                f"source={_label_scalar(atom.span.source_id or 'unknown')}",
-                f"ordinal={atom.span.ordinal}",
-                f"chunk={_label_scalar(atom.span.chunk_id)}",
+    evidence_index = 1
+    for group_index, group in enumerate(atom_groups, 1):
+        if group_headings:
+            lines.append(f"### Evidence group G{group_index}")
+        for atom in group:
+            fields = [f"E{evidence_index}"]
+            memberships = atom_bundles.get(atom.atom_id, ())
+            if memberships:
+                fields.append(f"bundles={','.join(memberships)}")
+            fields.extend(
+                (
+                    f"source={_label_scalar(atom.span.source_id or 'unknown')}",
+                    f"ordinal={int(atom.span.ordinal)}",
+                    f"chunk={_label_scalar(atom.span.chunk_id)}",
+                )
             )
-        )
-        if atom.role:
-            fields.append(f"role={_label_scalar(atom.role)}")
-        if atom.created_at:
-            fields.append(f"date={_label_scalar(atom.created_at)}")
-        fields.append(f"label={_label_scalar(atom.label)}")
-        lines.append(f"[{' | '.join(fields)}]\n{atom.text}")
+            if atom.role:
+                fields.append(f"role={_label_scalar(atom.role)}")
+            if atom.created_at:
+                fields.append(f"date={_label_scalar(atom.created_at)}")
+            fields.append(f"label={_label_scalar(atom.label)}")
+            lines.append(f"[{' | '.join(fields)}]\n{atom.text}")
+            evidence_index += 1
     if labels:
         membership_lines = []
         for bundle in bundles:
@@ -149,6 +285,53 @@ def render_evidence_context(
             )
         lines.append("Bundle map:\n" + "\n".join(membership_lines))
     return "\n\n".join(lines)
+
+
+def render_grouped_evidence_context(
+    atoms: Sequence[EvidenceAtom],
+    bundles: Sequence[EvidenceBundle],
+    atom_groups: Sequence[Sequence[str]],
+) -> str:
+    """Render exact atoms in an explicit one-time grouped order.
+
+    This is the narrow post-retrieval fusion seam.  Unlike
+    :func:`render_evidence_context`, it never applies the canonical source
+    sort: group and atom order are consumed exactly as supplied.  The fixed
+    group headings are ordinal presentation structure only; they expose no
+    latent slot, score, label, or inferred relation.
+    """
+    normalized_atoms = tuple(atoms)
+    normalized_bundles = tuple(bundles)
+    normalized_groups = tuple(tuple(group) for group in atom_groups)
+    _validate_render_inputs(normalized_atoms, normalized_bundles)
+    if not normalized_atoms:
+        if normalized_groups:
+            raise ValueError("empty evidence cannot have render groups")
+        return ""
+    if not normalized_groups or any(not group for group in normalized_groups):
+        raise ValueError("grouped renderer requires non-empty atom groups")
+    if any(type(atom_id) is not str for group in normalized_groups for atom_id in group):
+        raise TypeError("grouped renderer atom IDs must be exact strings")
+    atom_by_id = {atom.atom_id: atom for atom in normalized_atoms}
+    if len(atom_by_id) != len(normalized_atoms):
+        raise ValueError("grouped renderer atom IDs must be unique")
+    rendered_ids = tuple(atom_id for group in normalized_groups for atom_id in group)
+    if (
+        len(rendered_ids) != len(normalized_atoms)
+        or len(set(rendered_ids)) != len(rendered_ids)
+        or set(rendered_ids) != set(atom_by_id)
+    ):
+        raise ValueError("render groups must partition the exact atom set once")
+
+    ordered_groups = tuple(
+        tuple(atom_by_id[atom_id] for atom_id in atom_ids)
+        for atom_ids in normalized_groups
+    )
+    return _render_evidence_groups(
+        ordered_groups,
+        normalized_bundles,
+        group_headings=True,
+    )
 
 
 def _state_order_key(
@@ -205,7 +388,7 @@ def _measure(
     bundles: Sequence[EvidenceBundle],
     *,
     encoding: str,
-    prompt_budget: _PromptBudget | None,
+    prompt_budget: EvidencePromptBudget | None,
     max_context_tokens: int,
 ) -> tuple[str, int, int | None]:
     """Render one candidate context and measure both budgets exactly once.
@@ -225,7 +408,7 @@ def _measure(
 
 def _prompt_overflow(
     prompt_tokens: int | None,
-    prompt_budget: _PromptBudget | None,
+    prompt_budget: EvidencePromptBudget | None,
 ) -> bool:
     """True when the exact chat prompt plus output reserve exceeds its ceiling."""
     return (
@@ -349,7 +532,7 @@ def _direct_raw_bundle_ids(
     )
 
 
-def _normalize_prompt_budget(
+def normalize_evidence_prompt_budget(
     *,
     base_messages: Sequence[Mapping[str, str]] | None,
     evidence_message_role: str,
@@ -357,7 +540,7 @@ def _normalize_prompt_budget(
     evidence_suffix: str,
     max_prompt_tokens: int | None,
     output_token_reserve: int,
-) -> _PromptBudget | None:
+) -> EvidencePromptBudget | None:
     reserve = exact_int(output_token_reserve, "output_token_reserve", minimum=0)
     if not isinstance(evidence_message_role, str):
         raise TypeError("evidence_message_role must be a string")
@@ -378,7 +561,7 @@ def _normalize_prompt_budget(
         return None
 
     maximum = exact_int(max_prompt_tokens, "max_prompt_tokens", minimum=0)
-    normalized_messages: list[dict[str, str]] = []
+    normalized_messages: list[tuple[str, str]] = []
     for index, message in enumerate(raw_messages):
         if not isinstance(message, Mapping):
             raise TypeError(f"base message {index} must be a mapping")
@@ -398,10 +581,8 @@ def _normalize_prompt_budget(
             )
         if not isinstance(content, str):
             raise TypeError(f"base message {index} content must be a string")
-        normalized_messages.append(
-            {"role": message_role, "content": content}
-        )
-    return _PromptBudget(
+        normalized_messages.append((message_role, content))
+    return EvidencePromptBudget(
         base_messages=tuple(normalized_messages),
         evidence_message_role=role,
         evidence_prefix=evidence_prefix,
@@ -442,7 +623,7 @@ def pack_evidence_plan(
         "max_context_tokens",
         minimum=0,
     )
-    prompt_budget = _normalize_prompt_budget(
+    prompt_budget = normalize_evidence_prompt_budget(
         base_messages=base_messages,
         evidence_message_role=evidence_message_role,
         evidence_prefix=evidence_prefix,
@@ -693,4 +874,11 @@ def packet_identity(packet: EvidencePacket) -> str:
     )
 
 
-__all__ = ["pack_evidence_plan", "packet_identity", "render_evidence_context"]
+__all__ = [
+    "EvidencePromptBudget",
+    "normalize_evidence_prompt_budget",
+    "pack_evidence_plan",
+    "packet_identity",
+    "render_evidence_context",
+    "render_grouped_evidence_context",
+]

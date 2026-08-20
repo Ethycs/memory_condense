@@ -343,6 +343,8 @@ def test_executable_module_is_not_preimported_by_package(module_name):
         "memory_condense.search.fusion.resident_models",
         "memory_condense.search.fusion.resident_executor",
         "memory_condense.search.fusion.qwen_matched",
+        "memory_condense.search.fusion.render_models",
+        "memory_condense.search.fusion.renderer",
     ],
 )
 def test_qwen_fusion_feature_modules_keep_heavy_runtimes_cold(module_name):

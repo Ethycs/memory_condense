@@ -1,6 +1,6 @@
 # Episode-primary retrieval feeds a query-conditioned GPU latent fusion stage
 
-**Status**: 🟡 TRANCHES A/B IMPLEMENTED — the resident Qwen feature producer and atomic K-latent matched pair pass provider-free, CUDA, and pinned-checkpoint smoke gates; the extractive renderer, trained adapter checkpoint, route-bearing campaign, and measured comparison remain open
+**Status**: 🟡 TRANCHES A/B/C IMPLEMENTED — the resident Qwen feature producer, atomic K-latent matched pair, and deterministic extractive renderer pass provider-free, CUDA, and pinned-checkpoint smoke gates; the trained adapter checkpoint, route-bearing campaign, and measured comparison remain open
 **Date**: 2026-08-20
 **Applies to**: the bounded post-retrieval evidence-fusion path
 **Depends on**:
@@ -11,11 +11,14 @@
 > **Experimental implementation contract.** Generic and resident-path tests
 > establish the exact two-pass topology, provenance, bounds, and request-state
 > lifecycle. A route-agnostic two-atom smoke also executed the pinned one-layer
-> Qwen prefix and the untrained router together on one GPU. This does not
-> establish a trained-router quality gain, an end-to-end latency gain, an
-> episode-primary campaign result, or held-out answer improvement. This stage
-> retrieves no new evidence and generates no prose; it emits a text-free
-> extractive ordering/grouping plan over already-selected exact atoms.
+> Qwen prefix and the untrained router together on one GPU, then passed their
+> genuine matched pair through the public extractive renderer with a canonical
+> full-prompt packet. This synthetic diagnostic is not a receipt artifact or a
+> performance attestation. It does not establish a trained-router quality gain,
+> an end-to-end latency gain, an episode-primary campaign result, or held-out
+> answer improvement. This stage retrieves no new evidence and generates no
+> prose; it emits a text-free extractive ordering/grouping plan over
+> already-selected exact atoms.
 
 ## 1. Decision
 
@@ -42,7 +45,7 @@ before changing the implementation.
 
 ## 2. What already exists
 
-Four bounded pieces are now built:
+Five bounded pieces are now built:
 
 1. `episode_primary` retrieval routes through source-scoped episode
    representatives and seeded graph closure. It does not union in legacy
@@ -69,6 +72,10 @@ Four bounded pieces are now built:
    builds topology-only and latent-router plans over the same exact atoms and
    hyperedges, copies only bounded $[K,N]$ and $[N,K]$ route matrices to the
    host for canonicalization, and returns no request tensor.
+5. `render_matched_fusion_contexts` validates the packet/pair joins, renders
+   both sealed plans with identical neutral group syntax, recounts the complete
+   framed prompt, and applies original-context fallback atomically across both
+   arms. Its receipts retain hashes and counts, not prompt or evidence text.
 
 A local diagnostic at source commit `66ba8a1` exercised these resident pieces
 with the pinned Qwen3-8B one-layer prefix on `cuda:0` in `float16`, using two
@@ -78,6 +85,15 @@ forward and one router forward. The raw post-operation allocation delta was
 runtime workspace, live allocation exactly matched the resident pre-operation
 baseline and final cleanup returned PyTorch allocation to zero. The diagnostic
 is deliberately not a receipt artifact or a performance attestation.
+
+On the current Tranche C tree, the updated pinned diagnostic exercised the
+public matched renderer exactly once. Both arms completed without fallback at
+130 effective context tokens, 187 effective prompt tokens, and 251 effective
+prompt-workspace tokens. The run still recorded exactly one Qwen forward and
+one router forward; the normalized post-operation allocation delta was zero,
+and final cleanup again returned PyTorch allocation to zero. These are
+synthetic route-agnostic execution checks over an untrained router, not quality
+or latency results.
 
 The current router is infrastructure, not a learned result. Its status is
 `untrained` unless a caller honestly declares a trained checkpoint. A
@@ -506,9 +522,14 @@ renders either arm. A mismatch rejects; it is not a fallback condition. The
 returned receipts retain only hashes and counts, never the raw base messages,
 question, prefix, or suffix.
 
-The existing renderer canonically re-sorts atoms, so it cannot consume a
-learned permutation unchanged. Renderer integration is a separate, narrow
-tranche after the resident matched-pair operation is verified.
+The certified matched renderer requires a packet whose `ClosureReceipt`
+already enables the complete prompt-budget fields. A context-only packet is
+rejected rather than being issued the same full-prompt attestation with null
+counts.
+
+The legacy packet renderer canonically re-sorts atoms, so the matched renderer
+uses a separate validated ordered/grouped path while mechanically sharing the
+legacy atom and bundle formatting.
 
 ## 13. Training boundary
 
@@ -603,7 +624,7 @@ After provider-free tests pass, we may claim only:
 - returned objects are text-free, tensor-free, and preserve the exact atom
   set.
 
-Only after a separate real-checkpoint smoke passes may we additionally claim:
+The separate real-checkpoint smoke additionally established:
 
 - one bounded row was constructed for every exact packet atom, with admitted
   evidence tokens following the receipted prefix-only truncation rule;
@@ -612,7 +633,11 @@ Only after a separate real-checkpoint smoke passes may we additionally claim:
 - bounded route-matrix bytes were canonicalized and bound by hashes, while the
   matrices themselves and all full request tensors were not retained;
 - output remained extractive and post-operation retained request-tensor bytes
-  were zero under the documented metric.
+  were zero under the documented metric;
+- the genuine matched pair passed exactly once through the public renderer
+  under explicit full-prompt framing, preserving exact extractive atom bytes
+  and sealed order in both arms with no fallback or added model forwards, and
+  returning text-free, tensor-free receipts.
 
 We may not yet claim:
 
@@ -664,7 +689,7 @@ receipt must identify `episode_primary`, the feature operation, router
 checkpoint, and fusion output explicitly. The v1 artifact remains a valid
 record of the legacy route.
 
-## 17. Acceptance tests for tranches A and B
+## 17. Acceptance tests for tranches A, B, and C
 
 Provider-free tests must prove:
 
@@ -699,6 +724,17 @@ Provider-free tests must prove:
 16. Cold import loads neither Torch nor Transformers.
 17. Existing generic fusion, Qwen linker, retrieval, replay, and scoring tests
     remain unchanged and green.
+18. Both candidate contexts are always rendered and fully recounted; overflow
+    in either arm causes byte-identical original-context fallback in both.
+19. The renderer preserves exact atom text, membership, bundle labels, and
+    sealed order while exposing only neutral ordinal group boundaries.
+20. Framing, tokenizer, packet, pair, plan, and implementation-identity
+    mismatches reject rather than becoming fallback.
+21. Provider-free structural renderer tests mint no model-execution evidence;
+    the certified public success branch is exercised by a genuine matched pair
+    in the pinned local diagnostic.
 
-The real-model smoke comes only after these gates. It should record latency
-and CUDA residency, not scientific performance.
+The pinned real-model renderer smoke passed these gates. Its diagnostic-v2
+output remains explicitly non-artifactual and sets `performance_attested` to
+false; its operational timing and CUDA-residency fields are not scientific
+performance claims.

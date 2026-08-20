@@ -19,10 +19,14 @@ from pathlib import Path
 from typing import Any
 
 from memory_condense.domain._discourse_identity import canonical_json, identity_sha256
+from memory_condense.domain._tokenizer import (
+    count_chat_prompt_token_proxy,
+    count_tokens,
+    tokenizer_proxy_identity,
+)
 from memory_condense.domain.discourse import (
     ClosurePlan,
     ClosurePolicy,
-    ClosureReceipt,
     ClosureScopeWitness,
     DiscourseSnapshot,
     EvidenceAtom,
@@ -49,8 +53,17 @@ from memory_condense.search.fusion.qwen_features import QwenAtomFeatureProvider
 from memory_condense.search.fusion.qwen_matched import (
     build_qwen_matched_fusion_pair,
 )
+from memory_condense.search.fusion.render_models import MatchedFusionContexts
+from memory_condense.search.fusion.renderer import render_matched_fusion_contexts
 from memory_condense.search.fusion.resident_models import (
     MatchedEvidenceFusionPair,
+    resident_atom_order_sha256,
+    resident_values_sha256,
+)
+from memory_condense.search.packing.evidence_packet import (
+    pack_evidence_plan,
+    render_evidence_context,
+    render_grouped_evidence_context,
 )
 
 
@@ -67,6 +80,14 @@ _DTYPE_NAME = "float16"
 _TORCH_DTYPE_NAME = "torch.float16"
 _MIN_FREE_CUDA_BYTES = 3 * 1024**3
 _CUBLAS_WORKSPACE_CLEAR_NAME = "_cuda_clearCublasWorkspaces"
+_ENCODING = "cl100k_base"
+_MAX_CONTEXT_TOKENS = 256
+_MAX_PROMPT_TOKENS = 512
+_OUTPUT_TOKEN_RESERVE = 64
+_PROMPT_SYSTEM_MESSAGE = "Answer only from the exact evidence supplied next."
+_EVIDENCE_MESSAGE_ROLE = "system"
+_EVIDENCE_PREFIX = "## Evidence input\n"
+_EVIDENCE_SUFFIX = "\n## End evidence"
 _PINNED_PREFIX_CHECKPOINT_SHA256 = (
     "76273516aa6924b12344d5e83daa485b66459b663c745cb3b9ef51cc17c7440d"
 )
@@ -101,6 +122,13 @@ def _synthetic_atom(index: int, text: str) -> EvidenceAtom:
         span=span,
         text=text,
         label=f"synthetic-observation-{index}",
+    )
+
+
+def _synthetic_base_messages(plan: ClosurePlan) -> tuple[dict[str, str], ...]:
+    return (
+        {"role": "system", "content": _PROMPT_SYSTEM_MESSAGE},
+        {"role": "user", "content": plan.query_program.query},
     )
 
 
@@ -167,20 +195,18 @@ def _synthetic_packet_and_plan() -> tuple[EvidencePacket, ClosurePlan]:
             ),
         ),
     )
-    context = "Synthetic packet containing two exact observations."
-    receipt = ClosureReceipt(
-        plan_sha256=plan.plan_sha256,
-        context_sha256=quote_sha256(context),
-        selected_bundle_ids=(bundle.bundle_id,),
-        selected_atom_ids=tuple(atom.atom_id for atom in atoms),
-        dropped_bundle_reasons={},
-        context_token_proxy=8,
-        max_context_token_proxy=64,
-        tokenizer_identity="synthetic-smoke-tokenizer-proxy",
-        stopping_reason="complete",
-        complete_claimed=True,
+    packet = pack_evidence_plan(
+        plan,
+        max_context_tokens=_MAX_CONTEXT_TOKENS,
+        encoding=_ENCODING,
+        base_messages=_synthetic_base_messages(plan),
+        evidence_message_role=_EVIDENCE_MESSAGE_ROLE,
+        evidence_prefix=_EVIDENCE_PREFIX,
+        evidence_suffix=_EVIDENCE_SUFFIX,
+        max_prompt_tokens=_MAX_PROMPT_TOKENS,
+        output_token_reserve=_OUTPUT_TOKEN_RESERVE,
     )
-    return EvidencePacket(context, atoms, (bundle,), receipt), plan
+    return packet, plan
 
 
 def _fusion_caps() -> FusionCaps:
@@ -514,6 +540,288 @@ def _assert_success(
     _require(all(text not in encoded for text in request_text), "public pair retained request text")
 
 
+def _assert_render_success(
+    rendered: MatchedFusionContexts,
+    *,
+    packet: EvidencePacket,
+    plan: ClosurePlan,
+    pair: MatchedEvidenceFusionPair,
+    torch: Any,
+) -> None:
+    _require(
+        type(rendered) is MatchedFusionContexts,
+        "renderer returned a foreign matched view",
+    )
+    _require(
+        packet.context == render_evidence_context(packet.atoms, packet.bundles),
+        "renderer smoke packet context is not canonical",
+    )
+    matched = rendered.receipt
+    control = rendered.topology_only
+    treatment = rendered.latent_router
+    base_messages_sha256 = identity_sha256(
+        list(_synthetic_base_messages(plan))
+    )
+    tokenizer_body = tokenizer_proxy_identity(_ENCODING)
+    tokenizer_identity = (
+        f"{tokenizer_body['encoding']}:{identity_sha256(tokenizer_body)}"
+    )
+    _require(
+        packet.receipt.tokenizer_identity == tokenizer_identity,
+        "render tokenizer identity changed",
+    )
+    _require(
+        packet.receipt.base_messages_sha256 == base_messages_sha256
+        and packet.receipt.evidence_message_role == _EVIDENCE_MESSAGE_ROLE
+        and packet.receipt.evidence_prefix_sha256
+        == quote_sha256(_EVIDENCE_PREFIX)
+        and packet.receipt.evidence_suffix_sha256
+        == quote_sha256(_EVIDENCE_SUFFIX)
+        and packet.receipt.max_prompt_token_proxy == _MAX_PROMPT_TOKENS
+        and packet.receipt.responder_output_token_reserve
+        == _OUTPUT_TOKEN_RESERVE,
+        "render prompt-frame packet inputs changed",
+    )
+    expected_prompt_frame_sha256 = identity_sha256(
+        {
+            "format": "memory-condense-evidence-prompt-frame-v1",
+            "tokenizer_identity": tokenizer_identity,
+            "base_messages_sha256": base_messages_sha256,
+            "evidence_message_role": _EVIDENCE_MESSAGE_ROLE,
+            "evidence_prefix_sha256": quote_sha256(_EVIDENCE_PREFIX),
+            "evidence_suffix_sha256": quote_sha256(_EVIDENCE_SUFFIX),
+            "max_prompt_token_proxy": _MAX_PROMPT_TOKENS,
+            "responder_output_token_reserve": _OUTPUT_TOKEN_RESERVE,
+        }
+    )
+    _require(
+        matched.packet_receipt_sha256 == packet.receipt.receipt_sha256,
+        "render packet join failed",
+    )
+    _require(
+        matched.matched_pair_sha256 == pair.receipt.pair_sha256,
+        "render pair join failed",
+    )
+    _require(
+        matched.topology_render_receipt_sha256
+        == control.receipt.render_receipt_sha256
+        and matched.latent_render_receipt_sha256
+        == treatment.receipt.render_receipt_sha256,
+        "matched render arm joins failed",
+    )
+    _require(
+        matched.renderer_implementation_sha256
+        == control.receipt.renderer_implementation_sha256
+        == treatment.receipt.renderer_implementation_sha256,
+        "renderer implementation join failed",
+    )
+    _require(
+        matched.prompt_frame_sha256
+        == control.receipt.prompt_frame_sha256
+        == treatment.receipt.prompt_frame_sha256
+        == expected_prompt_frame_sha256,
+        "render prompt-frame join failed",
+    )
+    _require(
+        matched.render_format == "matched_fusion_render_v1",
+        "matched render format changed",
+    )
+    _require(
+        matched.atomic_pair_fallback_attested is True
+        and matched.shared_prompt_frame_attested is True,
+        "matched render contract was weakened",
+    )
+    _require(
+        not any(
+            (
+                matched.topology_context_overflow,
+                matched.topology_prompt_overflow,
+                matched.latent_context_overflow,
+                matched.latent_prompt_overflow,
+            )
+        )
+        and matched.pair_wide_fallback_applied is False,
+        "fixed smoke unexpectedly used render fallback",
+    )
+
+    original_order_sha256 = resident_atom_order_sha256(
+        packet.receipt.selected_atom_ids
+    )
+    atom_by_id = {atom.atom_id: atom for atom in packet.atoms}
+    for view, fusion_plan in (
+        (control, pair.topology_only),
+        (treatment, pair.latent_router),
+    ):
+        receipt = view.receipt
+        expected_context = render_grouped_evidence_context(
+            packet.atoms,
+            packet.bundles,
+            tuple(group.atom_ids for group in fusion_plan.groups),
+        )
+        _require(
+            view.context == expected_context,
+            "rendered candidate bytes changed",
+        )
+        _require(
+            receipt.packet_receipt_sha256 == packet.receipt.receipt_sha256
+            and receipt.matched_pair_sha256 == pair.receipt.pair_sha256
+            and receipt.fusion_plan_sha256 == fusion_plan.plan_sha256,
+            "render arm input joins failed",
+        )
+        _require(
+            receipt.groups_sha256
+            == resident_values_sha256("fusion_render_groups", fusion_plan.groups),
+            "render group identity changed",
+        )
+        candidate_order_sha256 = resident_atom_order_sha256(
+            fusion_plan.atom_order
+        )
+        _require(
+            receipt.candidate_atom_order_sha256
+            == receipt.effective_atom_order_sha256
+            == candidate_order_sha256
+            and receipt.original_atom_order_sha256 == original_order_sha256,
+            "render atom-order identity changed",
+        )
+        _require(
+            receipt.render_format == "fusion_render_arm_v1"
+            and receipt.plan_applied is True
+            and receipt.pair_wide_fallback_applied is False,
+            "fixed smoke render plan was not applied",
+        )
+        _require(
+            receipt.context_cap_compliant is True
+            and receipt.prompt_cap_compliant is True,
+            "fixed smoke render exceeded a cap",
+        )
+        _require(
+            receipt.exact_atom_set_preserved is True
+            and receipt.exact_bundle_set_preserved is True
+            and receipt.exact_evidence_bytes_preserved is True
+            and receipt.retained_request_tensor_bytes == 0,
+            "render arm weakened extractive preservation",
+        )
+        expected_atoms = tuple(atom_by_id[atom_id] for atom_id in fusion_plan.atom_order)
+        positions = tuple(view.context.index(atom.text) for atom in expected_atoms)
+        _require(
+            positions == tuple(sorted(positions))
+            and all(view.context.count(atom.text) == 1 for atom in packet.atoms),
+            "rendered evidence bytes or atom order changed",
+        )
+        _require(
+            view.context.count("### Evidence group G") == len(fusion_plan.groups)
+            and all(
+                view.context.count(f"### Evidence group G{index}") == 1
+                for index in range(1, len(fusion_plan.groups) + 1)
+            ),
+            "neutral render group boundaries changed",
+        )
+        _require(
+            "latent_index" not in view.context
+            and "extraction_weight" not in view.context
+            and "reinjection_weight" not in view.context
+            and "joint_weight" not in view.context,
+            "rendered context exposed latent metadata",
+        )
+        _require(
+            f"B1={packet.bundles[0].bundle_id}" in view.context,
+            "stable bundle label changed",
+        )
+        context_tokens = count_tokens(view.context, encoding=_ENCODING)
+        messages = (
+            *_synthetic_base_messages(plan),
+            {
+                "role": _EVIDENCE_MESSAGE_ROLE,
+                "content": _EVIDENCE_PREFIX + view.context + _EVIDENCE_SUFFIX,
+            },
+        )
+        prompt_messages_sha256 = identity_sha256(list(messages))
+        prompt_tokens = count_chat_prompt_token_proxy(
+            messages,
+            encoding=_ENCODING,
+        )
+        prompt_workspace = prompt_tokens + _OUTPUT_TOKEN_RESERVE
+        _require(
+            receipt.candidate_context_sha256
+            == receipt.effective_context_sha256
+            == quote_sha256(view.context)
+            and receipt.candidate_context_token_proxy
+            == receipt.effective_context_token_proxy
+            == context_tokens,
+            "render context recount changed",
+        )
+        _require(
+            receipt.candidate_prompt_messages_sha256
+            == receipt.effective_prompt_messages_sha256
+            == prompt_messages_sha256
+            and receipt.candidate_prompt_token_proxy
+            == receipt.effective_prompt_token_proxy
+            == prompt_tokens
+            and receipt.candidate_prompt_workspace_token_proxy
+            == receipt.effective_prompt_workspace_token_proxy
+            == prompt_workspace,
+            "render full-prompt recount changed",
+        )
+        _require(
+            receipt.original_context_sha256 == packet.receipt.context_sha256
+            and receipt.original_context_token_proxy
+            == packet.receipt.context_token_proxy
+            and receipt.original_prompt_messages_sha256
+            == packet.receipt.prompt_messages_sha256
+            and receipt.original_prompt_token_proxy
+            == packet.receipt.prompt_token_proxy
+            and receipt.original_prompt_workspace_token_proxy
+            == packet.receipt.prompt_workspace_token_proxy,
+            "original packet recount join changed",
+        )
+        _require(
+            receipt.max_context_token_proxy == _MAX_CONTEXT_TOKENS
+            and receipt.max_prompt_token_proxy == _MAX_PROMPT_TOKENS
+            and receipt.responder_output_token_reserve == _OUTPUT_TOKEN_RESERVE,
+            "render budget profile changed",
+        )
+
+    _require(
+        pair.operation.feature_suboperation.qwen_forward_count == 1
+        and pair.operation.router_forward_count == 1,
+        "renderer added a model forward",
+    )
+    _require(
+        not _contains_tensor(rendered, torch.Tensor),
+        "public rendered views retained a tensor",
+    )
+    encoded = canonical_json(
+        {
+            "control": control.receipt.identity_payload(),
+            "treatment": treatment.receipt.identity_payload(),
+            "matched": matched.identity_payload(),
+        }
+    )
+    raw_request_text = (
+        packet.context,
+        plan.query_program.query,
+        _PROMPT_SYSTEM_MESSAGE,
+        _EVIDENCE_PREFIX,
+        _EVIDENCE_SUFFIX,
+        *(atom.text for atom in packet.atoms),
+        *(atom.label for atom in packet.atoms),
+        *(bundle.bundle_id for bundle in packet.bundles),
+        *(
+            obligation_id
+            for bundle in packet.bundles
+            for obligation_id in bundle.obligation_ids
+        ),
+        *(atom.span.source_id for atom in packet.atoms),
+        *(atom.span.chunk_id for atom in packet.atoms),
+        *(atom.span.turn_id for atom in packet.atoms),
+    )
+    request_text = tuple(text for text in raw_request_text if text)
+    _require(
+        all(text not in encoded for text in request_text),
+        "render receipts retained request text",
+    )
+
+
 def _require_cublas_workspace_clearer(torch: Any) -> Any:
     extension = getattr(torch, "_C", None)
     clearer = getattr(extension, _CUBLAS_WORKSPACE_CLEAR_NAME, None)
@@ -613,6 +921,7 @@ def run_qwen_matched_fusion_smoke(
     provider: QwenAtomFeatureProvider | None = None
     router: LatentEvidenceRouter | None = None
     pair: MatchedEvidenceFusionPair | None = None
+    rendered: MatchedFusionContexts | None = None
     report: dict[str, object] = {}
     try:
         load_started = time.perf_counter()
@@ -695,9 +1004,25 @@ def run_qwen_matched_fusion_smoke(
             encoder=encoder,
             torch=torch,
         )
+        rendered = render_matched_fusion_contexts(
+            packet,
+            pair,
+            encoding=_ENCODING,
+            base_messages=_synthetic_base_messages(plan),
+            evidence_message_role=_EVIDENCE_MESSAGE_ROLE,
+            evidence_prefix=_EVIDENCE_PREFIX,
+            evidence_suffix=_EVIDENCE_SUFFIX,
+        )
+        _assert_render_success(
+            rendered,
+            packet=packet,
+            plan=plan,
+            pair=pair,
+            torch=torch,
+        )
         report.update(
             {
-                "format": "qwen_matched_fusion_local_diagnostic_v1",
+                "format": "qwen_matched_fusion_local_diagnostic_v2",
                 "diagnostic_non_artifact": True,
                 "performance_attested": False,
                 "retained_request_cuda_allocation_metric": (
@@ -721,6 +1046,40 @@ def run_qwen_matched_fusion_smoke(
                 "pair_sha256": pair.receipt.pair_sha256,
                 "operation_sha256": pair.operation.operation_sha256,
                 "feature_suboperation_sha256": pair.operation.feature_suboperation.operation_sha256,
+                "matched_render_sha256": rendered.receipt.matched_render_sha256,
+                "renderer_implementation_sha256": (
+                    rendered.receipt.renderer_implementation_sha256
+                ),
+                "render_prompt_frame_sha256": (
+                    rendered.receipt.prompt_frame_sha256
+                ),
+                "topology_render_receipt_sha256": (
+                    rendered.topology_only.receipt.render_receipt_sha256
+                ),
+                "latent_render_receipt_sha256": (
+                    rendered.latent_router.receipt.render_receipt_sha256
+                ),
+                "topology_render_effective_context_token_proxy": (
+                    rendered.topology_only.receipt.effective_context_token_proxy
+                ),
+                "latent_render_effective_context_token_proxy": (
+                    rendered.latent_router.receipt.effective_context_token_proxy
+                ),
+                "topology_render_effective_prompt_token_proxy": (
+                    rendered.topology_only.receipt.effective_prompt_token_proxy
+                ),
+                "latent_render_effective_prompt_token_proxy": (
+                    rendered.latent_router.receipt.effective_prompt_token_proxy
+                ),
+                "topology_render_effective_prompt_workspace_token_proxy": (
+                    rendered.topology_only.receipt.effective_prompt_workspace_token_proxy
+                ),
+                "latent_render_effective_prompt_workspace_token_proxy": (
+                    rendered.latent_router.receipt.effective_prompt_workspace_token_proxy
+                ),
+                "render_pair_wide_fallback_applied": (
+                    rendered.receipt.pair_wide_fallback_applied
+                ),
                 "observed_checkpoint_load_seconds": checkpoint_load_seconds,
                 "observed_router_setup_seconds": router_setup_seconds,
                 "observed_fusion_seconds": fusion_seconds,
@@ -772,6 +1131,7 @@ def run_qwen_matched_fusion_smoke(
     finally:
         primary_error = sys.exc_info()[1]
         cleanup_errors: list[BaseException] = []
+        rendered = None
         pair = None
         router = None
         if provider is not None:

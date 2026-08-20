@@ -1,6 +1,6 @@
 # Episode-primary retrieval feeds a query-conditioned GPU latent fusion stage
 
-**Status**: 🟡 DESIGN FROZEN FOR IMPLEMENTATION — episode-primary retrieval and the generic K-latent router exist; the resident Qwen feature producer, trained adapter checkpoint, fused renderer, and measured comparison remain open
+**Status**: 🟡 TRANCHES A/B IMPLEMENTED — the resident Qwen feature producer and atomic K-latent matched pair pass provider-free, CUDA, and pinned-checkpoint smoke gates; the extractive renderer, trained adapter checkpoint, route-bearing campaign, and measured comparison remain open
 **Date**: 2026-08-20
 **Applies to**: the bounded post-retrieval evidence-fusion path
 **Depends on**:
@@ -8,14 +8,14 @@
 - [`00 - Theory/07 - Attention As Graphs.md`](../00%20-%20Theory/07%20-%20Attention%20As%20Graphs.md)
 - [`02 - Implementation/03 - Qwen3 Prefix Attention Lab.md`](03%20-%20Qwen3%20Prefix%20Attention%20Lab.md)
 
-> **Experimental implementation contract.** Existing generic-router synthetic
-> tests establish the exact two-pass topology and reference-path provenance
-> and bounds. The resident-provider invariants below are design requirements;
-> they are not yet implemented or verified. No trained-router quality gain,
-> real-checkpoint end-to-end latency gain, or held-out answer improvement is
-> established. This stage retrieves no new evidence and generates no prose;
-> it emits a text-free extractive ordering/grouping plan over already-selected
-> exact atoms.
+> **Experimental implementation contract.** Generic and resident-path tests
+> establish the exact two-pass topology, provenance, bounds, and request-state
+> lifecycle. A route-agnostic two-atom smoke also executed the pinned one-layer
+> Qwen prefix and the untrained router together on one GPU. This does not
+> establish a trained-router quality gain, an end-to-end latency gain, an
+> episode-primary campaign result, or held-out answer improvement. This stage
+> retrieves no new evidence and generates no prose; it emits a text-free
+> extractive ordering/grouping plan over already-selected exact atoms.
 
 ## 1. Decision
 
@@ -42,7 +42,7 @@ before changing the implementation.
 
 ## 2. What already exists
 
-Two core pieces are now built independently:
+Four bounded pieces are now built:
 
 1. `episode_primary` retrieval routes through source-scoped episode
    representatives and seeded graph closure. It does not union in legacy
@@ -61,6 +61,23 @@ Two core pieces are now built independently:
    $[N,K]$. No $[N,N]$ content-attention matrix is constructed. The extraction
    residual rule is explicitly `none`, matching the supplied algorithm; only
    the node reinjection has the residual update.
+3. `QwenAtomFeatureProvider` constructs one bounded, query-preserving row per
+   exact packet atom and keeps the resulting $[N,D]$ workspace resident on the
+   encoder's indexed CUDA device. Its public operation returns only a sealed,
+   text-free receipt.
+4. `build_qwen_matched_fusion_pair` consumes that private workspace once,
+   builds topology-only and latent-router plans over the same exact atoms and
+   hyperedges, copies only bounded $[K,N]$ and $[N,K]$ route matrices to the
+   host for canonicalization, and returns no request tensor.
+
+A local diagnostic at source commit `66ba8a1` exercised these resident pieces
+with the pinned Qwen3-8B one-layer prefix on `cuda:0` in `float16`, using two
+synthetic atoms and two untrained latent slots. It recorded exactly one Qwen
+forward and one router forward. The raw post-operation allocation delta was
+8,519,680 bytes of cuBLAS workspace; after the dedicated smoke normalized that
+runtime workspace, live allocation exactly matched the resident pre-operation
+baseline and final cleanup returned PyTorch allocation to zero. The diagnostic
+is deliberately not a receipt artifact or a performance attestation.
 
 The current router is infrastructure, not a learned result. Its status is
 `untrained` unless a caller honestly declares a trained checkpoint. A
@@ -226,11 +243,11 @@ The proposed initial `QwenAtomFeatureCaps` row/workspace values are:
 | evidence Unicode codepoints | 4,096 |
 | query Unicode codepoints | 2,048 |
 
-The row/workspace values remain proposed until tranche A implements and tests
-the sealed feature-caps type. Cross-cap checks for $N$, $D$, $K$, and $K N$
-use `FusionCaps` only; `QwenAtomFeatureCaps` must not duplicate those
-authorities. These values are not scientifically selected hyperparameters.
-Once frozen in code, any later change is a named treatment change and must be
+The row/workspace values are now implemented and sealed by
+`QwenAtomFeatureCaps`. Cross-cap checks for $N$, $D$, $K$, and $K N$ use
+`FusionCaps` only; `QwenAtomFeatureCaps` does not duplicate those authorities.
+These values are engineering bounds, not scientifically selected
+hyperparameters. Any later change is a named treatment change and must be
 bound in receipts.
 
 `QwenAtomFeatureCaps` must also carry explicit batch-invariance `atol` and

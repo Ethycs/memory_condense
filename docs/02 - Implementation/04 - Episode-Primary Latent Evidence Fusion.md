@@ -142,6 +142,15 @@ row_ids = prefix_ids + evidence_ids[:evidence_budget] + tail_ids
 readout_end_index = len(row_ids) - 1
 ```
 
+Before invoking the tokenizer, the provider rejects evidence or query strings
+whose Python Unicode-codepoint length exceeds the exact
+`max_evidence_characters` or `max_query_characters` feature cap. This cheap
+preflight bounds tokenizer input work; it does not replace the token budget or
+normalize the authoritative string. Tokenization then observes at most
+`evidence_budget + 1` evidence IDs and `max_query_tail_tokens + 1` tail IDs so
+the provider can distinguish exact fit from truncation/overflow without
+materializing an unbounded token sequence.
+
 The evidence truncation rule is prefix-only. The implementation must validate
 that `tail_ids` ends with the complete tokenization of `[Readout]`, and that
 `readout_end_index` identifies its final token rather than padding or an
@@ -214,6 +223,8 @@ The proposed initial `QwenAtomFeatureCaps` row/workspace values are:
 | query-tail tokens | 64 |
 | rows per forward | 4 |
 | padded positions per forward | 512 |
+| evidence Unicode codepoints | 4,096 |
+| query Unicode codepoints | 2,048 |
 
 The row/workspace values remain proposed until tranche A implements and tests
 the sealed feature-caps type. Cross-cap checks for $N$, $D$, $K$, and $K N$
@@ -628,7 +639,8 @@ Provider-free tests must prove:
    real smoke.
 4. Duplicate, missing, reordered, partial, and zero-progress results reject.
 5. Wrong shape, width, finiteness, device, or dtype rejects.
-6. Atom/hidden/row/workspace/$K N$ caps reject before deep allocation.
+6. Atom/hidden/raw-character/row/workspace/$K N$ caps reject before deep
+   allocation; raw-character caps reject before tokenizer invocation.
 7. The encoder is called for one shared extraction operation, not once per
    arm.
 8. Full feature/steered tensor `.cpu()`, `.numpy()`, `.tolist()`, and digest

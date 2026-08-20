@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.eval.answer_value_coverage import (
@@ -25,8 +26,406 @@ from memory_condense.eval.recall_models import (
     RecallReport,
 )
 from memory_condense.eval.schemas import EvalConfig
-from memory_condense.ingest.loader import BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 from memory_condense.search.packing.context_packer import is_source_metadata_text
+
+# --- coverage-selector report transcription -------------------------------
+#
+# Each row maps one stats-dict entry onto one ``QuestionRecall`` field via a
+# coercer, replacing a hand-written field-by-field transcription. A ``None``
+# key means the stats key equals the field suffix (prefix-identity); renames
+# carry the stats key explicitly.
+
+_Coercer = Callable[[dict, str], object]
+
+
+def _int(stats: dict, key: str) -> int:
+    return int(stats.get(key, 0))
+
+
+def _int_or_zero(stats: dict, key: str) -> int:
+    return int(stats.get(key, 0) or 0)
+
+
+def _int_neg_one(stats: dict, key: str) -> int:
+    return int(stats.get(key, -1))
+
+
+def _float(stats: dict, key: str) -> float:
+    return float(stats.get(key, 0.0))
+
+
+def _str(stats: dict, key: str) -> str:
+    return str(stats.get(key, ""))
+
+
+def _str_or_empty(stats: dict, key: str) -> str:
+    return str(stats.get(key, "") or "")
+
+
+def _bool(stats: dict, key: str) -> bool:
+    return bool(stats.get(key, False))
+
+
+def _raw(stats: dict, key: str):
+    return stats.get(key)
+
+
+#: ``coverage_selector_<suffix>`` <- coverage-selection report entries.
+_COVERAGE_SELECTOR_FIELDS: tuple[tuple[str, str | None, _Coercer], ...] = (
+    ("inspected", "inspected_candidates", _int),
+    ("classified", "classified_candidates", _int),
+    ("clusters", "event_clusters", _int),
+    ("null", "null_assignments", _int),
+    ("uncertain", "uncertain_assignments", _int),
+    ("output", "output_candidates", _int),
+    ("representatives", None, _int),
+    ("workspace_tokens", None, _int),
+    ("elapsed_s", None, _float),
+    ("operator", None, _str),
+    ("cardinality", None, _raw),
+    ("quantifier", None, _str),
+    ("ordering", None, _str),
+    ("query_timestamp", None, _raw),
+    ("temporal_window_days", None, _raw),
+    ("posterior_kind", None, _str),
+    ("semantic_score_kind", None, _str),
+    ("answerability_score_kind", None, _str),
+    ("frontier_candidates", None, _int),
+    ("frontier_attempted", None, _int),
+    ("frontier_uninspected", None, _int),
+    ("frontier_exhaustive", None, _bool),
+    ("frontier_batches", None, _int),
+    ("routed_frontier_exhaustive", None, _raw),
+    ("active_partition_total", None, _raw),
+    ("active_partition_inspected", None, _raw),
+    ("active_partition_exhaustive", None, _raw),
+    ("active_partition_sources_total", None, _raw),
+    ("active_partition_structural_rows", None, _int_or_zero),
+    ("active_partition_structural_hypotheses", None, _int_or_zero),
+    ("active_partition_candidates_admitted", None, _int_or_zero),
+    ("active_partition_candidates_already_present", None, _int_or_zero),
+    ("active_partition_candidates_replaced", None, _int_or_zero),
+    ("active_partition_candidates_truncated", None, _int_or_zero),
+    ("active_partition_structural_overflow", None, _int_or_zero),
+    ("active_partition_scan_contract", None, _str_or_empty),
+    ("active_partition_semantically_complete", None, _raw),
+    ("partition_scope_kind", None, _str_or_empty),
+    ("partition_inventory_total", None, _raw),
+    ("selected_partition_count", None, _raw),
+    ("partition_scope_exhaustive", None, _raw),
+    ("selected_scope_structurally_complete", None, _raw),
+    ("global_semantic_complete", None, _raw),
+    ("allow_selected_scope_fixed_k_closure", None, _bool),
+    ("cardinality_deficit", None, _int_or_zero),
+    ("credible_clusters", None, _int),
+    ("reserved_representatives", None, _int),
+    ("structural_eligible_clusters", None, _int),
+    ("structural_reserved_representatives", None, _int),
+    ("score_provider_fallback", None, _str),
+    ("prefix_model_id", None, _str),
+    ("prefix_model_revision", None, _str),
+    ("prefix_checkpoint_sha256", None, _str),
+    ("prefix_device", None, _str),
+    ("prefix_dtype", None, _str),
+    ("prefix_layers", None, _int_or_zero),
+    ("prefix_attention_layer", None, _int_neg_one),
+    ("model_id", "semantic_model_id", _str),
+    ("model_revision", "semantic_model_revision", _str),
+    ("checkpoint_sha256", "semantic_checkpoint_sha256", _str),
+    ("semantic_inspected", "semantic_inspected_candidates", _int),
+    ("semantic_workspace_tokens", None, _int),
+    ("semantic_elapsed_s", None, _float),
+    ("retained_state_bytes", "retained_transformer_state_bytes", _int),
+    ("status", "selection_status", _str),
+    ("bypass_reason", None, _str),
+    ("fallback_reason", None, _str),
+)
+
+#: ``coverage_selector_score_provider_<suffix>`` <- nested provider report.
+_SCORE_PROVIDER_FIELDS: tuple[tuple[str, str | None, _Coercer], ...] = (
+    ("model_id", None, _str),
+    ("model_revision", None, _str),
+    ("checkpoint_sha256", None, _str),
+    ("device", None, _str),
+    ("dtype", None, _str),
+    ("forward_passes", None, _int),
+    ("elapsed_s", None, _float),
+    ("retained_state_bytes", "retained_transformer_state_bytes", _int),
+)
+
+
+def _coverage_selector_fields(coverage_stats: dict) -> dict:
+    """Transcribe the coverage-selection report into ``QuestionRecall`` kwargs."""
+    score_provider_stats = coverage_stats.get(
+        "score_provider_report",
+        {},
+    ) or {}
+    fields = {
+        f"coverage_selector_{suffix}": coerce(coverage_stats, key or suffix)
+        for suffix, key, coerce in _COVERAGE_SELECTOR_FIELDS
+    }
+    fields.update(
+        {
+            f"coverage_selector_score_provider_{suffix}": coerce(
+                score_provider_stats, key or suffix
+            )
+            for suffix, key, coerce in _SCORE_PROVIDER_FIELDS
+        }
+    )
+    # Dual-key legacy fallbacks do not fit the single-key table pattern.
+    fields["coverage_selector_score_provider_peak_workspace_tokens"] = int(
+        score_provider_stats.get(
+            "peak_workspace_tokens",
+            score_provider_stats.get("workspace_tokens", 0),
+        )
+    )
+    fields["coverage_selector_score_provider_total_workspace_tokens"] = int(
+        score_provider_stats.get(
+            "total_workspace_tokens",
+            score_provider_stats.get("total_sequence_tokens", 0),
+        )
+    )
+    return fields
+
+
+# --- per-question measurement phases --------------------------------------
+
+
+def _capped_context(
+    mc, query_text: str, config: EvalConfig
+) -> tuple[list[str], list[str], list[str], list[bool]]:
+    """Assemble the context and apply the hard prompt-budget cap."""
+    header, body, body_sources, body_is_consolidation = _assemble(
+        mc, query_text, config
+    )
+    header_count = len(header)
+    capped = cap_context_to_prompt_budget(
+        query_text,
+        header + body,
+        config.max_prompt_tokens,
+    )
+    header = capped[:header_count]
+    body = capped[header_count:]
+    return (
+        header,
+        body,
+        body_sources[: len(body)],
+        body_is_consolidation[: len(body)],
+    )
+
+
+def _answer_scoring_fields(
+    mc,
+    question: BenchmarkQuestion,
+    haystack_texts: list[str],
+    header: list[str],
+    body: list[str],
+    body_sources: list[str],
+    expected_sources: set[str],
+) -> dict:
+    """Score answer reachability and evidence-source coverage."""
+    everything = header + body
+    # Gold answer decomposition begins only here: retrieval, selector
+    # execution, context packing, and the hard prompt cap have already
+    # completed. Score the exact raw body the responder receives,
+    # never memory summaries or provenance-only timestamp rows.
+    packed_raw_body = [
+        excerpt
+        for excerpt in body
+        if not is_source_metadata_text(excerpt)
+    ]
+    answer_value_coverage = answer_value_component_coverage(
+        question.answer,
+        len(question.evidence_sources),
+        packed_raw_body,
+    )
+    retrieved_sources = {source for source in body_sources if source}
+    raw_retrieved_source_ids = list(
+        getattr(mc, "last_raw_graph_source_ids", [])
+    )
+    raw_retrieved_sources = set(raw_retrieved_source_ids)
+    evidence_coverage = (
+        len(expected_sources & retrieved_sources) / len(expected_sources)
+        if expected_sources
+        else None
+    )
+    raw_evidence_coverage = (
+        len(expected_sources & raw_retrieved_sources) / len(expected_sources)
+        if expected_sources and raw_retrieved_source_ids
+        else None
+    )
+    scored = answer_value_coverage is not None
+    return {
+        "in_haystack": contains_answer(haystack_texts, question.answer),
+        "in_context": contains_answer(everything, question.answer),
+        "best_f1": best_f1(everything, question.answer),
+        "in_memory_header": contains_answer(header, question.answer),
+        "in_expansions": contains_answer(body, question.answer),
+        "context_tokens": sum(count_tokens(t) for t in everything),
+        "evidence_source_hit": (
+            bool(expected_sources & retrieved_sources)
+            if expected_sources
+            else None
+        ),
+        "evidence_source_recall": evidence_coverage,
+        "all_evidence_sources": (
+            evidence_coverage == 1.0
+            if evidence_coverage is not None
+            else None
+        ),
+        "retrieved_source_ids": list(
+            dict.fromkeys(source for source in body_sources if source)
+        ),
+        "raw_evidence_source_recall": raw_evidence_coverage,
+        "raw_all_evidence_sources": (
+            raw_evidence_coverage == 1.0
+            if raw_evidence_coverage is not None
+            else None
+        ),
+        "raw_retrieved_source_ids": raw_retrieved_source_ids,
+        "answer_value_components_expected": (
+            answer_value_coverage.expected if scored else None
+        ),
+        "answer_value_components_found": (
+            answer_value_coverage.found if scored else None
+        ),
+        "answer_value_component_recall": (
+            answer_value_coverage.recall if scored else None
+        ),
+        "all_answer_value_components": (
+            answer_value_coverage.all_components if scored else None
+        ),
+        "answer_value_component_hit_mask": (
+            list(answer_value_coverage.hit_mask) if scored else []
+        ),
+        "answer_value_metric_kind": (
+            answer_value_coverage.metric_kind if scored else ""
+        ),
+    }
+
+
+def _trace_and_closure_fields(mc, expected_sources: set[str]) -> dict:
+    """Join gold sources onto the candidate trace and summarize closure rows."""
+    coverage_candidate_trace = []
+    for row in getattr(mc, "last_coverage_candidate_trace", ()):
+        diagnostic = dict(row)
+        source_id = str(diagnostic.get("source_id") or "")
+        diagnostic["required_source"] = (
+            source_id in expected_sources if expected_sources else None
+        )
+        coverage_candidate_trace.append(diagnostic)
+    closure_rows = [
+        row
+        for row in coverage_candidate_trace
+        if row.get("post_coverage_closure_applied") is True
+    ]
+    closure_applied = bool(closure_rows)
+    closure_scopes = {
+        str(row.get("closure_scope") or "")
+        for row in closure_rows
+    }
+    closure_guarantees = {
+        row.get("closure_global_recall_guaranteed")
+        for row in closure_rows
+    }
+    closure_scope = (
+        next(iter(closure_scopes))
+        if len(closure_scopes) == 1
+        else ("inconsistent" if closure_scopes else "")
+    )
+    closure_guarantee = (
+        next(iter(closure_guarantees))
+        if len(closure_guarantees) == 1
+        else None
+    )
+    return {
+        "coverage_candidate_trace": coverage_candidate_trace,
+        "closure_applied": closure_applied,
+        "closure_scope": closure_scope,
+        "closure_global_recall_guaranteed": (
+            closure_guarantee
+            if closure_applied and isinstance(closure_guarantee, bool)
+            else None
+        ),
+    }
+
+
+def _engine_diagnostic_fields(mc) -> dict:
+    """Transcribe the engine's per-question diagnostic reports."""
+    causal_stats = getattr(mc, "causal_consolidation_stats", {})
+    staging_stats = causal_stats.get("staging", {})
+    learning_stats = causal_stats.get("learning", {})
+    qwen_stats = getattr(mc, "last_source_rerank_report", {})
+    companion_stats = getattr(mc, "last_source_companion_report", {})
+    partition_stats = getattr(mc, "last_partition_routing_report", {})
+    coverage_stats = getattr(
+        mc,
+        "last_coverage_selection_report",
+        {},
+    )
+    return {
+        "source_companion_requested": list(
+            companion_stats.get("requested_sources", [])
+        ),
+        "source_companion_hydrated": list(
+            companion_stats.get("hydrated_sources", [])
+        ),
+        "source_companion_orphans": list(
+            companion_stats.get("orphan_sources", [])
+        ),
+        "source_companion_direct_date_retained": int(
+            companion_stats.get("direct_date_retained", 0)
+        ),
+        "source_companion_candidates_before": int(
+            companion_stats.get("candidate_count_before", 0)
+        ),
+        "source_companion_candidates_after": int(
+            companion_stats.get("candidate_count_after", 0)
+        ),
+        "selected_partitions": list(
+            partition_stats.get("selected_partitions", [])
+        ),
+        "partition_ranking": list(
+            partition_stats.get("partition_ranking", [])
+        ),
+        "causal_events": int(staging_stats.get("events", 0)),
+        "causal_graph_edges": int(
+            learning_stats.get("graph", {}).get("edges", 0)
+        ),
+        "causal_write_s": float(staging_stats.get("elapsed_s", 0.0))
+        + float(learning_stats.get("elapsed_s", 0.0)),
+        "qwen_rerank_passes": int(qwen_stats.get("passes", 0)),
+        "qwen_candidate_inspections": int(
+            qwen_stats.get("total_candidate_inspections", 0)
+        ),
+        "qwen_max_workspace_candidates": int(
+            qwen_stats.get("max_workspace_candidates", 0)
+        ),
+        "qwen_max_workspace_tokens": int(
+            qwen_stats.get("max_workspace_tokens", 0)
+        ),
+        "qwen_candidates_added": int(
+            qwen_stats.get("qwen_candidates_added", 0)
+        ),
+        "qwen_feedback_rounds": int(
+            qwen_stats.get("feedback_rounds", 0)
+        ),
+        "qwen_feedback_seed_sources": int(
+            qwen_stats.get("feedback_seed_sources", 0)
+        ),
+        "qwen_feedback_candidates_added": int(
+            qwen_stats.get("feedback_candidates_added", 0)
+        ),
+        "qwen_feedback_activation_candidates": int(
+            qwen_stats.get("feedback_activation_candidates", 0)
+        ),
+        "qwen_feedback_query_tokens": int(
+            qwen_stats.get("feedback_query_tokens", 0)
+        ),
+        **_coverage_selector_fields(coverage_stats),
+    }
+
 
 def measure_sample(
     sample: BenchmarkSample,
@@ -48,504 +447,32 @@ def measure_sample(
             else question_offset + max_questions
         )
         for question in sample.questions[question_offset:stop]:
-            query_text = question.dated_question
-            header, body, body_sources, body_is_consolidation = _assemble(
-                mc, query_text, config
-            )
-            header_count = len(header)
-            capped = cap_context_to_prompt_budget(
-                query_text,
-                header + body,
-                config.max_prompt_tokens,
-            )
-            header = capped[:header_count]
-            body = capped[header_count:]
-            body_sources = body_sources[: len(body)]
-            body_is_consolidation = body_is_consolidation[: len(body)]
-            everything = header + body
-            # Gold answer decomposition begins only here: retrieval, selector
-            # execution, context packing, and the hard prompt cap have already
-            # completed. Score the exact raw body the responder receives,
-            # never memory summaries or provenance-only timestamp rows.
-            packed_raw_body = [
-                excerpt
-                for excerpt in body
-                if not is_source_metadata_text(excerpt)
-            ]
-            answer_value_coverage = answer_value_component_coverage(
-                question.answer,
-                len(question.evidence_sources),
-                packed_raw_body,
+            header, body, body_sources, body_is_consolidation = (
+                _capped_context(mc, question.dated_question, config)
             )
             expected_sources = set(question.evidence_sources)
-            retrieved_sources = {source for source in body_sources if source}
-            raw_retrieved_source_ids = list(
-                getattr(mc, "last_raw_graph_source_ids", [])
-            )
-            raw_retrieved_sources = set(raw_retrieved_source_ids)
-            evidence_coverage = (
-                len(expected_sources & retrieved_sources) / len(expected_sources)
-                if expected_sources
-                else None
-            )
-            raw_evidence_coverage = (
-                len(expected_sources & raw_retrieved_sources) / len(expected_sources)
-                if expected_sources and raw_retrieved_source_ids
-                else None
-            )
-            causal_stats = getattr(mc, "causal_consolidation_stats", {})
-            staging_stats = causal_stats.get("staging", {})
-            learning_stats = causal_stats.get("learning", {})
-            qwen_stats = getattr(mc, "last_source_rerank_report", {})
-            coverage_stats = getattr(
-                mc,
-                "last_coverage_selection_report",
-                {},
-            )
-            score_provider_stats = coverage_stats.get(
-                "score_provider_report",
-                {},
-            ) or {}
-            coverage_candidate_trace = []
-            for row in getattr(mc, "last_coverage_candidate_trace", ()):
-                diagnostic = dict(row)
-                source_id = str(diagnostic.get("source_id") or "")
-                diagnostic["required_source"] = (
-                    source_id in expected_sources if expected_sources else None
-                )
-                coverage_candidate_trace.append(diagnostic)
-            closure_rows = [
-                row
-                for row in coverage_candidate_trace
-                if row.get("post_coverage_closure_applied") is True
-            ]
-            closure_applied = bool(closure_rows)
-            closure_scopes = {
-                str(row.get("closure_scope") or "")
-                for row in closure_rows
-            }
-            closure_guarantees = {
-                row.get("closure_global_recall_guaranteed")
-                for row in closure_rows
-            }
-            closure_scope = (
-                next(iter(closure_scopes))
-                if len(closure_scopes) == 1
-                else ("inconsistent" if closure_scopes else "")
-            )
-            closure_guarantee = (
-                next(iter(closure_guarantees))
-                if len(closure_guarantees) == 1
-                else None
-            )
-            closure_global_recall_guaranteed = (
-                closure_guarantee
-                if closure_applied
-                and isinstance(closure_guarantee, bool)
-                else None
-            )
-            companion_stats = getattr(mc, "last_source_companion_report", {})
-            partition_stats = getattr(mc, "last_partition_routing_report", {})
             out.append(
                 QuestionRecall(
                     question_id=question.question_id,
                     category=question.category or "",
-                    in_haystack=contains_answer(haystack_texts, question.answer),
-                    in_context=contains_answer(everything, question.answer),
-                    best_f1=best_f1(everything, question.answer),
-                    in_memory_header=contains_answer(header, question.answer),
-                    in_expansions=contains_answer(body, question.answer),
-                    context_tokens=sum(count_tokens(t) for t in everything),
-                    evidence_source_hit=(
-                        bool(expected_sources & retrieved_sources)
-                        if expected_sources
-                        else None
+                    direct_chunks=sum(
+                        not value for value in body_is_consolidation
                     ),
-                    evidence_source_recall=evidence_coverage,
-                    all_evidence_sources=(
-                        evidence_coverage == 1.0
-                        if evidence_coverage is not None
-                        else None
-                    ),
-                    retrieved_source_ids=list(
-                        dict.fromkeys(source for source in body_sources if source)
-                    ),
-                    raw_evidence_source_recall=raw_evidence_coverage,
-                    raw_all_evidence_sources=(
-                        raw_evidence_coverage == 1.0
-                        if raw_evidence_coverage is not None
-                        else None
-                    ),
-                    raw_retrieved_source_ids=raw_retrieved_source_ids,
-                    answer_value_components_expected=(
-                        answer_value_coverage.expected
-                        if answer_value_coverage is not None
-                        else None
-                    ),
-                    answer_value_components_found=(
-                        answer_value_coverage.found
-                        if answer_value_coverage is not None
-                        else None
-                    ),
-                    answer_value_component_recall=(
-                        answer_value_coverage.recall
-                        if answer_value_coverage is not None
-                        else None
-                    ),
-                    all_answer_value_components=(
-                        answer_value_coverage.all_components
-                        if answer_value_coverage is not None
-                        else None
-                    ),
-                    answer_value_component_hit_mask=(
-                        list(answer_value_coverage.hit_mask)
-                        if answer_value_coverage is not None
-                        else []
-                    ),
-                    answer_value_metric_kind=(
-                        answer_value_coverage.metric_kind
-                        if answer_value_coverage is not None
-                        else ""
-                    ),
-                    source_companion_requested=list(
-                        companion_stats.get("requested_sources", [])
-                    ),
-                    source_companion_hydrated=list(
-                        companion_stats.get("hydrated_sources", [])
-                    ),
-                    source_companion_orphans=list(
-                        companion_stats.get("orphan_sources", [])
-                    ),
-                    source_companion_direct_date_retained=int(
-                        companion_stats.get("direct_date_retained", 0)
-                    ),
-                    source_companion_candidates_before=int(
-                        companion_stats.get("candidate_count_before", 0)
-                    ),
-                    source_companion_candidates_after=int(
-                        companion_stats.get("candidate_count_after", 0)
-                    ),
-                    selected_partitions=list(
-                        partition_stats.get("selected_partitions", [])
-                    ),
-                    partition_ranking=list(
-                        partition_stats.get("partition_ranking", [])
-                    ),
-                    direct_chunks=sum(not value for value in body_is_consolidation),
                     consolidation_chunks=sum(body_is_consolidation),
-                    causal_events=int(staging_stats.get("events", 0)),
-                    causal_graph_edges=int(
-                        learning_stats.get("graph", {}).get("edges", 0)
-                    ),
-                    causal_write_s=float(staging_stats.get("elapsed_s", 0.0))
-                    + float(learning_stats.get("elapsed_s", 0.0)),
-                    qwen_rerank_passes=int(qwen_stats.get("passes", 0)),
-                    qwen_candidate_inspections=int(
-                        qwen_stats.get("total_candidate_inspections", 0)
-                    ),
-                    qwen_max_workspace_candidates=int(
-                        qwen_stats.get("max_workspace_candidates", 0)
-                    ),
-                    qwen_max_workspace_tokens=int(
-                        qwen_stats.get("max_workspace_tokens", 0)
-                    ),
-                    qwen_candidates_added=int(
-                        qwen_stats.get("qwen_candidates_added", 0)
-                    ),
-                    qwen_feedback_rounds=int(
-                        qwen_stats.get("feedback_rounds", 0)
-                    ),
-                    qwen_feedback_seed_sources=int(
-                        qwen_stats.get("feedback_seed_sources", 0)
-                    ),
-                    qwen_feedback_candidates_added=int(
-                        qwen_stats.get("feedback_candidates_added", 0)
-                    ),
-                    qwen_feedback_activation_candidates=int(
-                        qwen_stats.get("feedback_activation_candidates", 0)
-                    ),
-                    qwen_feedback_query_tokens=int(
-                        qwen_stats.get("feedback_query_tokens", 0)
-                    ),
-                    coverage_selector_inspected=int(
-                        coverage_stats.get("inspected_candidates", 0)
-                    ),
-                    coverage_selector_classified=int(
-                        coverage_stats.get("classified_candidates", 0)
-                    ),
-                    coverage_selector_clusters=int(
-                        coverage_stats.get("event_clusters", 0)
-                    ),
-                    coverage_selector_null=int(
-                        coverage_stats.get("null_assignments", 0)
-                    ),
-                    coverage_selector_uncertain=int(
-                        coverage_stats.get("uncertain_assignments", 0)
-                    ),
-                    coverage_selector_output=int(
-                        coverage_stats.get("output_candidates", 0)
-                    ),
-                    coverage_selector_representatives=int(
-                        coverage_stats.get("representatives", 0)
-                    ),
-                    coverage_selector_workspace_tokens=int(
-                        coverage_stats.get("workspace_tokens", 0)
-                    ),
-                    coverage_selector_elapsed_s=float(
-                        coverage_stats.get("elapsed_s", 0.0)
-                    ),
-                    coverage_selector_operator=str(
-                        coverage_stats.get("operator", "")
-                    ),
-                    coverage_selector_cardinality=coverage_stats.get(
-                        "cardinality"
-                    ),
-                    coverage_selector_quantifier=str(
-                        coverage_stats.get("quantifier", "")
-                    ),
-                    coverage_selector_ordering=str(
-                        coverage_stats.get("ordering", "")
-                    ),
-                    coverage_selector_query_timestamp=coverage_stats.get(
-                        "query_timestamp"
-                    ),
-                    coverage_selector_temporal_window_days=coverage_stats.get(
-                        "temporal_window_days"
-                    ),
-                    coverage_selector_posterior_kind=str(
-                        coverage_stats.get("posterior_kind", "")
-                    ),
-                    coverage_selector_semantic_score_kind=str(
-                        coverage_stats.get("semantic_score_kind", "")
-                    ),
-                    coverage_selector_answerability_score_kind=str(
-                        coverage_stats.get("answerability_score_kind", "")
-                    ),
-                    coverage_selector_frontier_candidates=int(
-                        coverage_stats.get("frontier_candidates", 0)
-                    ),
-                    coverage_selector_frontier_attempted=int(
-                        coverage_stats.get("frontier_attempted", 0)
-                    ),
-                    coverage_selector_frontier_uninspected=int(
-                        coverage_stats.get("frontier_uninspected", 0)
-                    ),
-                    coverage_selector_frontier_exhaustive=bool(
-                        coverage_stats.get("frontier_exhaustive", False)
-                    ),
-                    coverage_selector_frontier_batches=int(
-                        coverage_stats.get("frontier_batches", 0)
-                    ),
-                    coverage_selector_routed_frontier_exhaustive=(
-                        coverage_stats.get("routed_frontier_exhaustive")
-                    ),
-                    coverage_selector_active_partition_total=(
-                        coverage_stats.get("active_partition_total")
-                    ),
-                    coverage_selector_active_partition_inspected=(
-                        coverage_stats.get("active_partition_inspected")
-                    ),
-                    coverage_selector_active_partition_exhaustive=(
-                        coverage_stats.get("active_partition_exhaustive")
-                    ),
-                    coverage_selector_active_partition_sources_total=(
-                        coverage_stats.get("active_partition_sources_total")
-                    ),
-                    coverage_selector_active_partition_structural_rows=int(
-                        coverage_stats.get(
-                            "active_partition_structural_rows", 0
-                        )
-                        or 0
-                    ),
-                    coverage_selector_active_partition_structural_hypotheses=int(
-                        coverage_stats.get(
-                            "active_partition_structural_hypotheses", 0
-                        )
-                        or 0
-                    ),
-                    coverage_selector_active_partition_candidates_admitted=int(
-                        coverage_stats.get(
-                            "active_partition_candidates_admitted", 0
-                        )
-                        or 0
-                    ),
-                    coverage_selector_active_partition_candidates_already_present=int(
-                        coverage_stats.get(
-                            "active_partition_candidates_already_present", 0
-                        )
-                        or 0
-                    ),
-                    coverage_selector_active_partition_candidates_replaced=int(
-                        coverage_stats.get(
-                            "active_partition_candidates_replaced", 0
-                        )
-                        or 0
-                    ),
-                    coverage_selector_active_partition_candidates_truncated=int(
-                        coverage_stats.get(
-                            "active_partition_candidates_truncated", 0
-                        )
-                        or 0
-                    ),
-                    coverage_selector_active_partition_structural_overflow=int(
-                        coverage_stats.get(
-                            "active_partition_structural_overflow", 0
-                        )
-                        or 0
-                    ),
-                    coverage_selector_active_partition_scan_contract=str(
-                        coverage_stats.get("active_partition_scan_contract", "")
-                        or ""
-                    ),
-                    coverage_selector_active_partition_semantically_complete=(
-                        coverage_stats.get(
-                            "active_partition_semantically_complete"
-                        )
-                    ),
-                    coverage_selector_partition_scope_kind=str(
-                        coverage_stats.get("partition_scope_kind", "") or ""
-                    ),
-                    coverage_selector_partition_inventory_total=(
-                        coverage_stats.get("partition_inventory_total")
-                    ),
-                    coverage_selector_selected_partition_count=(
-                        coverage_stats.get("selected_partition_count")
-                    ),
-                    coverage_selector_partition_scope_exhaustive=(
-                        coverage_stats.get("partition_scope_exhaustive")
-                    ),
-                    coverage_selector_selected_scope_structurally_complete=(
-                        coverage_stats.get(
-                            "selected_scope_structurally_complete"
-                        )
-                    ),
-                    coverage_selector_global_semantic_complete=(
-                        coverage_stats.get("global_semantic_complete")
-                    ),
-                    coverage_selector_allow_selected_scope_fixed_k_closure=bool(
-                        coverage_stats.get(
-                            "allow_selected_scope_fixed_k_closure",
-                            False,
-                        )
-                    ),
-                    closure_applied=closure_applied,
-                    closure_scope=closure_scope,
-                    closure_global_recall_guaranteed=(
-                        closure_global_recall_guaranteed
-                    ),
-                    coverage_selector_cardinality_deficit=int(
-                        coverage_stats.get("cardinality_deficit", 0) or 0
-                    ),
-                    coverage_selector_credible_clusters=int(
-                        coverage_stats.get("credible_clusters", 0)
-                    ),
-                    coverage_selector_reserved_representatives=int(
-                        coverage_stats.get("reserved_representatives", 0)
-                    ),
-                    coverage_selector_structural_eligible_clusters=int(
-                        coverage_stats.get("structural_eligible_clusters", 0)
-                    ),
-                    coverage_selector_structural_reserved_representatives=int(
-                        coverage_stats.get(
-                            "structural_reserved_representatives",
-                            0,
-                        )
-                    ),
-                    coverage_selector_score_provider_fallback=str(
-                        coverage_stats.get("score_provider_fallback", "")
-                    ),
-                    coverage_selector_score_provider_model_id=str(
-                        score_provider_stats.get("model_id", "")
-                    ),
-                    coverage_selector_score_provider_model_revision=str(
-                        score_provider_stats.get("model_revision", "")
-                    ),
-                    coverage_selector_score_provider_checkpoint_sha256=str(
-                        score_provider_stats.get("checkpoint_sha256", "")
-                    ),
-                    coverage_selector_score_provider_device=str(
-                        score_provider_stats.get("device", "")
-                    ),
-                    coverage_selector_score_provider_dtype=str(
-                        score_provider_stats.get("dtype", "")
-                    ),
-                    coverage_selector_score_provider_forward_passes=int(
-                        score_provider_stats.get("forward_passes", 0)
-                    ),
-                    coverage_selector_score_provider_peak_workspace_tokens=int(
-                        score_provider_stats.get(
-                            "peak_workspace_tokens",
-                            score_provider_stats.get("workspace_tokens", 0),
-                        )
-                    ),
-                    coverage_selector_score_provider_total_workspace_tokens=int(
-                        score_provider_stats.get(
-                            "total_workspace_tokens",
-                            score_provider_stats.get("total_sequence_tokens", 0),
-                        )
-                    ),
-                    coverage_selector_score_provider_elapsed_s=float(
-                        score_provider_stats.get("elapsed_s", 0.0)
-                    ),
-                    coverage_selector_score_provider_retained_state_bytes=int(
-                        score_provider_stats.get(
-                            "retained_transformer_state_bytes",
-                            0,
-                        )
-                    ),
-                    coverage_selector_prefix_model_id=str(
-                        coverage_stats.get("prefix_model_id", "")
-                    ),
-                    coverage_selector_prefix_model_revision=str(
-                        coverage_stats.get("prefix_model_revision", "")
-                    ),
-                    coverage_selector_prefix_checkpoint_sha256=str(
-                        coverage_stats.get("prefix_checkpoint_sha256", "")
-                    ),
-                    coverage_selector_prefix_device=str(
-                        coverage_stats.get("prefix_device", "")
-                    ),
-                    coverage_selector_prefix_dtype=str(
-                        coverage_stats.get("prefix_dtype", "")
-                    ),
-                    coverage_selector_prefix_layers=int(
-                        coverage_stats.get("prefix_layers", 0) or 0
-                    ),
-                    coverage_selector_prefix_attention_layer=int(
-                        coverage_stats.get("prefix_attention_layer", -1)
-                    ),
-                    coverage_selector_model_id=str(
-                        coverage_stats.get("semantic_model_id", "")
-                    ),
-                    coverage_selector_model_revision=str(
-                        coverage_stats.get("semantic_model_revision", "")
-                    ),
-                    coverage_selector_checkpoint_sha256=str(
-                        coverage_stats.get("semantic_checkpoint_sha256", "")
-                    ),
-                    coverage_selector_semantic_inspected=int(
-                        coverage_stats.get("semantic_inspected_candidates", 0)
-                    ),
-                    coverage_selector_semantic_workspace_tokens=int(
-                        coverage_stats.get("semantic_workspace_tokens", 0)
-                    ),
-                    coverage_selector_semantic_elapsed_s=float(
-                        coverage_stats.get("semantic_elapsed_s", 0.0)
-                    ),
-                    coverage_selector_retained_state_bytes=int(
-                        coverage_stats.get("retained_transformer_state_bytes", 0)
-                    ),
-                    coverage_selector_status=str(
-                        coverage_stats.get("selection_status", "")
-                    ),
-                    coverage_selector_bypass_reason=str(
-                        coverage_stats.get("bypass_reason", "")
-                    ),
-                    coverage_selector_fallback_reason=str(
-                        coverage_stats.get("fallback_reason", "")
-                    ),
-                    coverage_candidate_trace=coverage_candidate_trace,
-                    survives_horizon=_survival(mc, question.answer, horizons_turns),
+                    survives_horizon=_survival(
+                        mc, question.answer, horizons_turns
+                    ),
+                    **_answer_scoring_fields(
+                        mc,
+                        question,
+                        haystack_texts,
+                        header,
+                        body,
+                        body_sources,
+                        expected_sources,
+                    ),
+                    **_trace_and_closure_fields(mc, expected_sources),
+                    **_engine_diagnostic_fields(mc),
                 )
             )
         return out

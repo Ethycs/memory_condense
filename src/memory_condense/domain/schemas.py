@@ -396,6 +396,23 @@ class RetrievalResult(ConsolidationDiagnostics):
             return str(self.turn.source_id or self.turn.turn_id)
         return str(self.chunk.turn_id)
 
+    @property
+    def source_hints(self) -> frozenset[str]:
+        """Distinct non-empty source identities attached to this result.
+
+        More than one element means the durable ``memory_source_id`` and the
+        hydrated turn disagree about provenance.  This property only detects
+        the conflict; each caller decides its own response.
+        """
+        return frozenset(
+            str(value).strip()
+            for value in (
+                self.memory_source_id,
+                None if self.turn is None else self.turn.source_id,
+            )
+            if value is not None and str(value).strip()
+        )
+
 
 class MemoryResult(ConsolidationDiagnostics):
     """A memory item returned from retrieval, with its score breakdown.

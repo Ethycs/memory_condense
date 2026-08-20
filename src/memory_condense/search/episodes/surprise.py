@@ -5,12 +5,10 @@ from memory_condense.domain._tokenizer import tokenizer_proxy_identity
 from .qwen_episode_signal import (
     QwenAttentionHeadSurpriseScorer,
     _attention_head_implementation_sha256,
-    _head_transport_similarities,
     _lossless_proxy_prefix,
     _normalized_transport_signature,
     _owned_qwen_runtime_binding,
     _owned_qwen_receipt_matches,
-    _qwen_linker_identity,
 )
 from .surprise_controls import (
     LexicalEmbeddingChangeScorer,
@@ -28,12 +26,6 @@ from .surprise_models import (
     ScoredSurpriseSequence,
     SurpriseScorer,
     SurpriseSequenceScorer,
-    _adjacent_cosine_change,
-    _evidence_sequence_sha256,
-    _exact_integer,
-    _input_sequence_sha256,
-    _score_sequence_sha256,
-    _similarity_matrix_sha256,
 )
 
 

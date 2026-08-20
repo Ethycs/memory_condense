@@ -410,9 +410,6 @@ def test_incident_queries_apply_per_unit_degree_cap(graph):
     assert store.incident_relations(("u-result",), max_degree=1)["u-result"] == (
         revision,
     )
-    assert store.incident_units(("u-result",), max_degree=1)["u-result"] == (
-        decision,
-    )
     assert store.units_for_chunks(("c2",)) == (result,)
     assert store.relations_for_chunks(("c1", "c3")) == (revision, support)
 

@@ -699,6 +699,7 @@ class TestRunRecall:
         )
         timestamp = SimpleNamespace(
             memory_source_id="source-required",
+            durable_source_id="source-required",
             turn=SimpleNamespace(source_id="source-required"),
             chunk=SimpleNamespace(
                 chunk_id="timestamp-chunk",
@@ -711,6 +712,7 @@ class TestRunRecall:
         )
         content = SimpleNamespace(
             memory_source_id="source-other",
+            durable_source_id="source-other",
             turn=SimpleNamespace(source_id="source-other"),
             chunk=SimpleNamespace(
                 chunk_id="content-chunk",

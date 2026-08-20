@@ -16,7 +16,6 @@ from memory_condense.search.selectors.coverage_models import (
 )
 from memory_condense.search.selectors.evidence_features import (
     _energy_softmax,
-    _source_id,
     _timestamp_key,
 )
 from memory_condense.search.selectors.prefix_models import (
@@ -237,7 +236,7 @@ class QwenPrefixCoverageSelector:
         return [
             {
                 "chunk_id": result.chunk.chunk_id,
-                "source_id": _source_id(result),
+                "source_id": result.durable_source_id,
                 "selector_input_rank": index + 1,
                 "group_id": None,
                 "group_role": "uninspected",
@@ -440,7 +439,7 @@ class QwenPrefixCoverageSelector:
             ]
             member_thresholds = [
                 self.same_source_merge_similarity
-                if source_id == _source_id(member.result)
+                if source_id == member.result.durable_source_id
                 else self.merge_similarity
                 for member in cluster.members
             ]

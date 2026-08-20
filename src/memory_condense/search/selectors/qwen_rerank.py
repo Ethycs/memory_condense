@@ -206,12 +206,7 @@ class QwenCandidateReranker:
             chunk_id = result.chunk.chunk_id
             if chunk_id in seen:
                 continue
-            source_id = str(
-                result.memory_source_id
-                or getattr(result.turn, "source_id", None)
-                or getattr(result.turn, "turn_id", None)
-                or result.chunk.turn_id
-            )
+            source_id = result.durable_source_id
             if unique_sources and source_id in seen_sources:
                 continue
             seen.add(chunk_id)

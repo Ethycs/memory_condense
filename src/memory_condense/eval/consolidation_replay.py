@@ -11,7 +11,6 @@ consolidation.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 import sqlite3
@@ -24,6 +23,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.domain.integrity import file_sha256 as _sha256
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.search.packing.context_packer import ContextBudget
 from memory_condense.modeling.embedding import EmbeddingService
@@ -75,14 +75,6 @@ class FrozenQueryEmbedder:
         if chunks:
             raise RuntimeError("compiled replay must not re-embed source chunks")
         return []
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _source_rows(

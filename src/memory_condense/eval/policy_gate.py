@@ -135,32 +135,268 @@ def _benchmark_evaluation_identity(
     }
 
 
+_SOURCE_MODES = frozenset({"hybrid_source", "hybrid_graph", "causal_graph"})
+_GRAPH_MODES = frozenset({"hybrid_graph", "causal_graph"})
+_CONSOLIDATION_MODES = frozenset({"causal_consolidation", "causal_graph"})
+_PREFIX_COVERAGE_BACKENDS = frozenset(
+    {"qwen_prefix", "qwen_prefix_choice", "cross_encoder_qwen_prefix"}
+)
+_CROSS_ENCODER_COVERAGE_BACKENDS = frozenset(
+    {"cross_encoder", "cross_encoder_qwen_prefix"}
+)
+
+_COVERAGE_PREFIX_FIELDS = (
+    "coverage_selector_prefix_model_id",
+    "coverage_selector_prefix_revision",
+    "coverage_selector_prefix_checkpoint_sha256",
+    "coverage_selector_prefix_device",
+    "coverage_selector_prefix_dtype",
+)
+
+#: Qwen-rerank runtime keys shared verbatim by the rerank and feedback arms.
+#: ``qwen_rerank_score_weight`` sits between the two runs in the rerank arm
+#: only, so the shared keys are kept as an ordered head and tail.
+_QWEN_RERANK_SHARED_HEAD = (
+    "qwen_rerank_group_size",
+    "qwen_rerank_beam_per_group",
+    "qwen_rerank_candidate_tokens",
+    "qwen_rerank_query_tokens",
+)
+_QWEN_RERANK_SHARED_TAIL = (
+    "qwen_rerank_model",
+    "qwen_rerank_prefix_layers",
+    "qwen_rerank_attention_layer",
+    "qwen_rerank_use_cav",
+    "qwen_rerank_cav_layer",
+    "qwen_rerank_max_workspace_tokens",
+)
+
+
 def _coverage_prefix_policy_identity(config: EvalConfig) -> dict[str, str]:
     """Exact runtime/checkpoint identity for prefix-backed coverage arms."""
 
-    if config.retrieval.coverage_selector_backend not in {
-        "qwen_prefix",
-        "qwen_prefix_choice",
-        "cross_encoder_qwen_prefix",
-    }:
+    if config.retrieval.coverage_selector_backend not in (
+        _PREFIX_COVERAGE_BACKENDS
+    ):
         return {}
     return {
-        "coverage_selector_prefix_model_id": (
-            config.retrieval.coverage_selector_prefix_model_id
-        ),
-        "coverage_selector_prefix_revision": (
-            config.retrieval.coverage_selector_prefix_revision
-        ),
-        "coverage_selector_prefix_checkpoint_sha256": (
-            config.retrieval.coverage_selector_prefix_checkpoint_sha256
-        ),
-        "coverage_selector_prefix_device": (
-            config.retrieval.coverage_selector_prefix_device
-        ),
-        "coverage_selector_prefix_dtype": (
-            config.retrieval.coverage_selector_prefix_dtype
-        ),
+        field: getattr(config.retrieval, field)
+        for field in _COVERAGE_PREFIX_FIELDS
     }
+
+
+def _enabled(name: str) -> tuple[str, object]:
+    """Table entry that records an active gate flag as literal ``True``."""
+
+    return (name, lambda config: True)
+
+
+#: Declarative form of the conditional retrieval identity. Each row is
+#: ``(modes, flags, backends, entries)``: the row applies when the retrieval
+#: mode is in ``modes`` (``None`` = always), every named boolean flag is set,
+#: and — for coverage sub-blocks — the selector backend is in ``backends``.
+#: Entries are either a retrieval field name copied verbatim into the
+#: identity, or an explicit ``(key, fn(config))`` override for the few values
+#: that are not pure ``config.retrieval`` attributes. Row and entry order is
+#: the serialized key order and must not change.
+_RETRIEVAL_IDENTITY_TABLE: tuple = (
+    (
+        None,
+        (),
+        None,
+        (
+            "mode",
+            "k",
+            "ef_search",
+            "alpha",
+            "candidates",
+            "neighbor_radius",
+            "neighbor_slots",
+            "neighbor_replacement_slots",
+            ("max_prompt_tokens", lambda config: config.max_prompt_tokens),
+            ("chunker_min_tokens", lambda config: config.chunker.min_tokens),
+            ("chunker_max_tokens", lambda config: config.chunker.max_tokens),
+        ),
+    ),
+    (
+        _SOURCE_MODES,
+        (),
+        None,
+        (
+            "source_slots",
+            (
+                "source_activation_k",
+                lambda config: (
+                    config.retrieval.source_activation_k or config.retrieval.k
+                ),
+            ),
+            "source_candidate_pool",
+        ),
+    ),
+    (_SOURCE_MODES, ("source_local_search",), None, (
+        _enabled("source_local_search"),
+    )),
+    (_SOURCE_MODES, ("source_tfisf_activation",), None, (
+        _enabled("source_tfisf_activation"),
+        "source_tfisf_slots",
+    )),
+    (_SOURCE_MODES, ("source_hsc_activation",), None, (
+        _enabled("source_hsc_activation"),
+        "source_hsc_slots",
+        "source_hsc_hops",
+        "source_hsc_chunk_slots",
+    )),
+    (_SOURCE_MODES, ("source_partition_routing",), None, (
+        _enabled("source_partition_routing"),
+        "source_partition_slots",
+        "source_partition_separator",
+    )),
+    (_SOURCE_MODES, ("qwen_rerank",), None, (
+        _enabled("qwen_rerank"),
+        "qwen_rerank_candidate_pool",
+        "qwen_rerank_slots",
+        *_QWEN_RERANK_SHARED_HEAD,
+        "qwen_rerank_score_weight",
+        *_QWEN_RERANK_SHARED_TAIL,
+    )),
+    (_SOURCE_MODES, ("qwen_feedback",), None, (
+        _enabled("qwen_feedback"),
+        "qwen_feedback_candidate_pool",
+        "qwen_feedback_seed_slots",
+        "qwen_feedback_slots",
+        "qwen_feedback_evidence_tokens",
+        "qwen_feedback_query_tokens",
+        *_QWEN_RERANK_SHARED_HEAD,
+        *_QWEN_RERANK_SHARED_TAIL,
+    )),
+    (_GRAPH_MODES, (), None, ("neighbor_direction",)),
+    (_GRAPH_MODES, ("query_facet_retrieval",), None, (
+        _enabled("query_facet_retrieval"),
+        "query_facet_slots",
+        "query_facet_max",
+    )),
+    (_GRAPH_MODES, ("role_aware_retrieval",), None, (
+        _enabled("role_aware_retrieval"),
+        "role_user_weight",
+        "role_assistant_weight",
+        "role_system_weight",
+    )),
+    (_GRAPH_MODES, ("multi_fact_source_diversity",), None, (
+        _enabled("multi_fact_source_diversity"),
+    )),
+    (
+        _CONSOLIDATION_MODES,
+        (),
+        None,
+        (
+            "consolidation_chunk_slots",
+            "consolidation_hops",
+            "consolidation_candidates",
+            "consolidation_diffusion_width",
+            "consolidation_min_count",
+            "consolidation_expansion_tokens",
+            "consolidation_training_expansion_tokens",
+            "consolidation_budget_aware_packing",
+            "consolidation_training_k",
+            "consolidation_max_event_nodes",
+            "consolidation_new_event_nodes",
+            "consolidation_max_training_prompt_tokens",
+        ),
+    ),
+    (_CONSOLIDATION_MODES, ("consolidation_source_diverse_packing",), None, (
+        _enabled("consolidation_source_diverse_packing"),
+    )),
+    (
+        _CONSOLIDATION_MODES,
+        ("consolidation_query_aware_sentence_packing",),
+        None,
+        (
+            _enabled("consolidation_query_aware_sentence_packing"),
+            "consolidation_max_sentences_per_expansion",
+        ),
+    ),
+    (
+        _CONSOLIDATION_MODES,
+        ("consolidation_information_gain_packing",),
+        None,
+        (
+            _enabled("consolidation_information_gain_packing"),
+            "consolidation_min_information_gain_per_token",
+        ),
+    ),
+    (_CONSOLIDATION_MODES, ("consolidation_source_metadata_packing",), None, (
+        _enabled("consolidation_source_metadata_packing"),
+    )),
+    (
+        _CONSOLIDATION_MODES,
+        ("coverage_selection",),
+        None,
+        (
+            _enabled("coverage_selection"),
+            "coverage_selector_backend",
+            "coverage_selector_model",
+            "coverage_selector_dtype",
+            "coverage_selector_candidate_pool",
+            "coverage_selector_candidate_tokens",
+            "coverage_selector_query_tokens",
+            "coverage_selector_max_workspace_tokens",
+            "coverage_selector_max_new_tokens",
+            "coverage_selector_null_threshold",
+            "coverage_selector_uncertainty_entropy",
+            "coverage_selector_prefix_layers",
+            "coverage_selector_attention_layer",
+            "coverage_selector_merge_similarity",
+            "coverage_selector_same_source_merge_similarity",
+            "coverage_selector_strict",
+        ),
+    ),
+    (
+        _CONSOLIDATION_MODES,
+        ("coverage_selection", "allow_selected_scope_fixed_k_closure"),
+        None,
+        (_enabled("allow_selected_scope_fixed_k_closure"),),
+    ),
+    (
+        _CONSOLIDATION_MODES,
+        ("coverage_selection",),
+        _CROSS_ENCODER_COVERAGE_BACKENDS,
+        (
+            "coverage_selector_cross_encoder_model_id",
+            "coverage_selector_cross_encoder_revision",
+            "coverage_selector_cross_encoder_checkpoint_sha256",
+            "coverage_selector_cross_encoder_device",
+            "coverage_selector_cross_encoder_candidate_pool",
+            "coverage_selector_cross_encoder_semantic_rerank",
+            "coverage_selector_cross_encoder_score_only",
+            "coverage_selector_cross_encoder_batch_size",
+            "coverage_selector_cross_encoder_max_length",
+        ),
+    ),
+    (
+        _CONSOLIDATION_MODES,
+        ("coverage_selection",),
+        _PREFIX_COVERAGE_BACKENDS,
+        _COVERAGE_PREFIX_FIELDS,
+    ),
+    (
+        _CONSOLIDATION_MODES,
+        ("coverage_selection",),
+        frozenset({"qwen_prefix_choice"}),
+        (
+            "coverage_selector_choice_model_id",
+            "coverage_selector_choice_revision",
+            "coverage_selector_choice_checkpoint_sha256",
+            "coverage_selector_choice_device",
+            "coverage_selector_choice_dtype",
+            "coverage_selector_choice_batch_size",
+            "coverage_selector_choice_max_candidates",
+            "coverage_selector_choice_query_tokens",
+            "coverage_selector_choice_candidate_tokens",
+            "coverage_selector_choice_max_prompt_tokens",
+            "coverage_selector_choice_max_workspace_tokens",
+        ),
+    ),
+)
 
 
 def _policy_retrieval_identity(config: EvalConfig) -> dict[str, object]:
@@ -172,358 +408,24 @@ def _policy_retrieval_identity(config: EvalConfig) -> dict[str, object]:
     arm includes both its explicit values and runtime defaults.
     """
 
-    expected = {
-        "mode": config.retrieval.mode,
-        "k": config.retrieval.k,
-        "ef_search": config.retrieval.ef_search,
-        "alpha": config.retrieval.alpha,
-        "candidates": config.retrieval.candidates,
-        "neighbor_radius": config.retrieval.neighbor_radius,
-        "neighbor_slots": config.retrieval.neighbor_slots,
-        "neighbor_replacement_slots": (
-            config.retrieval.neighbor_replacement_slots
-        ),
-        "max_prompt_tokens": config.max_prompt_tokens,
-        "chunker_min_tokens": config.chunker.min_tokens,
-        "chunker_max_tokens": config.chunker.max_tokens,
-    }
-    if config.retrieval.mode in {
-        "hybrid_source",
-        "hybrid_graph",
-        "causal_graph",
-    }:
-        expected.update(
-            {
-                "source_slots": config.retrieval.source_slots,
-                "source_activation_k": (
-                    config.retrieval.source_activation_k or config.retrieval.k
-                ),
-                "source_candidate_pool": config.retrieval.source_candidate_pool,
-            }
-        )
-        if config.retrieval.source_local_search:
-            expected["source_local_search"] = True
-        if config.retrieval.source_tfisf_activation:
-            expected["source_tfisf_activation"] = True
-            expected["source_tfisf_slots"] = config.retrieval.source_tfisf_slots
-        if config.retrieval.source_hsc_activation:
-            expected.update(
-                {
-                    "source_hsc_activation": True,
-                    "source_hsc_slots": config.retrieval.source_hsc_slots,
-                    "source_hsc_hops": config.retrieval.source_hsc_hops,
-                    "source_hsc_chunk_slots": (
-                        config.retrieval.source_hsc_chunk_slots
-                    ),
-                }
-            )
-        if config.retrieval.source_partition_routing:
-            expected.update(
-                {
-                    "source_partition_routing": True,
-                    "source_partition_slots": (
-                        config.retrieval.source_partition_slots
-                    ),
-                    "source_partition_separator": (
-                        config.retrieval.source_partition_separator
-                    ),
-                }
-            )
-        if config.retrieval.qwen_rerank:
-            expected.update(
-                {
-                    "qwen_rerank": True,
-                    "qwen_rerank_candidate_pool": (
-                        config.retrieval.qwen_rerank_candidate_pool
-                    ),
-                    "qwen_rerank_slots": config.retrieval.qwen_rerank_slots,
-                    "qwen_rerank_group_size": (
-                        config.retrieval.qwen_rerank_group_size
-                    ),
-                    "qwen_rerank_beam_per_group": (
-                        config.retrieval.qwen_rerank_beam_per_group
-                    ),
-                    "qwen_rerank_candidate_tokens": (
-                        config.retrieval.qwen_rerank_candidate_tokens
-                    ),
-                    "qwen_rerank_query_tokens": (
-                        config.retrieval.qwen_rerank_query_tokens
-                    ),
-                    "qwen_rerank_score_weight": (
-                        config.retrieval.qwen_rerank_score_weight
-                    ),
-                    "qwen_rerank_model": config.retrieval.qwen_rerank_model,
-                    "qwen_rerank_prefix_layers": (
-                        config.retrieval.qwen_rerank_prefix_layers
-                    ),
-                    "qwen_rerank_attention_layer": (
-                        config.retrieval.qwen_rerank_attention_layer
-                    ),
-                    "qwen_rerank_use_cav": config.retrieval.qwen_rerank_use_cav,
-                    "qwen_rerank_cav_layer": (
-                        config.retrieval.qwen_rerank_cav_layer
-                    ),
-                    "qwen_rerank_max_workspace_tokens": (
-                        config.retrieval.qwen_rerank_max_workspace_tokens
-                    ),
-                }
-            )
-        if config.retrieval.qwen_feedback:
-            expected.update(
-                {
-                    "qwen_feedback": True,
-                    "qwen_feedback_candidate_pool": (
-                        config.retrieval.qwen_feedback_candidate_pool
-                    ),
-                    "qwen_feedback_seed_slots": (
-                        config.retrieval.qwen_feedback_seed_slots
-                    ),
-                    "qwen_feedback_slots": config.retrieval.qwen_feedback_slots,
-                    "qwen_feedback_evidence_tokens": (
-                        config.retrieval.qwen_feedback_evidence_tokens
-                    ),
-                    "qwen_feedback_query_tokens": (
-                        config.retrieval.qwen_feedback_query_tokens
-                    ),
-                    "qwen_rerank_group_size": (
-                        config.retrieval.qwen_rerank_group_size
-                    ),
-                    "qwen_rerank_beam_per_group": (
-                        config.retrieval.qwen_rerank_beam_per_group
-                    ),
-                    "qwen_rerank_candidate_tokens": (
-                        config.retrieval.qwen_rerank_candidate_tokens
-                    ),
-                    "qwen_rerank_query_tokens": (
-                        config.retrieval.qwen_rerank_query_tokens
-                    ),
-                    "qwen_rerank_model": config.retrieval.qwen_rerank_model,
-                    "qwen_rerank_prefix_layers": (
-                        config.retrieval.qwen_rerank_prefix_layers
-                    ),
-                    "qwen_rerank_attention_layer": (
-                        config.retrieval.qwen_rerank_attention_layer
-                    ),
-                    "qwen_rerank_use_cav": config.retrieval.qwen_rerank_use_cav,
-                    "qwen_rerank_cav_layer": (
-                        config.retrieval.qwen_rerank_cav_layer
-                    ),
-                    "qwen_rerank_max_workspace_tokens": (
-                        config.retrieval.qwen_rerank_max_workspace_tokens
-                    ),
-                }
-            )
-    if config.retrieval.mode in {"hybrid_graph", "causal_graph"}:
-        expected["neighbor_direction"] = config.retrieval.neighbor_direction
-        if config.retrieval.query_facet_retrieval:
-            expected.update(
-                {
-                    "query_facet_retrieval": True,
-                    "query_facet_slots": config.retrieval.query_facet_slots,
-                    "query_facet_max": config.retrieval.query_facet_max,
-                }
-            )
-        if config.retrieval.role_aware_retrieval:
-            expected.update(
-                {
-                    "role_aware_retrieval": True,
-                    "role_user_weight": config.retrieval.role_user_weight,
-                    "role_assistant_weight": (
-                        config.retrieval.role_assistant_weight
-                    ),
-                    "role_system_weight": config.retrieval.role_system_weight,
-                }
-            )
-        if config.retrieval.multi_fact_source_diversity:
-            expected["multi_fact_source_diversity"] = True
-    if config.retrieval.mode in {"causal_consolidation", "causal_graph"}:
-        expected.update(
-            {
-                "consolidation_chunk_slots": (
-                    config.retrieval.consolidation_chunk_slots
-                ),
-                "consolidation_hops": config.retrieval.consolidation_hops,
-                "consolidation_candidates": (
-                    config.retrieval.consolidation_candidates
-                ),
-                "consolidation_diffusion_width": (
-                    config.retrieval.consolidation_diffusion_width
-                ),
-                "consolidation_min_count": (
-                    config.retrieval.consolidation_min_count
-                ),
-                "consolidation_expansion_tokens": (
-                    config.retrieval.consolidation_expansion_tokens
-                ),
-                "consolidation_training_expansion_tokens": (
-                    config.retrieval.consolidation_training_expansion_tokens
-                ),
-                "consolidation_budget_aware_packing": (
-                    config.retrieval.consolidation_budget_aware_packing
-                ),
-                "consolidation_training_k": (
-                    config.retrieval.consolidation_training_k
-                ),
-                "consolidation_max_event_nodes": (
-                    config.retrieval.consolidation_max_event_nodes
-                ),
-                "consolidation_new_event_nodes": (
-                    config.retrieval.consolidation_new_event_nodes
-                ),
-                "consolidation_max_training_prompt_tokens": (
-                    config.retrieval.consolidation_max_training_prompt_tokens
-                ),
-            }
-        )
-        if config.retrieval.consolidation_source_diverse_packing:
-            expected["consolidation_source_diverse_packing"] = True
-        if config.retrieval.consolidation_query_aware_sentence_packing:
-            expected["consolidation_query_aware_sentence_packing"] = True
-            expected["consolidation_max_sentences_per_expansion"] = (
-                config.retrieval.consolidation_max_sentences_per_expansion
-            )
-        if config.retrieval.consolidation_information_gain_packing:
-            expected["consolidation_information_gain_packing"] = True
-            expected["consolidation_min_information_gain_per_token"] = (
-                config.retrieval.consolidation_min_information_gain_per_token
-            )
-        if config.retrieval.consolidation_source_metadata_packing:
-            expected["consolidation_source_metadata_packing"] = True
-        if config.retrieval.coverage_selection:
-            expected.update(
-                {
-                    "coverage_selection": True,
-                    "coverage_selector_backend": (
-                        config.retrieval.coverage_selector_backend
-                    ),
-                    "coverage_selector_model": (
-                        config.retrieval.coverage_selector_model
-                    ),
-                    "coverage_selector_dtype": (
-                        config.retrieval.coverage_selector_dtype
-                    ),
-                    "coverage_selector_candidate_pool": (
-                        config.retrieval.coverage_selector_candidate_pool
-                    ),
-                    "coverage_selector_candidate_tokens": (
-                        config.retrieval.coverage_selector_candidate_tokens
-                    ),
-                    "coverage_selector_query_tokens": (
-                        config.retrieval.coverage_selector_query_tokens
-                    ),
-                    "coverage_selector_max_workspace_tokens": (
-                        config.retrieval.coverage_selector_max_workspace_tokens
-                    ),
-                    "coverage_selector_max_new_tokens": (
-                        config.retrieval.coverage_selector_max_new_tokens
-                    ),
-                    "coverage_selector_null_threshold": (
-                        config.retrieval.coverage_selector_null_threshold
-                    ),
-                    "coverage_selector_uncertainty_entropy": (
-                        config.retrieval.coverage_selector_uncertainty_entropy
-                    ),
-                    "coverage_selector_prefix_layers": (
-                        config.retrieval.coverage_selector_prefix_layers
-                    ),
-                    "coverage_selector_attention_layer": (
-                        config.retrieval.coverage_selector_attention_layer
-                    ),
-                    "coverage_selector_merge_similarity": (
-                        config.retrieval.coverage_selector_merge_similarity
-                    ),
-                    "coverage_selector_same_source_merge_similarity": (
-                        config.retrieval.coverage_selector_same_source_merge_similarity
-                    ),
-                    "coverage_selector_strict": (
-                        config.retrieval.coverage_selector_strict
-                    ),
-                }
-            )
-            if config.retrieval.allow_selected_scope_fixed_k_closure:
-                expected["allow_selected_scope_fixed_k_closure"] = True
-            if config.retrieval.coverage_selector_backend in {
-                "cross_encoder",
-                "cross_encoder_qwen_prefix",
-            }:
-                expected.update(
-                    {
-                        "coverage_selector_cross_encoder_model_id": (
-                            config.retrieval.coverage_selector_cross_encoder_model_id
-                        ),
-                        "coverage_selector_cross_encoder_revision": (
-                            config.retrieval.coverage_selector_cross_encoder_revision
-                        ),
-                        "coverage_selector_cross_encoder_checkpoint_sha256": (
-                            config.retrieval.coverage_selector_cross_encoder_checkpoint_sha256
-                        ),
-                        "coverage_selector_cross_encoder_device": (
-                            config.retrieval.coverage_selector_cross_encoder_device
-                        ),
-                        "coverage_selector_cross_encoder_candidate_pool": (
-                            config.retrieval.coverage_selector_cross_encoder_candidate_pool
-                        ),
-                        "coverage_selector_cross_encoder_semantic_rerank": (
-                            config.retrieval.coverage_selector_cross_encoder_semantic_rerank
-                        ),
-                        "coverage_selector_cross_encoder_score_only": (
-                            config.retrieval.coverage_selector_cross_encoder_score_only
-                        ),
-                        "coverage_selector_cross_encoder_batch_size": (
-                            config.retrieval.coverage_selector_cross_encoder_batch_size
-                        ),
-                        "coverage_selector_cross_encoder_max_length": (
-                            config.retrieval.coverage_selector_cross_encoder_max_length
-                        ),
-                    }
-                )
-            if config.retrieval.coverage_selector_backend in {
-                "qwen_prefix",
-                "qwen_prefix_choice",
-                "cross_encoder_qwen_prefix",
-            }:
-                expected.update(_coverage_prefix_policy_identity(config))
-            if (
-                config.retrieval.coverage_selector_backend
-                == "qwen_prefix_choice"
-            ):
-                expected.update(
-                    {
-                        "coverage_selector_choice_model_id": (
-                            config.retrieval.coverage_selector_choice_model_id
-                        ),
-                        "coverage_selector_choice_revision": (
-                            config.retrieval.coverage_selector_choice_revision
-                        ),
-                        "coverage_selector_choice_checkpoint_sha256": (
-                            config.retrieval.coverage_selector_choice_checkpoint_sha256
-                        ),
-                        "coverage_selector_choice_device": (
-                            config.retrieval.coverage_selector_choice_device
-                        ),
-                        "coverage_selector_choice_dtype": (
-                            config.retrieval.coverage_selector_choice_dtype
-                        ),
-                        "coverage_selector_choice_batch_size": (
-                            config.retrieval.coverage_selector_choice_batch_size
-                        ),
-                        "coverage_selector_choice_max_candidates": (
-                            config.retrieval.coverage_selector_choice_max_candidates
-                        ),
-                        "coverage_selector_choice_query_tokens": (
-                            config.retrieval.coverage_selector_choice_query_tokens
-                        ),
-                        "coverage_selector_choice_candidate_tokens": (
-                            config.retrieval.coverage_selector_choice_candidate_tokens
-                        ),
-                        "coverage_selector_choice_max_prompt_tokens": (
-                            config.retrieval.coverage_selector_choice_max_prompt_tokens
-                        ),
-                        "coverage_selector_choice_max_workspace_tokens": (
-                            config.retrieval.coverage_selector_choice_max_workspace_tokens
-                        ),
-                    }
-                )
+    retrieval = config.retrieval
+    expected: dict[str, object] = {}
+    for modes, flags, backends, entries in _RETRIEVAL_IDENTITY_TABLE:
+        if modes is not None and retrieval.mode not in modes:
+            continue
+        if not all(getattr(retrieval, flag) for flag in flags):
+            continue
+        if (
+            backends is not None
+            and retrieval.coverage_selector_backend not in backends
+        ):
+            continue
+        for entry in entries:
+            if isinstance(entry, str):
+                expected[entry] = getattr(retrieval, entry)
+            else:
+                key, value_fn = entry
+                expected[key] = value_fn(config)
     return expected
 
 

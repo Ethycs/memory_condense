@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from memory_condense.domain.integrity import file_sha256
 
-def file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+__all__ = [
+    "environment_lock_sha256",
+    "file_sha256",
+    "implementation_sha256",
+    "project_root",
+]
 
 
 def project_root() -> Path:

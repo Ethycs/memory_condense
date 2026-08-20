@@ -18,6 +18,7 @@ import time
 
 import litellm
 
+from memory_condense.eval._completion import _content, build_completion_request
 from memory_condense.eval.schemas import DEFAULT_JUDGE_MODEL, UsageStats
 
 JUDGE_SYSTEM = """You are a strict but fair judge evaluating the quality of an AI-generated response.
@@ -78,15 +79,20 @@ def judge_response_with_usage(
 
     start = time.perf_counter()
     response = litellm.completion(
-        model=model,
-        messages=messages,
-        max_tokens=JUDGE_MAX_TOKENS,
-        num_retries=5,
+        **build_completion_request(
+            model,
+            messages,
+            max_tokens=JUDGE_MAX_TOKENS,
+            num_retries=5,
+        )
     )
     elapsed = time.perf_counter() - start
 
     usage = UsageStats.from_litellm(response, elapsed)
-    content = response.choices[0].message.content.strip()
+    # ``None`` content (refusal / thinking exhausted max_tokens) becomes "",
+    # which fails JSON parsing below and is scored as an explicit 1 with a
+    # "Failed to parse" reasoning — not an AttributeError mid-run.
+    content = _content(response)
 
     try:
         result = json.loads(content)
@@ -98,23 +104,3 @@ def judge_response_with_usage(
         reasoning = f"Failed to parse judge response: {content[:200]}"
 
     return score, reasoning, usage
-
-
-def judge_response(
-    user_text: str,
-    actual_response: str,
-    generated_response: str,
-    model: str = DEFAULT_JUDGE_MODEL,
-) -> tuple[int, str]:
-    """Score a generated response against the actual response.
-
-    Returns (score, reasoning). Use :func:`judge_response_with_usage` when you
-    also need token/latency accounting.
-    """
-    score, reasoning, _ = judge_response_with_usage(
-        user_text=user_text,
-        actual_response=actual_response,
-        generated_response=generated_response,
-        model=model,
-    )
-    return score, reasoning

@@ -6,6 +6,7 @@ import time
 
 import litellm
 
+from memory_condense.eval._completion import _content, build_completion_request
 from memory_condense.eval.schemas import DEFAULT_RESPONDER_MODEL, UsageStats
 from memory_condense.domain.schemas import RetrievalResult
 
@@ -66,21 +67,20 @@ def generate_from_messages(
     Returns ``(generated_text, usage)``.
     """
     start = time.perf_counter()
+    # The shared builder omits ``temperature`` for codex_sdk routes, which
+    # reject non-default sampling parameters with a 400.
     response = litellm.completion(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        num_retries=5,
+        **build_completion_request(
+            model,
+            messages,
+            max_tokens=max_tokens,
+            num_retries=5,
+            temperature=temperature,
+        )
     )
     elapsed = time.perf_counter() - start
 
-    usage = UsageStats.from_litellm(response, elapsed)
-    try:
-        text = (response.choices[0].message.content or "").strip()
-    except (AttributeError, IndexError, TypeError):
-        text = ""
-    return text, usage
+    return _content(response), UsageStats.from_litellm(response, elapsed)
 
 
 def generate_response_with_usage(

@@ -91,8 +91,6 @@ class _Store:
         artifact_id: str,
         source_id: str,
         *,
-        start_sequence: int | None = None,
-        end_sequence: int | None = None,
         limit: int | None = None,
     ) -> tuple[Episode, ...]:
         rows = sorted(
@@ -101,14 +99,6 @@ class _Store:
                 for episode in self.episodes.values()
                 if episode.artifact_id == artifact_id
                 and episode.source_id == source_id
-                and (
-                    start_sequence is None
-                    or episode.sequence_no >= start_sequence
-                )
-                and (
-                    end_sequence is None
-                    or episode.sequence_no <= end_sequence
-                )
             ),
             key=lambda item: (item.sequence_no, item.episode_id),
         )

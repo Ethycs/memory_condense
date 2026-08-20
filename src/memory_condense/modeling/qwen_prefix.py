@@ -13,13 +13,18 @@ This is an experimental component.  It does not participate in the existing
 from __future__ import annotations
 
 import argparse
-import hashlib
 import hmac
 import json
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from memory_condense.modeling.checkpoint_identity import (
+    checkpoint_manifest_sha256,
+    verify_file_sha256,
+)
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-8B"
 DEFAULT_MODEL_REVISION = "b968826d9c46dd6066d109eabc6255188de91218"
@@ -65,37 +70,18 @@ class QwenPrefixCheckpointIdentity:
     verified_files: tuple[str, ...]
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as source:
-        buffer = bytearray(8 * 1024 * 1024)
-        view = memoryview(buffer)
-        while size := source.readinto(buffer):
-            digest.update(view[:size])
-    return digest.hexdigest()
-
-
 def _prefix_manifest_sha256(
     file_hashes: Mapping[str, str],
     *,
     model_id: str,
     model_revision: str,
 ) -> str:
-    payload = {
-        "format": _PREFIX_MANIFEST_FORMAT,
-        "model_id": str(model_id),
-        "model_revision": str(model_revision),
-        "files": {
-            str(name): str(digest).casefold()
-            for name, digest in sorted(file_hashes.items())
-        },
-    }
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return checkpoint_manifest_sha256(
+        file_hashes,
+        manifest_format=_PREFIX_MANIFEST_FORMAT,
+        model_id=model_id,
+        model_revision=model_revision,
+    )
 
 
 def _known_required_shards(layers: int) -> tuple[str, ...]:
@@ -157,23 +143,15 @@ def verify_prefix_checkpoint(
     expected_index = expected_file_sha256.get(index_path.name)
     if not expected_index:
         raise ValueError(f"no pinned SHA-256 for {index_path.name}")
-    actual_index = _file_sha256(index_path)
-    if not hmac.compare_digest(actual_index, expected_index.casefold()):
-        raise ValueError(
-            f"checkpoint SHA-256 mismatch for {index_path.name}: "
-            f"expected {expected_index}, got {actual_index}"
-        )
+    actual_index = verify_file_sha256(
+        index_path,
+        expected_index,
+        name=index_path.name,
+        context="checkpoint",
+    )
 
     index = json.loads(index_path.read_text(encoding="utf-8"))
-    required_shards = tuple(
-        sorted(
-            {
-                shard
-                for key, shard in index["weight_map"].items()
-                if checkpoint_key_is_needed(key, int(layers))
-            }
-        )
-    )
+    required_shards = _required_shards_from_index(index, layers)
     known_shards = _known_required_shards(layers)
     if required_shards != known_shards:
         raise ValueError(
@@ -192,13 +170,12 @@ def verify_prefix_checkpoint(
         path = root / name
         if not path.is_file():
             raise FileNotFoundError(f"required prefix checkpoint file is missing: {path}")
-        actual = _file_sha256(path)
-        if not hmac.compare_digest(actual, expected.casefold()):
-            raise ValueError(
-                f"checkpoint SHA-256 mismatch for {name}: "
-                f"expected {expected}, got {actual}"
-            )
-        actual_hashes[name] = actual
+        actual_hashes[name] = verify_file_sha256(
+            path,
+            expected,
+            name=name,
+            context="checkpoint",
+        )
 
     checkpoint_sha256 = _prefix_manifest_sha256(
         actual_hashes,
@@ -226,6 +203,7 @@ def verify_prefix_checkpoint(
     )
 
 
+@lru_cache(maxsize=1)
 def _require_torch_stack() -> tuple[Any, ...]:
     """Import the heavyweight experimental dependencies only when requested."""
     try:
@@ -260,6 +238,34 @@ def checkpoint_key_is_needed(key: str, layers: int) -> bool:
         return True
     match = _LAYER_KEY.match(key)
     return match is not None and int(match.group(1)) < layers
+
+
+def _required_shards_from_index(index: Mapping[str, Any], layers: int) -> tuple[str, ...]:
+    """Return the sorted shard names a prefix load consumes, per the index."""
+    return tuple(
+        sorted(
+            {
+                shard
+                for key, shard in index["weight_map"].items()
+                if checkpoint_key_is_needed(key, int(layers))
+            }
+        )
+    )
+
+
+def _validated_layers(layers: Sequence[int], available: int) -> tuple[int, ...]:
+    """Validate a non-empty, duplicate-free layer selection within the prefix."""
+    selected = tuple(int(layer) for layer in layers)
+    if not selected:
+        raise ValueError("at least one layer must be selected")
+    if len(set(selected)) != len(selected):
+        raise ValueError("layers must not contain duplicates")
+    invalid = [layer for layer in selected if not 0 <= layer < available]
+    if invalid:
+        raise IndexError(
+            f"layers must be in [0, {available}); invalid values: {invalid}"
+        )
+    return selected
 
 
 def model_parameter_name(checkpoint_key: str) -> str:
@@ -424,13 +430,7 @@ class Qwen3PrefixEncoder:
                 encoding="utf-8"
             )
         )
-        required_shards = sorted(
-            {
-                shard
-                for key, shard in index["weight_map"].items()
-                if checkpoint_key_is_needed(key, self.layers)
-            }
-        )
+        required_shards = _required_shards_from_index(index, self.layers)
         for shard_name in required_shards:
             shard_path = self.model_dir / shard_name
             if not shard_path.is_file():
@@ -515,16 +515,9 @@ class Qwen3PrefixEncoder:
             return {}
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        selected = tuple(range(self.layers)) if layers is None else tuple(layers)
-        if not selected:
-            raise ValueError("at least one layer must be selected")
-        if len(set(selected)) != len(selected):
-            raise ValueError("layers must not contain duplicates")
-        invalid = [layer for layer in selected if not 0 <= layer < self.layers]
-        if invalid:
-            raise IndexError(
-                f"layers must be in [0, {self.layers}); invalid values: {invalid}"
-            )
+        selected = _validated_layers(
+            range(self.layers) if layers is None else layers, self.layers
+        )
 
         pooled: dict[int, list[Any]] = {layer: [] for layer in selected}
         captured: dict[int, Any] = {}
@@ -578,16 +571,7 @@ class Qwen3PrefixEncoder:
         layers: Sequence[int],
     ) -> dict[int, QwenHeadCapture]:
         """Capture complete head signals for several layers in one prefix pass."""
-        selected = tuple(int(layer) for layer in layers)
-        if not selected:
-            raise ValueError("at least one layer must be selected")
-        if len(set(selected)) != len(selected):
-            raise ValueError("layers must not contain duplicates")
-        invalid = [layer for layer in selected if not 0 <= layer < self.layers]
-        if invalid:
-            raise IndexError(
-                f"layers must be in [0, {self.layers}); invalid values: {invalid}"
-            )
+        selected = _validated_layers(layers, self.layers)
 
         saved: dict[int, dict[str, Any]] = {layer: {} for layer in selected}
         handles = []
@@ -750,48 +734,80 @@ def mean_pool_residual(residual: Any, attention_mask: Any | None = None) -> Any:
     return (residual * weights).sum(dim=1) / denominator
 
 
+_DTYPE_ALIASES = {
+    "float16": "float16",
+    "fp16": "float16",
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "float32": "float32",
+    "fp32": "float32",
+}
+
+
 def _torch_dtype(torch: Any, name: str) -> Any:
-    aliases = {
-        "float16": torch.float16,
-        "fp16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float32": torch.float32,
-        "fp32": torch.float32,
-    }
-    try:
-        return aliases[name.lower()]
-    except KeyError as exc:
-        raise ValueError(f"unsupported dtype {name!r}; choose {sorted(aliases)}") from exc
+    return getattr(torch, _canonical_dtype_name(name))
 
 
 def _canonical_dtype_name(name: str) -> str:
-    aliases = {
-        "float16": "float16",
-        "fp16": "float16",
-        "bfloat16": "bfloat16",
-        "bf16": "bfloat16",
-        "float32": "float32",
-        "fp32": "float32",
-    }
     try:
-        return aliases[str(name).casefold()]
+        return _DTYPE_ALIASES[str(name).casefold()]
     except KeyError as exc:
-        raise ValueError(f"unsupported dtype {name!r}; choose {sorted(aliases)}") from exc
+        raise ValueError(
+            f"unsupported dtype {name!r}; choose {sorted(_DTYPE_ALIASES)}"
+        ) from exc
 
 
 def _shape(value: Any | None) -> list[int] | None:
     return None if value is None else list(value.shape)
 
 
+def add_prefix_encoder_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    model_dir_default: Path | None = None,
+    layers_flags: Sequence[str] = ("--prefix-layers",),
+    layers_default: int = DEFAULT_PREFIX_LAYERS,
+    dtype_default: str = "bfloat16",
+) -> None:
+    """Register the shared Qwen prefix bootstrap flags on a tool parser.
+
+    Every lab command bootstraps the same encoder from the same four flags.
+    Tools whose historical prefix-length spelling was ``--layers`` pass both
+    spellings via ``layers_flags`` so existing invocations keep working; the
+    parsed value always lands on ``args.prefix_layers``.
+    """
+    if model_dir_default is None:
+        parser.add_argument("--model-dir", type=Path, required=True)
+    else:
+        parser.add_argument("--model-dir", type=Path, default=model_dir_default)
+    parser.add_argument(
+        *layers_flags,
+        dest="prefix_layers",
+        type=int,
+        default=layers_default,
+    )
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", default=dtype_default)
+
+
+def prefix_encoder_from_args(args: argparse.Namespace) -> "Qwen3PrefixEncoder":
+    """Build the encoder from flags registered by ``add_prefix_encoder_arguments``."""
+    return Qwen3PrefixEncoder(
+        args.model_dir,
+        layers=args.prefix_layers,
+        device=args.device,
+        dtype=args.dtype,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--layers", type=int, default=DEFAULT_PREFIX_LAYERS)
+    add_prefix_encoder_arguments(
+        parser,
+        layers_flags=("--layers", "--prefix-layers"),
+    )
     parser.add_argument("--capture-layer", type=int)
     parser.add_argument("--head", type=int, default=0)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument(
         "--text",
         default="A live memory system links related concepts through attention.",
@@ -807,12 +823,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     inventory = inspect_prefix_checkpoint(args.model_dir)
     print("checkpoint", json.dumps(inventory, indent=2))
-    encoder = Qwen3PrefixEncoder(
-        args.model_dir,
-        layers=args.layers,
-        device=args.device,
-        dtype=args.dtype,
-    )
+    encoder = prefix_encoder_from_args(args)
     capture = encoder.capture(args.text, layer=args.capture_layer)
     head_output = capture.output_for_head(args.head)
     report = {

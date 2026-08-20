@@ -19,7 +19,11 @@ from memory_condense.application.query_routing import (
     source_partition_ranking,
 )
 from memory_condense.domain._tokenizer import count_tokens, truncate_to_tokens
-from memory_condense.domain.ranking import DEFAULT_WEIGHTS, RankWeights
+from memory_condense.domain.ranking import (
+    DEFAULT_WEIGHTS,
+    RankWeights,
+    round_robin_unique,
+)
 from memory_condense.domain.schemas import MemoryResult, RetrievalResult
 
 
@@ -35,28 +39,13 @@ def _round_robin_unique(
     ``stop_on_stall=True`` gives up the first time a full position yields
     nothing new; ``False`` keeps scanning until every group is exhausted.
     """
-    output: list[RetrievalResult] = []
-    position = 0
-    while groups and len(output) < limit:
-        added = False
-        for group in groups:
-            if position >= len(group):
-                continue
-            result = group[position]
-            if result.chunk.chunk_id in seen:
-                continue
-            seen.add(result.chunk.chunk_id)
-            output.append(result)
-            added = True
-            if len(output) >= limit:
-                break
-        if not added and (
-            stop_on_stall
-            or all(position >= len(group) - 1 for group in groups)
-        ):
-            break
-        position += 1
-    return output
+    return round_robin_unique(
+        groups,
+        limit,
+        key=lambda result: result.chunk.chunk_id,
+        seen=seen,
+        stop_on_stall=stop_on_stall,
+    )
 
 
 def _accumulate_source_activation(

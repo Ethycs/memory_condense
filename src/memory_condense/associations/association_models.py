@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
+from memory_condense.domain._discourse_identity import _positive, normalize_fields
 from memory_condense.domain.decay import decay_factor
 
 
@@ -63,20 +64,19 @@ class AssociationArtifact:
     def __post_init__(self) -> None:
         names = tuple(str(name) for name in self.concept_names)
         metadata = dict(self.metadata)
+        # Validate-only: the stored identifiers keep their original bytes.
         if not self.artifact_id.strip():
             raise ValueError("artifact_id must be non-empty")
         if not self.model_id.strip():
             raise ValueError("model_id must be non-empty")
         if not self.checkpoint_id.strip():
             raise ValueError("checkpoint_id must be non-empty")
-        if self.prefix_layers < 1:
-            raise ValueError("prefix_layers must be positive")
+        normalize_fields(self, prefix_layers=_positive)
         if not 0 <= self.head_layer < self.prefix_layers:
             raise ValueError("head_layer must be inside the loaded prefix")
         if self.cav_layer is not None and not 0 <= self.cav_layer < self.prefix_layers:
             raise ValueError("cav_layer must be inside the loaded prefix")
-        if self.head_count < 1:
-            raise ValueError("head_count must be positive")
+        normalize_fields(self, head_count=_positive)
         if any(not name.strip() for name in names) or len(set(names)) != len(names):
             raise ValueError("concept_names must be non-empty strings and unique")
         # Fail at registration time rather than halfway through an experiment.
@@ -190,11 +190,6 @@ class CoaccessUpdate:
     members_observed: int
     edges_reinforced: int
     edges_pruned: int
-
-    @property
-    def concepts_observed(self) -> int:
-        """Hebbian spelling: observed members are conceptual chunks."""
-        return self.members_observed
 
     @property
     def nodes_observed(self) -> int:

@@ -107,6 +107,57 @@ def validate_observation_params(
     return event_id, rate, half_life
 
 
+def validated_recall_params(
+    *,
+    top_k: int,
+    min_score: float,
+    half_life_turns: float,
+    now_turn: int | None,
+    current_turn: Callable[[], int],
+) -> tuple[float, int] | None:
+    """Validate the neighbor-recall scalars shared by both co-access stores.
+
+    Returns ``(half_life, turn)``, or ``None`` when ``top_k`` is zero and the
+    recall is trivially empty.
+    """
+    if top_k < 0:
+        raise ValueError("top_k must be non-negative")
+    if top_k == 0:
+        return None
+    half_life = float(half_life_turns)
+    if not math.isfinite(half_life) or half_life <= 0.0:
+        raise ValueError("half_life_turns must be finite and positive")
+    if not 0.0 <= min_score <= 1.0:
+        raise ValueError("min_score must lie in [0, 1]")
+    turn = current_turn() if now_turn is None else int(now_turn)
+    if turn < 0:
+        raise ValueError("now_turn must be non-negative")
+    return half_life, turn
+
+
+def positive_seed_activations(
+    activations: Iterable[tuple[str, float]],
+    *,
+    what: str,
+) -> dict[str, float]:
+    """Keep the strongest positive activation per key, validating the range."""
+    seeds: dict[str, float] = {}
+    for key, raw_activation in activations:
+        activation = float(raw_activation)
+        if not math.isfinite(activation) or not 0.0 <= activation <= 1.0:
+            raise ValueError(f"{what} must be finite and in [0, 1]")
+        if activation > 0.0:
+            seeds[key] = max(seeds.get(key, 0.0), activation)
+    return seeds
+
+
+def edge_endpoint_keys(edge_rows: Iterable[tuple]) -> list[str]:
+    """Sorted unique endpoint keys across fetched co-access edge rows."""
+    return sorted(
+        {str(row[0]) for row in edge_rows} | {str(row[1]) for row in edge_rows}
+    )
+
+
 @dataclass(slots=True)
 class CoaccessNeighborState:
     """Accumulated noisy-OR evidence for one candidate node."""

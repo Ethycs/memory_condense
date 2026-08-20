@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import tempfile
 import types
 from collections.abc import Callable, Mapping

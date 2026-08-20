@@ -86,11 +86,6 @@ __all__ = [
     "expand_episode_seeds",
     "lexical_cosine",
     "retrieve_episode_representatives",
-    "score_episode_surprises",
     "score_surprise_sequence",
     "select_episode_representatives",
 ]
-
-
-# Readable alias for callers operating at the episode abstraction.
-score_episode_surprises = score_surprise_sequence

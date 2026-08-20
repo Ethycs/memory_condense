@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 
+from memory_condense.domain._discourse_identity import _as_tuple, normalize_fields
 from memory_condense.domain.discourse import (
     Episode,
     EvidenceSpan,
@@ -45,21 +46,24 @@ class EpisodeBuildResult:
     surprise_signal_receipt: AttentionHeadSurpriseReceipt | None = None
 
     def __post_init__(self) -> None:
+        # Validate-only: the stored identifiers keep their original bytes.
         if not self.source_id.strip() or not self.artifact_id.strip():
             raise ValueError("source_id and artifact_id must be non-empty")
-        episodes = tuple(self.episodes)
-        if any(item.source_id != self.source_id for item in episodes):
+        normalize_fields(
+            self,
+            episodes=_as_tuple,
+            initial_boundaries=_as_tuple,
+            refined_boundaries=_as_tuple,
+            forced_boundaries=_as_tuple,
+        )
+        if any(item.source_id != self.source_id for item in self.episodes):
             raise ValueError("build results cannot contain another source")
-        if any(item.artifact_id != self.artifact_id for item in episodes):
+        if any(item.artifact_id != self.artifact_id for item in self.episodes):
             raise ValueError("build results cannot mix annotation artifacts")
-        object.__setattr__(self, "episodes", episodes)
-        object.__setattr__(self, "initial_boundaries", tuple(self.initial_boundaries))
-        object.__setattr__(self, "refined_boundaries", tuple(self.refined_boundaries))
-        object.__setattr__(self, "forced_boundaries", tuple(self.forced_boundaries))
         receipt = self.surprise_signal_receipt
         if receipt is not None:
             emitted_evidence = tuple(
-                span for episode in episodes for span in episode.evidence
+                span for episode in self.episodes for span in episode.evidence
             )
             if receipt.input_spans != len(emitted_evidence):
                 raise ValueError(

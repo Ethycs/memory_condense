@@ -8,11 +8,14 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from memory_condense.application.discourse_workflow import DiscourseLinker
+from memory_condense.domain._discourse_identity import _as_tuple, normalize_fields
 from memory_condense.domain.discourse import (
     DiscourseArtifact,
     DiscourseSnapshot,
     identity_sha256,
 )
+from memory_condense.domain.sealed import SealedIdentity, reflect_payload
+from memory_condense.eval._identity import exact_int, sha256_digest
 from memory_condense.eval.reproducibility import implementation_sha256
 from memory_condense.ingest.discourse_linker import RuleBasedDiscourseLinker
 from memory_condense.persistence.discourse_store import ArtifactCoverageMark
@@ -65,15 +68,16 @@ class DiffuseCompilationPolicy:
             "refinement_max_degree",
             "representative_limit",
         ):
-            value = _positive_integer(getattr(self, name), name)
+            value = exact_int(getattr(self, name), name, minimum=1)
             object.__setattr__(self, name, value)
         if self.max_episode_size < self.min_episode_size:
             raise ValueError("max_episode_size cannot be smaller than min")
         if self.surprise_min_history > self.surprise_window:
             raise ValueError("surprise_min_history exceeds its window")
-        refinement_window = _nonnegative_integer(
+        refinement_window = exact_int(
             self.refinement_window,
             "refinement_window",
+            minimum=0,
         )
         object.__setattr__(self, "refinement_window", refinement_window)
         for name in (
@@ -93,14 +97,13 @@ class DiffuseCompilationPolicy:
         return identity_sha256(self.identity_payload())
 
     def identity_payload(self) -> dict[str, object]:
-        return {
-            name: getattr(self, name)
-            for name in self.__dataclass_fields__
-        }
+        return reflect_payload(self)
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseSourceCompilationReceipt:
+class DiffuseSourceCompilationReceipt(SealedIdentity):
+    _SEAL_MISMATCH = "source compilation receipt does not match"
+
     source_id: str
     source_stream_sha256: str
     content_chunks: int
@@ -117,7 +120,7 @@ class DiffuseSourceCompilationReceipt:
     def __post_init__(self) -> None:
         if not self.source_id.strip():
             raise ValueError("source_id must be non-empty")
-        _digest(self.source_stream_sha256, "source_stream_sha256")
+        sha256_digest(self.source_stream_sha256, "source_stream_sha256")
         for name in (
             "episode_build_sha256",
             "discourse_link_sha256",
@@ -125,9 +128,9 @@ class DiffuseSourceCompilationReceipt:
         ):
             value = getattr(self, name)
             if value is not None:
-                _digest(value, name)
+                sha256_digest(value, name)
         for name in ("content_chunks", "metadata_chunks"):
-            if _nonnegative_integer(getattr(self, name), name) != getattr(
+            if exact_int(getattr(self, name), name, minimum=0) != getattr(
                 self,
                 name,
             ):
@@ -135,36 +138,13 @@ class DiffuseSourceCompilationReceipt:
         retained = self.returned_signal_transformer_state_bytes
         if retained is not None and (type(retained) is not int or retained != 0):
             raise ValueError("returned signal retention must be zero or unattested")
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("source compilation receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
-
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
-        payload = {
-            "source_id": self.source_id,
-            "source_stream_sha256": self.source_stream_sha256,
-            "content_chunks": self.content_chunks,
-            "metadata_chunks": self.metadata_chunks,
-            "episode_ids": list(self.episode_ids),
-            "unit_ids": list(self.unit_ids),
-            "relation_ids": list(self.relation_ids),
-            "episode_build_sha256": self.episode_build_sha256,
-            "discourse_link_sha256": self.discourse_link_sha256,
-            "surprise_signal_receipt_sha256": (
-                self.surprise_signal_receipt_sha256
-            ),
-            "returned_signal_transformer_state_bytes": (
-                self.returned_signal_transformer_state_bytes
-            ),
-        }
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseCompilationReceipt:
+class DiffuseCompilationReceipt(SealedIdentity):
+    _SEAL_MISMATCH = "diffuse compilation receipt does not match"
+
     artifact: DiscourseArtifact
     # ``policy_sha256`` binds the artifact's complete composition policy;
     # this field separately binds the exact segmentation policy requested by
@@ -188,7 +168,7 @@ class DiffuseCompilationReceipt:
             "episode_coverage_receipt_sha256",
             "discourse_coverage_receipt_sha256",
         ):
-            _digest(getattr(self, name), name)
+            sha256_digest(getattr(self, name), name)
         if self.policy_sha256 != self.artifact.policy_sha256:
             raise ValueError("artifact and compilation policy disagree")
         if (
@@ -196,16 +176,13 @@ class DiffuseCompilationReceipt:
             or self.persisted_request_token_state_bytes != 0
         ):
             raise ValueError("diffuse persistence must retain zero request state")
-        receipts = tuple(self.source_receipts)
+        normalize_fields(self, source_receipts=_as_tuple)
+        receipts = self.source_receipts
         if len({item.source_id for item in receipts}) != len(receipts):
             raise ValueError("source compilation receipts must be unique")
         if self.artifact.artifact_id not in self.final_snapshot.artifact_ids:
             raise ValueError("final snapshot does not contain the artifact")
-        object.__setattr__(self, "source_receipts", receipts)
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("diffuse compilation receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
+        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
         payload = {
@@ -519,35 +496,6 @@ def _relation_identity_payload(relation) -> dict[str, object]:
     }
 
 
-def _positive_integer(value, label):
-    normalized = _nonnegative_integer(value, label)
-    if normalized < 1:
-        raise ValueError(f"{label} must be positive")
-    return normalized
-
-
-def _nonnegative_integer(value, label):
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be an integer")
-    try:
-        normalized = int(value)
-        exact = float(value) == float(normalized)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be an integer") from exc
-    if not exact or normalized < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
-    return normalized
-
-
-def _digest(value, label):
-    normalized = str(value)
-    if len(normalized) != 64 or any(
-        char not in "0123456789abcdef" for char in normalized
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return normalized
-
-
 def _optional_text(value):
     normalized = "" if value is None else str(value).strip()
     return normalized or None
@@ -556,7 +504,7 @@ def _optional_text(value):
 def _optional_digest(value):
     if value is None:
         return None
-    return _digest(value, "checkpoint_sha256")
+    return sha256_digest(value, "checkpoint_sha256")
 
 
 __all__ = [

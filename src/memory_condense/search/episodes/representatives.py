@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from memory_condense.domain.discourse import (
     Episode,
     EpisodeRepresentative,
+    evidence_span_sort_key,
     identity_sha256,
 )
 
@@ -37,15 +38,7 @@ def select_episode_representatives(
         tuple[int, str, int, int, int, str, str],
     ] = {}
     for span in episode.evidence:
-        order = (
-            span.ordinal,
-            span.source_id or "",
-            span.turn_start_char,
-            span.start_char,
-            span.end_char,
-            span.chunk_id,
-            span.quote_sha256,
-        )
+        order = evidence_span_sort_key(span)
         current = source_order_by_chunk.get(span.chunk_id)
         if current is None or order < current:
             source_order_by_chunk[span.chunk_id] = order

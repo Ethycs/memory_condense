@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from statistics import mean
 from collections.abc import Callable
 from typing import Mapping, Sequence
 
+from memory_condense.domain._discourse_identity import normalize_fields
 from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.eval._identity import sha256_digest
 from memory_condense.domain.discourse import (
     ClosurePlan,
     EvidencePacket,
@@ -55,10 +56,7 @@ class DiffuseRetrievalGold:
     def __post_init__(self) -> None:
         if not self.question_id.strip():
             raise ValueError("question_id must be non-empty")
-        snapshot_sha256 = str(self.snapshot_sha256).casefold()
-        if re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256) is None:
-            raise ValueError("snapshot_sha256 must be a lowercase SHA-256 digest")
-        object.__setattr__(self, "snapshot_sha256", snapshot_sha256)
+        normalize_fields(self, snapshot_sha256=sha256_digest)
         if self.artifact_id is not None:
             artifact_id = str(self.artifact_id).strip()
             if not artifact_id:

@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from typing import Protocol
 
 from memory_condense.domain._tokenizer import count_chat_prompt_token_proxy
 from memory_condense.domain.discourse import (
@@ -32,6 +32,8 @@ from memory_condense.domain.discourse import (
     quote_sha256,
 )
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.domain.sealed import SealedIdentity
+from memory_condense.eval._identity import exact_int, sha256_digest
 from memory_condense.eval.answer_value_coverage import best_f1, contains_answer
 from memory_condense.eval.benchmark import (
     BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
@@ -103,19 +105,6 @@ class SupportsDiffuseEvidence(Protocol):
     ) -> EvidencePacket: ...
 
 
-def _exact_nonnegative_int(value: object, label: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be a non-negative integer")
-    try:
-        normalized = int(value)  # type: ignore[arg-type]
-        exact = math.isfinite(float(value)) and float(value) == normalized  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be a non-negative integer") from exc
-    if not exact or normalized < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
-    return normalized
-
-
 def _anchor_payload(result: RetrievalResult) -> dict[str, object]:
     optional_scores: dict[str, float | None] = {}
     for name in ("dense_score", "lexical_score", "association_score"):
@@ -130,26 +119,12 @@ def _anchor_payload(result: RetrievalResult) -> dict[str, object]:
     turn = result.turn
     if turn is not None and turn.turn_id != result.chunk.turn_id:
         raise ValueError("anchor chunk and hydrated turn disagree")
-    memory_source = (
-        None
-        if result.memory_source_id is None
-        else str(result.memory_source_id).strip()
-    )
-    turn_source = (
-        None
-        if turn is None or turn.source_id is None
-        else str(turn.source_id).strip()
-    )
-    if memory_source and turn_source and memory_source != turn_source:
+    if len(result.source_hints) > 1:
         raise ValueError("anchor source identities disagree")
     return {
         "chunk_id": result.chunk.chunk_id,
         "turn_id": result.chunk.turn_id,
-        "source_id": (
-            memory_source
-            or turn_source
-            or result.chunk.turn_id
-        ),
+        "source_id": result.durable_source_id,
         "start_char": result.chunk.start_char,
         "end_char": result.chunk.end_char,
         "token_count": result.chunk.token_count,
@@ -194,8 +169,10 @@ def qa_packet_framing(question: str) -> tuple[str, str]:
 
 
 @dataclass(frozen=True, slots=True)
-class LongMemEvalDiffuseQueryReceipt:
+class LongMemEvalDiffuseQueryReceipt(SealedIdentity):
     """Text-free binding from exact direct anchors to the final QA prompt."""
+
+    _SEAL_MISMATCH = "diffuse query receipt does not match its contents"
 
     artifact_id: str
     snapshot_sha256: str
@@ -256,17 +233,12 @@ class LongMemEvalDiffuseQueryReceipt:
             "evidence_coordinates_sha256",
             "prompt_messages_sha256",
         ):
-            value = str(getattr(self, name))
-            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+            sha256_digest(getattr(self, name), name)
         if self.representative_receipt_sha256 is not None:
-            value = str(self.representative_receipt_sha256)
-            if len(value) != 64 or any(
-                char not in "0123456789abcdef" for char in value
-            ):
-                raise ValueError(
-                    "representative_receipt_sha256 must be a SHA-256 digest"
-                )
+            sha256_digest(
+                self.representative_receipt_sha256,
+                "representative_receipt_sha256",
+            )
         if self.representative_scope_exhaustive is not None and type(
             self.representative_scope_exhaustive
         ) is not bool:
@@ -320,33 +292,7 @@ class LongMemEvalDiffuseQueryReceipt:
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value != 0):
                 raise ValueError(f"{name} must be zero or unattested")
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("diffuse query receipt does not match its contents")
-        object.__setattr__(self, "receipt_sha256", expected)
-
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
-        payload = {
-            name: getattr(self, name)
-            for name in self.__dataclass_fields__
-            if name != "receipt_sha256"
-        }
-        payload.update(
-            {
-                "input_anchor_chunk_ids": list(self.input_anchor_chunk_ids),
-                "representative_seed_episode_ids": list(
-                    self.representative_seed_episode_ids
-                ),
-                "truncated_episode_ids": list(self.truncated_episode_ids),
-                "truncated_direct_chunk_ids": list(
-                    self.truncated_direct_chunk_ids
-                ),
-                "scope_witness_sha256s": list(self.scope_witness_sha256s),
-            }
-        )
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,11 +373,12 @@ def retrieve_longmemeval_diffuse_packet(
     normalized_artifact = str(artifact_id).strip()
     if not normalized_query or not normalized_prompt_question or not normalized_artifact:
         raise ValueError("query, prompt question, and artifact_id must be non-empty")
-    context_cap = _exact_nonnegative_int(max_context_tokens, "max_context_tokens")
-    prompt_cap = _exact_nonnegative_int(max_prompt_tokens, "max_prompt_tokens")
-    reserve = _exact_nonnegative_int(
+    context_cap = exact_int(max_context_tokens, "max_context_tokens", minimum=0)
+    prompt_cap = exact_int(max_prompt_tokens, "max_prompt_tokens", minimum=0)
+    reserve = exact_int(
         responder_output_token_reserve,
         "responder_output_token_reserve",
+        minimum=0,
     )
     if prompt_cap < 1:
         raise ValueError("max_prompt_tokens must be positive")

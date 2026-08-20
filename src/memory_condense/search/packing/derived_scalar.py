@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from memory_condense.domain.text_numbers import NUMBER_WORDS as _NUMBER_WORDS
 from memory_condense.search.indexes.lexical import tokenize
 from memory_condense.search.packing.source_provenance import (
     provenance_timestamp_key,
@@ -110,28 +111,6 @@ _APPROXIMATE_DURATION_RE = re.compile(
 )
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|[\r\n]+")
 
-_NUMBER_WORDS = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-    "eleven": 11,
-    "twelve": 12,
-    "thirteen": 13,
-    "fourteen": 14,
-    "fifteen": 15,
-    "sixteen": 16,
-    "seventeen": 17,
-    "eighteen": 18,
-    "nineteen": 19,
-    "twenty": 20,
-}
 _UNIT_SECONDS = {
     "minute": 60.0,
     "hour": 60.0 * 60.0,
@@ -327,15 +306,11 @@ def _is_user_evidence(result: RetrievalResult) -> bool:
     )
 
 
-def _source_id(result: RetrievalResult) -> str:
-    return result.durable_source_id
-
-
 def _source_timestamp(
     result: RetrievalResult,
     source_timestamps: Mapping[str, str],
 ) -> float | None:
-    return _parse_timestamp(source_timestamps.get(_source_id(result)))
+    return _parse_timestamp(source_timestamps.get(result.durable_source_id))
 
 
 def _parse_timestamp(value: str | None) -> float | None:

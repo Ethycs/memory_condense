@@ -12,7 +12,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import islice
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from memory_condense.associations.head_memory_models import (
     AssociativeMemoryCandidate,
@@ -29,8 +29,54 @@ from memory_condense.domain.discourse import (
     identity_sha256,
     quote_sha256,
 )
+from memory_condense.domain._discourse_identity import (
+    _sha256 as sha256_digest,
+)
+from memory_condense.domain._discourse_identity import (
+    _as_tuple,
+    _finite,
+    _labeled,
+    _nonempty,
+    _nonnegative,
+    _positive,
+    exact_int,
+    normalize_fields,
+)
 from memory_condense.domain.schemas import RetrievalResult
-from memory_condense.search.episodes.retrieval import _exact_int
+
+
+def _finite_float(value: Any, label: str) -> float:
+    """Validate finiteness and store the value as an exact ``float``."""
+
+    return float(_finite(value, label))
+
+
+def _exact_positive(value: Any, label: str) -> int:
+    """Exactly-integral and at least one, keeping the two-step messages."""
+
+    return _positive(exact_int(value, label), label)
+
+
+def _exact_nonnegative(value: Any, label: str) -> int:
+    """Exactly-integral and at least zero, keeping the two-step messages."""
+
+    return _nonnegative(exact_int(value, label), label)
+
+
+def _require_digests(obj: Any, names: tuple[str, ...]) -> None:
+    """Validate SHA-256 fields without rebinding; stored bytes stay verbatim."""
+
+    for name in names:
+        sha256_digest(getattr(obj, name), name)
+
+
+def _bind_receipt(obj: Any, mismatch: str) -> None:
+    """Verify a supplied self-hash or bind the freshly computed one."""
+
+    expected = identity_sha256(obj.identity_payload(include_receipt=False))
+    if obj.receipt_sha256 and obj.receipt_sha256 != expected:
+        raise ValueError(mismatch)
+    object.__setattr__(obj, "receipt_sha256", expected)
 
 
 @runtime_checkable
@@ -42,8 +88,6 @@ class EpisodeRepresentativeLookup(Protocol):
         artifact_id: str,
         source_id: str,
         *,
-        start_sequence: int | None = None,
-        end_sequence: int | None = None,
         limit: int | None = None,
     ) -> tuple[Episode, ...]: ...
 
@@ -92,16 +136,12 @@ class EpisodeSourceCandidate:
     route: str = "source_router"
 
     def __post_init__(self) -> None:
-        source_id = str(self.source_id).strip()
-        route = str(self.route).strip()
-        if not source_id or not route:
-            raise ValueError("source candidate IDs and routes must be non-empty")
-        score = float(self.score)
-        if not math.isfinite(score):
-            raise ValueError("source candidate score must be finite")
-        object.__setattr__(self, "source_id", source_id)
-        object.__setattr__(self, "score", score)
-        object.__setattr__(self, "route", route)
+        normalize_fields(
+            self,
+            source_id=_labeled("source candidate IDs and routes", _nonempty),
+            route=_labeled("source candidate IDs and routes", _nonempty),
+            score=_labeled("source candidate score", _finite_float),
+        )
 
     def identity_payload(self) -> dict[str, object]:
         return {
@@ -128,23 +168,25 @@ class EpisodeSourceCandidateScope:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        artifact_id = str(self.artifact_id).strip()
-        if not artifact_id:
-            raise ValueError("artifact_id must be non-empty")
-        object.__setattr__(self, "artifact_id", artifact_id)
-        for name in (
-            "snapshot_sha256",
-            "source_content_sha256",
-            "query_sha256",
-            "router_policy_sha256",
-        ):
-            _digest(getattr(self, name), name)
-        source_revision = _exact_int(self.source_revision, "source_revision")
-        if source_revision < 0:
-            raise ValueError("source_revision must be non-negative")
-        object.__setattr__(self, "source_revision", source_revision)
+        normalize_fields(self, artifact_id=_nonempty)
+        _require_digests(
+            self,
+            (
+                "snapshot_sha256",
+                "source_content_sha256",
+                "query_sha256",
+                "router_policy_sha256",
+            ),
+        )
+        normalize_fields(self, source_revision=_exact_nonnegative)
         if type(self.universe_enumerated) is not bool:
             raise ValueError("universe_enumerated must be boolean")
+        self._validate_source_rows()
+        _bind_receipt(self, "source candidate scope receipt does not match")
+
+    def _validate_source_rows(self) -> None:
+        """Cross-check the universe, selected, and truncated source ID sets."""
+
         universe = tuple(str(value).strip() for value in self.universe_source_ids)
         if any(not value for value in universe) or len(set(universe)) != len(universe):
             raise ValueError("source universe must contain unique non-empty IDs")
@@ -168,10 +210,6 @@ class EpisodeSourceCandidateScope:
         object.__setattr__(self, "universe_source_ids", universe)
         object.__setattr__(self, "candidates", candidates)
         object.__setattr__(self, "truncated_source_ids", truncated)
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("source candidate scope receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
 
     @property
     def selected_scope_exhaustive(self) -> bool:
@@ -213,30 +251,29 @@ class EpisodeRepresentativeRetrievalPolicy:
     score_mode: Literal["qk", "qk_ov"] = "qk_ov"
 
     def __post_init__(self) -> None:
+        # ``artifact_id is required`` predates the shared non-empty message.
         artifact_id = str(self.artifact_id).strip()
         if not artifact_id:
             raise ValueError("artifact_id is required")
         object.__setattr__(self, "artifact_id", artifact_id)
-        for name in (
-            "max_input_sources",
-            "max_source_groups",
-            "max_episodes_per_source",
-            "max_total_episodes",
-            "max_representatives_per_episode",
-            "group_size",
-            "beam_per_group",
-            "top_k",
-            "representative_tokens",
-            "query_tokens",
-        ):
-            value = _exact_int(getattr(self, name), name)
-            if value < 1:
-                raise ValueError(f"{name} must be positive")
-            object.__setattr__(self, name, value)
+        normalize_fields(
+            self,
+            max_input_sources=_exact_positive,
+            max_source_groups=_exact_positive,
+            max_episodes_per_source=_exact_positive,
+            max_total_episodes=_exact_positive,
+            max_representatives_per_episode=_exact_positive,
+            group_size=_exact_positive,
+            beam_per_group=_exact_positive,
+            top_k=_exact_positive,
+            representative_tokens=_exact_positive,
+            query_tokens=_exact_positive,
+        )
         if self.max_source_groups > self.max_input_sources:
             raise ValueError("max_source_groups cannot exceed max_input_sources")
         if self.top_k > self.max_total_episodes:
             raise ValueError("top_k cannot exceed max_total_episodes")
+        # Membership only: score_mode is stored verbatim, never stripped.
         if self.score_mode not in {"qk", "qk_ov"}:
             raise ValueError("score_mode must be 'qk' or 'qk_ov'")
 
@@ -265,16 +302,14 @@ class EpisodeSourceScan:
     status: str = "ok"
 
     def __post_init__(self) -> None:
-        for name in ("source_id", "status"):
-            value = str(getattr(self, name)).strip()
-            if not value:
-                raise ValueError(f"{name} must be non-empty")
-            object.__setattr__(self, name, value)
-        for name in ("requested_limit", "observed_count", "candidate_count"):
-            value = _exact_int(getattr(self, name), name)
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative")
-            object.__setattr__(self, name, value)
+        normalize_fields(
+            self,
+            source_id=_nonempty,
+            status=_nonempty,
+            requested_limit=_exact_nonnegative,
+            observed_count=_exact_nonnegative,
+            candidate_count=_exact_nonnegative,
+        )
         if self.candidate_count > self.observed_count:
             raise ValueError("candidate_count cannot exceed observed_count")
 
@@ -293,17 +328,15 @@ class EpisodeRepresentativeWitness:
     source_route: str
 
     def __post_init__(self) -> None:
-        for name in (
-            "episode_id",
-            "source_id",
-            "anchor_chunk_id",
-            "candidate_text_sha256",
-            "source_route",
-        ):
-            value = str(getattr(self, name)).strip()
-            if not value:
-                raise ValueError(f"{name} must be non-empty")
-            object.__setattr__(self, name, value)
+        normalize_fields(
+            self,
+            episode_id=_nonempty,
+            source_id=_nonempty,
+            anchor_chunk_id=_nonempty,
+            candidate_text_sha256=_nonempty,
+            source_route=_nonempty,
+            source_score=_finite_float,
+        )
         chunk_ids = tuple(str(value).strip() for value in self.representative_chunk_ids)
         identities = tuple(
             str(value).strip() for value in self.representative_identity_sha256s
@@ -314,11 +347,8 @@ class EpisodeRepresentativeWitness:
             raise ValueError("each representative chunk requires an identity hash")
         if self.anchor_chunk_id != chunk_ids[0]:
             raise ValueError("anchor_chunk_id must be the first representative")
-        if not math.isfinite(float(self.source_score)):
-            raise ValueError("source_score must be finite")
         object.__setattr__(self, "representative_chunk_ids", chunk_ids)
         object.__setattr__(self, "representative_identity_sha256s", identities)
-        object.__setattr__(self, "source_score", float(self.source_score))
 
     def identity_payload(self) -> dict[str, object]:
         return {
@@ -361,21 +391,31 @@ class EpisodeRepresentativeRetrievalPlan:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        artifact_id = str(self.artifact_id).strip()
-        if not artifact_id:
-            raise ValueError("artifact_id must be non-empty")
-        object.__setattr__(self, "artifact_id", artifact_id)
-        for name in (
-            "policy_sha256",
-            "query_sha256",
-            "query_input_sha256",
-            "linker_identity_sha256",
-        ):
-            _digest(getattr(self, name), name)
+        normalize_fields(self, artifact_id=_nonempty)
+        _require_digests(
+            self,
+            (
+                "policy_sha256",
+                "query_sha256",
+                "query_input_sha256",
+                "linker_identity_sha256",
+            ),
+        )
+        self._validate_scope_binding()
+        self._validate_collections()
+        self._validate_workspace_counters()
+        _bind_receipt(
+            self,
+            "representative retrieval receipt does not match its contents",
+        )
+
+    def _validate_scope_binding(self) -> None:
+        """Require boolean flags and the optional scope receipt to cohere."""
+
         if type(self.runtime_binding_certified) is not bool:
             raise ValueError("runtime_binding_certified must be boolean")
         if self.source_scope_receipt_sha256 is not None:
-            _digest(
+            sha256_digest(
                 self.source_scope_receipt_sha256,
                 "source_scope_receipt_sha256",
             )
@@ -383,9 +423,19 @@ class EpisodeRepresentativeRetrievalPlan:
             raise ValueError("source_universe_exhaustive must be boolean")
         if self.source_scope_receipt_sha256 is None and self.source_universe_exhaustive:
             raise ValueError("source exhaustiveness requires a scope receipt")
-        scans = tuple(self.source_scans)
-        witnesses = tuple(self.candidate_witnesses)
-        seeds = tuple(self.seeds)
+
+    def _validate_collections(self) -> None:
+        """Freeze scan/witness/seed rows and require their IDs to agree."""
+
+        normalize_fields(
+            self,
+            source_scans=_as_tuple,
+            candidate_witnesses=_as_tuple,
+            seeds=_as_tuple,
+        )
+        scans = self.source_scans
+        witnesses = self.candidate_witnesses
+        seeds = self.seeds
         if len({item.source_id for item in scans}) != len(scans):
             raise ValueError("source scans must be unique")
         if len({item.episode_id for item in witnesses}) != len(witnesses):
@@ -396,22 +446,6 @@ class EpisodeRepresentativeRetrievalPlan:
         if any(item.episode_id not in witnessed for item in seeds):
             raise ValueError("every seed must have an inspected candidate witness")
         for name in (
-            "passes",
-            "max_workspace_candidates",
-            "max_workspace_tokens",
-            "total_candidate_inspections",
-            "returned_plan_transformer_state_bytes",
-        ):
-            value = _exact_int(getattr(self, name), name)
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative")
-            object.__setattr__(self, name, value)
-        if self.returned_plan_transformer_state_bytes != 0:
-            raise ValueError("representative plan cannot retain transformer state")
-        object.__setattr__(self, "source_scans", scans)
-        object.__setattr__(self, "candidate_witnesses", witnesses)
-        object.__setattr__(self, "seeds", seeds)
-        for name in (
             "truncated_source_ids",
             "truncated_episode_ids",
             "unavailable_episode_ids",
@@ -420,10 +454,20 @@ class EpisodeRepresentativeRetrievalPlan:
             if any(not value for value in values):
                 raise ValueError(f"{name} must contain non-empty IDs")
             object.__setattr__(self, name, values)
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("representative retrieval receipt does not match its contents")
-        object.__setattr__(self, "receipt_sha256", expected)
+
+    def _validate_workspace_counters(self) -> None:
+        """Require exact non-negative counters and zero retained state."""
+
+        normalize_fields(
+            self,
+            passes=_exact_nonnegative,
+            max_workspace_candidates=_exact_nonnegative,
+            max_workspace_tokens=_exact_nonnegative,
+            total_candidate_inspections=_exact_nonnegative,
+            returned_plan_transformer_state_bytes=_exact_nonnegative,
+        )
+        if self.returned_plan_transformer_state_bytes != 0:
+            raise ValueError("representative plan cannot retain transformer state")
 
     @property
     def selected_source_episode_scope_exhaustive(self) -> bool:
@@ -527,7 +571,7 @@ def retrieve_episode_representatives(
             raise ValueError("source scope does not bind the supplied candidates")
     if len(source_candidates) > policy.max_input_sources:
         raise ValueError("source candidates exceed max_input_sources")
-    linker_max = _exact_int(getattr(linker, "max_candidates", None), "linker.max_candidates")
+    linker_max = exact_int(getattr(linker, "max_candidates", None), "linker.max_candidates")
     if linker_max < 2:
         raise ValueError("linker.max_candidates must be at least two")
     if policy.group_size > linker_max:
@@ -643,27 +687,27 @@ def retrieve_episode_representatives(
         for rows in (candidates_by_source.get(source.source_id, []),)
         for start in range(0, len(rows), policy.group_size)
     ]
+    plan_kwargs: dict[str, object] = {
+        "artifact_id": policy.artifact_id,
+        "policy_sha256": policy.policy_sha256,
+        "query_sha256": query_sha256,
+        "query_input_sha256": query_input_sha256,
+        "linker_identity_sha256": linker_identity_sha256,
+        "runtime_binding_certified": runtime_binding_certified,
+        "source_scope_receipt_sha256": (
+            None if source_scope is None else source_scope.receipt_sha256
+        ),
+        "source_universe_exhaustive": bool(
+            source_scope is not None and source_scope.selected_scope_exhaustive
+        ),
+        "source_scans": tuple(source_scans),
+        "candidate_witnesses": tuple(witnesses),
+        "truncated_source_ids": truncated_source_ids,
+        "truncated_episode_ids": tuple(truncated_episode_ids),
+        "unavailable_episode_ids": tuple(unavailable_episode_ids),
+    }
     if not groups:
-        return EpisodeRepresentativeRetrievalPlan(
-            artifact_id=policy.artifact_id,
-            policy_sha256=policy.policy_sha256,
-            query_sha256=query_sha256,
-            query_input_sha256=query_input_sha256,
-            linker_identity_sha256=linker_identity_sha256,
-            runtime_binding_certified=runtime_binding_certified,
-            source_scope_receipt_sha256=(
-                None if source_scope is None else source_scope.receipt_sha256
-            ),
-            source_universe_exhaustive=bool(
-                source_scope is not None and source_scope.selected_scope_exhaustive
-            ),
-            source_scans=tuple(source_scans),
-            candidate_witnesses=tuple(witnesses),
-            seeds=(),
-            truncated_source_ids=truncated_source_ids,
-            truncated_episode_ids=tuple(truncated_episode_ids),
-            unavailable_episode_ids=tuple(unavailable_episode_ids),
-        )
+        return EpisodeRepresentativeRetrievalPlan(seeds=(), **plan_kwargs)
 
     inspection = linker.inspect_nested(
         query_input,
@@ -703,28 +747,12 @@ def retrieve_episode_representatives(
             break
 
     return EpisodeRepresentativeRetrievalPlan(
-        artifact_id=policy.artifact_id,
-        policy_sha256=policy.policy_sha256,
-        query_sha256=query_sha256,
-        query_input_sha256=query_input_sha256,
-        linker_identity_sha256=linker_identity_sha256,
-        runtime_binding_certified=runtime_binding_certified,
-        source_scope_receipt_sha256=(
-            None if source_scope is None else source_scope.receipt_sha256
-        ),
-        source_universe_exhaustive=bool(
-            source_scope is not None and source_scope.selected_scope_exhaustive
-        ),
-        source_scans=tuple(source_scans),
-        candidate_witnesses=tuple(witnesses),
         seeds=tuple(seeds),
-        truncated_source_ids=truncated_source_ids,
-        truncated_episode_ids=tuple(truncated_episode_ids),
-        unavailable_episode_ids=tuple(unavailable_episode_ids),
         passes=inspection.passes,
         max_workspace_candidates=inspection.max_workspace_candidates,
         max_workspace_tokens=inspection.max_workspace_tokens,
         total_candidate_inspections=inspection.total_candidate_inspections,
+        **plan_kwargs,
     )
 
 
@@ -735,30 +763,21 @@ def episode_source_candidates_from_results(
 ) -> tuple[EpisodeSourceCandidate, ...]:
     """Reduce a gold-blind ranked source route to one scalar per source."""
 
-    limit = _exact_int(max_sources, "max_sources")
+    limit = exact_int(max_sources, "max_sources")
     if limit < 1:
         raise ValueError("max_sources must be positive")
     selected: dict[str, EpisodeSourceCandidate] = {}
     for result in results:
         if not isinstance(result, RetrievalResult):
             raise TypeError("results must contain RetrievalResult values")
-        memory_source = (
-            None
-            if result.memory_source_id is None
-            else str(result.memory_source_id).strip()
-        )
-        turn_source = (
-            None
-            if result.turn is None or result.turn.source_id is None
-            else str(result.turn.source_id).strip()
-        )
-        if memory_source and turn_source and memory_source != turn_source:
+        # Conflict responses deliberately differ across the three episode
+        # retrieval sites (drop fail-open / raise here / skip) pending an
+        # author decision on one policy.
+        hints = result.source_hints
+        if len(hints) > 1:
             raise ValueError("retrieval source identities disagree")
-        source_id = (
-            memory_source
-            or turn_source
-        )
-        if source_id is None or not str(source_id).strip():
+        source_id = next(iter(hints), None)
+        if source_id is None:
             continue
         candidate = EpisodeSourceCandidate(
             source_id=str(source_id),
@@ -825,14 +844,10 @@ def _prepare_candidate(
             continue
         if result.chunk.chunk_id != representative.chunk_id:
             continue
-        source_hints = {
-            str(value).strip()
-            for value in (
-                result.memory_source_id,
-                None if result.turn is None else result.turn.source_id,
-            )
-            if value is not None and str(value).strip()
-        }
+        # Conflict responses deliberately differ across the three episode
+        # retrieval sites (drop fail-open / raise / skip here) pending an
+        # author decision on one policy.
+        source_hints = result.source_hints
         if source_hints and source_hints != {episode.source_id}:
             continue
         spans = tuple(
@@ -934,64 +949,14 @@ def _hit_utility(hit: object, *, score_mode: str) -> float:
     return utility
 
 
-def _digest(value: object, label: str) -> str:
-    normalized = str(value)
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return normalized
-
-
 def _linker_identity(linker: object) -> dict[str, object]:
     """Bind the observable query-time linker without trusting injected types."""
 
-    encoder = getattr(linker, "encoder", None)
-    checkpoint = getattr(encoder, "checkpoint_identity", None)
-    raw_device = getattr(encoder, "device", None)
-    try:
-        from memory_condense.associations.qwen_memory_linker import (
-            QwenMemoryLinker,
-        )
-        from memory_condense.search.episodes.qwen_episode_signal import (
-            _attention_head_implementation_sha256,
-            _owned_qwen_runtime_binding,
-        )
+    from memory_condense.search.episodes.qwen_episode_signal import (
+        qwen_linker_identity,
+    )
 
-        inspection = getattr(linker, "inspect_nested", None)
-        owned = bool(
-            _owned_qwen_runtime_binding(linker)
-            and getattr(inspection, "__self__", None) is linker
-            and getattr(inspection, "__func__", None)
-            is QwenMemoryLinker.inspect_nested
-        )
-        implementation_sha256 = (
-            _attention_head_implementation_sha256(linker) if owned else None
-        )
-    except Exception:
-        owned = False
-        implementation_sha256 = None
-    return {
-        "implementation": f"{type(linker).__module__}.{type(linker).__qualname__}",
-        "owned_runtime_binding": bool(owned),
-        "implementation_sha256": implementation_sha256,
-        "max_candidates": _exact_int(
-            getattr(linker, "max_candidates", None),
-            "linker.max_candidates",
-        ),
-        "max_workspace_tokens": getattr(linker, "max_workspace_tokens", None),
-        "attention_layer": getattr(linker, "layer", None),
-        "head_vote_k": getattr(linker, "head_vote_k", None),
-        "model_id": getattr(checkpoint, "model_id", None),
-        "model_revision": getattr(checkpoint, "model_revision", None),
-        "checkpoint_sha256": getattr(checkpoint, "checkpoint_sha256", None),
-        "encoder_layers": getattr(encoder, "layers", None),
-        # Qwen3PrefixEncoder stores a torch.device, which is not JSON-native.
-        # Its canonical string preserves the exact device/index while making
-        # the runtime identity strict-JSON serializable.
-        "device": None if raw_device is None else str(raw_device).strip(),
-        "dtype": getattr(encoder, "dtype_name", None),
-    }
+    return qwen_linker_identity(linker, strict=False)
 
 
 __all__ = [

@@ -25,7 +25,6 @@ from memory_condense.domain.discourse import (
     ClosurePolicy,
     DiscourseSnapshot,
     EpisodeSeed,
-    EvidencePacket,
     identity_sha256,
 )
 from memory_condense.eval._diffuse_base_contracts import (

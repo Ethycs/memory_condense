@@ -17,7 +17,7 @@ from collections import Counter
 from math import log
 from typing import Iterable, Sequence
 
-from memory_condense.persistence.db import Database
+from memory_condense.persistence.db import TURN_SOURCE_ID_SQL, Database
 from memory_condense.domain.schemas import Chunk
 
 # ---------------------------------------------------------------------------
@@ -342,7 +342,7 @@ class LexicalIndex:
             return results
 
         source_placeholders = ",".join("?" for _ in selected)
-        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        source_expr = TURN_SOURCE_ID_SQL
         n_docs, avgdl = self.corpus_stats()
         if n_docs <= 0 or avgdl <= 0.0:
             return results
@@ -429,7 +429,7 @@ class LexicalIndex:
         if not terms:
             return []
 
-        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        source_expr = TURN_SOURCE_ID_SQL
         if self._source_length_cache is None:
             source_rows = self._db.execute(
                 "SELECT " + source_expr + ", SUM(c.term_count) "

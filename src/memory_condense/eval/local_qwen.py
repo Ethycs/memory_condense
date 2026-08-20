@@ -8,10 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-from memory_condense.modeling.qwen_dtype import (  # noqa: F401 - re-export
-    _DTYPE_NAMES,
-    resolve_local_qwen_dtype,
-)
+from memory_condense.modeling.qwen_dtype import resolve_local_qwen_dtype
 
 
 def strip_qwen_thinking(text: str) -> str:

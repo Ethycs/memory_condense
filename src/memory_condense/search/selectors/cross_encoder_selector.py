@@ -10,7 +10,6 @@ the semantic order to demote duplicate event support after relevance ranking.
 from __future__ import annotations
 
 import gc
-import hashlib
 import inspect
 import time
 from dataclasses import dataclass
@@ -20,6 +19,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from memory_condense.domain._tokenizer import truncate_to_tokens
+from memory_condense.domain.integrity import file_sha256
+from memory_condense.domain.ranking import (
+    round_robin_unique,
+    source_rows_with_fallback,
+)
 from memory_condense.search.selectors.coverage_models import ReportDumpMixin
 from memory_condense.search.selectors.coverage_selector import compile_set_program
 from memory_condense.domain.schemas import RetrievalResult
@@ -49,11 +53,7 @@ def verify_ms_marco_checkpoint(model_dir: str | Path) -> str:
             f"incomplete {MS_MARCO_MODEL_ID} checkpoint under {root}: "
             f"missing {', '.join(missing)}"
         )
-    digest = hashlib.sha256()
-    with (root / "model.safetensors").open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    actual = digest.hexdigest()
+    actual = file_sha256(root / "model.safetensors")
     if actual != MS_MARCO_WEIGHTS_SHA256:
         raise ValueError(
             f"unexpected {MS_MARCO_MODEL_ID} weights sha256: {actual}; "
@@ -229,10 +229,6 @@ class CrossEncoderCompanionReport(ReportDumpMixin):
     selected_chunk_ids: Mapping[str, str]
     retained_transformer_state_bytes: int = 0
     fallback_reason: str = ""
-
-
-def _source_id(result: RetrievalResult) -> str:
-    return result.durable_source_id
 
 
 class MSMarcoCrossEncoderSelector:
@@ -418,34 +414,17 @@ class MSMarcoCrossEncoderSelector:
         """
 
         started = time.perf_counter()
-        source_rows: list[tuple[str, list[RetrievalResult]]] = []
-        for source_id, candidates in candidates_by_source.items():
-            rows: list[RetrievalResult] = []
-            seen: set[str] = set()
-            for result in candidates:
-                chunk_id = result.chunk.chunk_id
-                if chunk_id in seen:
-                    continue
-                seen.add(chunk_id)
-                rows.append(result)
-            if rows:
-                source_rows.append((str(source_id), rows))
-
-        fallback = {source_id: rows[0] for source_id, rows in source_rows}
-        flattened: list[tuple[str, RetrievalResult]] = []
-        depth = 0
-        while len(flattened) < self.candidate_pool:
-            added = False
-            for source_id, rows in source_rows:
-                if depth >= len(rows):
-                    continue
-                flattened.append((source_id, rows[depth]))
-                added = True
-                if len(flattened) >= self.candidate_pool:
-                    break
-            if not added:
-                break
-            depth += 1
+        source_rows, fallback = source_rows_with_fallback(
+            candidates_by_source,
+            dedup_key=lambda result: result.chunk.chunk_id,
+        )
+        flattened = round_robin_unique(
+            [
+                [(source_id, result) for result in rows]
+                for source_id, rows in source_rows
+            ],
+            self.candidate_pool,
+        )
 
         fallback_reason = ""
         winners = dict(fallback)
@@ -548,7 +527,7 @@ class MSMarcoCrossEncoderSelector:
         trace_by_id = {
             result.chunk.chunk_id: {
                 "chunk_id": result.chunk.chunk_id,
-                "source_id": _source_id(result),
+                "source_id": result.durable_source_id,
                 "cross_encoder_input_rank": rank,
                 "cross_encoder_score": scores.get(result.chunk.chunk_id),
                 "cross_encoder_rank": cross_encoder_rank[result.chunk.chunk_id],

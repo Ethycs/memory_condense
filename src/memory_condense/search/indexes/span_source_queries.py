@@ -6,6 +6,8 @@ from typing import Iterator, Sequence
 
 import numpy as np
 
+from memory_condense.domain.ranking import round_robin_unique
+from memory_condense.persistence.db import INDEXED_CHUNK_SQL, TURN_SOURCE_ID_SQL
 from memory_condense.persistence.transcript_store import parse_source_metadata
 from memory_condense.search.indexes.retrieval_models import (
     DEFAULT_SPAN_TOKENS,
@@ -237,10 +239,10 @@ class SpanSourceQueryMixin:
             query_vec = query_vec / query_norm
 
         rows = self._db.execute(
-            "SELECT c.chunk_id, c.embedding, COALESCE(t.source_id, t.turn_id), "
+            f"SELECT c.chunk_id, c.embedding, {TURN_SOURCE_ID_SQL}, "
             "t.ordinal, c.rowid FROM chunks AS c "
             "JOIN turns AS t ON t.turn_id = c.turn_id "
-            "WHERE c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            f"WHERE {INDEXED_CHUNK_SQL} "
             "ORDER BY t.ordinal, c.rowid"
         ).fetchall()
         if not rows:
@@ -296,10 +298,10 @@ class SpanSourceQueryMixin:
             return []
         placeholders = ",".join("?" for _ in selected)
         rows = self._db.execute(
-            "SELECT c.chunk_id, COALESCE(t.source_id, t.turn_id) "
+            f"SELECT c.chunk_id, {TURN_SOURCE_ID_SQL} "
             "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
-            f"WHERE COALESCE(t.source_id, t.turn_id) IN ({placeholders}) "
-            "AND c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            f"WHERE {TURN_SOURCE_ID_SQL} IN ({placeholders}) "
+            f"AND {INDEXED_CHUNK_SQL} "
             "ORDER BY t.ordinal, c.rowid",
             tuple(selected),
         ).fetchall()
@@ -309,14 +311,14 @@ class SpanSourceQueryMixin:
             if key in members:
                 members[key].append(str(chunk_id))
 
-        ordered_ids: list[tuple[str, str]] = []
+        ordered_ids: list[tuple[str, str]]
         if interleave:
-            depth = 0
-            while any(depth < len(members[source_id]) for source_id in selected):
-                for source_id in selected:
-                    if depth < len(members[source_id]):
-                        ordered_ids.append((source_id, members[source_id][depth]))
-                depth += 1
+            ordered_ids = round_robin_unique(
+                [
+                    [(source_id, chunk_id) for chunk_id in members[source_id]]
+                    for source_id in selected
+                ]
+            )
         else:
             ordered_ids = [
                 (source_id, chunk_id)
@@ -461,7 +463,7 @@ class SpanSourceQueryMixin:
         selected_sources = list(
             dict.fromkeys(str(source_id) for source_id in source_ids if source_id)
         )
-        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        source_expr = TURN_SOURCE_ID_SQL
         for start in range(0, len(selected_sources), source_batch_size):
             batch = selected_sources[start : start + source_batch_size]
             placeholders = ",".join("?" for _ in batch)
@@ -532,10 +534,10 @@ class SpanSourceQueryMixin:
 
         placeholders = ",".join("?" for _ in source_ids)
         rows = self._db.execute(
-            "SELECT c.chunk_id, COALESCE(t.source_id, t.turn_id) "
+            f"SELECT c.chunk_id, {TURN_SOURCE_ID_SQL} "
             "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
-            f"WHERE COALESCE(t.source_id, t.turn_id) IN ({placeholders}) "
-            "AND c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            f"WHERE {TURN_SOURCE_ID_SQL} IN ({placeholders}) "
+            f"AND {INDEXED_CHUNK_SQL} "
             "ORDER BY t.ordinal, c.rowid",
             tuple(source_ids),
         ).fetchall()

@@ -13,7 +13,6 @@ from memory_condense.search.packing.performance_events import (
     is_performance_query,
     performance_event_key,
 )
-from memory_condense.search.selectors.evidence_features import _source_id
 from memory_condense.search.selectors.prefix_models import _PreparedCoverage
 from memory_condense.search.selectors.set_program import (
     SetOrdering,
@@ -334,7 +333,7 @@ def prepare_prefix_coverage(
                 if result.turn is not None
                 else ""
             )
-            source_id = _source_id(result)
+            source_id = result.durable_source_id
             if (
                 (
                     program.required_evidence_role is not None

@@ -20,7 +20,10 @@ from typing import Sequence
 
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.associations.head_memory import CAVBank, MemoryLinkResult, QwenMemoryLinker
-from memory_condense.modeling.qwen_prefix import Qwen3PrefixEncoder
+from memory_condense.modeling.qwen_prefix import (
+    Qwen3PrefixEncoder,
+    add_prefix_encoder_arguments,
+)
 from memory_condense.domain.schemas import PackedContext
 
 
@@ -154,11 +157,12 @@ def load_qwen_linker(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_prefix_encoder_arguments(
+        parser,
+        model_dir_default=Path(".cache/models/Qwen3-8B"),
+    )
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--prompt", required=True)
-    parser.add_argument(
-        "--model-dir", type=Path, default=Path(".cache/models/Qwen3-8B")
-    )
     parser.add_argument(
         "--cav-report",
         type=Path,
@@ -169,12 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("eval_results/qwen3_prefix_cav_probe.safetensors"),
     )
-    parser.add_argument("--prefix-layers", type=int, default=7)
     parser.add_argument("--attention-layer", type=int, default=1)
     parser.add_argument("--cav-layer", type=int, default=5)
     parser.add_argument("--concept", action="append", dest="concepts")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--retrieval-device", default="cpu")
     parser.add_argument("--max-candidates", type=int, default=8)
     parser.add_argument("--max-workspace-tokens", type=int, default=1024)

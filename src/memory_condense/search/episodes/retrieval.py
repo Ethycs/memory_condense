@@ -3,11 +3,56 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Mapping, Protocol, Sequence, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
+from memory_condense.domain._discourse_identity import (
+    _as_tuple,
+    _choice,
+    _confidence,
+    _finite,
+    _labeled,
+    _nonempty,
+    _nonnegative,
+    _positive,
+    exact_int,
+    normalize_fields,
+)
 from memory_condense.domain.discourse import Episode, EpisodeSeed, identity_sha256
 from memory_condense.domain.schemas import RetrievalResult
+
+
+def _finite_float(value: Any, label: str) -> float:
+    """Validate finiteness and store the value as an exact ``float``."""
+
+    return float(_finite(value, label))
+
+
+def _exact_positive(value: Any, label: str) -> int:
+    """Exactly-integral and at least one, keeping the two-step messages."""
+
+    return _positive(exact_int(value, label), label)
+
+
+def _exact_nonnegative(value: Any, label: str) -> int:
+    """Exactly-integral and at least zero, keeping the two-step messages."""
+
+    return _nonnegative(exact_int(value, label), label)
+
+
+_seed_field = _labeled("direct chunk seed IDs and routes", _nonempty)
+_failure_code = _choice(
+    frozenset(
+        {
+            "artifact_not_selected",
+            "episode_mapped",
+            "identity_mismatch",
+            "lookup_error",
+            "not_annotated",
+        }
+    ),
+    "unsupported direct fallback failure code",
+)
 
 
 @runtime_checkable
@@ -40,8 +85,6 @@ class EpisodeLookup(Protocol):
         artifact_id: str,
         source_id: str,
         *,
-        start_sequence: int | None = None,
-        end_sequence: int | None = None,
         limit: int | None = None,
     ) -> tuple[Episode, ...]: ...
 
@@ -59,25 +102,21 @@ class EpisodeRetrievalPolicy:
     neighbor_decay: float = 0.85
 
     def __post_init__(self) -> None:
+        # ``... when supplied`` is a pinned optional-field message.
         if self.artifact_id is not None:
             normalized_artifact = str(self.artifact_id).strip()
             if not normalized_artifact:
                 raise ValueError("artifact_id must be non-empty when supplied")
             object.__setattr__(self, "artifact_id", normalized_artifact)
-        for name in ("max_anchor_episodes", "max_episode_seeds", "max_direct_fallbacks"):
-            value = _exact_int(getattr(self, name), name)
-            if value < 1:
-                raise ValueError(f"{name} must be positive")
-            object.__setattr__(self, name, value)
-        for name in ("previous_episodes", "next_episodes"):
-            value = _exact_int(getattr(self, name), name)
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative")
-            object.__setattr__(self, name, value)
-        decay = float(self.neighbor_decay)
-        if not math.isfinite(decay) or not 0.0 <= decay <= 1.0:
-            raise ValueError("neighbor_decay must be finite and inside [0, 1]")
-        object.__setattr__(self, "neighbor_decay", decay)
+        normalize_fields(
+            self,
+            max_anchor_episodes=_exact_positive,
+            max_episode_seeds=_exact_positive,
+            max_direct_fallbacks=_exact_positive,
+            previous_episodes=_exact_nonnegative,
+            next_episodes=_exact_nonnegative,
+            neighbor_decay=_confidence,
+        )
 
     @property
     def policy_sha256(self) -> str:
@@ -105,28 +144,20 @@ class DirectChunkSeed:
     path: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        chunk_id = str(self.chunk_id).strip()
-        route = str(self.route).strip()
-        failure_code = str(self.failure_code).strip()
-        if not chunk_id or not route or not failure_code:
-            raise ValueError("direct chunk seed IDs and routes must be non-empty")
-        if failure_code not in {
-            "artifact_not_selected",
-            "episode_mapped",
-            "identity_mismatch",
-            "lookup_error",
-            "not_annotated",
-        }:
-            raise ValueError("unsupported direct fallback failure code")
-        if not math.isfinite(float(self.score)):
-            raise ValueError("direct chunk seed score must be finite")
-        path = tuple(self.path) or (chunk_id,)
+        normalize_fields(
+            self,
+            chunk_id=_seed_field,
+            route=_seed_field,
+            failure_code=_seed_field,
+        )
+        normalize_fields(
+            self,
+            failure_code=_failure_code,
+            score=_labeled("direct chunk seed score", _finite_float),
+        )
+        path = tuple(self.path) or (self.chunk_id,)
         if any(not str(item).strip() for item in path):
             raise ValueError("direct chunk seed paths must contain non-empty IDs")
-        object.__setattr__(self, "chunk_id", chunk_id)
-        object.__setattr__(self, "score", float(self.score))
-        object.__setattr__(self, "route", route)
-        object.__setattr__(self, "failure_code", failure_code)
         object.__setattr__(self, "path", path)
 
 
@@ -142,20 +173,19 @@ class EpisodeRetrievalPlan:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        seeds = tuple(self.seeds)
-        direct = tuple(self.direct_fallbacks)
-        if len({item.episode_id for item in seeds}) != len(seeds):
-            raise ValueError("episode seeds must be unique")
-        if len({item.chunk_id for item in direct}) != len(direct):
-            raise ValueError("direct fallback chunks must be unique")
-        object.__setattr__(self, "seeds", seeds)
-        object.__setattr__(self, "direct_fallbacks", direct)
-        object.__setattr__(self, "truncated_episode_ids", tuple(self.truncated_episode_ids))
-        object.__setattr__(
+        normalize_fields(
             self,
-            "truncated_direct_chunk_ids",
-            tuple(self.truncated_direct_chunk_ids),
+            seeds=_as_tuple,
+            direct_fallbacks=_as_tuple,
+            truncated_episode_ids=_as_tuple,
+            truncated_direct_chunk_ids=_as_tuple,
         )
+        if len({item.episode_id for item in self.seeds}) != len(self.seeds):
+            raise ValueError("episode seeds must be unique")
+        if len({item.chunk_id for item in self.direct_fallbacks}) != len(
+            self.direct_fallbacks
+        ):
+            raise ValueError("direct fallback chunks must be unique")
         expected = identity_sha256(self.identity_payload(include_receipt=False))
         if self.receipt_sha256 and self.receipt_sha256 != expected:
             raise ValueError("episode retrieval receipt does not match its contents")
@@ -422,14 +452,10 @@ def _deduplicate_inputs(results: Sequence[RetrievalResult]) -> tuple[_DirectInpu
         chunk_id = str(result.chunk.chunk_id).strip()
         if not chunk_id:
             raise ValueError("retrieval result chunk IDs must be non-empty")
-        hints = {
-            str(value).strip()
-            for value in (
-                result.memory_source_id,
-                None if result.turn is None else result.turn.source_id,
-            )
-            if value is not None and str(value).strip()
-        }
+        # Conflict responses deliberately differ across the three episode
+        # retrieval sites (drop fail-open here / raise / skip) pending an
+        # author decision on one policy.
+        hints = result.source_hints
         direct = _DirectInput(
             chunk_id=chunk_id,
             score=score,
@@ -514,20 +540,6 @@ def _neighbor_score(anchor_score: float, distance: int, decay: float) -> float:
     if math.isfinite(value):
         return value
     return -float.fromhex("0x1.fffffffffffffp+1023")
-
-
-def _exact_int(value: object, label: str) -> int:
-    try:
-        normalized = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be an integer") from exc
-    try:
-        exact = float(value) == float(normalized)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        exact = False
-    if not exact:
-        raise ValueError(f"{label} must be an integer")
-    return normalized
 
 
 def _direct_choice_key(item: _DirectInput) -> tuple[float, str, str, str]:

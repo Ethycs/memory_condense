@@ -881,6 +881,8 @@ def canonical_json_sha256(value: Any) -> str:
 
 
 def _file_sha256(path: Path) -> str:
+    # Deliberately self-contained: this module is bootstrapped against the
+    # frozen v3 source snapshot, which predates memory_condense.domain.
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while block := handle.read(1024 * 1024):

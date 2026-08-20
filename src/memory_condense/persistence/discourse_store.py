@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, Sequence, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
 
 from memory_condense.domain.discourse import (
     ArtifactCoverageReceipt,
@@ -96,6 +96,103 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
             unique[identity] = value
         return tuple(unique.values())
 
+    @staticmethod
+    def _replayed(
+        stored: _T | None, value: _T, *, label: str, identity: str
+    ) -> bool:
+        """Whether an identical row already exists (an idempotent replay).
+
+        Reusing the same stable ID for different contents raises instead.
+        """
+
+        if stored is None:
+            return False
+        if stored != value:
+            raise DiscourseIdentityError(
+                f"{label} {identity!r} already has another identity"
+            )
+        return True
+
+    @staticmethod
+    def _hydrate(
+        getter: Callable[[Any], _T | None], ids: Iterable[Any]
+    ) -> tuple[_T, ...]:
+        """Load each ID through ``getter``, dropping rows that vanished."""
+
+        values = (getter(item) for item in ids)
+        return tuple(item for item in values if item is not None)
+
+    def _scan_chunk_batches(
+        self,
+        selected: Sequence[str],
+        *,
+        select_prefix: str,
+        chunk_column: str,
+        artifact_column: str,
+        artifact_id: str | None,
+        order_by: str,
+        limit: int | None = None,
+    ) -> Iterator[list[Any]]:
+        """Run one evidence-join chunk scan over 400-ID batches.
+
+        Batching keeps every statement under SQLite's traditional 999-variable
+        cap.  Each yielded value is one batch's rows for the SQL assembled as
+        ``select_prefix`` + IN-clause (+ optional artifact filter) +
+        ``order_by`` (+ optional per-batch LIMIT).
+        """
+
+        for offset in range(0, len(selected), 400):
+            batch = selected[offset : offset + 400]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            params: list[Any] = list(batch)
+            where = f"{chunk_column} IN ({placeholders})"
+            if artifact_id is not None:
+                where += f" AND {artifact_column} = ?"
+                params.append(artifact_id)
+            sql = select_prefix + where + order_by
+            if limit is not None:
+                sql += " LIMIT ?"
+                params.append(limit)
+            yield self._db.execute(sql, tuple(params)).fetchall()
+
+    def _ranked_chunk_scan_ids(
+        self,
+        chunk_ids: Sequence[str],
+        *,
+        select_prefix: str,
+        chunk_column: str,
+        artifact_column: str,
+        artifact_id: str | None,
+        order_by: str,
+        limit: int | None,
+        row_rank: Callable[[Any], Any],
+        sort_key: Callable[[tuple[str, Any]], Any],
+    ) -> list[str]:
+        """Collect scan-winner IDs, truncating to ``limit`` by ``sort_key``."""
+
+        selected = _unique(str(item) for item in chunk_ids)
+        candidates: dict[str, Any] = {}
+        for rows in self._scan_chunk_batches(
+            selected,
+            select_prefix=select_prefix,
+            chunk_column=chunk_column,
+            artifact_column=artifact_column,
+            artifact_id=artifact_id,
+            order_by=order_by,
+            limit=limit,
+        ):
+            candidates.update((str(row[0]), row_rank(row)) for row in rows)
+            if limit is not None and len(candidates) > limit:
+                candidates = dict(
+                    sorted(candidates.items(), key=sort_key)[:limit]
+                )
+        return [
+            item_id
+            for item_id, _ in sorted(candidates.items(), key=sort_key)
+        ]
+
     def publish(
         self,
         artifact: DiscourseArtifact,
@@ -174,12 +271,12 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
             label="artifact metadata",
             owner="artifact",
         )
-        stored = self.get_artifact(artifact.artifact_id)
-        if stored is not None:
-            if stored != artifact:
-                raise DiscourseIdentityError(
-                    f"artifact_id {artifact.artifact_id!r} already has another identity"
-                )
+        if self._replayed(
+            self.get_artifact(artifact.artifact_id),
+            artifact,
+            label="artifact_id",
+            identity=artifact.artifact_id,
+        ):
             return False
         self._db.execute(
             "INSERT INTO discourse_artifacts "
@@ -200,12 +297,12 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
         return True
 
     def _insert_episode(self, episode: Episode) -> bool:
-        stored = self.get_episode(episode.episode_id)
-        if stored is not None:
-            if stored != episode:
-                raise DiscourseIdentityError(
-                    f"episode_id {episode.episode_id!r} already has another identity"
-                )
+        if self._replayed(
+            self.get_episode(episode.episode_id),
+            episode,
+            label="episode_id",
+            identity=episode.episode_id,
+        ):
             return False
         coordinate = self._db.execute(
             "SELECT episode_id FROM episodes WHERE artifact_id = ? AND source_id = ? "
@@ -352,12 +449,12 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
             label="unit metadata",
             owner="unit",
         )
-        stored = self.get_unit(unit.unit_id)
-        if stored is not None:
-            if stored != unit:
-                raise DiscourseIdentityError(
-                    f"unit_id {unit.unit_id!r} already has another identity"
-                )
+        if self._replayed(
+            self.get_unit(unit.unit_id),
+            unit,
+            label="unit_id",
+            identity=unit.unit_id,
+        ):
             return False
         for span in unit.evidence:
             self._validate_span(span)
@@ -389,12 +486,12 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
             label="relation metadata",
             owner="relation",
         )
-        stored = self.get_relation(relation.relation_id)
-        if stored is not None:
-            if stored != relation:
-                raise DiscourseIdentityError(
-                    f"relation_id {relation.relation_id!r} already has another identity"
-                )
+        if self._replayed(
+            self.get_relation(relation.relation_id),
+            relation,
+            label="relation_id",
+            identity=relation.relation_id,
+        ):
             return False
         unit_artifacts: set[str] = set()
         for member in relation.members:
@@ -857,11 +954,10 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
-        values = tuple(
-            self.get_unit(str(row[0]))
-            for row in self._db.execute(sql, tuple(params)).fetchall()
+        return self._hydrate(
+            self.get_unit,
+            (str(row[0]) for row in self._db.execute(sql, tuple(params)).fetchall()),
         )
-        return tuple(item for item in values if item is not None)
 
     @staticmethod
     def _bounded_limit(limit: int | None) -> int | None:
@@ -876,31 +972,22 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
         artifact_id: str,
         source_id: str,
         *,
-        start_sequence: int | None = None,
-        end_sequence: int | None = None,
         limit: int | None = None,
     ) -> tuple[Episode, ...]:
         limit = self._bounded_limit(limit)
         self._validate_source_episode_order(artifact_id, source_id)
-        clauses = ["artifact_id = ?", "source_id = ?"]
-        params: list[Any] = [artifact_id, source_id]
-        if start_sequence is not None:
-            clauses.append("sequence_no >= ?")
-            params.append(int(start_sequence))
-        if end_sequence is not None:
-            clauses.append("sequence_no <= ?")
-            params.append(int(end_sequence))
         sql = (
-            "SELECT episode_id FROM episodes WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY sequence_no, episode_id"
+            "SELECT episode_id FROM episodes WHERE artifact_id = ? "
+            "AND source_id = ? ORDER BY sequence_no, episode_id"
         )
+        params: list[Any] = [artifact_id, source_id]
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
-        ids = [row[0] for row in self._db.execute(sql, tuple(params)).fetchall()]
-        episodes = tuple(self.get_episode(item) for item in ids)
-        return tuple(item for item in episodes if item is not None)
+        return self._hydrate(
+            self.get_episode,
+            (row[0] for row in self._db.execute(sql, tuple(params)).fetchall()),
+        )
 
     def adjacent_episodes(
         self,
@@ -930,8 +1017,7 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
         if include_self:
             ordered_ids.append(seed.episode_id)
         ordered_ids.extend(row[0] for row in following)
-        values = tuple(self.get_episode(item) for item in ordered_ids)
-        return tuple(item for item in values if item is not None)
+        return self._hydrate(self.get_episode, ordered_ids)
 
     def episode_ids_for_chunks(
         self,
@@ -948,24 +1034,20 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
 
         selected = _unique(str(item) for item in chunk_ids)
         found: dict[str, str] = {}
-        for offset in range(0, len(selected), 400):
-            batch = selected[offset : offset + 400]
-            if not batch:
-                continue
-            placeholders = ",".join("?" for _ in batch)
-            params: list[Any] = list(batch)
-            where = f"ee.chunk_id IN ({placeholders})"
-            if artifact_id is not None:
-                where += " AND e.artifact_id = ?"
-                params.append(artifact_id)
-            rows = self._db.execute(
+        for rows in self._scan_chunk_batches(
+            selected,
+            select_prefix=(
                 "SELECT ee.chunk_id, e.episode_id FROM episode_evidence AS ee "
                 "JOIN episodes AS e ON e.episode_id = ee.episode_id WHERE "
-                + where
-                + " ORDER BY ee.chunk_id, e.artifact_id, e.source_id, "
-                "e.sequence_no, e.episode_id",
-                tuple(params),
-            ).fetchall()
+            ),
+            chunk_column="ee.chunk_id",
+            artifact_column="e.artifact_id",
+            artifact_id=artifact_id,
+            order_by=(
+                " ORDER BY ee.chunk_id, e.artifact_id, e.source_id, "
+                "e.sequence_no, e.episode_id"
+            ),
+        ):
             for chunk_id, found_episode_id in rows:
                 found.setdefault(chunk_id, found_episode_id)
         result = {
@@ -981,20 +1063,6 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
                 )
         return result
 
-    def episodes_for_chunks(
-        self,
-        chunk_ids: Sequence[str],
-        *,
-        artifact_id: str | None = None,
-    ) -> dict[str, Episode]:
-        ids = self.episode_ids_for_chunks(chunk_ids, artifact_id=artifact_id)
-        hydrated: dict[str, Episode] = {}
-        for chunk_id, episode_id in ids.items():
-            value = self.get_episode(episode_id)
-            if value is not None:
-                hydrated[chunk_id] = value
-        return hydrated
-
     def units_for_chunks(
         self,
         chunk_ids: Sequence[str],
@@ -1003,46 +1071,22 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
         limit: int | None = None,
     ) -> tuple[DiscourseUnit, ...]:
         limit = self._bounded_limit(limit)
-        selected = _unique(str(item) for item in chunk_ids)
-        candidates: dict[str, int] = {}
-        for offset in range(0, len(selected), 400):
-            batch = selected[offset : offset + 400]
-            if not batch:
-                continue
-            placeholders = ",".join("?" for _ in batch)
-            params: list[Any] = list(batch)
-            where = f"ue.chunk_id IN ({placeholders})"
-            if artifact_id is not None:
-                where += " AND u.artifact_id = ?"
-                params.append(artifact_id)
-            sql = (
+        ids = self._ranked_chunk_scan_ids(
+            chunk_ids,
+            select_prefix=(
                 "SELECT DISTINCT u.unit_id, u.asserted_ordinal "
                 "FROM discourse_unit_evidence AS ue "
                 "JOIN discourse_units AS u ON u.unit_id = ue.unit_id WHERE "
-                + where
-                + " ORDER BY u.asserted_ordinal DESC, u.unit_id"
-            )
-            if limit is not None:
-                sql += " LIMIT ?"
-                params.append(limit)
-            rows = self._db.execute(sql, tuple(params)).fetchall()
-            candidates.update((str(row[0]), int(row[1])) for row in rows)
-            if limit is not None and len(candidates) > limit:
-                candidates = dict(
-                    sorted(
-                        candidates.items(),
-                        key=lambda item: (-item[1], item[0]),
-                    )[:limit]
-                )
-        ids = [
-            unit_id
-            for unit_id, _ in sorted(
-                candidates.items(),
-                key=lambda item: (-item[1], item[0]),
-            )
-        ]
-        values = tuple(self.get_unit(item) for item in ids)
-        return tuple(item for item in values if item is not None)
+            ),
+            chunk_column="ue.chunk_id",
+            artifact_column="u.artifact_id",
+            artifact_id=artifact_id,
+            order_by=" ORDER BY u.asserted_ordinal DESC, u.unit_id",
+            limit=limit,
+            row_rank=lambda row: int(row[1]),
+            sort_key=lambda item: (-item[1], item[0]),
+        )
+        return self._hydrate(self.get_unit, ids)
 
     def incident_relations(
         self,
@@ -1072,33 +1116,9 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
                 "r.relation_id LIMIT ?",
                 tuple(params),
             ).fetchall()
-            values = tuple(self.get_relation(row[0]) for row in rows)
-            result[unit_id] = tuple(item for item in values if item is not None)
-        return result
-
-    def incident_units(
-        self,
-        unit_ids: Sequence[str],
-        *,
-        artifact_id: str | None = None,
-        max_degree: int,
-    ) -> dict[str, tuple[DiscourseUnit, ...]]:
-        relations = self.incident_relations(
-            unit_ids, artifact_id=artifact_id, max_degree=max_degree
-        )
-        result: dict[str, tuple[DiscourseUnit, ...]] = {}
-        for unit_id, incident in relations.items():
-            peer_ids: list[str] = []
-            for relation in incident:
-                peer_ids.extend(
-                    member.unit_id
-                    for member in relation.members
-                    if member.unit_id != unit_id
-                )
-            peers = tuple(self.get_unit(item) for item in dict.fromkeys(peer_ids))
-            result[unit_id] = tuple(
-                item for item in peers if item is not None
-            )[:max_degree]
+            result[unit_id] = self._hydrate(
+                self.get_relation, (row[0] for row in rows)
+            )
         return result
 
     def relations_for_chunks(
@@ -1109,49 +1129,26 @@ class DiscourseStore(EvidenceStoreMixin, DiscourseReceiptMixin, DiscourseQueryMi
         limit: int | None = None,
     ) -> tuple[DiscourseRelation, ...]:
         limit = self._bounded_limit(limit)
-        selected = _unique(str(item) for item in chunk_ids)
-        candidates: dict[str, tuple[float, int]] = {}
-        for offset in range(0, len(selected), 400):
-            batch = selected[offset : offset + 400]
-            if not batch:
-                continue
-            placeholders = ",".join("?" for _ in batch)
-            params: list[Any] = list(batch)
-            where = f"re.chunk_id IN ({placeholders})"
-            if artifact_id is not None:
-                where += " AND r.artifact_id = ?"
-                params.append(artifact_id)
-            sql = (
+        ids = self._ranked_chunk_scan_ids(
+            chunk_ids,
+            select_prefix=(
                 "SELECT DISTINCT r.relation_id, r.confidence, r.created_ordinal "
                 "FROM discourse_relation_evidence AS re "
                 "JOIN discourse_relations AS r ON r.relation_id = re.relation_id "
                 "WHERE "
-                + where
-                + " ORDER BY r.confidence DESC, r.created_ordinal DESC, r.relation_id"
-            )
-            if limit is not None:
-                sql += " LIMIT ?"
-                params.append(limit)
-            rows = self._db.execute(sql, tuple(params)).fetchall()
-            candidates.update(
-                (str(row[0]), (float(row[1]), int(row[2]))) for row in rows
-            )
-            if limit is not None and len(candidates) > limit:
-                candidates = dict(
-                    sorted(
-                        candidates.items(),
-                        key=lambda item: (-item[1][0], -item[1][1], item[0]),
-                    )[:limit]
-                )
-        ids = [
-            relation_id
-            for relation_id, _ in sorted(
-                candidates.items(),
-                key=lambda item: (-item[1][0], -item[1][1], item[0]),
-            )
-        ]
-        values = tuple(self.get_relation(item) for item in ids)
-        return tuple(item for item in values if item is not None)
+            ),
+            chunk_column="re.chunk_id",
+            artifact_column="r.artifact_id",
+            artifact_id=artifact_id,
+            order_by=(
+                " ORDER BY r.confidence DESC, r.created_ordinal DESC, "
+                "r.relation_id"
+            ),
+            limit=limit,
+            row_rank=lambda row: (float(row[1]), int(row[2])),
+            sort_key=lambda item: (-item[1][0], -item[1][1], item[0]),
+        )
+        return self._hydrate(self.get_relation, ids)
 
     def stats(self) -> dict[str, int]:
         counts = {}

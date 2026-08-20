@@ -15,10 +15,13 @@ from memory_condense.associations.association_models import (
 from memory_condense.associations.coaccess_graph import (
     accumulate_neighbor_evidence,
     decayed_mass,
+    edge_endpoint_keys,
+    positive_seed_activations,
     ranked_neighbor_states,
     score_coaccess_edges,
     select_prune_victims,
     validate_observation_params,
+    validated_recall_params,
 )
 
 
@@ -230,29 +233,30 @@ class HebbianAssociationStoreMixin:
     ) -> tuple[StoredHebbianNeighbor, ...]:
         """Recall conceptual chunks associated by prior same-turn exposure."""
         self._require_artifact(artifact_id)
-        if top_k < 0:
-            raise ValueError("top_k must be non-negative")
-        if top_k == 0:
+        window = validated_recall_params(
+            top_k=top_k,
+            min_score=min_score,
+            half_life_turns=half_life_turns,
+            now_turn=now_turn,
+            current_turn=self._db.current_turn,
+        )
+        if window is None:
             return ()
-        half_life = float(half_life_turns)
-        if not math.isfinite(half_life) or half_life <= 0.0:
-            raise ValueError("half_life_turns must be finite and positive")
-        if not 0.0 <= min_score <= 1.0:
-            raise ValueError("min_score must lie in [0, 1]")
-        turn = self._db.current_turn() if now_turn is None else int(now_turn)
-        if turn < 0:
-            raise ValueError("now_turn must be non-negative")
+        half_life, turn = window
 
-        seeds: dict[str, float] = {}
-        for raw_chunk_id, raw_activation in concept_activations.items():
+        def seed_key(raw_chunk_id: str) -> str:
             chunk_id = str(raw_chunk_id).strip()
-            activation = float(raw_activation)
             if not chunk_id:
                 raise ValueError("concept chunk IDs must be non-empty")
-            if not math.isfinite(activation) or not 0.0 <= activation <= 1.0:
-                raise ValueError("concept activations must be finite and in [0, 1]")
-            if activation > 0.0:
-                seeds[chunk_id] = max(seeds.get(chunk_id, 0.0), activation)
+            return chunk_id
+
+        seeds = positive_seed_activations(
+            (
+                (seed_key(chunk_id), activation)
+                for chunk_id, activation in concept_activations.items()
+            ),
+            what="concept activations",
+        )
         if not seeds:
             return ()
 
@@ -268,9 +272,7 @@ class HebbianAssociationStoreMixin:
         if not edge_rows:
             return ()
 
-        endpoint_ids = sorted(
-            {row[0] for row in edge_rows} | {row[1] for row in edge_rows}
-        )
+        endpoint_ids = edge_endpoint_keys(edge_rows)
         endpoint_placeholders = ",".join("?" for _ in endpoint_ids)
         node_rows = self._db.execute(
             "SELECT chunk_id, access_mass, last_access_turn "

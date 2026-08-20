@@ -7,7 +7,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from memory_condense.domain._discourse_identity import _as_tuple, normalize_fields
 from memory_condense.domain.discourse import identity_sha256
+from memory_condense.domain.sealed import SealedIdentity
+from memory_condense.eval._identity import exact_int, sha256_digest
 from memory_condense.eval.diffuse_longmemeval_matched import (
     MATCHED_BOUNDARY_MODES,
     DiffuseLongMemEvalMatchedSuiteReceipt,
@@ -27,28 +30,6 @@ RESIDENT_PREFLIGHT_POLICY = "cuda-mem-get-info-min-free-v1"
 STAGED_PREFLIGHT_POLICY = "bge-close-before-qwen-load-v1"
 MINIMUM_RESIDENT_FREE_BYTES = 3072 * 1024 * 1024
 _CUDA_DEVICE_RE = re.compile(r"^cuda(?::[0-9]+)?$")
-
-
-def _digest(value: object, label: str) -> str:
-    normalized = str(value)
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return normalized
-
-
-def _exact_int(value: object, label: str, *, minimum: int = 0) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be an integer")
-    try:
-        normalized = int(value)  # type: ignore[arg-type]
-        exact = float(value) == float(normalized)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be an integer") from exc
-    if not exact or normalized < minimum:
-        raise ValueError(f"{label} must be at least {minimum}")
-    return normalized
 
 
 def _preflight_payload(
@@ -83,7 +64,7 @@ def _validate_preflight_observations(
         raise ValueError("certified matched runtime requires an explicit CUDA device")
 
     if policy == RESIDENT_PREFLIGHT_POLICY:
-        required = _exact_int(
+        required = exact_int(
             next(iter(required_values)),
             "resident required_free_bytes",
             minimum=MINIMUM_RESIDENT_FREE_BYTES,
@@ -93,8 +74,12 @@ def _validate_preflight_observations(
                 raise ValueError("resident runtime cannot release BGE before Qwen")
             if item.observed_free_bytes is None or item.observed_total_bytes is None:
                 raise ValueError("resident runtime requires observed CUDA memory")
-            free = _exact_int(item.observed_free_bytes, "observed_free_bytes")
-            total = _exact_int(item.observed_total_bytes, "observed_total_bytes")
+            free = exact_int(
+                item.observed_free_bytes, "observed_free_bytes", minimum=0
+            )
+            total = exact_int(
+                item.observed_total_bytes, "observed_total_bytes", minimum=0
+            )
             if free < required:
                 raise ValueError("resident CUDA free memory is below its threshold")
             if total < free:
@@ -102,9 +87,10 @@ def _validate_preflight_observations(
         return policy, device, required
 
     if policy == STAGED_PREFLIGHT_POLICY:
-        required = _exact_int(
+        required = exact_int(
             next(iter(required_values)),
             "staged required_free_bytes",
+            minimum=0,
         )
         if required != 0:
             raise ValueError("staged runtime cannot carry a resident-memory threshold")
@@ -119,8 +105,10 @@ def _validate_preflight_observations(
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseLongMemEvalMatchedRuntimeSuiteReceipt:
+class DiffuseLongMemEvalMatchedRuntimeSuiteReceipt(SealedIdentity):
     """Self-contained runtime attestation layered over the matched phases."""
+
+    _SEAL_MISMATCH = "matched runtime suite receipt does not match"
 
     sample_id: str
     runtime_binding_sha256: str
@@ -139,22 +127,22 @@ class DiffuseLongMemEvalMatchedRuntimeSuiteReceipt:
             raise ValueError("unsupported matched runtime suite format")
         if not str(self.sample_id).strip():
             raise ValueError("sample_id must be non-empty")
-        _digest(self.runtime_binding_sha256, "runtime_binding_sha256")
+        sha256_digest(self.runtime_binding_sha256, "runtime_binding_sha256")
         if self.runtime_binding_certified is not True:
             raise ValueError("runtime_binding_certified must be true")
-        receipts = tuple(self.runtime_result_receipt_sha256s)
-        if len(receipts) != len(MATCHED_BOUNDARY_MODES):
+        normalize_fields(self, runtime_result_receipt_sha256s=_as_tuple)
+        if len(self.runtime_result_receipt_sha256s) != len(MATCHED_BOUNDARY_MODES):
             raise ValueError("runtime receipts must cover every matched arm")
-        for index, value in enumerate(receipts):
-            _digest(value, f"runtime_result_receipt_sha256s[{index}]")
-        object.__setattr__(self, "runtime_result_receipt_sha256s", receipts)
-        observations = tuple(self.preflight_observations)
-        policy, device, required = _validate_preflight_observations(observations)
+        for index, value in enumerate(self.runtime_result_receipt_sha256s):
+            sha256_digest(value, f"runtime_result_receipt_sha256s[{index}]")
+        normalize_fields(self, preflight_observations=_as_tuple)
+        policy, device, required = _validate_preflight_observations(
+            self.preflight_observations
+        )
         if self.residency_policy != policy or self.residency_device != device:
             raise ValueError("aggregate residency identity changed")
         if self.required_free_bytes != required:
             raise ValueError("aggregate residency threshold changed")
-        object.__setattr__(self, "preflight_observations", observations)
         if type(self.matched_suite) is not DiffuseLongMemEvalMatchedSuiteReceipt:
             raise TypeError("matched_suite must be the exact matched-phase receipt")
         matched_expected = identity_sha256(
@@ -164,10 +152,7 @@ class DiffuseLongMemEvalMatchedRuntimeSuiteReceipt:
             raise ValueError("matched-phase suite receipt does not match")
         if self.matched_suite.sample_id != self.sample_id:
             raise ValueError("runtime suite and matched phases name different samples")
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("matched runtime suite receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
+        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {

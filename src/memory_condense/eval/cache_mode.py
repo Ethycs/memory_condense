@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from memory_condense.eval.cache_receipts import validated_cache_receipts
+from memory_condense.eval.runtime import prepare_samples, run_provenance
 from memory_condense.eval.schemas import (
     DEFAULT_JUDGE_MODEL,
     DEFAULT_RESPONDER_MODEL,
@@ -114,52 +115,25 @@ def run_prepare_cache_only(
     config = runtime.config_from_args(args)
     runtime._validate_prepare_cache_args(args, config)
 
-    dataset_hash = runtime.file_sha256(args.benchmark_file)
-    implementation_hash = runtime.implementation_sha256()
-    environment_lock_hash = runtime.environment_lock_sha256()
-    policy_hash = runtime._verified_policy_sha256(
-        args.policy_manifest,
-        config=config,
-        dataset_sha256=dataset_hash,
-        split_manifest=args.benchmark_split_manifest,
-        active_split=args.benchmark_split,
-        active_implementation_sha256=implementation_hash,
-        active_environment_lock_sha256=environment_lock_hash,
-        evaluation_identity=runtime._benchmark_evaluation_identity(args, config),
+    provenance = run_provenance(
+        args,
+        args.benchmark_file,
+        config,
+        runtime=runtime,
         prepare_only=True,
     )
-    split_manifest_hash = (
-        runtime.file_sha256(args.benchmark_split_manifest)
-        if args.benchmark_split_manifest
-        else ""
-    )
 
-    samples = runtime.load_benchmark(args.benchmark_file, args.benchmark_format)
-    if not samples:
-        raise ValueError("no benchmark samples found")
-    samples = runtime._apply_sample_offset(
+    prepared = prepare_samples(
         args,
-        runtime._apply_locked_split(args, samples, verbose=False),
+        args.benchmark_file,
+        runtime=runtime,
         verbose=False,
+        stress=True,
+        shard_stress_questions=True,
     )
-
-    stress_tokens = getattr(args, "stress_context_tokens", None)
-    actual_stress_tokens = 0
-    if stress_tokens is not None:
-        from memory_condense.eval.context_stress import (
-            compose_context_stress_sample,
-            transcript_tokens,
-        )
-
-        samples = [
-            compose_context_stress_sample(
-                samples,
-                target_tokens=stress_tokens,
-                max_questions=getattr(args, "stress_questions", 10),
-                question_offset=getattr(args, "stress_question_offset", 0),
-            )
-        ]
-        actual_stress_tokens = transcript_tokens(samples[0])
+    if prepared is None:
+        raise ValueError("no benchmark samples found")
+    samples = prepared.samples
 
     if args.max_samples is not None:
         if args.max_samples <= 0:
@@ -220,17 +194,17 @@ def run_prepare_cache_only(
         if callable(release_embedder):
             release_embedder()
 
-    runtime._assert_implementation_unchanged(implementation_hash)
+    runtime._assert_implementation_unchanged(provenance.implementation_sha256)
     report: dict[str, object] = {
-        "dataset_sha256": dataset_hash,
-        "split_manifest_sha256": split_manifest_hash,
-        "policy_manifest_sha256": policy_hash,
-        "implementation_sha256": implementation_hash,
-        "environment_lock_sha256": environment_lock_hash,
+        "dataset_sha256": provenance.dataset_sha256,
+        "split_manifest_sha256": provenance.split_manifest_sha256,
+        "policy_manifest_sha256": provenance.policy_manifest_sha256,
+        "implementation_sha256": provenance.implementation_sha256,
+        "environment_lock_sha256": provenance.environment_lock_sha256,
         "sample_count": len(sample_rows),
         "turn_count": sum(int(row["turn_count"]) for row in sample_rows),
         "source_count": sum(int(row["source_count"]) for row in sample_rows),
-        "stress_context_tokens": actual_stress_tokens,
+        "stress_context_tokens": prepared.stress_tokens,
         "samples": sample_rows,
         "elapsed_s": time.perf_counter() - started,
     }

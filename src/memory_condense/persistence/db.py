@@ -6,6 +6,14 @@ from typing import Callable
 
 CURRENT_SCHEMA_VERSION = 11
 
+#: A chunk's owning source: a turn falls back to its own ID when no source
+#: grouped it.  Expects the ``turns`` table aliased as ``t``.
+TURN_SOURCE_ID_SQL = "COALESCE(t.source_id, t.turn_id)"
+
+#: Predicate selecting chunks that are fully indexed for retrieval (embedded
+#: and registered in the ANN index).  Expects ``chunks`` aliased as ``c``.
+INDEXED_CHUNK_SQL = "c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL"
+
 
 def _execute_sql_script(
     conn: sqlite3.Connection,
@@ -32,14 +40,25 @@ def _execute_sql_script(
 def _apply_schema_transaction(
     conn: sqlite3.Connection,
     script: str,
+    version: int,
     *,
     post: Callable[[sqlite3.Connection], None] | None = None,
 ) -> None:
-    """Atomically apply DDL, its backfill hook, and version publication."""
+    """Atomically apply DDL, its backfill hook, and version publication.
+
+    ``schema_version`` is published here, inside the transaction that owns
+    the DDL, so no migration entry can forget its own version bump and
+    silently re-apply on every open.
+    """
 
     conn.execute("BEGIN IMMEDIATE")
     try:
         _execute_sql_script(conn, script)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value)"
+            " VALUES ('schema_version', ?)",
+            (str(version),),
+        )
         if post is not None:
             post(conn)
         conn.commit()
@@ -734,8 +753,6 @@ _SCHEMA_SQL = (
     + _V9_CAUSAL_BINDING_SCHEMA
     + _V10_DISCOURSE_SCHEMA
     + _V11_REVISION_SCHEMA
-    + f"\nINSERT OR REPLACE INTO meta (key, value)"
-    f" VALUES ('schema_version', '{CURRENT_SCHEMA_VERSION}');\n"
 )
 
 #: Statements that upgrade a database *into* the keyed version.
@@ -782,16 +799,11 @@ CREATE TABLE IF NOT EXISTS memory_provenance (
 );
 
 CREATE INDEX IF NOT EXISTS idx_provenance_mem ON memory_provenance(mem_id);
-
-UPDATE meta SET value = '2' WHERE key = 'schema_version';
 """,
     3: """
 ALTER TABLE memory_items ADD COLUMN content_hash TEXT;
 """
-    + _V3_INDEXES
-    + """
-UPDATE meta SET value = '3' WHERE key = 'schema_version';
-""",
+    + _V3_INDEXES,
     # v4 moves the decay coordinate from wall-clock seconds to conversation
     # turns. Purely additive: `half_life_s` and `last_access_at` stay, because
     # dropping a column in SQLite needs a 12-step table rebuild that clause 10
@@ -804,44 +816,22 @@ ALTER TABLE memory_items ADD COLUMN last_access_turn INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE turns ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_turns_ordinal ON turns(ordinal);
-
-UPDATE meta SET value = '4' WHERE key = 'schema_version';
 """,
-    5: _V5_ASSOCIATION_SCHEMA
-    + """
-UPDATE meta SET value = '5' WHERE key = 'schema_version';
-""",
+    5: _V5_ASSOCIATION_SCHEMA,
     6: """
 ALTER TABLE turns ADD COLUMN source_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_turns_source ON turns(source_id, ordinal);
-
-UPDATE meta SET value = '6' WHERE key = 'schema_version';
 """,
-    7: _V7_HEBBIAN_SCHEMA
-    + """
-UPDATE meta SET value = '7' WHERE key = 'schema_version';
-""",
-    8: _V8_CONSOLIDATION_SCHEMA
-    + """
-UPDATE meta SET value = '8' WHERE key = 'schema_version';
-""",
+    7: _V7_HEBBIAN_SCHEMA,
+    8: _V8_CONSOLIDATION_SCHEMA,
     # A completed prompt/response episode is stronger evidence than an
     # incidental retrieved-together event. Keep that provenance as one scalar
     # counter so unique outcomes can be recalled without lowering the repeated
     # co-access guard for every edge in the graph.
-    9: _V9_CAUSAL_BINDING_SCHEMA
-    + """
-UPDATE meta SET value = '9' WHERE key = 'schema_version';
-""",
-    10: _V10_DISCOURSE_SCHEMA
-    + """
-UPDATE meta SET value = '10' WHERE key = 'schema_version';
-""",
-    11: _V11_REVISION_SCHEMA
-    + """
-UPDATE meta SET value = '11' WHERE key = 'schema_version';
-""",
+    9: _V9_CAUSAL_BINDING_SCHEMA,
+    10: _V10_DISCOURSE_SCHEMA,
+    11: _V11_REVISION_SCHEMA,
 }
 
 
@@ -905,7 +895,7 @@ def _backfill_discourse_snapshot_revisions(conn: sqlite3.Connection) -> None:
     ):
         conn.execute(
             f"UPDATE {table} SET "
-            "source_id = (SELECT COALESCE(t.source_id, t.turn_id) "
+            f"source_id = (SELECT {TURN_SOURCE_ID_SQL} "
             "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
             f"WHERE c.chunk_id = {table}.chunk_id), "
             "turn_id = (SELECT c.turn_id FROM chunks AS c "
@@ -922,9 +912,10 @@ def _backfill_discourse_snapshot_revisions(conn: sqlite3.Connection) -> None:
         DiscourseSnapshot,
         Episode,
         EvidenceSpan,
-        canonical_json,
     )
     from memory_condense.persistence.discourse_receipts import (
+        _SNAPSHOT_INSERT_SQL,
+        _snapshot_insert_row,
         discourse_content_digests,
     )
 
@@ -1030,25 +1021,7 @@ def _backfill_discourse_snapshot_revisions(conn: sqlite3.Connection) -> None:
             source_content_sha256=source_content,
             graph_content_sha256=graph_content,
         )
-        conn.execute(
-            "INSERT INTO discourse_graph_revisions "
-            "(graph_revision, max_turn_ordinal, chunk_count, schema_version, "
-            "artifact_ids, snapshot_sha256, source_revision, "
-            "graph_content_revision, source_content_sha256, "
-            "graph_content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                baseline.graph_revision,
-                baseline.max_turn_ordinal,
-                baseline.chunk_count,
-                baseline.schema_version,
-                canonical_json(list(baseline.artifact_ids)),
-                baseline.snapshot_sha256,
-                baseline.source_revision,
-                baseline.graph_content_revision,
-                baseline.source_content_sha256,
-                baseline.graph_content_sha256,
-            ),
-        )
+        conn.execute(_SNAPSHOT_INSERT_SQL, _snapshot_insert_row(baseline))
     _execute_sql_script(
         conn,
         """
@@ -1136,7 +1109,9 @@ class Database:
         version = self._read_version()
 
         if version is None:
-            _apply_schema_transaction(self._conn, _SCHEMA_SQL)
+            _apply_schema_transaction(
+                self._conn, _SCHEMA_SQL, CURRENT_SCHEMA_VERSION
+            )
         else:
             for target in range(version + 1, CURRENT_SCHEMA_VERSION + 1):
                 sql = _MIGRATIONS.get(target)
@@ -1144,6 +1119,7 @@ class Database:
                     _apply_schema_transaction(
                         self._conn,
                         sql,
+                        target,
                         post=_POST_MIGRATIONS.get(target),
                     )
 

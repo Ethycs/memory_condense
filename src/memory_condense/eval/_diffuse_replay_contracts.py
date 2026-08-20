@@ -14,6 +14,7 @@ from memory_condense.domain.discourse import (
     ClosureReceipt,
     ClosureScopeWitness,
     EvidenceSpan,
+    canonical_json as _canonical_json,
     identity_sha256,
     make_atom_id,
     make_bundle_id,
@@ -52,16 +53,6 @@ _FORBIDDEN_IDENTITY_KEYS = frozenset(
 
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-
-
-def _canonical_json(value: object) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
 
 
 def _canonical_file_sha256(value: object) -> tuple[str, int]:

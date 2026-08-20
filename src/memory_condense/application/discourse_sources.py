@@ -6,6 +6,11 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from memory_condense.domain._discourse_identity import (
+    _as_tuple,
+    exact_int,
+    normalize_fields,
+)
 from memory_condense.domain.discourse import (
     DiscourseSnapshot,
     identity_sha256,
@@ -32,10 +37,17 @@ class SourceChunkStream:
     stream_sha256: str
 
     def __post_init__(self) -> None:
+        # Validate-only: source_id and stream_sha256 keep their original
+        # bytes, and uppercase digests are rejected rather than lowercased.
         if not self.source_id.strip():
             raise ValueError("source_id must be non-empty")
-        content = tuple(self.content_chunk_ids)
-        metadata = tuple(self.metadata_chunk_ids)
+        normalize_fields(
+            self,
+            content_chunk_ids=_as_tuple,
+            metadata_chunk_ids=_as_tuple,
+        )
+        content = self.content_chunk_ids
+        metadata = self.metadata_chunk_ids
         if not content and not metadata:
             raise ValueError("a source stream must contain at least one chunk")
         if len(set((*content, *metadata))) != len(content) + len(metadata):
@@ -46,12 +58,6 @@ class SourceChunkStream:
             char not in "0123456789abcdef" for char in self.stream_sha256
         ):
             raise ValueError("stream_sha256 must be a lowercase SHA-256 digest")
-        object.__setattr__(self, "content_chunk_ids", content)
-        object.__setattr__(self, "metadata_chunk_ids", metadata)
-
-    @property
-    def all_chunk_ids(self) -> tuple[str, ...]:
-        return (*self.content_chunk_ids, *self.metadata_chunk_ids)
 
 
 def scan_discourse_source_chunks(db: Database) -> tuple[SourceChunkStream, ...]:
@@ -134,8 +140,8 @@ def rank_episode_source_candidates(
 ) -> tuple[EpisodeSourceCandidate, ...]:
     """Fuse chunk and source-lexical ranks without comparing raw scores."""
 
-    limit = _positive_integer(max_sources, "max_sources")
-    constant = _positive_integer(rrf_constant, "rrf_constant")
+    limit = exact_int(max_sources, "max_sources", minimum=1)
+    constant = exact_int(rrf_constant, "rrf_constant", minimum=1)
     universe = tuple(str(value).strip() for value in universe_source_ids)
     if any(not value for value in universe) or len(set(universe)) != len(universe):
         raise ValueError("source universe must contain unique non-empty IDs")
@@ -144,24 +150,9 @@ def rank_episode_source_candidates(
     for result in anchors:
         if not isinstance(result, RetrievalResult):
             raise TypeError("anchors must contain RetrievalResult values")
-        memory_source = (
-            None
-            if result.memory_source_id is None
-            else str(result.memory_source_id).strip()
-        )
-        turn_source = (
-            None
-            if result.turn is None or result.turn.source_id is None
-            else str(result.turn.source_id).strip()
-        )
-        if memory_source and turn_source and memory_source != turn_source:
+        if len(result.source_hints) > 1:
             raise ValueError("anchor source identities disagree")
-        source_id = (
-            memory_source
-            or turn_source
-            or result.chunk.turn_id
-        )
-        normalized = str(source_id).strip()
+        normalized = result.durable_source_id.strip()
         if normalized not in universe_set:
             raise ValueError("anchor source is absent from the source universe")
         if normalized and normalized not in direct_ids:
@@ -230,8 +221,8 @@ def build_episode_source_candidate_scope(
         raise ValueError("source routing requires an artifact in the snapshot")
     if not normalized_query:
         raise ValueError("query must be non-empty")
-    limit = _positive_integer(max_sources, "max_sources")
-    constant = _positive_integer(rrf_constant, "rrf_constant")
+    limit = exact_int(max_sources, "max_sources", minimum=1)
+    constant = exact_int(rrf_constant, "rrf_constant", minimum=1)
     universe = tuple(str(value).strip() for value in universe_source_ids)
     ranked = rank_episode_source_candidates(
         anchors,
@@ -261,19 +252,6 @@ def build_episode_source_candidate_scope(
         truncated_source_ids=truncated,
         universe_enumerated=True,
     )
-
-
-def _positive_integer(value: object, label: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be a positive integer")
-    try:
-        normalized = int(value)  # type: ignore[arg-type]
-        exact = math.isfinite(float(value)) and float(value) == normalized  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be a positive integer") from exc
-    if not exact or normalized < 1:
-        raise ValueError(f"{label} must be a positive integer")
-    return normalized
 
 
 __all__ = [

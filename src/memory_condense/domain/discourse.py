@@ -9,15 +9,25 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping
 
 from memory_condense.domain._discourse_identity import (
+    _as_tuple,
+    _choice,
     _confidence,
+    _finite,
     _json_mapping,
+    _labeled,
     _nonempty,
+    _nonnegative,
     _optional,
     _plain_json,
+    _positive,
     _sha256,
+    _sorted_unique,
+    _sorted_unique_nonempty,
+    _strict_int,
+    _unique_nonempty,
     canonical_json,
     identity_sha256,
     make_atom_id,
@@ -31,6 +41,13 @@ from memory_condense.domain.sealed import SealedIdentity, reflect_payload
 
 _TEMPORAL_STANCES = frozenset(
     {"any", "latest", "terminal", "ordered", "ascending", "descending"}
+)
+_ROLES = frozenset({"user", "assistant", "system"})
+_span_role = _choice(_ROLES, "evidence role must be user, assistant, or system")
+_atom_role = _choice(_ROLES, "atom role must be user, assistant, or system")
+_stance = _choice(
+    _TEMPORAL_STANCES,
+    "temporal_stance is not a supported closed value",
 )
 ClosureStatus = Literal[
     "satisfied",
@@ -79,15 +96,12 @@ class EvidenceSpan:
         )
         if self.start_char < 0 or self.end_char <= self.start_char:
             raise ValueError("evidence span must have 0 <= start_char < end_char")
-        if self.ordinal < 0:
-            raise ValueError("evidence span ordinal must be non-negative")
-        if self.turn_start_char < 0:
-            raise ValueError("turn_start_char must be non-negative")
-        if self.role is not None:
-            role = _nonempty(self.role, "role")
-            if role not in {"user", "assistant", "system"}:
-                raise ValueError("evidence role must be user, assistant, or system")
-            object.__setattr__(self, "role", role)
+        normalize_fields(
+            self,
+            ordinal=_labeled("evidence span ordinal", _nonnegative),
+            turn_start_char=_nonnegative,
+            role=_optional(_span_role),
+        )
 
     def identity_payload(self) -> dict[str, Any]:
         return reflect_payload(self)
@@ -113,6 +127,12 @@ def evidence_span_sort_key(
     )
 
 
+def _sorted_evidence(value: Any, label: str) -> tuple[EvidenceSpan, ...]:
+    """Order exact evidence spans by their authoritative source position."""
+
+    return tuple(sorted(value, key=evidence_span_sort_key))
+
+
 @dataclass(frozen=True, slots=True)
 class DiscourseArtifact:
     """Identity of one deterministic or model-assisted annotation procedure."""
@@ -127,9 +147,9 @@ class DiscourseArtifact:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "kind", _nonempty(self.kind, "artifact kind"))
         normalize_fields(
             self,
+            kind=_labeled("artifact kind", _nonempty),
             artifact_id=_nonempty,
             implementation_sha256=_sha256,
             policy_sha256=_sha256,
@@ -216,10 +236,10 @@ class Episode(SealedIdentity):
             artifact_id=_nonempty,
             source_id=_nonempty,
             boundary_method=_nonempty,
+            sequence_no=_nonnegative,
+            evidence=_as_tuple,
         )
-        evidence = tuple(self.evidence)
-        if self.sequence_no < 0:
-            raise ValueError("sequence_no must be non-negative")
+        evidence = self.evidence
         if self.first_ordinal < 0 or self.last_ordinal < self.first_ordinal:
             raise ValueError("episode ordinal range is invalid")
         if not evidence:
@@ -230,11 +250,11 @@ class Episode(SealedIdentity):
             raise ValueError("episode ordinal bounds must match its evidence")
         if any(item.source_id not in (None, self.source_id) for item in evidence):
             raise ValueError("an episode cannot cross source histories")
-        for name in ("boundary_score", "boundary_threshold"):
-            value = getattr(self, name)
-            if value is not None and not math.isfinite(float(value)):
-                raise ValueError(f"{name} must be finite")
-        object.__setattr__(self, "evidence", evidence)
+        normalize_fields(
+            self,
+            boundary_score=_optional(_finite),
+            boundary_threshold=_optional(_finite),
+        )
         self._seal()
 
 
@@ -251,9 +271,8 @@ class EpisodeRepresentative:
             episode_id=_nonempty,
             chunk_id=_nonempty,
             vector_identity_sha256=_sha256,
+            rank=_labeled("representative rank", _nonnegative),
         )
-        if self.rank < 0:
-            raise ValueError("representative rank must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,20 +289,23 @@ class DiscourseUnit:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for name in ("unit_id", "artifact_id", "kind", "canonical_key"):
-            object.__setattr__(self, name, _nonempty(getattr(self, name), name))
-        if self.asserted_ordinal < 0:
-            raise ValueError("asserted_ordinal must be non-negative")
-        object.__setattr__(self, "confidence", _confidence(self.confidence))
-        evidence = tuple(sorted(self.evidence, key=evidence_span_sort_key))
-        if not evidence:
+        normalize_fields(
+            self,
+            unit_id=_nonempty,
+            artifact_id=_nonempty,
+            kind=_nonempty,
+            canonical_key=_nonempty,
+            asserted_ordinal=_nonnegative,
+            confidence=_confidence,
+            evidence=_sorted_evidence,
+        )
+        if not self.evidence:
             raise ValueError("a discourse unit requires source evidence")
-        if self.asserted_ordinal != max(item.ordinal for item in evidence):
+        if self.asserted_ordinal != max(item.ordinal for item in self.evidence):
             raise ValueError(
                 "asserted_ordinal must equal the latest cited evidence ordinal"
             )
-        object.__setattr__(self, "evidence", evidence)
-        object.__setattr__(self, "metadata", _json_mapping(self.metadata, "metadata"))
+        normalize_fields(self, metadata=_json_mapping)
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,10 +316,12 @@ class RelationMember:
     weight: float = 1.0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "unit_id", _nonempty(self.unit_id, "unit_id"))
-        object.__setattr__(self, "role", _nonempty(self.role, "relation member role"))
-        if self.ordinal < 0:
-            raise ValueError("relation member ordinal must be non-negative")
+        normalize_fields(
+            self,
+            unit_id=_nonempty,
+            role=_labeled("relation member role", _nonempty),
+            ordinal=_labeled("relation member ordinal", _nonnegative),
+        )
         if not math.isfinite(float(self.weight)) or self.weight < 0:
             raise ValueError("relation member weight must be finite and non-negative")
 
@@ -316,8 +340,12 @@ class DiscourseRelation:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for name in ("relation_id", "artifact_id", "relation_type"):
-            object.__setattr__(self, name, _nonempty(getattr(self, name), name))
+        normalize_fields(
+            self,
+            relation_id=_nonempty,
+            artifact_id=_nonempty,
+            relation_type=_nonempty,
+        )
         members = tuple(
             sorted(
                 self.members,
@@ -330,19 +358,16 @@ class DiscourseRelation:
             raise ValueError("relation members must be unique")
         if tuple(item.ordinal for item in members) != tuple(range(len(members))):
             raise ValueError("relation member ordinals must be contiguous from zero")
-        evidence = tuple(sorted(self.evidence, key=evidence_span_sort_key))
-        if not evidence:
+        object.__setattr__(self, "members", members)
+        normalize_fields(self, evidence=_sorted_evidence)
+        if not self.evidence:
             raise ValueError("a discourse relation requires exact source evidence")
-        if self.created_ordinal < 0:
-            raise ValueError("created_ordinal must be non-negative")
-        if self.created_ordinal != max(item.ordinal for item in evidence):
+        normalize_fields(self, created_ordinal=_nonnegative)
+        if self.created_ordinal != max(item.ordinal for item in self.evidence):
             raise ValueError(
                 "created_ordinal must equal the latest cited evidence ordinal"
             )
-        object.__setattr__(self, "members", members)
-        object.__setattr__(self, "evidence", evidence)
-        object.__setattr__(self, "confidence", _confidence(self.confidence))
-        object.__setattr__(self, "metadata", _json_mapping(self.metadata, "metadata"))
+        normalize_fields(self, confidence=_confidence, metadata=_json_mapping)
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,10 +396,9 @@ class DiscourseSnapshot(SealedIdentity):
             self.graph_content_revision,
         ) < 0:
             raise ValueError("snapshot counters must be non-negative")
-        artifacts = tuple(sorted({_nonempty(item, "artifact_id") for item in self.artifact_ids}))
-        object.__setattr__(self, "artifact_ids", artifacts)
         normalize_fields(
             self,
+            artifact_ids=_labeled("artifact_id", _sorted_unique_nonempty),
             source_content_sha256=_sha256,
             graph_content_sha256=_sha256,
         )
@@ -384,7 +408,7 @@ class DiscourseSnapshot(SealedIdentity):
         ) and self.source_content_sha256 == zero:
             raise ValueError("non-empty source snapshot requires a content root")
         if (
-            artifacts or self.graph_content_revision
+            self.artifact_ids or self.graph_content_revision
         ) and self.graph_content_sha256 == zero:
             raise ValueError("non-empty graph snapshot requires a content root")
         self._seal()
@@ -411,6 +435,7 @@ class ArtifactCoverageReceipt(SealedIdentity):
             coverage_sha256=_sha256,
             turn_coverage_sha256=_sha256,
         )
+        # Membership only: coverage_kind is stored verbatim, never stripped.
         if self.coverage_kind not in {"episode", "discourse"}:
             raise ValueError("coverage_kind must be episode or discourse")
         if min(self.source_revision, self.chunk_count) < 0:
@@ -433,22 +458,56 @@ class EvidenceObligation:
     temporal_stance: str = "any"
 
     def __post_init__(self) -> None:
-        for name in ("obligation_id", "kind", "temporal_stance"):
-            object.__setattr__(self, name, _nonempty(getattr(self, name), name))
-        if self.temporal_stance not in _TEMPORAL_STANCES:
-            raise ValueError("temporal_stance is not a supported closed value")
+        normalize_fields(
+            self,
+            obligation_id=_nonempty,
+            kind=_nonempty,
+            temporal_stance=_stance,
+        )
         if not math.isfinite(float(self.weight)) or self.weight <= 0:
             raise ValueError("obligation weight must be finite and positive")
-        if self.min_count < 1:
-            raise ValueError("obligation min_count must be positive")
+        normalize_fields(self, min_count=_labeled("obligation min_count", _positive))
         if self.max_count is not None and self.max_count < self.min_count:
             raise ValueError("obligation max_count cannot be below min_count")
-        for name in ("unit_kinds", "relation_types", "subject_terms", "dependencies"):
-            values = tuple(dict.fromkeys(_nonempty(value, name) for value in getattr(self, name)))
-            object.__setattr__(self, name, values)
+        normalize_fields(
+            self,
+            unit_kinds=_unique_nonempty,
+            relation_types=_unique_nonempty,
+            subject_terms=_unique_nonempty,
+            dependencies=_unique_nonempty,
+        )
 
     def identity_payload(self) -> dict[str, Any]:
         return reflect_payload(self)
+
+
+def _validate_obligation_dependencies(
+    obligations: tuple[EvidenceObligation, ...],
+) -> None:
+    """Require obligation dependencies to be known and acyclic."""
+
+    known = {item.obligation_id for item in obligations}
+    if any(dep not in known for item in obligations for dep in item.dependencies):
+        raise ValueError("obligation dependency references an unknown obligation")
+    dependencies = {
+        item.obligation_id: item.dependencies for item in obligations
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(obligation_id: str) -> None:
+        if obligation_id in visiting:
+            raise ValueError("obligation dependencies must form an acyclic graph")
+        if obligation_id in visited:
+            return
+        visiting.add(obligation_id)
+        for dependency in dependencies[obligation_id]:
+            visit(dependency)
+        visiting.remove(obligation_id)
+        visited.add(obligation_id)
+
+    for obligation_id in dependencies:
+        visit(obligation_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,41 +527,24 @@ class QueryProgram(SealedIdentity):
     program_sha256: str = ""
 
     def __post_init__(self) -> None:
-        normalize_fields(self, query=_nonempty, intent=_nonempty, ordering=_nonempty)
-        subjects = tuple(dict.fromkeys(_nonempty(item, "subject term") for item in self.subject_terms))
-        obligations = tuple(self.obligations)
-        if not obligations:
+        normalize_fields(
+            self,
+            query=_nonempty,
+            intent=_nonempty,
+            ordering=_nonempty,
+            subject_terms=_labeled("subject term", _unique_nonempty),
+            obligations=_as_tuple,
+        )
+        if not self.obligations:
             raise ValueError("a query program requires at least one obligation")
-        if len({item.obligation_id for item in obligations}) != len(obligations):
+        if len({item.obligation_id for item in self.obligations}) != len(self.obligations):
             raise ValueError("obligation IDs must be unique")
-        known = {item.obligation_id for item in obligations}
-        if any(dep not in known for item in obligations for dep in item.dependencies):
-            raise ValueError("obligation dependency references an unknown obligation")
-        dependencies = {
-            item.obligation_id: item.dependencies for item in obligations
-        }
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def visit(obligation_id: str) -> None:
-            if obligation_id in visiting:
-                raise ValueError("obligation dependencies must form an acyclic graph")
-            if obligation_id in visited:
-                return
-            visiting.add(obligation_id)
-            for dependency in dependencies[obligation_id]:
-                visit(dependency)
-            visiting.remove(obligation_id)
-            visited.add(obligation_id)
-
-        for obligation_id in dependencies:
-            visit(obligation_id)
-        if self.as_of_ordinal is not None and self.as_of_ordinal < 0:
-            raise ValueError("as_of_ordinal must be non-negative")
-        if self.cardinality is not None and self.cardinality < 1:
-            raise ValueError("cardinality must be positive")
-        object.__setattr__(self, "subject_terms", subjects)
-        object.__setattr__(self, "obligations", obligations)
+        _validate_obligation_dependencies(self.obligations)
+        normalize_fields(
+            self,
+            as_of_ordinal=_optional(_nonnegative),
+            cardinality=_optional(_positive),
+        )
         self._seal()
 
 
@@ -519,23 +561,17 @@ class ClosurePolicy:
     min_relation_confidence: float = 0.5
 
     def __post_init__(self) -> None:
-        for name in (
-            "max_hops",
-            "max_units",
-            "max_relations",
-            "max_degree",
-            "max_frontier",
-            "max_bundles",
-            "beam_width",
-        ):
-            if getattr(self, name) < 1:
-                raise ValueError(f"{name} must be positive")
-        if self.max_episode_neighbors < 0:
-            raise ValueError("max_episode_neighbors must be non-negative")
-        object.__setattr__(
+        normalize_fields(
             self,
-            "min_relation_confidence",
-            _confidence(self.min_relation_confidence, "min_relation_confidence"),
+            max_hops=_positive,
+            max_units=_positive,
+            max_relations=_positive,
+            max_degree=_positive,
+            max_frontier=_positive,
+            max_bundles=_positive,
+            beam_width=_positive,
+            max_episode_neighbors=_nonnegative,
+            min_relation_confidence=_confidence,
         )
 
     @property
@@ -557,11 +593,17 @@ class EpisodeSeed:
     path: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("episode_id", "anchor_chunk_id", "route"):
-            object.__setattr__(self, name, _nonempty(getattr(self, name), name))
-        if not math.isfinite(float(self.score)):
-            raise ValueError("seed score must be finite")
-        object.__setattr__(self, "path", tuple(self.path))
+        normalize_fields(
+            self,
+            episode_id=_nonempty,
+            anchor_chunk_id=_nonempty,
+            route=_nonempty,
+            score=_labeled("seed score", _finite),
+            path=_as_tuple,
+        )
+
+    def identity_payload(self) -> dict[str, Any]:
+        return reflect_payload(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -576,25 +618,25 @@ class EvidenceAtom:
     created_at: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "atom_id", _nonempty(self.atom_id, "atom_id"))
+        normalize_fields(self, atom_id=_nonempty)
         # Evidence bytes are authoritative.  Validate with ``strip`` but never
         # normalize the stored value before comparing its source-span digest.
         text = str(self.text)
         if not text.strip():
             raise ValueError("atom text must be non-empty")
         object.__setattr__(self, "text", text)
-        object.__setattr__(self, "label", _nonempty(self.label, "atom label"))
+        normalize_fields(self, label=_labeled("atom label", _nonempty))
         if quote_sha256(self.text) != self.span.quote_sha256:
             raise ValueError("hydrated atom text does not match its source-span hash")
+        # The span's provenance is authoritative; a caller may repeat it but
+        # never contradict it.
         role = self.role
         if self.span.role is not None:
             if role is not None and role != self.span.role:
                 raise ValueError("evidence atom role contradicts its source span")
             role = self.span.role
         if role is not None:
-            role = _nonempty(role, "atom role")
-            if role not in {"user", "assistant", "system"}:
-                raise ValueError("atom role must be user, assistant, or system")
+            role = _atom_role(role, "atom role")
         created_at = self.created_at
         if self.span.created_at is not None:
             if created_at is not None and created_at != self.span.created_at:
@@ -604,6 +646,13 @@ class EvidenceAtom:
             created_at = _nonempty(created_at, "atom created_at")
         object.__setattr__(self, "role", role)
         object.__setattr__(self, "created_at", created_at)
+
+    def identity_payload(self) -> dict[str, Any]:
+        """Project hydrated text to its digest; evidence bytes never persist."""
+
+        payload = reflect_payload(self)
+        payload["text_sha256"] = quote_sha256(payload.pop("text"))
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,14 +666,20 @@ class EvidenceBundle:
     utility: float = 0.0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "bundle_id", _nonempty(self.bundle_id, "bundle_id"))
-        for name in ("atom_ids", "obligation_ids", "unit_ids", "relation_ids"):
-            values = tuple(dict.fromkeys(_nonempty(item, name) for item in getattr(self, name)))
-            object.__setattr__(self, name, values)
+        normalize_fields(
+            self,
+            bundle_id=_nonempty,
+            atom_ids=_unique_nonempty,
+            obligation_ids=_unique_nonempty,
+            unit_ids=_unique_nonempty,
+            relation_ids=_unique_nonempty,
+        )
         if not self.atom_ids:
             raise ValueError("an evidence bundle must contain at least one atom")
-        if not math.isfinite(float(self.utility)):
-            raise ValueError("bundle utility must be finite")
+        _finite(self.utility, "bundle utility")
+
+    def identity_payload(self) -> dict[str, Any]:
+        return reflect_payload(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -637,7 +692,10 @@ class ObligationResult:
     reason: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "obligation_id", _nonempty(self.obligation_id, "obligation_id"))
+        normalize_fields(self, obligation_id=_nonempty)
+
+    def identity_payload(self) -> dict[str, Any]:
+        return reflect_payload(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -658,26 +716,21 @@ class ClosureScopeWitness(SealedIdentity):
     witness_sha256: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "kind", _nonempty(self.kind, "scope witness kind"))
-        object.__setattr__(
+        normalize_fields(
             self,
-            "subject_id",
-            _nonempty(self.subject_id, "scope witness subject_id"),
+            kind=_labeled("scope witness kind", _nonempty),
+            subject_id=_labeled("scope witness subject_id", _nonempty),
+            requested_limit=_optional(
+                _labeled("scope witness requested_limit", _nonnegative)
+            ),
+            returned_count=_labeled("scope witness returned_count", _nonnegative),
         )
-        if self.requested_limit is not None and self.requested_limit < 0:
-            raise ValueError("scope witness requested_limit must be non-negative")
-        if self.returned_count < 0:
-            raise ValueError("scope witness returned_count must be non-negative")
         if (
             self.requested_limit is not None
             and self.returned_count > self.requested_limit
         ):
             raise ValueError("scope witness returned_count exceeds its requested limit")
-        object.__setattr__(
-            self,
-            "detail",
-            _json_mapping(self.detail, "scope witness detail"),
-        )
+        normalize_fields(self, detail=_labeled("scope witness detail", _json_mapping))
         self._seal()
 
 
@@ -705,6 +758,38 @@ class ClosurePlan(SealedIdentity):
     plan_sha256: str = ""
 
     def __post_init__(self) -> None:
+        atoms, bundles, witnesses = self._normalized_collections()
+        normalize_fields(
+            self,
+            direct_chunk_ids=_labeled("direct_chunk_id", _sorted_unique_nonempty),
+            expansion_receipt_sha256=_optional(_sha256),
+        )
+        self._validate_artifact_link()
+        results = tuple(self.obligation_results)
+        self._validate_unique_ids(atoms, bundles, witnesses)
+        self._validate_obligation_coverage(results)
+        self._validate_bundle_links(atoms, bundles, results)
+        self._validate_completion_claim(results, witnesses)
+        object.__setattr__(self, "atoms", atoms)
+        object.__setattr__(self, "bundles", bundles)
+        object.__setattr__(self, "scope_witnesses", witnesses)
+        normalize_fields(
+            self,
+            visited_episode_ids=_sorted_unique,
+            visited_unit_ids=_sorted_unique,
+            visited_relation_ids=_sorted_unique,
+        )
+        self._seal()
+
+    def _normalized_collections(
+        self,
+    ) -> tuple[
+        tuple[EvidenceAtom, ...],
+        tuple[EvidenceBundle, ...],
+        tuple[ClosureScopeWitness, ...],
+    ]:
+        """Return atoms, bundles, and witnesses in their deterministic order."""
+
         atoms = tuple(
             sorted(
                 self.atoms,
@@ -724,34 +809,44 @@ class ClosurePlan(SealedIdentity):
                 ),
             )
         )
-        direct_chunk_ids = tuple(
-            sorted({_nonempty(item, "direct_chunk_id") for item in self.direct_chunk_ids})
-        )
-        expansion_receipt = self.expansion_receipt_sha256
-        if expansion_receipt is not None:
-            expansion_receipt = _sha256(
-                expansion_receipt,
-                "expansion_receipt_sha256",
-            )
-        artifact_id = self.artifact_id
-        if artifact_id is not None:
-            artifact_id = _nonempty(artifact_id, "artifact_id")
-            if artifact_id not in self.snapshot.artifact_ids:
-                raise ValueError("closure artifact_id is absent from its snapshot")
-        results = tuple(self.obligation_results)
-        known_obligations = {
-            item.obligation_id: item for item in self.query_program.obligations
-        }
+        return atoms, bundles, witnesses
+
+    def _validate_artifact_link(self) -> None:
+        """Require the optional artifact_id to exist inside the snapshot."""
+
+        if self.artifact_id is None:
+            return
+        artifact_id = _nonempty(self.artifact_id, "artifact_id")
+        if artifact_id not in self.snapshot.artifact_ids:
+            raise ValueError("closure artifact_id is absent from its snapshot")
+        object.__setattr__(self, "artifact_id", artifact_id)
+
+    def _validate_unique_ids(
+        self,
+        atoms: tuple[EvidenceAtom, ...],
+        bundles: tuple[EvidenceBundle, ...],
+        witnesses: tuple[ClosureScopeWitness, ...],
+    ) -> None:
         if len({item.atom_id for item in atoms}) != len(atoms):
             raise ValueError("closure atom IDs must be unique")
         if len({item.bundle_id for item in bundles}) != len(bundles):
             raise ValueError("closure bundle IDs must be unique")
         if len({item.witness_sha256 for item in witnesses}) != len(witnesses):
             raise ValueError("closure scope witnesses must be unique")
+
+    def _validate_obligation_coverage(
+        self,
+        results: tuple[ObligationResult, ...],
+    ) -> None:
+        """Require exactly one supported result per query obligation."""
+
+        known_obligations = {
+            item.obligation_id for item in self.query_program.obligations
+        }
         if (
             len(results) != len(known_obligations)
             or len({item.obligation_id for item in results}) != len(results)
-            or {item.obligation_id for item in results} != set(known_obligations)
+            or {item.obligation_id for item in results} != known_obligations
         ):
             raise ValueError("closure results must cover every query obligation exactly")
         if any(
@@ -760,6 +855,18 @@ class ClosurePlan(SealedIdentity):
             for item in results
         ):
             raise ValueError("closure result has an unsupported status")
+
+    def _validate_bundle_links(
+        self,
+        atoms: tuple[EvidenceAtom, ...],
+        bundles: tuple[EvidenceBundle, ...],
+        results: tuple[ObligationResult, ...],
+    ) -> None:
+        """Require every cross-reference among atoms, bundles, and results to agree."""
+
+        known_obligations = {
+            item.obligation_id: item for item in self.query_program.obligations
+        }
         known_atoms = {item.atom_id for item in atoms}
         if any(atom_id not in known_atoms for item in bundles for atom_id in item.atom_ids):
             raise ValueError("closure bundle references an unknown atom")
@@ -823,6 +930,14 @@ class ClosurePlan(SealedIdentity):
             for result in results
         ):
             raise ValueError("satisfied closure result does not meet min_count")
+
+    def _validate_completion_claim(
+        self,
+        results: tuple[ObligationResult, ...],
+        witnesses: tuple[ClosureScopeWitness, ...],
+    ) -> None:
+        """Require complete_claimed to follow from results and exhaustive scans."""
+
         required = {
             item.obligation_id
             for item in self.query_program.obligations
@@ -839,77 +954,19 @@ class ClosurePlan(SealedIdentity):
         )
         if self.complete_claimed != should_complete:
             raise ValueError("complete_claimed is inconsistent with required obligations")
-        object.__setattr__(self, "atoms", atoms)
-        object.__setattr__(self, "bundles", bundles)
-        object.__setattr__(self, "scope_witnesses", witnesses)
-        object.__setattr__(self, "direct_chunk_ids", direct_chunk_ids)
-        object.__setattr__(self, "expansion_receipt_sha256", expansion_receipt)
-        object.__setattr__(self, "artifact_id", artifact_id)
-        object.__setattr__(
-            self,
-            "visited_episode_ids",
-            tuple(sorted(dict.fromkeys(self.visited_episode_ids))),
-        )
-        object.__setattr__(
-            self,
-            "visited_unit_ids",
-            tuple(sorted(dict.fromkeys(self.visited_unit_ids))),
-        )
-        object.__setattr__(
-            self,
-            "visited_relation_ids",
-            tuple(sorted(dict.fromkeys(self.visited_relation_ids))),
-        )
-        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
+        # The three composite inputs are projected to their own digests; the
+        # child collections contribute their reflective identity payloads.
         payload = {
             "query_program_sha256": self.query_program.program_sha256,
             "policy_sha256": self.policy.policy_sha256,
             "snapshot_sha256": self.snapshot.snapshot_sha256,
-            "seeds": [
-                {
-                    "episode_id": item.episode_id,
-                    "anchor_chunk_id": item.anchor_chunk_id,
-                    "score": item.score,
-                    "route": item.route,
-                    "path": list(item.path),
-                }
-                for item in self.seeds
-            ],
-            "atoms": [
-                {
-                    "atom_id": item.atom_id,
-                    "span": item.span.identity_payload(),
-                    "text_sha256": quote_sha256(item.text),
-                    "label": item.label,
-                    "role": item.role,
-                    "created_at": item.created_at,
-                }
-                for item in self.atoms
-            ],
-            "bundles": [
-                {
-                    "bundle_id": item.bundle_id,
-                    "atom_ids": list(item.atom_ids),
-                    "obligation_ids": list(item.obligation_ids),
-                    "unit_ids": list(item.unit_ids),
-                    "relation_ids": list(item.relation_ids),
-                    "required": item.required,
-                    "utility": item.utility,
-                }
-                for item in self.bundles
-            ],
+            "seeds": [item.identity_payload() for item in self.seeds],
+            "atoms": [item.identity_payload() for item in self.atoms],
+            "bundles": [item.identity_payload() for item in self.bundles],
             "obligation_results": [
-                {
-                    "obligation_id": item.obligation_id,
-                    "status": item.status,
-                    "unit_ids": list(item.unit_ids),
-                    "relation_ids": list(item.relation_ids),
-                    "bundle_ids": list(item.bundle_ids),
-                    "reason": item.reason,
-                }
-                for item in self.obligation_results
+                item.identity_payload() for item in self.obligation_results
             ],
             "visited_episode_ids": list(self.visited_episode_ids),
             "visited_unit_ids": list(self.visited_unit_ids),
@@ -958,25 +1015,42 @@ class ClosureReceipt(SealedIdentity):
 
     def __post_init__(self) -> None:
         normalize_fields(self, plan_sha256=_sha256, context_sha256=_sha256)
-        for name in (
-            "context_token_proxy",
-            "max_context_token_proxy",
-            "retained_request_token_state_bytes",
-            "responder_output_token_reserve",
-        ):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise ValueError(f"{name} must be an integer")
+        self._validate_token_accounting()
+        if self.complete_claimed and self.stopping_reason != "complete":
+            raise ValueError(
+                "complete_claimed must be false unless stopping_reason is complete"
+            )
+        self._validate_prompt_budget()
+        dropped = _json_mapping(
+            self.dropped_bundle_reasons,
+            "dropped_bundle_reasons",
+        )
+        if any(not isinstance(value, str) for value in dropped.values()):
+            raise ValueError("dropped_bundle_reasons values must be strings")
+        object.__setattr__(self, "dropped_bundle_reasons", dropped)
+        normalize_fields(self, tokenizer_identity=_nonempty)
+        self._seal()
+
+    def _validate_token_accounting(self) -> None:
+        """Require exact, non-negative context counts and zero retained state."""
+
+        normalize_fields(
+            self,
+            context_token_proxy=_strict_int,
+            max_context_token_proxy=_strict_int,
+            retained_request_token_state_bytes=_strict_int,
+            responder_output_token_reserve=_strict_int,
+        )
         if self.context_token_proxy < 0 or self.max_context_token_proxy < 0:
             raise ValueError("token counts must be non-negative")
         if self.context_token_proxy > self.max_context_token_proxy:
             raise ValueError("closure packet exceeds its hard token budget")
         if self.retained_request_token_state_bytes != 0:
             raise ValueError("closure receipts require zero retained request token state")
-        if self.complete_claimed and self.stopping_reason != "complete":
-            raise ValueError(
-                "complete_claimed must be false unless stopping_reason is complete"
-            )
+
+    def _validate_prompt_budget(self) -> None:
+        """Require the optional prompt-budget fields to be all-or-nothing and coherent."""
+
         if self.responder_output_token_reserve < 0:
             raise ValueError("responder output token reserve must be non-negative")
         prompt_fields = (
@@ -989,63 +1063,46 @@ class ClosureReceipt(SealedIdentity):
             self.evidence_suffix_sha256,
             self.prompt_messages_sha256,
         )
-        prompt_budget_enabled = any(value is not None for value in prompt_fields)
-        if prompt_budget_enabled:
-            if any(value is None for value in prompt_fields):
+        if all(value is None for value in prompt_fields):
+            if self.responder_output_token_reserve != 0:
                 raise ValueError(
-                    "prompt-budget receipt fields must be supplied together"
+                    "an output reserve requires an enabled prompt-token proxy budget"
                 )
-            assert self.prompt_token_proxy is not None
-            assert self.max_prompt_token_proxy is not None
-            assert self.prompt_workspace_token_proxy is not None
-            for name in (
-                "prompt_token_proxy",
-                "max_prompt_token_proxy",
-                "prompt_workspace_token_proxy",
-            ):
-                value = getattr(self, name)
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ValueError(f"{name} must be an integer")
-                if value < 0:
-                    raise ValueError(f"{name} must be non-negative")
-            expected_request = (
-                self.prompt_token_proxy + self.responder_output_token_reserve
-            )
-            if self.prompt_workspace_token_proxy != expected_request:
-                raise ValueError(
-                    "prompt workspace token proxy must equal prompt proxy plus "
-                    "output reserve"
-                )
-            if self.prompt_workspace_token_proxy > self.max_prompt_token_proxy:
-                raise ValueError(
-                    "closure packet prompt proxy plus output reserve exceeds "
-                    "its hard prompt budget"
-                )
-            normalize_fields(
-                self,
-                base_messages_sha256=_sha256,
-                evidence_prefix_sha256=_sha256,
-                evidence_suffix_sha256=_sha256,
-                prompt_messages_sha256=_sha256,
-                evidence_message_role=_nonempty,
-            )
-        elif self.responder_output_token_reserve != 0:
+            return
+        if any(value is None for value in prompt_fields):
             raise ValueError(
-                "an output reserve requires an enabled prompt-token proxy budget"
+                "prompt-budget receipt fields must be supplied together"
             )
-        dropped = _json_mapping(
-            self.dropped_bundle_reasons,
-            "dropped_bundle_reasons",
+        assert self.prompt_token_proxy is not None
+        assert self.max_prompt_token_proxy is not None
+        assert self.prompt_workspace_token_proxy is not None
+        for name in (
+            "prompt_token_proxy",
+            "max_prompt_token_proxy",
+            "prompt_workspace_token_proxy",
+        ):
+            _nonnegative(_strict_int(getattr(self, name), name), name)
+        expected_request = (
+            self.prompt_token_proxy + self.responder_output_token_reserve
         )
-        if any(not isinstance(value, str) for value in dropped.values()):
-            raise ValueError("dropped_bundle_reasons values must be strings")
-        object.__setattr__(self, "dropped_bundle_reasons", dropped)
-        object.__setattr__(
+        if self.prompt_workspace_token_proxy != expected_request:
+            raise ValueError(
+                "prompt workspace token proxy must equal prompt proxy plus "
+                "output reserve"
+            )
+        if self.prompt_workspace_token_proxy > self.max_prompt_token_proxy:
+            raise ValueError(
+                "closure packet prompt proxy plus output reserve exceeds "
+                "its hard prompt budget"
+            )
+        normalize_fields(
             self,
-            "tokenizer_identity",
-            _nonempty(self.tokenizer_identity, "tokenizer_identity"),
+            base_messages_sha256=_sha256,
+            evidence_prefix_sha256=_sha256,
+            evidence_suffix_sha256=_sha256,
+            prompt_messages_sha256=_sha256,
+            evidence_message_role=_nonempty,
         )
-        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
         payload = {

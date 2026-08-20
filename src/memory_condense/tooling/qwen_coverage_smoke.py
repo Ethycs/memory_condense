@@ -5,13 +5,15 @@ from __future__ import annotations
 import argparse
 import gc
 import time
-from pathlib import Path
 
 from memory_condense.associations.head_memory import (
     AssociativeMemoryCandidate,
     QwenMemoryLinker,
 )
-from memory_condense.modeling.qwen_prefix import Qwen3PrefixEncoder
+from memory_condense.modeling.qwen_prefix import (
+    add_prefix_encoder_arguments,
+    prefix_encoder_from_args,
+)
 
 
 _CANDIDATES = (
@@ -28,11 +30,13 @@ _CANDIDATES = (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--layers", type=int, default=6)
+    add_prefix_encoder_arguments(
+        parser,
+        layers_flags=("--layers", "--prefix-layers"),
+        layers_default=6,
+        dtype_default="float16",
+    )
     parser.add_argument("--attention-layer", type=int, default=5)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="float16")
     parser.add_argument("--candidates", type=int, default=2)
     parser.add_argument("--workspace-tokens", type=int, default=1024)
     return parser
@@ -44,15 +48,10 @@ def main() -> None:
         raise ValueError(f"candidates must be in [1, {len(_CANDIDATES)}]")
 
     started = time.perf_counter()
-    encoder = Qwen3PrefixEncoder(
-        args.model_dir,
-        layers=args.layers,
-        device=args.device,
-        dtype=args.dtype,
-    )
+    encoder = prefix_encoder_from_args(args)
     loaded_s = time.perf_counter() - started
     print(
-        f"load_s={loaded_s:.3f} layers=0..{args.layers - 1} "
+        f"load_s={loaded_s:.3f} layers=0..{args.prefix_layers - 1} "
         f"readout_layer={args.attention_layer} lm_head=absent",
         flush=True,
     )

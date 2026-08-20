@@ -40,6 +40,10 @@ from memory_condense.domain._tokenizer import (
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.search.packing.context_packer import ContextBudget
 from memory_condense.modeling.embedding import EmbeddingService
+from memory_condense.eval.search_kwargs import (
+    graph_search_kwargs,
+    source_search_kwargs,
+)
 from memory_condense.eval.reproducibility import file_sha256
 from memory_condense.eval.schemas import EvalConfig, UsageStats
 from memory_condense.eval.cache_receipts import (
@@ -455,18 +459,6 @@ def build_qa_prompt(question: str, chunk_texts: list[str]) -> list[dict[str, str
     ]
 
 
-def _message_content_tokens(messages: list[dict[str, str]]) -> int:
-    """cl100k message-content count, excluding any chat framing."""
-
-    return sum(count_tokens(message.get("content", "")) for message in messages)
-
-
-def _message_prompt_token_proxy(messages: list[dict[str, str]]) -> int:
-    """Stable local input proxy including the explicit framing reserve."""
-
-    return count_chat_prompt_token_proxy(messages)
-
-
 def cap_context_to_prompt_budget(
     question: str,
     chunk_texts: list[str],
@@ -484,7 +476,7 @@ def cap_context_to_prompt_budget(
     if max_prompt_tokens < 1:
         raise ValueError("max_prompt_tokens must be positive")
 
-    if _message_prompt_token_proxy(build_qa_prompt(question, [])) > max_prompt_tokens:
+    if count_chat_prompt_token_proxy(build_qa_prompt(question, [])) > max_prompt_tokens:
         raise ValueError(
             "max_prompt_tokens is smaller than the QA prompt without context"
         )
@@ -493,7 +485,7 @@ def cap_context_to_prompt_budget(
     for excerpt in chunk_texts:
         proposal = [*selected, excerpt]
         if (
-            _message_prompt_token_proxy(build_qa_prompt(question, proposal))
+            count_chat_prompt_token_proxy(build_qa_prompt(question, proposal))
             <= max_prompt_tokens
         ):
             selected.append(excerpt)
@@ -504,7 +496,7 @@ def cap_context_to_prompt_budget(
         while low < high:
             midpoint = (low + high + 1) // 2
             prefix = truncate_to_tokens(excerpt, midpoint)
-            tokens = _message_prompt_token_proxy(
+            tokens = count_chat_prompt_token_proxy(
                 build_qa_prompt(question, [*selected, prefix])
             )
             if tokens <= max_prompt_tokens:
@@ -563,52 +555,7 @@ def answer_question(
         graph_results = (
             mc.search_hybrid_graph(
                 query_text,
-                k=config.retrieval.k,
-                neighbor_radius=config.retrieval.neighbor_radius,
-                neighbor_slots=config.retrieval.neighbor_slots,
-                neighbor_direction=config.retrieval.neighbor_direction,
-                source_slots=config.retrieval.source_slots,
-                source_candidate_pool=config.retrieval.source_candidate_pool,
-                source_activation_k=config.retrieval.source_activation_k,
-                query_facet_retrieval=config.retrieval.query_facet_retrieval,
-                query_facet_slots=config.retrieval.query_facet_slots,
-                query_facet_max=config.retrieval.query_facet_max,
-                role_aware_retrieval=config.retrieval.role_aware_retrieval,
-                role_user_weight=config.retrieval.role_user_weight,
-                role_assistant_weight=config.retrieval.role_assistant_weight,
-                role_system_weight=config.retrieval.role_system_weight,
-                multi_fact_source_diversity=(
-                    config.retrieval.multi_fact_source_diversity
-                ),
-                source_tfisf_activation=(
-                    config.retrieval.source_tfisf_activation
-                ),
-                source_tfisf_slots=config.retrieval.source_tfisf_slots,
-                source_hsc_activation=config.retrieval.source_hsc_activation,
-                source_hsc_slots=config.retrieval.source_hsc_slots,
-                source_hsc_hops=config.retrieval.source_hsc_hops,
-                source_hsc_chunk_slots=(
-                    config.retrieval.source_hsc_chunk_slots
-                ),
-                source_partition_routing=(
-                    config.retrieval.source_partition_routing
-                ),
-                source_partition_slots=config.retrieval.source_partition_slots,
-                source_partition_separator=(
-                    config.retrieval.source_partition_separator
-                ),
-                source_local_search=config.retrieval.source_local_search,
-                use_source_reranker=config.retrieval.qwen_rerank,
-                use_attention_feedback=config.retrieval.qwen_feedback,
-                feedback_slots=config.retrieval.qwen_feedback_slots,
-                feedback_seed_slots=config.retrieval.qwen_feedback_seed_slots,
-                feedback_evidence_tokens=(
-                    config.retrieval.qwen_feedback_evidence_tokens
-                ),
-                feedback_query_tokens=config.retrieval.qwen_feedback_query_tokens,
-                ef_search=config.retrieval.ef_search,
-                candidates=config.retrieval.candidates,
-                alpha=config.retrieval.alpha,
+                **graph_search_kwargs(config.retrieval, routing=True),
             )
             if config.retrieval.mode == "causal_graph"
             else None
@@ -679,32 +626,7 @@ def answer_question(
             result.chunk.text
             for result in mc.search_hybrid_sources(
                 query_text,
-                k=config.retrieval.k,
-                source_slots=config.retrieval.source_slots,
-                source_candidate_pool=config.retrieval.source_candidate_pool,
-                source_activation_k=config.retrieval.source_activation_k,
-                query_facet_retrieval=config.retrieval.query_facet_retrieval,
-                query_facet_slots=config.retrieval.query_facet_slots,
-                query_facet_max=config.retrieval.query_facet_max,
-                role_aware_retrieval=config.retrieval.role_aware_retrieval,
-                role_user_weight=config.retrieval.role_user_weight,
-                role_assistant_weight=config.retrieval.role_assistant_weight,
-                role_system_weight=config.retrieval.role_system_weight,
-                multi_fact_source_diversity=(
-                    config.retrieval.multi_fact_source_diversity
-                ),
-                source_partition_routing=(
-                    config.retrieval.source_partition_routing
-                ),
-                source_partition_slots=config.retrieval.source_partition_slots,
-                source_partition_separator=(
-                    config.retrieval.source_partition_separator
-                ),
-                source_local_search=config.retrieval.source_local_search,
-                use_source_reranker=config.retrieval.qwen_rerank,
-                ef_search=config.retrieval.ef_search,
-                candidates=config.retrieval.candidates,
-                alpha=config.retrieval.alpha,
+                **source_search_kwargs(config.retrieval),
             )
         ]
     elif config.retrieval.mode == "hybrid_graph":
@@ -712,35 +634,7 @@ def answer_question(
             result.chunk.text
             for result in mc.search_hybrid_graph(
                 query_text,
-                k=config.retrieval.k,
-                neighbor_radius=config.retrieval.neighbor_radius,
-                neighbor_slots=config.retrieval.neighbor_slots,
-                neighbor_direction=config.retrieval.neighbor_direction,
-                source_slots=config.retrieval.source_slots,
-                source_candidate_pool=config.retrieval.source_candidate_pool,
-                source_activation_k=config.retrieval.source_activation_k,
-                source_tfisf_activation=(
-                    config.retrieval.source_tfisf_activation
-                ),
-                source_tfisf_slots=config.retrieval.source_tfisf_slots,
-                source_hsc_activation=config.retrieval.source_hsc_activation,
-                source_hsc_slots=config.retrieval.source_hsc_slots,
-                source_hsc_hops=config.retrieval.source_hsc_hops,
-                source_hsc_chunk_slots=(
-                    config.retrieval.source_hsc_chunk_slots
-                ),
-                source_local_search=config.retrieval.source_local_search,
-                use_source_reranker=config.retrieval.qwen_rerank,
-                use_attention_feedback=config.retrieval.qwen_feedback,
-                feedback_slots=config.retrieval.qwen_feedback_slots,
-                feedback_seed_slots=config.retrieval.qwen_feedback_seed_slots,
-                feedback_evidence_tokens=(
-                    config.retrieval.qwen_feedback_evidence_tokens
-                ),
-                feedback_query_tokens=config.retrieval.qwen_feedback_query_tokens,
-                ef_search=config.retrieval.ef_search,
-                candidates=config.retrieval.candidates,
-                alpha=config.retrieval.alpha,
+                **graph_search_kwargs(config.retrieval),
             )
         ]
     elif config.retrieval.mode == "hybrid_neighbor":
@@ -780,7 +674,7 @@ def answer_question(
         config.max_prompt_tokens,
     )
     messages = build_qa_prompt(query_text, context_texts)
-    prompt_tokens = _message_prompt_token_proxy(messages)
+    prompt_tokens = count_chat_prompt_token_proxy(messages)
     raw_answer = answer_fn(messages)
     if isinstance(raw_answer, tuple):
         answer, usage = raw_answer

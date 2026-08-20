@@ -21,6 +21,47 @@ class _Executor(Protocol):
     def execute(self, sql: str, params: tuple = ()) -> Any: ...
 
 
+# One canonical column list for ``discourse_graph_revisions`` receipt rows, in
+# table order.  The SELECT list, both INSERT statements (the publish path here
+# and the v11 migration backfill in ``db.py``), and the row reader all derive
+# from this spec, so a positionally-reordered reader can never silently
+# mispair a column with the wrong snapshot field — the same hazard
+# ``memory_store._COLUMNS`` closes for memory rows.
+_SNAPSHOT_COLUMNS = (
+    "graph_revision",
+    "max_turn_ordinal",
+    "chunk_count",
+    "schema_version",
+    "artifact_ids",
+    "snapshot_sha256",
+    "source_revision",
+    "graph_content_revision",
+    "source_content_sha256",
+    "graph_content_sha256",
+)
+_SNAPSHOT_COLUMN_SQL = ", ".join(_SNAPSHOT_COLUMNS)
+_SNAPSHOT_INSERT_SQL = (
+    "INSERT INTO discourse_graph_revisions "
+    f"({_SNAPSHOT_COLUMN_SQL}) "
+    f"VALUES ({', '.join('?' for _ in _SNAPSHOT_COLUMNS)})"
+)
+
+
+def _snapshot_insert_row(snapshot: DiscourseSnapshot) -> tuple:
+    """One INSERT parameter row in canonical column order.
+
+    Snapshot attribute names match column names exactly; ``artifact_ids`` is
+    the lone serialized column.
+    """
+
+    return tuple(
+        canonical_json(list(snapshot.artifact_ids))
+        if column == "artifact_ids"
+        else getattr(snapshot, column)
+        for column in _SNAPSHOT_COLUMNS
+    )
+
+
 _SOURCE_ROW_STREAMS = (
     (
         "turns",
@@ -170,15 +211,16 @@ class DiscourseReceiptMixin:
         )
 
     def _snapshot_from_row(self, row: Sequence[Any]) -> DiscourseSnapshot:
+        record = dict(zip(_SNAPSHOT_COLUMNS, row))
         try:
-            artifact_ids = json.loads(row[4])
+            artifact_ids = json.loads(record["artifact_ids"])
         except (TypeError, json.JSONDecodeError) as exc:
             raise DiscourseSnapshotError(
                 "snapshot artifact IDs are invalid JSON"
             ) from exc
         if (
             not isinstance(artifact_ids, list)
-            or canonical_json(artifact_ids) != row[4]
+            or canonical_json(artifact_ids) != record["artifact_ids"]
             or artifact_ids != sorted(set(artifact_ids))
             or any(
                 not isinstance(item, str) or not item.strip()
@@ -188,16 +230,16 @@ class DiscourseReceiptMixin:
             raise DiscourseSnapshotError("snapshot artifact IDs are not canonical")
         try:
             return DiscourseSnapshot(
-                max_turn_ordinal=int(row[1]),
-                chunk_count=int(row[2]),
-                graph_revision=int(row[0]),
-                schema_version=int(row[3]),
+                max_turn_ordinal=int(record["max_turn_ordinal"]),
+                chunk_count=int(record["chunk_count"]),
+                graph_revision=int(record["graph_revision"]),
+                schema_version=int(record["schema_version"]),
                 artifact_ids=tuple(artifact_ids),
-                source_revision=int(row[6]),
-                graph_content_revision=int(row[7]),
-                source_content_sha256=row[8],
-                graph_content_sha256=row[9],
-                snapshot_sha256=row[5],
+                source_revision=int(record["source_revision"]),
+                graph_content_revision=int(record["graph_content_revision"]),
+                source_content_sha256=record["source_content_sha256"],
+                graph_content_sha256=record["graph_content_sha256"],
+                snapshot_sha256=record["snapshot_sha256"],
             )
         except ValueError as exc:
             raise DiscourseSnapshotError(
@@ -206,10 +248,7 @@ class DiscourseReceiptMixin:
 
     def _latest_stored_snapshot(self) -> DiscourseSnapshot | None:
         row = self._db.execute(
-            "SELECT graph_revision, max_turn_ordinal, chunk_count, "
-            "schema_version, artifact_ids, snapshot_sha256, source_revision, "
-            "graph_content_revision, source_content_sha256, "
-            "graph_content_sha256 FROM discourse_graph_revisions "
+            f"SELECT {_SNAPSHOT_COLUMN_SQL} FROM discourse_graph_revisions "
             "ORDER BY graph_revision DESC LIMIT 1"
         ).fetchone()
         return None if row is None else self._snapshot_from_row(row)
@@ -264,25 +303,7 @@ class DiscourseReceiptMixin:
             source_content_sha256=source_content,
             graph_content_sha256=graph_content,
         )
-        self._db.execute(
-            "INSERT INTO discourse_graph_revisions "
-            "(graph_revision, max_turn_ordinal, chunk_count, schema_version, "
-            "artifact_ids, snapshot_sha256, source_revision, "
-            "graph_content_revision, source_content_sha256, "
-            "graph_content_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                snapshot.graph_revision,
-                snapshot.max_turn_ordinal,
-                snapshot.chunk_count,
-                snapshot.schema_version,
-                canonical_json(list(snapshot.artifact_ids)),
-                snapshot.snapshot_sha256,
-                snapshot.source_revision,
-                snapshot.graph_content_revision,
-                snapshot.source_content_sha256,
-                snapshot.graph_content_sha256,
-            ),
-        )
+        self._db.execute(_SNAPSHOT_INSERT_SQL, _snapshot_insert_row(snapshot))
         return snapshot
 
     def snapshot(self, graph_revision: int | None = None) -> DiscourseSnapshot:
@@ -291,10 +312,7 @@ class DiscourseReceiptMixin:
         if graph_revision is None:
             return self._live_snapshot()
         row = self._db.execute(
-            "SELECT graph_revision, max_turn_ordinal, chunk_count, "
-            "schema_version, artifact_ids, snapshot_sha256, source_revision, "
-            "graph_content_revision, source_content_sha256, "
-            "graph_content_sha256 FROM discourse_graph_revisions "
+            f"SELECT {_SNAPSHOT_COLUMN_SQL} FROM discourse_graph_revisions "
             "WHERE graph_revision = ?",
             (int(graph_revision),),
         ).fetchone()

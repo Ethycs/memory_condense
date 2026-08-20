@@ -9,14 +9,10 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.domain.ranking import min_max_normalize, softmax
 from memory_condense.search.packing.source_provenance import (
     provenance_timestamp_key,
 )
-
-def _source_id(result: RetrievalResult) -> str:
-    return result.durable_source_id
-
 
 def _normalized_event_key(value: str | None) -> str | None:
     if value is None:
@@ -42,26 +38,15 @@ def _normalized_transport(value: Any) -> np.ndarray | None:
 
 
 def _normalized_scalars(values: Sequence[float]) -> list[float]:
-    if not values:
-        return []
-    low = min(values)
-    high = max(values)
-    if high - low <= 1e-12:
-        # An invariant component contains no ranking information. Treat it as
-        # neutral rather than as uniformly strong evidence.
-        return [0.5 for _value in values]
-    return [(float(value) - low) / (high - low) for value in values]
+    # An invariant component contains no ranking information. Treat it as
+    # neutral rather than as uniformly strong evidence.
+    return min_max_normalize([float(value) for value in values], flat_value=0.5)
 
 
 def _energy_softmax(energies: Sequence[float]) -> list[float]:
     """Stable normalization for posterior-shaped, explicitly uncalibrated scores."""
 
-    if not energies:
-        return []
-    peak = max(energies)
-    weights = [math.exp(max(-60.0, min(60.0, value - peak))) for value in energies]
-    total = sum(weights)
-    return [value / total for value in weights]
+    return softmax(energies, clamp=60.0)
 
 
 def _surface_value_evidence(text: str, timestamp: str | None) -> float:

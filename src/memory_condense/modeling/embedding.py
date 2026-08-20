@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import hmac
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 
 from memory_condense.domain.schemas import Chunk
+from memory_condense.modeling.checkpoint_identity import (
+    checkpoint_manifest_sha256,
+    verify_file_sha256,
+)
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
@@ -63,21 +65,12 @@ def _embedding_checkpoint_manifest_sha256(
     model_id: str,
     model_revision: str,
 ) -> str:
-    payload = {
-        "format": _EMBEDDING_CHECKPOINT_MANIFEST_FORMAT,
-        "model_id": str(model_id),
-        "model_revision": str(model_revision),
-        "files": {
-            str(name): str(digest).casefold()
-            for name, digest in sorted(file_hashes.items())
-        },
-    }
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return checkpoint_manifest_sha256(
+        file_hashes,
+        manifest_format=_EMBEDDING_CHECKPOINT_MANIFEST_FORMAT,
+        model_id=model_id,
+        model_revision=model_revision,
+    )
 
 
 BGE_M3_CHECKPOINT_SHA256 = _embedding_checkpoint_manifest_sha256(
@@ -85,16 +78,6 @@ BGE_M3_CHECKPOINT_SHA256 = _embedding_checkpoint_manifest_sha256(
     model_id=DEFAULT_MODEL_NAME,
     model_revision=DEFAULT_MODEL_REVISION,
 )
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as source:
-        buffer = bytearray(8 * 1024 * 1024)
-        view = memoryview(buffer)
-        while size := source.readinto(buffer):
-            digest.update(view[:size])
-    return digest.hexdigest()
 
 
 def verify_bge_m3_checkpoint(
@@ -135,16 +118,12 @@ def verify_bge_m3_checkpoint(
             raise FileNotFoundError(
                 f"incomplete BGE-M3 checkpoint under {root}: missing {relative}"
             )
-        actual_file_digest = _file_sha256(path)
-        if not hmac.compare_digest(
-            actual_file_digest,
-            str(expected_file_digest).casefold(),
-        ):
-            raise ValueError(
-                f"BGE-M3 SHA-256 mismatch for {relative}: expected "
-                f"{expected_file_digest}, got {actual_file_digest}"
-            )
-        actual_files[relative] = actual_file_digest
+        actual_files[relative] = verify_file_sha256(
+            path,
+            expected_file_digest,
+            name=relative,
+            context="BGE-M3",
+        )
     actual = _embedding_checkpoint_manifest_sha256(
         actual_files,
         model_id=DEFAULT_MODEL_NAME,
@@ -239,22 +218,10 @@ class EmbeddingService:
             texts, batch_size=self._batch_size, normalize_embeddings=False
         )
 
-        result: list[Chunk] = []
-        for i, chunk in enumerate(chunks):
-            result.append(
-                Chunk(
-                    chunk_id=chunk.chunk_id,
-                    turn_id=chunk.turn_id,
-                    text=chunk.text,
-                    start_char=chunk.start_char,
-                    end_char=chunk.end_char,
-                    token_count=chunk.token_count,
-                    embedding=dense_vecs[i].tolist(),
-                    lexical_weights=chunk.lexical_weights,
-                )
-            )
-
-        return result
+        return [
+            chunk.model_copy(update={"embedding": dense_vecs[i].tolist()})
+            for i, chunk in enumerate(chunks)
+        ]
 
     def embed_query(self, query: str) -> np.ndarray:
         """Compute a dense embedding for a single query string.

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 import shutil
 import tempfile
@@ -14,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.domain.integrity import file_sha256 as _file_sha256
 from memory_condense.persistence.db import CURRENT_SCHEMA_VERSION, Database
 from memory_condense.modeling.embedding import DEFAULT_MODEL_NAME, EmbeddingService
 from memory_condense.eval.benchmark import IngestFn, ingest_sample
@@ -56,24 +55,6 @@ class CompiledStoreManifest(BaseModel):
     index_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     model_config = {"frozen": True}
-
-
-def _canonical_sha256(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _embedding_identity(embedder: Any) -> tuple[str, int]:
@@ -143,7 +124,7 @@ def cache_key(
     environment_digest: str | None = None,
 ) -> str:
     """Address only write-time inputs; retrieval policy does not affect bytes."""
-    return _canonical_sha256(
+    return canonical_sha256(
         {
             "format": CACHE_FORMAT,
             "revision": CACHE_REVISION,

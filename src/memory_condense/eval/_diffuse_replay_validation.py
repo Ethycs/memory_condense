@@ -10,6 +10,7 @@ from memory_condense.domain.discourse import (
     DiscourseArtifact,
     DiscourseSnapshot,
     EpisodeSeed,
+    canonical_json,
     identity_sha256,
 )
 from memory_condense.eval.diffuse_compilation import (
@@ -62,7 +63,7 @@ def _keys(value: dict[str, object], expected: set[str], label: str) -> None:
 
 
 def _jsonable(value: object) -> object:
-    return json.loads(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    return json.loads(canonical_json(value))
 
 
 def _matched_arm_sha256(arm: DiffuseLongMemEvalArm) -> str:

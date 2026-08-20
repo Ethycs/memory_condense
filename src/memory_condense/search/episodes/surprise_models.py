@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from memory_condense.domain._discourse_identity import _nonempty, normalize_fields
 from memory_condense.domain.discourse import (
     EvidenceSpan,
     identity_sha256,
@@ -16,6 +17,18 @@ from memory_condense.domain.sealed import SealedIdentity
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _positive_exact(value: Any, label: str) -> int:
+    """Local exact integer at least one; keeps this module's messages."""
+
+    return exact_integer(value, label, minimum=1)
+
+
+def _nonnegative_exact(value: Any, label: str) -> int:
+    """Local exact integer at least zero; keeps this module's messages."""
+
+    return exact_integer(value, label, minimum=0)
 
 ATTENTION_HEAD_SURPRISE_FORMAT = (
     "memory-condense-attention-head-surprise-receipt-v1"
@@ -78,17 +91,48 @@ class AttentionHeadSurpriseReceipt(SealedIdentity):
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        for name in (
-            "model_id",
-            "model_revision",
-            "device",
-            "dtype",
-            "linker_implementation",
-        ):
-            value = str(getattr(self, name)).strip()
-            if not value:
-                raise ValueError(f"{name} must be non-empty")
-            object.__setattr__(self, name, value)
+        normalize_fields(
+            self,
+            model_id=_nonempty,
+            model_revision=_nonempty,
+            device=_nonempty,
+            dtype=_nonempty,
+            linker_implementation=_nonempty,
+        )
+        self._validate_digest_fields()
+        normalize_fields(
+            self,
+            prefix_layers=_positive_exact,
+            head_vote_k=_positive_exact,
+            max_input_spans=_positive_exact,
+            span_token_cap=_positive_exact,
+            probe_token_cap=_positive_exact,
+            max_transport_dimension=_positive_exact,
+            linker_max_candidates=_positive_exact,
+            linker_max_workspace_tokens=_positive_exact,
+            attention_layer=_nonnegative_exact,
+            input_spans=_nonnegative_exact,
+            workspace_batches=_nonnegative_exact,
+            forward_passes=_nonnegative_exact,
+            inspected_spans=_nonnegative_exact,
+            transport_dimension=_nonnegative_exact,
+            similarity_scalar_pairs=_nonnegative_exact,
+            max_workspace_candidates=_nonnegative_exact,
+            max_workspace_tokens=_nonnegative_exact,
+            total_workspace_tokens=_nonnegative_exact,
+            retained_signal_transformer_state_bytes=_nonnegative_exact,
+        )
+        self._validate_pinned_markers()
+        self._validate_workload()
+        # ``identity_payload`` is inherited: every field except the seal feeds
+        # the digest, including the constant format/algorithm markers.
+        self._seal()
+
+    def _validate_digest_fields(self) -> None:
+        """Require verbatim lowercase digests; stricter than the shared
+        ``_sha256`` normalizer, which would accept and lowercase uppercase
+        input instead of rejecting it."""
+
         for name in (
             "checkpoint_sha256",
             "implementation_sha256",
@@ -112,39 +156,10 @@ class AttentionHeadSurpriseReceipt(SealedIdentity):
                 "evidence_sequence_sha256",
                 evidence_digest,
             )
-        for name in (
-            "prefix_layers",
-            "head_vote_k",
-            "max_input_spans",
-            "span_token_cap",
-            "probe_token_cap",
-            "max_transport_dimension",
-            "linker_max_candidates",
-            "linker_max_workspace_tokens",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _exact_integer(getattr(self, name), name, minimum=1),
-            )
-        for name in (
-            "attention_layer",
-            "input_spans",
-            "workspace_batches",
-            "forward_passes",
-            "inspected_spans",
-            "transport_dimension",
-            "similarity_scalar_pairs",
-            "max_workspace_candidates",
-            "max_workspace_tokens",
-            "total_workspace_tokens",
-            "retained_signal_transformer_state_bytes",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _exact_integer(getattr(self, name), name, minimum=0),
-            )
+
+    def _validate_pinned_markers(self) -> None:
+        """Reject any drift from the pinned receipt format and algorithms."""
+
         if type(self.owned_runtime_binding) is not bool:
             raise ValueError("owned_runtime_binding must be boolean")
         if self.format != ATTENTION_HEAD_SURPRISE_FORMAT:
@@ -155,6 +170,10 @@ class AttentionHeadSurpriseReceipt(SealedIdentity):
             raise ValueError("unsupported attention-head surprise score formula")
         if self.head_similarity_algorithm != ATTENTION_HEAD_SIMILARITY_ALGORITHM:
             raise ValueError("unsupported attention-head similarity algorithm")
+
+    def _validate_workload(self) -> None:
+        """Cross-check the observed model work against every configured cap."""
+
         if self.attention_layer >= self.prefix_layers:
             raise ValueError("attention_layer must lie inside the loaded prefix")
         if self.input_spans > self.max_input_spans:
@@ -199,9 +218,6 @@ class AttentionHeadSurpriseReceipt(SealedIdentity):
             raise ValueError("total workspace exceeds its bounded batch budget")
         if self.retained_signal_transformer_state_bytes != 0:
             raise ValueError("attention-head signal cannot retain transformer state")
-        # ``identity_payload`` is inherited: every field except the seal feeds
-        # the digest, including the constant format/algorithm markers.
-        self._seal()
 
     def bind_evidence(
         self,

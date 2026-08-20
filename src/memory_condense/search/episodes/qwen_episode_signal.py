@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from memory_condense.domain._discourse_identity import exact_int
 from memory_condense.domain._tokenizer import (
     tokenizer_proxy_identity,
     truncate_to_tokens_lossless,
@@ -84,7 +85,7 @@ class QwenAttentionHeadSurpriseScorer:
             minimum=1,
         )
         self._lock = threading.Lock()
-        _qwen_linker_identity(linker)
+        qwen_linker_identity(linker, strict=True)
 
     def score(
         self,
@@ -127,7 +128,7 @@ class QwenAttentionHeadSurpriseScorer:
             )
         if embeddings is not None and len(tuple(embeddings)) != len(rows):
             raise ValueError("embeddings must align one-for-one with texts")
-        identity = _qwen_linker_identity(self.linker)
+        identity = qwen_linker_identity(self.linker, strict=True)
         implementation_sha256 = _attention_head_implementation_sha256(self.linker)
         similarities, stats = _head_transport_similarities(
             self.linker,
@@ -136,7 +137,7 @@ class QwenAttentionHeadSurpriseScorer:
             probe_token_cap=self.probe_token_cap,
             max_transport_dimension=self.max_transport_dimension,
         )
-        if _qwen_linker_identity(self.linker) != identity:
+        if qwen_linker_identity(self.linker, strict=True) != identity:
             raise RuntimeError("Qwen linker identity changed during surprise scoring")
         if (
             _attention_head_implementation_sha256(self.linker)
@@ -393,9 +394,68 @@ def _lossless_proxy_prefix(text: str, max_tokens: int) -> str:
     return truncate_to_tokens_lossless(str(text), cap)
 
 
-def _qwen_linker_identity(linker: Any) -> dict[str, str | int | bool]:
+def qwen_linker_identity(
+    linker: Any,
+    *,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Extract one Qwen linker's observable runtime identity.
+
+    ``strict=True`` (attention-head surprise scoring) demands a complete,
+    validated checkpoint/runtime identity bound to ``inspect_coverage`` and
+    raises on anything incomplete or CAV-bearing.  ``strict=False``
+    (query-time representative retrieval) binds whatever is observable
+    without trusting injected types: missing attributes become ``None``,
+    ownership is judged against ``inspect_nested``, and any failure merely
+    clears the owned-runtime qualification instead of raising.
+    """
+
     encoder = getattr(linker, "encoder", None)
     checkpoint = getattr(encoder, "checkpoint_identity", None)
+    if not strict:
+        raw_device = getattr(encoder, "device", None)
+        try:
+            from memory_condense.associations.qwen_memory_linker import (
+                QwenMemoryLinker,
+            )
+
+            inspection = getattr(linker, "inspect_nested", None)
+            owned = bool(
+                _owned_qwen_runtime_binding(linker)
+                and getattr(inspection, "__self__", None) is linker
+                and getattr(inspection, "__func__", None)
+                is QwenMemoryLinker.inspect_nested
+            )
+            implementation_sha256 = (
+                _attention_head_implementation_sha256(linker) if owned else None
+            )
+        except Exception:
+            owned = False
+            implementation_sha256 = None
+        return {
+            "implementation": (
+                f"{type(linker).__module__}.{type(linker).__qualname__}"
+            ),
+            "owned_runtime_binding": bool(owned),
+            "implementation_sha256": implementation_sha256,
+            "max_candidates": exact_int(
+                getattr(linker, "max_candidates", None),
+                "linker.max_candidates",
+            ),
+            "max_workspace_tokens": getattr(linker, "max_workspace_tokens", None),
+            "attention_layer": getattr(linker, "layer", None),
+            "head_vote_k": getattr(linker, "head_vote_k", None),
+            "model_id": getattr(checkpoint, "model_id", None),
+            "model_revision": getattr(checkpoint, "model_revision", None),
+            "checkpoint_sha256": getattr(checkpoint, "checkpoint_sha256", None),
+            "encoder_layers": getattr(encoder, "layers", None),
+            # Qwen3PrefixEncoder stores a torch.device, which is not
+            # JSON-native.  Its canonical string preserves the exact
+            # device/index while making the runtime identity strict-JSON
+            # serializable.
+            "device": None if raw_device is None else str(raw_device).strip(),
+            "dtype": getattr(encoder, "dtype_name", None),
+        }
     values: dict[str, str | int | bool] = {
         "model_id": str(getattr(checkpoint, "model_id", "")).strip(),
         "model_revision": str(
@@ -450,6 +510,12 @@ def _qwen_linker_identity(linker: Any) -> dict[str, str | int | bool]:
     return values
 
 
+def _qwen_linker_identity(linker: Any) -> dict[str, str | int | bool]:
+    """Back-compat spelling of :func:`qwen_linker_identity` in strict mode."""
+
+    return qwen_linker_identity(linker, strict=True)
+
+
 def _owned_qwen_receipt_matches(
     scorer: Any,
     receipt: AttentionHeadSurpriseReceipt | None,
@@ -461,7 +527,7 @@ def _owned_qwen_receipt_matches(
     if type(receipt) is not AttentionHeadSurpriseReceipt:
         return False
     try:
-        identity = _qwen_linker_identity(scorer.linker)
+        identity = qwen_linker_identity(scorer.linker, strict=True)
         if identity.get("owned_runtime_binding") is not True:
             return False
         if any(getattr(receipt, name) != value for name, value in identity.items()):
@@ -618,19 +684,9 @@ def _canonical_callable_code(
 ) -> bytes:
     """Marshal live code without checkout-specific absolute filenames."""
 
-    constants = tuple(
-        (
-            _canonical_code_object(value, stable_filename=stable_filename)
-            if isinstance(value, CodeType)
-            else value
-        )
-        for value in code.co_consts
+    return marshal.dumps(
+        _canonical_code_object(code, stable_filename=stable_filename)
     )
-    normalized = code.replace(
-        co_filename=str(stable_filename),
-        co_consts=constants,
-    )
-    return marshal.dumps(normalized)
 
 
 def _canonical_code_object(
@@ -652,4 +708,4 @@ def _canonical_code_object(
     )
 
 
-__all__ = ["QwenAttentionHeadSurpriseScorer"]
+__all__ = ["QwenAttentionHeadSurpriseScorer", "qwen_linker_identity"]

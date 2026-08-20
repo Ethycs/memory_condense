@@ -8,7 +8,10 @@ from typing import Any, Mapping
 from memory_condense.domain._discourse_identity import (
     _confidence,
     _json_mapping,
+    _labeled,
     _nonempty,
+    _nonnegative,
+    normalize_fields,
 )
 from memory_condense.domain.discourse import DiscourseUnit
 
@@ -26,25 +29,15 @@ class DiscourseUnitRoute:
     metadata: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "unit_id", _nonempty(self.unit_id, "unit_id"))
-        object.__setattr__(
+        normalize_fields(
             self,
-            "artifact_id",
-            _nonempty(self.artifact_id, "artifact_id"),
-        )
-        object.__setattr__(self, "kind", _nonempty(self.kind, "kind"))
-        object.__setattr__(
-            self,
-            "canonical_key",
-            _nonempty(self.canonical_key, "canonical_key"),
-        )
-        if self.asserted_ordinal < 0:
-            raise ValueError("asserted_ordinal must be non-negative")
-        object.__setattr__(self, "confidence", _confidence(self.confidence))
-        object.__setattr__(
-            self,
-            "metadata",
-            _json_mapping(self.metadata, "unit route metadata"),
+            unit_id=_nonempty,
+            artifact_id=_nonempty,
+            kind=_nonempty,
+            canonical_key=_nonempty,
+            asserted_ordinal=_nonnegative,
+            confidence=_confidence,
+            metadata=_labeled("unit route metadata", _json_mapping),
         )
 
     @classmethod

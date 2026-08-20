@@ -380,188 +380,129 @@ def _load_coverage_selector(args: argparse.Namespace, config: EvalConfig):
             strict=config.retrieval.coverage_selector_strict,
         )
 
-    if config.retrieval.coverage_selector_backend == "qwen_prefix":
+    def load_choice_selector():
+        from memory_condense.search.selectors.causal_choice_scorer import CausalChoiceScorer
 
-        return _LazyQwenPrefixCoverageSelector(
-            load_prefix_selector,
-            strict=config.retrieval.coverage_selector_strict,
-            allow_selected_scope_fixed_k_closure=(
-                config.retrieval.allow_selected_scope_fixed_k_closure
+        print(
+            "Loading staged generation-free choice scorer from "
+            f"{args.coverage_selector_choice_model_dir} "
+            f"({config.retrieval.coverage_selector_choice_model_id}@"
+            f"{config.retrieval.coverage_selector_choice_revision[:12]}, "
+            "K/V cache disabled)...",
+            flush=True,
+        )
+        scorer = CausalChoiceScorer.from_local_checkpoint(
+            args.coverage_selector_choice_model_dir,
+            model_id=config.retrieval.coverage_selector_choice_model_id,
+            model_revision=(
+                config.retrieval.coverage_selector_choice_revision
             ),
+            expected_weights_sha256=(
+                config.retrieval.coverage_selector_choice_checkpoint_sha256
+            ),
+            device=config.retrieval.coverage_selector_choice_device,
+            dtype=config.retrieval.coverage_selector_choice_dtype,
+            batch_size=config.retrieval.coverage_selector_choice_batch_size,
+            max_candidates=(
+                config.retrieval.coverage_selector_choice_max_candidates
+            ),
+            query_tokens=(
+                config.retrieval.coverage_selector_choice_query_tokens
+            ),
+            candidate_tokens=(
+                config.retrieval.coverage_selector_choice_candidate_tokens
+            ),
+            max_prompt_tokens=(
+                config.retrieval.coverage_selector_choice_max_prompt_tokens
+            ),
+            max_workspace_tokens=(
+                config.retrieval.coverage_selector_choice_max_workspace_tokens
+            ),
+            require_single_token_labels=True,
+            strict=config.retrieval.coverage_selector_strict,
+        )
+        try:
+            return load_prefix_selector(score_provider=scorer)
+        except BaseException:
+            scorer.close()
+            raise
+
+    def load_cross_encoder_selector():
+        import gc
+
+        import torch
+        from sentence_transformers import CrossEncoder
+
+        from memory_condense.search.selectors.cross_encoder_selector import (
+            MS_MARCO_MODEL_ID,
+            MS_MARCO_MODEL_REVISION,
+            MSMarcoCrossEncoderSelector,
+            verify_ms_marco_checkpoint,
         )
 
-    if config.retrieval.coverage_selector_backend == "qwen_prefix_choice":
-        if args.coverage_selector_choice_model_dir is None:
-            raise ValueError(
-                "forced-choice coverage selection requires "
-                "--coverage-selector-choice-model-dir"
-            )
-
-        def load_choice_selector():
-            from memory_condense.search.selectors.causal_choice_scorer import CausalChoiceScorer
-
-            print(
-                "Loading staged generation-free choice scorer from "
-                f"{args.coverage_selector_choice_model_dir} "
-                f"({config.retrieval.coverage_selector_choice_model_id}@"
-                f"{config.retrieval.coverage_selector_choice_revision[:12]}, "
-                "K/V cache disabled)...",
-                flush=True,
-            )
-            scorer = CausalChoiceScorer.from_local_checkpoint(
-                args.coverage_selector_choice_model_dir,
-                model_id=config.retrieval.coverage_selector_choice_model_id,
-                model_revision=(
-                    config.retrieval.coverage_selector_choice_revision
-                ),
-                expected_weights_sha256=(
-                    config.retrieval.coverage_selector_choice_checkpoint_sha256
-                ),
-                device=config.retrieval.coverage_selector_choice_device,
-                dtype=config.retrieval.coverage_selector_choice_dtype,
-                batch_size=config.retrieval.coverage_selector_choice_batch_size,
-                max_candidates=(
-                    config.retrieval.coverage_selector_choice_max_candidates
-                ),
-                query_tokens=(
-                    config.retrieval.coverage_selector_choice_query_tokens
+        checkpoint_sha256 = verify_ms_marco_checkpoint(
+            args.coverage_selector_cross_encoder_model_dir
+        )
+        print(
+            "Loading staged MS MARCO cross-encoder from "
+            f"{args.coverage_selector_cross_encoder_model_dir} "
+            f"({MS_MARCO_MODEL_ID}@{MS_MARCO_MODEL_REVISION[:12]}, "
+            f"sha256={checkpoint_sha256[:12]}...)...",
+            flush=True,
+        )
+        encoder = CrossEncoder(
+            str(args.coverage_selector_cross_encoder_model_dir),
+            device=config.retrieval.coverage_selector_cross_encoder_device,
+            local_files_only=True,
+            trust_remote_code=False,
+            max_length=(
+                config.retrieval.coverage_selector_cross_encoder_max_length
+            ),
+            model_kwargs={"use_safetensors": True},
+        )
+        duplicate_grouper = None
+        try:
+            if (
+                config.retrieval.coverage_selector_backend
+                == "cross_encoder_qwen_prefix"
+            ):
+                duplicate_grouper = load_prefix_selector()
+            return MSMarcoCrossEncoderSelector(
+                encoder,
+                candidate_pool=(
+                    config.retrieval.coverage_selector_cross_encoder_candidate_pool
                 ),
                 candidate_tokens=(
-                    config.retrieval.coverage_selector_choice_candidate_tokens
+                    config.retrieval.coverage_selector_candidate_tokens
                 ),
-                max_prompt_tokens=(
-                    config.retrieval.coverage_selector_choice_max_prompt_tokens
+                query_tokens=config.retrieval.coverage_selector_query_tokens,
+                batch_size=(
+                    config.retrieval.coverage_selector_cross_encoder_batch_size
                 ),
-                max_workspace_tokens=(
-                    config.retrieval.coverage_selector_choice_max_workspace_tokens
-                ),
-                require_single_token_labels=True,
-                strict=config.retrieval.coverage_selector_strict,
-            )
-            try:
-                return load_prefix_selector(score_provider=scorer)
-            except BaseException:
-                scorer.close()
-                raise
-
-        return _LazyQwenPrefixCoverageSelector(
-            load_choice_selector,
-            strict=config.retrieval.coverage_selector_strict,
-            allow_selected_scope_fixed_k_closure=(
-                config.retrieval.allow_selected_scope_fixed_k_closure
-            ),
-        )
-
-    if config.retrieval.coverage_selector_backend in {
-        "cross_encoder",
-        "cross_encoder_qwen_prefix",
-    }:
-        if args.coverage_selector_cross_encoder_model_dir is None:
-            raise ValueError(
-                "MS MARCO coverage selection requires "
-                "--coverage-selector-cross-encoder-model-dir"
-            )
-
-        def load_cross_encoder_selector():
-            import gc
-
-            import torch
-            from sentence_transformers import CrossEncoder
-
-            from memory_condense.search.selectors.cross_encoder_selector import (
-                MS_MARCO_MODEL_ID,
-                MS_MARCO_MODEL_REVISION,
-                MSMarcoCrossEncoderSelector,
-                verify_ms_marco_checkpoint,
-            )
-
-            checkpoint_sha256 = verify_ms_marco_checkpoint(
-                args.coverage_selector_cross_encoder_model_dir
-            )
-            print(
-                "Loading staged MS MARCO cross-encoder from "
-                f"{args.coverage_selector_cross_encoder_model_dir} "
-                f"({MS_MARCO_MODEL_ID}@{MS_MARCO_MODEL_REVISION[:12]}, "
-                f"sha256={checkpoint_sha256[:12]}...)...",
-                flush=True,
-            )
-            encoder = CrossEncoder(
-                str(args.coverage_selector_cross_encoder_model_dir),
-                device=config.retrieval.coverage_selector_cross_encoder_device,
-                local_files_only=True,
-                trust_remote_code=False,
                 max_length=(
                     config.retrieval.coverage_selector_cross_encoder_max_length
                 ),
-                model_kwargs={"use_safetensors": True},
+                max_workspace_tokens=(
+                    config.retrieval.coverage_selector_max_workspace_tokens
+                ),
+                duplicate_grouper=duplicate_grouper,
+                checkpoint_sha256=checkpoint_sha256,
+                semantic_rerank=(
+                    config.retrieval.coverage_selector_cross_encoder_semantic_rerank
+                ),
+                semantic_score_only=(
+                    config.retrieval.coverage_selector_cross_encoder_score_only
+                ),
+                strict=config.retrieval.coverage_selector_strict,
             )
-            duplicate_grouper = None
-            try:
-                if (
-                    config.retrieval.coverage_selector_backend
-                    == "cross_encoder_qwen_prefix"
-                ):
-                    duplicate_grouper = load_prefix_selector()
-                return MSMarcoCrossEncoderSelector(
-                    encoder,
-                    candidate_pool=(
-                        config.retrieval.coverage_selector_cross_encoder_candidate_pool
-                    ),
-                    candidate_tokens=(
-                        config.retrieval.coverage_selector_candidate_tokens
-                    ),
-                    query_tokens=config.retrieval.coverage_selector_query_tokens,
-                    batch_size=(
-                        config.retrieval.coverage_selector_cross_encoder_batch_size
-                    ),
-                    max_length=(
-                        config.retrieval.coverage_selector_cross_encoder_max_length
-                    ),
-                    max_workspace_tokens=(
-                        config.retrieval.coverage_selector_max_workspace_tokens
-                    ),
-                    duplicate_grouper=duplicate_grouper,
-                    checkpoint_sha256=checkpoint_sha256,
-                    semantic_rerank=(
-                        config.retrieval.coverage_selector_cross_encoder_semantic_rerank
-                    ),
-                    semantic_score_only=(
-                        config.retrieval.coverage_selector_cross_encoder_score_only
-                    ),
-                    strict=config.retrieval.coverage_selector_strict,
-                )
-            except BaseException:
-                if duplicate_grouper is not None:
-                    duplicate_grouper.close()
-                del encoder
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                raise
-
-        return _LazyCrossEncoderCoverageSelector(
-            load_cross_encoder_selector,
-            strict=config.retrieval.coverage_selector_strict,
-            semantic_rerank=(
-                config.retrieval.coverage_selector_cross_encoder_semantic_rerank
-            ),
-            semantic_score_only=(
-                config.retrieval.coverage_selector_cross_encoder_score_only
-            ),
-            allow_selected_scope_fixed_k_closure=(
-                config.retrieval.allow_selected_scope_fixed_k_closure
-            ),
-        )
-
-    if config.retrieval.coverage_selector_backend != "local_ini":
-        raise ValueError(
-            "unsupported coverage selector backend: "
-            f"{config.retrieval.coverage_selector_backend}"
-        )
-    if args.coverage_selector_local_model_dir is None:
-        raise ValueError(
-            "local INI coverage selection requires --coverage-selector-local-model-dir"
-        )
+        except BaseException:
+            if duplicate_grouper is not None:
+                duplicate_grouper.close()
+            del encoder
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
 
     def load_local_ini_selector():
         from memory_condense.search.selectors.coverage_selector import QueryConditionedCoverageSelector
@@ -599,13 +540,71 @@ def _load_coverage_selector(args: argparse.Namespace, config: EvalConfig):
             strict=config.retrieval.coverage_selector_strict,
         )
 
-    # Lazy so the local INI classifier loads only after BGE leaves the
-    # shared GPU.
-    return _LazyQwenPrefixCoverageSelector(
-        load_local_ini_selector,
-        allow_selected_scope_fixed_k_closure=(
-            config.retrieval.allow_selected_scope_fixed_k_closure
+    # Backend registry: each spec keeps one backend's genuine differences —
+    # lazy wrapper class, loader, eagerly-guarded model-dir argument (labeled
+    # for its error message), and extra wrapper controls.  The guard and
+    # construction tail below are shared.  Two deliberate asymmetries: the
+    # qwen_prefix model-dir guard stays inside load_prefix_selector so it
+    # still fails at load time rather than eagerly, and the local INI wrapper
+    # is never strict.
+    retrieval = config.retrieval
+    strict = {"strict": retrieval.coverage_selector_strict}
+    cross_encoder = (
+        _LazyCrossEncoderCoverageSelector,
+        load_cross_encoder_selector,
+        ("MS MARCO", "coverage_selector_cross_encoder_model_dir"),
+        {
+            **strict,
+            "semantic_rerank": (
+                retrieval.coverage_selector_cross_encoder_semantic_rerank
+            ),
+            "semantic_score_only": (
+                retrieval.coverage_selector_cross_encoder_score_only
+            ),
+        },
+    )
+    backends = {
+        "qwen_prefix": (
+            _LazyQwenPrefixCoverageSelector,
+            load_prefix_selector,
+            None,
+            strict,
         ),
+        "qwen_prefix_choice": (
+            _LazyQwenPrefixCoverageSelector,
+            load_choice_selector,
+            ("forced-choice", "coverage_selector_choice_model_dir"),
+            strict,
+        ),
+        "cross_encoder": cross_encoder,
+        "cross_encoder_qwen_prefix": cross_encoder,
+        "local_ini": (
+            _LazyQwenPrefixCoverageSelector,
+            load_local_ini_selector,
+            ("local INI", "coverage_selector_local_model_dir"),
+            {},
+        ),
+    }
+    spec = backends.get(retrieval.coverage_selector_backend)
+    if spec is None:
+        raise ValueError(
+            "unsupported coverage selector backend: "
+            f"{retrieval.coverage_selector_backend}"
+        )
+    wrapper, loader, guard, extra = spec
+    if guard is not None:
+        label, required_arg = guard
+        if getattr(args, required_arg) is None:
+            raise ValueError(
+                f"{label} coverage selection requires "
+                f"--{required_arg.replace('_', '-')}"
+            )
+    return wrapper(
+        loader,
+        allow_selected_scope_fixed_k_closure=(
+            retrieval.allow_selected_scope_fixed_k_closure
+        ),
+        **extra,
     )
 
 

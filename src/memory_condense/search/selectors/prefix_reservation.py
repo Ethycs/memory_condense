@@ -9,7 +9,6 @@ from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.search.selectors.coverage_models import CoverageSelectionReport
 from memory_condense.search.selectors.evidence_features import (
     _VENUE_QUERY_RE,
-    _source_id,
     _timestamp_key,
 )
 from memory_condense.search.selectors.prefix_models import (
@@ -188,7 +187,7 @@ def reserve_prefix_coverage(
             )
             representative_pool = performance_structural_pool
             representative_timestamp = timestamps.get(
-                _source_id(representative.result)
+                representative.result.durable_source_id
             )
         elif structural_pool:
             # Canonical identity can merge a direct occurrence and later
@@ -200,25 +199,25 @@ def reserve_prefix_coverage(
                 representative_pool,
                 key=lambda member: (
                     _timestamp_key(
-                        timestamps.get(_source_id(member.result))
+                        timestamps.get(member.result.durable_source_id)
                     )
                     is None,
                     _timestamp_key(
-                        timestamps.get(_source_id(member.result))
+                        timestamps.get(member.result.durable_source_id)
                     )
                     or 0.0,
                     member.index,
                 ),
             )
             representative_timestamp = timestamps.get(
-                _source_id(representative.result)
+                representative.result.durable_source_id
             )
         elif program.ordering is not SetOrdering.NONE:
             timed = [
                 (
                     member,
-                    timestamps.get(_source_id(member.result)),
-                    _timestamp_key(timestamps.get(_source_id(member.result))),
+                    timestamps.get(member.result.durable_source_id),
+                    _timestamp_key(timestamps.get(member.result.durable_source_id)),
                 )
                 for member in representative_pool
             ]
@@ -276,7 +275,7 @@ def reserve_prefix_coverage(
         representative_id = representative.result.chunk.chunk_id
         if representative_timestamp is None:
             representative_timestamp = timestamps.get(
-                _source_id(representative.result)
+                representative.result.durable_source_id
             )
         priority = (
             0.35 * representative.quality

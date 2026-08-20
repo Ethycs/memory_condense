@@ -279,11 +279,13 @@ class TestSchemaParity:
         """v2 is what a store written before this change actually looks like."""
         from memory_condense.persistence.db import _MIGRATIONS
 
-        v2_sql = _V1_SCHEMA.replace(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '1');", ""
-        ) + _MIGRATIONS[2].replace(
-            "UPDATE meta SET value = '2' WHERE key = 'schema_version';",
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '2');",
+        v2_sql = (
+            _V1_SCHEMA.replace(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
+                "",
+            )
+            + _MIGRATIONS[2]
+            + "\nINSERT INTO meta (key, value) VALUES ('schema_version', '2');\n"
         )
         with Database(tmp_path / "fresh2.db") as db:
             fresh = self._shape(db)
@@ -298,6 +300,10 @@ class TestSchemaParity:
         conn.executescript(_V1_SCHEMA)
         for target in range(2, 10):
             conn.executescript(_MIGRATIONS[target])
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(target),),
+            )
         assert conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()[0] == "9"
@@ -319,6 +325,10 @@ def test_v10_historical_graph_receipts_are_retired_to_one_v11_baseline(tmp_path)
     conn.executescript(_V1_SCHEMA)
     for target in range(2, 11):
         conn.executescript(_MIGRATIONS[target])
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(target),),
+        )
     conn.execute(
         "INSERT INTO turns "
         "(turn_id, role, text, source_id, created_at, ordinal) "
@@ -389,6 +399,10 @@ def test_failed_post_migration_rolls_back_ddl_and_version_then_reopens(
     conn.executescript(_V1_SCHEMA)
     for version in range(2, target):
         conn.executescript(db_module._MIGRATIONS[version])
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(version),),
+        )
     conn.commit()
     conn.close()
 
@@ -442,13 +456,9 @@ class TestV4TurnCoordinateBackfill:
             _V1_SCHEMA.replace(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', '1');", ""
             )
-            + _MIGRATIONS[2].replace(
-                "UPDATE meta SET value = '2' WHERE key = 'schema_version';", ""
-            )
-            + _MIGRATIONS[3].replace(
-                "UPDATE meta SET value = '3' WHERE key = 'schema_version';",
-                "INSERT INTO meta (key, value) VALUES ('schema_version', '3');",
-            )
+            + _MIGRATIONS[2]
+            + _MIGRATIONS[3]
+            + "\nINSERT INTO meta (key, value) VALUES ('schema_version', '3');\n"
         )
         conn = sqlite3.connect(str(path))
         conn.executescript(sql)

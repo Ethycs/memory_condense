@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
+from memory_condense.domain._discourse_identity import exact_int
 from memory_condense.domain._tokenizer import (
     count_chat_prompt_token_proxy,
     count_tokens,
@@ -19,6 +19,7 @@ from memory_condense.domain.discourse import (
     EvidenceBundle,
     EvidencePacket,
     QueryProgram,
+    evidence_span_sort_key,
     identity_sha256,
 )
 
@@ -82,16 +83,7 @@ class _PromptBudget:
 def _atom_sort_key(
     atom: EvidenceAtom,
 ) -> tuple[int, str, int, int, int, str, str, str]:
-    return (
-        atom.span.ordinal,
-        atom.span.source_id or "",
-        atom.span.turn_start_char,
-        atom.span.start_char,
-        atom.span.end_char,
-        atom.span.chunk_id,
-        atom.span.quote_sha256,
-        atom.atom_id,
-    )
+    return (*evidence_span_sort_key(atom.span), atom.atom_id)
 
 
 def _label_scalar(value: object) -> str:
@@ -159,22 +151,20 @@ def render_evidence_context(
     return "\n\n".join(lines)
 
 
-def _state_key(
+def _state_order_key(
     state: _BeamState,
     *,
     required_total: frozenset[str],
-) -> tuple[float | int | tuple[str, ...], ...]:
-    required_complete = int(required_total <= state.obligation_ids)
-    # ``tuple(-ord(...))`` would obscure determinism.  The caller sorts with
-    # reverse=True on the numeric prefix, then uses bundle IDs explicitly.
+) -> tuple[int, float, float, float, int, int, tuple[str, ...]]:
+    """Ascending beam objective: lexicographically smaller states are better."""
     return (
-        required_complete,
-        state.required_weight,
-        state.desired_weight,
-        state.utility,
-        state.direct_raw_count,
-        -_state_budget_cost(state),
-        tuple(reversed(state.bundle_ids)),
+        -int(required_total <= state.obligation_ids),
+        -state.required_weight,
+        -state.desired_weight,
+        -state.utility,
+        -state.direct_raw_count,
+        _state_budget_cost(state),
+        state.bundle_ids,
     )
 
 
@@ -185,25 +175,19 @@ def _prune_beam(
     beam_width: int,
 ) -> list[_BeamState]:
     # Two different paths can reach the same selected bundle set.  Retain only
-    # the best canonical state before the bounded sort.
+    # the best canonical state before the bounded sort.  The dedup dict keys on
+    # bundle_ids, so the key's bundle-ID tie-break element is inert in this
+    # comparison and only the numeric prefix decides.
     unique: dict[tuple[str, ...], _BeamState] = {}
     for state in states:
         current = unique.get(state.bundle_ids)
-        if current is None or _state_key(
+        if current is None or _state_order_key(
             state, required_total=required_total
-        ) > _state_key(current, required_total=required_total):
+        ) < _state_order_key(current, required_total=required_total):
             unique[state.bundle_ids] = state
     ordered = sorted(
         unique.values(),
-        key=lambda state: (
-            -int(required_total <= state.obligation_ids),
-            -state.required_weight,
-            -state.desired_weight,
-            -state.utility,
-            -state.direct_raw_count,
-            _state_budget_cost(state),
-            state.bundle_ids,
-        ),
+        key=lambda state: _state_order_key(state, required_total=required_total),
     )
     return ordered[:beam_width]
 
@@ -213,6 +197,42 @@ def _state_budget_cost(state: _BeamState) -> int:
         state.prompt_token_count
         if state.prompt_token_count is not None
         else state.token_count
+    )
+
+
+def _measure(
+    atoms: Sequence[EvidenceAtom],
+    bundles: Sequence[EvidenceBundle],
+    *,
+    encoding: str,
+    prompt_budget: _PromptBudget | None,
+    max_context_tokens: int,
+) -> tuple[str, int, int | None]:
+    """Render one candidate context and measure both budgets exactly once.
+
+    The chat-prompt proxy is skipped for contexts that already exceed the hard
+    context ceiling: every caller rejects those on the context count alone.
+    """
+    context = render_evidence_context(atoms, bundles)
+    tokens = count_tokens(context, encoding=encoding)
+    prompt_tokens = (
+        None
+        if prompt_budget is None or tokens > max_context_tokens
+        else prompt_budget.prompt_tokens(context, encoding=encoding)
+    )
+    return context, tokens, prompt_tokens
+
+
+def _prompt_overflow(
+    prompt_tokens: int | None,
+    prompt_budget: _PromptBudget | None,
+) -> bool:
+    """True when the exact chat prompt plus output reserve exceeds its ceiling."""
+    return (
+        prompt_budget is not None
+        and prompt_tokens is not None
+        and prompt_tokens + prompt_budget.output_token_reserve
+        > prompt_budget.max_prompt_tokens
     )
 
 
@@ -338,10 +358,7 @@ def _normalize_prompt_budget(
     max_prompt_tokens: int | None,
     output_token_reserve: int,
 ) -> _PromptBudget | None:
-    reserve = _exact_nonnegative_int(
-        output_token_reserve,
-        "output_token_reserve",
-    )
+    reserve = exact_int(output_token_reserve, "output_token_reserve", minimum=0)
     if not isinstance(evidence_message_role, str):
         raise TypeError("evidence_message_role must be a string")
     role = evidence_message_role.strip()
@@ -360,7 +377,7 @@ def _normalize_prompt_budget(
             )
         return None
 
-    maximum = _exact_nonnegative_int(max_prompt_tokens, "max_prompt_tokens")
+    maximum = exact_int(max_prompt_tokens, "max_prompt_tokens", minimum=0)
     normalized_messages: list[dict[str, str]] = []
     for index, message in enumerate(raw_messages):
         if not isinstance(message, Mapping):
@@ -394,19 +411,6 @@ def _normalize_prompt_budget(
     )
 
 
-def _exact_nonnegative_int(value: object, label: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be a non-negative integer")
-    try:
-        normalized = int(value)  # type: ignore[arg-type]
-        exact = math.isfinite(float(value)) and float(value) == float(normalized)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be a non-negative integer") from exc
-    if not exact or normalized < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
-    return normalized
-
-
 def pack_evidence_plan(
     plan: ClosurePlan,
     *,
@@ -433,9 +437,10 @@ def pack_evidence_plan(
     concatenated before BPE counting, so cross-boundary token merges and the
     chat framing allowance are both included during every beam admission.
     """
-    max_context_tokens = _exact_nonnegative_int(
+    max_context_tokens = exact_int(
         max_context_tokens,
         "max_context_tokens",
+        minimum=0,
     )
     prompt_budget = _normalize_prompt_budget(
         base_messages=base_messages,
@@ -467,18 +472,14 @@ def pack_evidence_plan(
     candidates = ranked_candidates[: plan.policy.max_bundles]
     candidate_cap_drops = ranked_candidates[plan.policy.max_bundles :]
 
-    empty_context = render_evidence_context((), ())
-    empty_prompt_tokens = (
-        None
-        if prompt_budget is None
-        else prompt_budget.prompt_tokens(empty_context, encoding=encoding)
+    _, empty_tokens, empty_prompt_tokens = _measure(
+        (),
+        (),
+        encoding=encoding,
+        prompt_budget=prompt_budget,
+        max_context_tokens=max_context_tokens,
     )
-    if (
-        prompt_budget is not None
-        and empty_prompt_tokens is not None
-        and empty_prompt_tokens + prompt_budget.output_token_reserve
-        > prompt_budget.max_prompt_tokens
-    ):
+    if _prompt_overflow(empty_prompt_tokens, prompt_budget):
         raise ValueError(
             "base chat prompt, evidence framing, and output reserve exceed "
             "max_prompt_tokens before evidence admission"
@@ -492,7 +493,7 @@ def pack_evidence_plan(
             desired_weight=0.0,
             utility=0.0,
             direct_raw_count=0,
-            token_count=count_tokens(empty_context, encoding=encoding),
+            token_count=empty_tokens,
             prompt_token_count=empty_prompt_tokens,
         )
     ]
@@ -516,21 +517,16 @@ def pack_evidence_plan(
                 atom_by_id[atom_id]
                 for atom_id in next_atom_ids
             )
-            rendered = render_evidence_context(selected_atoms, selected_bundles)
-            tokens = count_tokens(rendered, encoding=encoding)
+            _, tokens, prompt_tokens = _measure(
+                selected_atoms,
+                selected_bundles,
+                encoding=encoding,
+                prompt_budget=prompt_budget,
+                max_context_tokens=max_context_tokens,
+            )
             if tokens > max_context_tokens:
                 continue
-            prompt_tokens = (
-                None
-                if prompt_budget is None
-                else prompt_budget.prompt_tokens(rendered, encoding=encoding)
-            )
-            if (
-                prompt_budget is not None
-                and prompt_tokens is not None
-                and prompt_tokens + prompt_budget.output_token_reserve
-                > prompt_budget.max_prompt_tokens
-            ):
+            if _prompt_overflow(prompt_tokens, prompt_budget):
                 continue
             new_obligations = next_obligation_ids - state.obligation_ids
             required_gain = sum(
@@ -579,20 +575,17 @@ def pack_evidence_plan(
             key=_atom_sort_key,
         )
     )
-    context = render_evidence_context(selected_atoms, selected_bundles)
-    exact_tokens = count_tokens(context, encoding=encoding)
+    context, exact_tokens, exact_prompt_tokens = _measure(
+        selected_atoms,
+        selected_bundles,
+        encoding=encoding,
+        prompt_budget=prompt_budget,
+        max_context_tokens=max_context_tokens,
+    )
     if exact_tokens > max_context_tokens:  # pragma: no cover - defensive
         raise AssertionError("atomic evidence packer exceeded its hard budget")
-    exact_prompt_tokens = (
-        None
-        if prompt_budget is None
-        else prompt_budget.prompt_tokens(context, encoding=encoding)
-    )
-    if (
-        prompt_budget is not None
-        and exact_prompt_tokens is not None
-        and exact_prompt_tokens + prompt_budget.output_token_reserve
-        > prompt_budget.max_prompt_tokens
+    if _prompt_overflow(
+        exact_prompt_tokens, prompt_budget
     ):  # pragma: no cover - defensive
         raise AssertionError("atomic evidence packer exceeded its hard prompt budget")
 
@@ -610,25 +603,19 @@ def pack_evidence_plan(
         )
         trial_atom_ids = set(best.atom_ids) | set(bundle.atom_ids)
         trial_atoms = tuple(atom_by_id[item] for item in trial_atom_ids)
-        trial_tokens = count_tokens(
-            render_evidence_context(trial_atoms, trial_bundles),
+        _, trial_tokens, trial_prompt_tokens = _measure(
+            trial_atoms,
+            trial_bundles,
             encoding=encoding,
+            prompt_budget=prompt_budget,
+            max_context_tokens=max_context_tokens,
         )
         if trial_tokens > max_context_tokens:
             dropped[bundle.bundle_id] = "hard_budget"
             continue
-        if prompt_budget is not None:
-            trial_context = render_evidence_context(trial_atoms, trial_bundles)
-            trial_prompt_tokens = prompt_budget.prompt_tokens(
-                trial_context,
-                encoding=encoding,
-            )
-            if (
-                trial_prompt_tokens + prompt_budget.output_token_reserve
-                > prompt_budget.max_prompt_tokens
-            ):
-                dropped[bundle.bundle_id] = "hard_prompt_budget"
-                continue
+        if _prompt_overflow(trial_prompt_tokens, prompt_budget):
+            dropped[bundle.bundle_id] = "hard_prompt_budget"
+            continue
         dropped[bundle.bundle_id] = "lower_utility"
 
     required_selected = required_total <= best.obligation_ids

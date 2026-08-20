@@ -7,6 +7,7 @@ import re
 from collections import Counter
 from typing import Sequence
 
+from memory_condense.domain.ranking import round_robin_unique
 from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.search.indexes.lexical import tokenize
 
@@ -135,27 +136,10 @@ def source_diverse_results(
 ) -> list[RetrievalResult]:
     """Round-robin ranked chunks by durable source, preserving local order."""
 
-    source_order: list[str] = []
     groups: dict[str, list[RetrievalResult]] = {}
     for result in candidates:
-        source_id = result.source_key
-        if source_id not in groups:
-            source_order.append(source_id)
-            groups[source_id] = []
-        groups[source_id].append(result)
-    output: list[RetrievalResult] = []
-    depth = 0
-    while True:
-        added = False
-        for source_id in source_order:
-            group = groups[source_id]
-            if depth >= len(group):
-                continue
-            output.append(group[depth])
-            added = True
-        if not added:
-            return output
-        depth += 1
+        groups.setdefault(result.source_key, []).append(result)
+    return round_robin_unique(list(groups.values()))
 
 
 def _source_partition(source_id: str, separator: str) -> str:

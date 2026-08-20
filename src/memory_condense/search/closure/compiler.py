@@ -11,6 +11,14 @@ import re
 from collections.abc import Iterable
 
 from memory_condense.domain.discourse import EvidenceObligation, QueryProgram
+from memory_condense.domain.text_numbers import NUMBER_WORDS as _NUMBER_WORDS
+from memory_condense.search.closure.semantics import (
+    CONFLICT_RELATIONS,
+    DEPENDENCY_RELATIONS,
+    RESOLUTION_RELATIONS,
+    REVISION_RELATIONS,
+    TEST_RESULT_RELATIONS,
+)
 
 
 _INTENTS = {
@@ -47,28 +55,6 @@ _EXPLICIT_COUNT_PATTERNS = tuple(
         rf"(?<![/\.\w])(?P<count>{_COUNT_TOKEN})\s+(?:items?|entries|members|examples|options|issues|features|results|events|steps)\b",
     )
 )
-_NUMBER_WORDS = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-    "eleven": 11,
-    "twelve": 12,
-    "thirteen": 13,
-    "fourteen": 14,
-    "fifteen": 15,
-    "sixteen": 16,
-    "seventeen": 17,
-    "eighteen": 18,
-    "nineteen": 19,
-    "twenty": 20,
-}
 
 # These words express query grammar, not a content domain.  Removing them
 # leaves stable content-bearing terms for deterministic store-side matching.
@@ -217,35 +203,15 @@ _REVISION_KINDS = (
     "amendment",
 )
 
-_REVISION_RELATIONS = (
-    "revises",
-    "supersedes",
-    "retracts",
-    "amends",
-    "replaces",
-    "corrects",
-    "updates",
-)
-_CONFLICT_RELATIONS = (
-    "contradicts",
-    "conflicts_with",
-    "opposes",
-    "inconsistent_with",
-)
-_RESOLUTION_RELATIONS = (
-    "resolves",
-    "accepts",
-    "rejects",
-    "qualifies",
-    "settles",
-    "chooses",
-)
-_DEPENDENCY_RELATIONS = (
-    "depends_on",
-    "requires",
-    "blocked_by",
-    "prerequisite_for",
-)
+# Relation families come from the shared closure ontology in ``semantics``.
+# Obligation ``relation_types`` are ordered tuples inside a sealed
+# ``QueryProgram``, so each family is frozen into one deterministic sorted
+# tuple here rather than re-declared.
+_REVISION_RELATIONS = tuple(sorted(REVISION_RELATIONS))
+_CONFLICT_RELATIONS = tuple(sorted(CONFLICT_RELATIONS))
+_RESOLUTION_RELATIONS = tuple(sorted(RESOLUTION_RELATIONS))
+_DEPENDENCY_RELATIONS = tuple(sorted(DEPENDENCY_RELATIONS))
+# Compiler-only family: has no counterpart in the shared ontology.
 _EXPLANATION_RELATIONS = (
     "causes",
     "explains",
@@ -254,18 +220,10 @@ _EXPLANATION_RELATIONS = (
     "depends_on",
     "requires",
 )
-_TEST_RESULT_RELATIONS = (
-    "tests",
-    "validates",
-    "evaluates",
-    "checks",
-    "produces",
-    "results_in",
-    "measures",
-    "observes",
-    "implements",
-    "addresses",
-)
+# Walk-time semantics credit "causes" as a test-result relation, but compiled
+# obligations deliberately exclude it (open author decision).  The explicit
+# subtraction preserves that compiled behavior.
+_TEST_RESULT_RELATIONS = tuple(sorted(TEST_RESULT_RELATIONS - {"causes"}))
 
 
 def compile_query_program(
@@ -274,22 +232,18 @@ def compile_query_program(
     intent: str | None = None,
     subject_terms: Iterable[str] | None = None,
     as_of_ordinal: int | None = None,
-    manual_program: QueryProgram | None = None,
 ) -> QueryProgram:
     """Compile one query, or return an explicitly supplied manual program.
 
-    Passing a :class:`QueryProgram` either as ``query`` or ``manual_program``
-    is the fail-closed manual path used by evaluation fixtures.  Overrides are
-    rejected on that path so the program identity cannot be silently changed.
+    Passing a :class:`QueryProgram` as ``query`` is the fail-closed manual
+    path used by evaluation fixtures.  Overrides are rejected on that path so
+    the program identity cannot be silently changed.
     """
 
-    supplied = query if isinstance(query, QueryProgram) else manual_program
-    if supplied is not None:
-        if isinstance(query, QueryProgram) and manual_program is not None:
-            raise ValueError("supply a manual query program only once")
+    if isinstance(query, QueryProgram):
         if intent is not None or subject_terms is not None or as_of_ordinal is not None:
             raise ValueError("manual query programs cannot be partially overridden")
-        return supplied
+        return query
 
     body = str(query).strip()
     if not body:

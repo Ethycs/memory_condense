@@ -25,9 +25,7 @@ import re
 from memory_condense.persistence.db import Database
 from memory_condense.domain.schemas import (
     CreateOp,
-    DeleteOp,
     MemoryOps,
-    PinOp,
     Provenance,
     SupersedeOp,
     UpdateOp,
@@ -78,12 +76,14 @@ class Validator:
         # Per-call cache so a batch of ops over one turn hits SQLite once.
         turn_cache: dict[str, str | None] = {}
 
-        for op in ops.create:
-            error = self._check_create(op, "create", turn_cache)
+        def admit(op, error: ValidationError | None, bucket: list) -> None:
             if error is None:
-                accepted.create.append(op)
+                bucket.append(op)
             else:
                 rejected.append(error)
+
+        for op in ops.create:
+            admit(op, self._check_create(op, "create", turn_cache), accepted.create)
 
         for update in ops.update:
             error = self._check_mem_id(update.mem_id, "update")
@@ -91,33 +91,19 @@ class Validator:
                 error = self._check_provenance(
                     update.provenance, "update", turn_cache, required=False
                 )
-            if error is None:
-                accepted.update.append(update)
-            else:
-                rejected.append(error)
+            admit(update, error, accepted.update)
 
         for sup in ops.supersede:
             error = self._check_mem_id(sup.mem_id, "supersede")
             if error is None:
                 error = self._check_create(sup.replacement, "supersede", turn_cache)
-            if error is None:
-                accepted.supersede.append(sup)
-            else:
-                rejected.append(error)
+            admit(sup, error, accepted.supersede)
 
         for dele in ops.delete:
-            error = self._check_mem_id(dele.mem_id, "delete")
-            if error is None:
-                accepted.delete.append(dele)
-            else:
-                rejected.append(error)
+            admit(dele, self._check_mem_id(dele.mem_id, "delete"), accepted.delete)
 
         for pin in ops.pin:
-            error = self._check_mem_id(pin.mem_id, "pin")
-            if error is None:
-                accepted.pin.append(pin)
-            else:
-                rejected.append(error)
+            admit(pin, self._check_mem_id(pin.mem_id, "pin"), accepted.pin)
 
         return ValidationReport(accepted=accepted, rejected=rejected)
 

@@ -15,14 +15,16 @@ from memory_condense.eval.mem0_models import (
     _PreparedBatch,
     _PreparedCorpus,
 )
-from memory_condense.ingest.loader import BenchmarkSample
+from memory_condense.ingest.loader import (
+    BenchmarkSample,
+    _parse_longmemeval_date,
+)
 
 
 _SESSION_DATE_RE = re.compile(
     r"^\[(?P<session>.+?) took place at (?P<date>.+?)\]$",
     re.IGNORECASE,
 )
-_WEEKDAY_RE = re.compile(r"\s+\([^)]*\)\s+")
 
 def _response_rows(response: Any, *, operation: str) -> list[Mapping[str, Any]]:
     """Strictly normalize documented list/``{"results": [...]}`` variants."""
@@ -115,19 +117,17 @@ def _safe_label_value(value: Any) -> str:
 
 
 def _parse_session_date(value: str) -> datetime:
-    cleaned = _WEEKDAY_RE.sub(" ", value.strip())
-    for format_string in (
-        "%Y/%m/%d %H:%M",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-    ):
-        try:
-            return datetime.strptime(cleaned, format_string)
-        except ValueError:
-            continue
-    raise Mem0ProtocolError(
-        f"Unsupported haystack session date {value!r}; chronology cannot be certified."
-    )
+    """Parse a session date via the canonical loader parser (UTC-aware).
+
+    Certified chronology cannot tolerate an unparseable date, so the loader's
+    ``None`` failure signal is promoted to :class:`Mem0ProtocolError` here.
+    """
+    parsed = _parse_longmemeval_date(value)
+    if parsed is None:
+        raise Mem0ProtocolError(
+            f"Unsupported haystack session date {value!r}; chronology cannot be certified."
+        )
+    return parsed
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,7 +194,11 @@ def _session_blocks(sample: BenchmarkSample) -> tuple[_SessionBlock, ...]:
 
     def sort_key(block: _SessionBlock) -> tuple[int, datetime, int]:
         if not block.date:
-            return (1, datetime.max, block.original_index)
+            return (
+                1,
+                datetime.max.replace(tzinfo=timezone.utc),
+                block.original_index,
+            )
         return (0, _parse_session_date(block.date), block.original_index)
 
     return tuple(sorted(blocks, key=sort_key))

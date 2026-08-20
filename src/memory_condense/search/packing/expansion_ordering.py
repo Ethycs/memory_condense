@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict, deque
+from collections import defaultdict
 
 from memory_condense.domain._tokenizer import count_tokens, truncate_to_tokens
+from memory_condense.domain.ranking import weighted_fair_order
 from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.search.indexes.lexical import tokenize
 from memory_condense.search.packing.packing_contracts import EXPANSION_PREFIX
@@ -295,53 +296,24 @@ class _ExpansionOrderingMixin:
         """
 
         source_heat: dict[str, float] = {}
-        queues: dict[str, deque[RetrievalResult]] = defaultdict(deque)
         for result in expansions:
-            source_id = result.memory_source_id or result.chunk.turn_id
-            queues[source_id].append(result)
             if result.source_heat is not None:
+                source_id = self._result_source_id(result)
                 source_heat[source_id] = max(
                     source_heat.get(source_id, 0.0), float(result.source_heat)
                 )
         if not source_heat or sum(source_heat.values()) <= 0.0:
             return expansions
 
-        served: dict[str, int] = defaultdict(int)
-        ordered: list[RetrievalResult] = []
-        source_cap = max(
-            1,
-            math.ceil(
-                self.budget.expansion_tokens
-                * self.budget.max_source_expansion_fraction
-            ),
+        return weighted_fair_order(
+            expansions,
+            source_key=self._result_source_id,
+            source_weight=source_heat,
+            item_cost=lambda result: result.chunk.token_count,
+            item_priority=lambda result: float(result.diffusion_heat or 0.0),
+            total_budget=self.budget.expansion_tokens,
+            max_source_fraction=self.budget.max_source_expansion_fraction,
+            # Each rendered expansion is truncated to this ceiling, so a long
+            # chunk must not be billed for tokens it will never spend.
+            cost_clip=self.budget.max_expansion_tokens,
         )
-        while any(queues.values()):
-            choices: list[tuple[float, float, str, RetrievalResult]] = []
-            capped: list[tuple[float, float, str, RetrievalResult]] = []
-            for source_id, queue in queues.items():
-                if not queue:
-                    continue
-                result = queue[0]
-                cost = max(
-                    1,
-                    min(result.chunk.token_count, self.budget.max_expansion_tokens),
-                )
-                weight = max(source_heat.get(source_id, 0.0), 1e-12)
-                choice = (
-                    (served[source_id] + cost) / weight,
-                    -float(result.diffusion_heat or 0.0),
-                    source_id,
-                    result,
-                )
-                choices.append(choice)
-                if served[source_id] == 0 or served[source_id] + cost <= source_cap:
-                    capped.append(choice)
-            pool = capped or choices
-            _, _, source_id, result = min(pool)
-            queues[source_id].popleft()
-            served[source_id] += max(
-                1,
-                min(result.chunk.token_count, self.budget.max_expansion_tokens),
-            )
-            ordered.append(result)
-        return ordered

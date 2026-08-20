@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.domain.integrity import file_sha256 as _file_sha256
 from memory_condense.application.condenser import MemoryCondenser, query_facets
 from memory_condense.search.packing.context_packer import ContextBudget
 from memory_condense.modeling.embedding import DEFAULT_MODEL_NAME, EmbeddingService
@@ -67,14 +68,6 @@ def _held_out_query_batch(
                 )
             )
     return list(dict.fromkeys(queries))
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _causal_cache_key(

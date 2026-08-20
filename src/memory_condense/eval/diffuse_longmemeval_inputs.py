@@ -6,13 +6,15 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.domain._discourse_identity import _nonempty, normalize_fields
 from memory_condense.domain.discourse import identity_sha256, quote_sha256
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.domain.sealed import SealedIdentity
+from memory_condense.eval._identity import sha256_digest
 from memory_condense.eval.schemas import RetrievalConfig
-from memory_condense.ingest.loader import BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 from memory_condense.search.episodes import (
     EpisodeSourceCandidate,
     EpisodeSourceCandidateScope,
@@ -24,15 +26,6 @@ DETERMINISTIC_DIFFUSE_INGEST_FORMAT = (
     "memory-condense-longmemeval-diffuse-ingest-v1"
 )
 _MISSING_TIMESTAMP_SENTINEL = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-
-def _digest(value: object, label: str) -> str:
-    normalized = str(value)
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return normalized
 
 
 def _embedding_sha256(values: Sequence[float] | None) -> str | None:
@@ -110,11 +103,12 @@ class GoldBlindLongMemEvalQuestion:
     prompt_question: str
 
     def __post_init__(self) -> None:
-        for name in ("question_id", "retrieval_query", "prompt_question"):
-            normalized = str(getattr(self, name)).strip()
-            if not normalized:
-                raise ValueError(f"{name} must be non-empty")
-            object.__setattr__(self, name, normalized)
+        normalize_fields(
+            self,
+            question_id=_nonempty,
+            retrieval_query=_nonempty,
+            prompt_question=_nonempty,
+        )
 
     @property
     def probe_sha256(self) -> str:
@@ -139,10 +133,7 @@ class GoldBlindLongMemEvalSample:
     corpus_sha256: str
 
     def __post_init__(self) -> None:
-        sample_id = str(self.sample_id).strip()
-        if not sample_id:
-            raise ValueError("sample_id must be non-empty")
-        object.__setattr__(self, "sample_id", sample_id)
+        normalize_fields(self, sample_id=_nonempty)
         if not self.turns:
             raise ValueError("diffuse analysis requires a non-empty haystack")
         if len(self.turn_source_ids) != len(self.turns):
@@ -160,7 +151,7 @@ class GoldBlindLongMemEvalSample:
             self.questions
         ):
             raise ValueError("question IDs must be unique within one sample")
-        _digest(self.corpus_sha256, "corpus_sha256")
+        sha256_digest(self.corpus_sha256, "corpus_sha256")
         expected = _corpus_sha256(
             self.sample_id,
             self.turns,
@@ -297,6 +288,16 @@ def _corpus_sha256(
     )
 
 
+def _question_probe(question: BenchmarkQuestion) -> GoldBlindLongMemEvalQuestion:
+    """Project one benchmark question into its gold-blind probe."""
+
+    return GoldBlindLongMemEvalQuestion(
+        question_id=question.question_id,
+        retrieval_query=question.question,
+        prompt_question=question.dated_question,
+    )
+
+
 def gold_blind_longmemeval_sample(
     sample: BenchmarkSample,
 ) -> GoldBlindLongMemEvalSample:
@@ -310,12 +311,7 @@ def gold_blind_longmemeval_sample(
         raise ValueError("turn_created_at must be empty or parallel to turns")
     turns = tuple((str(role), str(text)) for role, text in sample.turns)
     questions = tuple(
-        GoldBlindLongMemEvalQuestion(
-            question_id=question.question_id,
-            retrieval_query=question.question,
-            prompt_question=question.dated_question,
-        )
-        for question in sample.questions
+        _question_probe(question) for question in sample.questions
     )
     return GoldBlindLongMemEvalSample(
         sample_id=str(sample.sample_id),
@@ -363,8 +359,10 @@ class LegacyDiffuseCandidates:
 
 
 @dataclass(frozen=True, slots=True)
-class LegacyDiffuseInputReceipt:
+class LegacyDiffuseInputReceipt(SealedIdentity):
     """Text-free binding of one exact legacy retrieval/router output."""
+
+    _SEAL_MISMATCH = "legacy diffuse input receipt does not match"
 
     artifact_id: str
     query_sha256: str
@@ -388,36 +386,41 @@ class LegacyDiffuseInputReceipt:
             "anchor_sequence_sha256",
             "source_candidate_sequence_sha256",
         ):
-            _digest(getattr(self, name), name)
+            sha256_digest(getattr(self, name), name)
         if self.source_candidate_scope_receipt_sha256 is not None:
-            _digest(
+            sha256_digest(
                 self.source_candidate_scope_receipt_sha256,
                 "source_candidate_scope_receipt_sha256",
             )
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("legacy diffuse input receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
+        self._seal()
 
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
-        payload = {
-            "format": self.format,
-            "artifact_id": self.artifact_id,
-            "query_sha256": self.query_sha256,
-            "retrieval_policy_sha256": self.retrieval_policy_sha256,
-            "anchor_sequence_sha256": self.anchor_sequence_sha256,
-            "source_candidate_sequence_sha256": (
-                self.source_candidate_sequence_sha256
-            ),
-            "source_candidate_scope_receipt_sha256": (
-                self.source_candidate_scope_receipt_sha256
-            ),
-            "anchor_chunk_ids": list(self.anchor_chunk_ids),
-            "source_candidate_ids": list(self.source_candidate_ids),
-        }
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+
+def _receipt_bindings(
+    candidates: LegacyDiffuseCandidates,
+) -> dict[str, object]:
+    """Candidate-derived receipt fields, shared by sealing and verification."""
+
+    scope = candidates.source_candidate_scope
+    return {
+        "anchor_sequence_sha256": identity_sha256(
+            tuple(_anchor_identity(item) for item in candidates.anchors)
+        ),
+        "source_candidate_sequence_sha256": identity_sha256(
+            tuple(
+                _source_candidate_identity(item)
+                for item in candidates.source_candidates
+            )
+        ),
+        "source_candidate_scope_receipt_sha256": (
+            None if scope is None else scope.receipt_sha256
+        ),
+        "anchor_chunk_ids": tuple(
+            item.chunk.chunk_id for item in candidates.anchors
+        ),
+        "source_candidate_ids": tuple(
+            item.source_id for item in candidates.source_candidates
+        ),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,38 +429,12 @@ class ExactLegacyDiffuseInputs:
     receipt: LegacyDiffuseInputReceipt
 
     def __post_init__(self) -> None:
-        anchor_payload = tuple(
-            _anchor_identity(item) for item in self.candidates.anchors
-        )
-        source_payload = tuple(
-            _source_candidate_identity(item)
-            for item in self.candidates.source_candidates
-        )
-        if self.receipt.anchor_sequence_sha256 != identity_sha256(
-            anchor_payload
+        expected = _receipt_bindings(self.candidates)
+        if any(
+            getattr(self.receipt, name) != value
+            for name, value in expected.items()
         ):
-            raise ValueError("legacy input receipt does not bind its anchors")
-        if self.receipt.source_candidate_sequence_sha256 != identity_sha256(
-            source_payload
-        ):
-            raise ValueError(
-                "legacy input receipt does not bind its source candidates"
-            )
-        if self.receipt.anchor_chunk_ids != tuple(
-            item.chunk.chunk_id for item in self.candidates.anchors
-        ):
-            raise ValueError("legacy input receipt anchor coordinates changed")
-        if self.receipt.source_candidate_ids != tuple(
-            item.source_id for item in self.candidates.source_candidates
-        ):
-            raise ValueError("legacy input receipt source coordinates changed")
-        scope_receipt = (
-            None
-            if self.candidates.source_candidate_scope is None
-            else self.candidates.source_candidate_scope.receipt_sha256
-        )
-        if self.receipt.source_candidate_scope_receipt_sha256 != scope_receipt:
-            raise ValueError("legacy input receipt does not bind its source scope")
+            raise ValueError("legacy input receipt does not bind its candidates")
 
 
 def capture_legacy_diffuse_inputs(
@@ -475,10 +452,6 @@ def capture_legacy_diffuse_inputs(
         raise ValueError("query and artifact_id must be non-empty")
     if not isinstance(candidates, LegacyDiffuseCandidates):
         raise TypeError("legacy provider must return LegacyDiffuseCandidates")
-    anchor_payload = tuple(_anchor_identity(item) for item in candidates.anchors)
-    source_payload = tuple(
-        _source_candidate_identity(item) for item in candidates.source_candidates
-    )
     scope = candidates.source_candidate_scope
     if scope is not None:
         if scope.artifact_id != normalized_artifact:
@@ -491,17 +464,7 @@ def capture_legacy_diffuse_inputs(
         retrieval_policy_sha256=identity_sha256(
             retrieval.model_dump(mode="json")
         ),
-        anchor_sequence_sha256=identity_sha256(anchor_payload),
-        source_candidate_sequence_sha256=identity_sha256(source_payload),
-        source_candidate_scope_receipt_sha256=(
-            None if scope is None else scope.receipt_sha256
-        ),
-        anchor_chunk_ids=tuple(
-            item.chunk.chunk_id for item in candidates.anchors
-        ),
-        source_candidate_ids=tuple(
-            item.source_id for item in candidates.source_candidates
-        ),
+        **_receipt_bindings(candidates),
     )
     return ExactLegacyDiffuseInputs(candidates=candidates, receipt=receipt)
 

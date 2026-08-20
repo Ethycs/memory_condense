@@ -5,6 +5,10 @@ from __future__ import annotations
 from memory_condense.domain import decay
 from memory_condense.eval.answer_value_coverage import contains_answer
 from memory_condense.eval.schemas import EvalConfig
+from memory_condense.eval.search_kwargs import (
+    graph_search_kwargs,
+    source_search_kwargs,
+)
 from memory_condense.search.packing.context_packer import is_source_metadata_text
 
 def _assemble(
@@ -28,52 +32,7 @@ def _assemble(
         graph_results = (
             mc.search_hybrid_graph(
                 question,
-                k=config.retrieval.k,
-                neighbor_radius=config.retrieval.neighbor_radius,
-                neighbor_slots=config.retrieval.neighbor_slots,
-                neighbor_direction=config.retrieval.neighbor_direction,
-                source_slots=config.retrieval.source_slots,
-                source_candidate_pool=config.retrieval.source_candidate_pool,
-                source_activation_k=config.retrieval.source_activation_k,
-                query_facet_retrieval=config.retrieval.query_facet_retrieval,
-                query_facet_slots=config.retrieval.query_facet_slots,
-                query_facet_max=config.retrieval.query_facet_max,
-                role_aware_retrieval=config.retrieval.role_aware_retrieval,
-                role_user_weight=config.retrieval.role_user_weight,
-                role_assistant_weight=config.retrieval.role_assistant_weight,
-                role_system_weight=config.retrieval.role_system_weight,
-                multi_fact_source_diversity=(
-                    config.retrieval.multi_fact_source_diversity
-                ),
-                source_tfisf_activation=(
-                    config.retrieval.source_tfisf_activation
-                ),
-                source_tfisf_slots=config.retrieval.source_tfisf_slots,
-                source_hsc_activation=config.retrieval.source_hsc_activation,
-                source_hsc_slots=config.retrieval.source_hsc_slots,
-                source_hsc_hops=config.retrieval.source_hsc_hops,
-                source_hsc_chunk_slots=(
-                    config.retrieval.source_hsc_chunk_slots
-                ),
-                source_partition_routing=(
-                    config.retrieval.source_partition_routing
-                ),
-                source_partition_slots=config.retrieval.source_partition_slots,
-                source_partition_separator=(
-                    config.retrieval.source_partition_separator
-                ),
-                source_local_search=config.retrieval.source_local_search,
-                use_source_reranker=config.retrieval.qwen_rerank,
-                use_attention_feedback=config.retrieval.qwen_feedback,
-                feedback_slots=config.retrieval.qwen_feedback_slots,
-                feedback_seed_slots=config.retrieval.qwen_feedback_seed_slots,
-                feedback_evidence_tokens=(
-                    config.retrieval.qwen_feedback_evidence_tokens
-                ),
-                feedback_query_tokens=config.retrieval.qwen_feedback_query_tokens,
-                ef_search=config.retrieval.ef_search,
-                candidates=config.retrieval.candidates,
-                alpha=config.retrieval.alpha,
+                **graph_search_kwargs(config.retrieval, routing=True),
             )
             if config.retrieval.mode == "causal_graph"
             else None
@@ -105,15 +64,7 @@ def _assemble(
         if graph_results is not None:
             mc.last_raw_graph_source_ids = list(
                 dict.fromkeys(
-                    str(
-                        result.memory_source_id
-                        or (
-                            result.turn.source_id
-                            if result.turn is not None
-                            else None
-                        )
-                        or result.chunk.turn_id
-                    )
+                    result.durable_source_id
                     for result in graph_results
                     if not is_source_metadata_text(result.chunk.text)
                 )
@@ -160,59 +111,12 @@ def _assemble(
     elif config.retrieval.mode == "hybrid_source":
         results = mc.search_hybrid_sources(
             question,
-            k=config.retrieval.k,
-            source_slots=config.retrieval.source_slots,
-            source_candidate_pool=config.retrieval.source_candidate_pool,
-            source_activation_k=config.retrieval.source_activation_k,
-            query_facet_retrieval=config.retrieval.query_facet_retrieval,
-            query_facet_slots=config.retrieval.query_facet_slots,
-            query_facet_max=config.retrieval.query_facet_max,
-            role_aware_retrieval=config.retrieval.role_aware_retrieval,
-            role_user_weight=config.retrieval.role_user_weight,
-            role_assistant_weight=config.retrieval.role_assistant_weight,
-            role_system_weight=config.retrieval.role_system_weight,
-            multi_fact_source_diversity=(
-                config.retrieval.multi_fact_source_diversity
-            ),
-            source_partition_routing=config.retrieval.source_partition_routing,
-            source_partition_slots=config.retrieval.source_partition_slots,
-            source_partition_separator=(
-                config.retrieval.source_partition_separator
-            ),
-            source_local_search=config.retrieval.source_local_search,
-            use_source_reranker=config.retrieval.qwen_rerank,
-            ef_search=config.retrieval.ef_search,
-            candidates=config.retrieval.candidates,
-            alpha=config.retrieval.alpha,
+            **source_search_kwargs(config.retrieval),
         )
     elif config.retrieval.mode == "hybrid_graph":
         results = mc.search_hybrid_graph(
             question,
-            k=config.retrieval.k,
-            neighbor_radius=config.retrieval.neighbor_radius,
-            neighbor_slots=config.retrieval.neighbor_slots,
-            neighbor_direction=config.retrieval.neighbor_direction,
-            source_slots=config.retrieval.source_slots,
-            source_candidate_pool=config.retrieval.source_candidate_pool,
-            source_activation_k=config.retrieval.source_activation_k,
-            source_tfisf_activation=config.retrieval.source_tfisf_activation,
-            source_tfisf_slots=config.retrieval.source_tfisf_slots,
-            source_hsc_activation=config.retrieval.source_hsc_activation,
-            source_hsc_slots=config.retrieval.source_hsc_slots,
-            source_hsc_hops=config.retrieval.source_hsc_hops,
-            source_hsc_chunk_slots=config.retrieval.source_hsc_chunk_slots,
-            source_local_search=config.retrieval.source_local_search,
-            use_source_reranker=config.retrieval.qwen_rerank,
-            use_attention_feedback=config.retrieval.qwen_feedback,
-            feedback_slots=config.retrieval.qwen_feedback_slots,
-            feedback_seed_slots=config.retrieval.qwen_feedback_seed_slots,
-            feedback_evidence_tokens=(
-                config.retrieval.qwen_feedback_evidence_tokens
-            ),
-            feedback_query_tokens=config.retrieval.qwen_feedback_query_tokens,
-            ef_search=config.retrieval.ef_search,
-            candidates=config.retrieval.candidates,
-            alpha=config.retrieval.alpha,
+            **graph_search_kwargs(config.retrieval),
         )
     elif config.retrieval.mode == "hybrid_neighbor":
         results = mc.search_hybrid_neighbors(

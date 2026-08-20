@@ -47,7 +47,16 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=CLI_EPILOG,
     )
+    _add_mode_arguments(parser)
+    _add_model_arguments(parser)
+    _add_qwen_rerank_arguments(parser)
+    _add_coverage_selector_arguments(parser)
+    _add_run_arguments(parser)
+    _add_retrieval_arguments(parser)
+    return parser
 
+
+def _add_mode_arguments(parser: argparse.ArgumentParser) -> None:
     # Mode selection
     parser.add_argument(
         "--conversation-dir",
@@ -106,6 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+
+def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
     # Models — import the defaults so the CLI can never drift from the schema.
     parser.add_argument(
         "--judge-model",
@@ -164,6 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "bfloat16", "float16", "float32"),
         default="auto",
     )
+
+
+def _add_qwen_rerank_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--qwen-rerank-model-dir",
         type=Path,
@@ -213,6 +227,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qwen-feedback-slots", type=int, default=12)
     parser.add_argument("--qwen-feedback-evidence-tokens", type=int, default=48)
     parser.add_argument("--qwen-feedback-query-tokens", type=int, default=384)
+
+
+def _add_coverage_selector_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--coverage-selector-local-model-dir",
         type=Path,
@@ -394,6 +411,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
 
+
+def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--results-dir", default="./eval_results", help="Output directory"
     )
@@ -492,6 +511,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write per-turn results as CSV (with --compare, writes the treatment run)",
     )
 
+
+def _add_retrieval_arguments(parser: argparse.ArgumentParser) -> None:
     # Retrieval / chunker params
     parser.add_argument("--min-tokens", type=int, default=120)
     parser.add_argument("--max-tokens", type=int, default=250)
@@ -731,5 +752,3 @@ def build_parser() -> argparse.ArgumentParser:
             "of packing anonymous timestamp-only chunks"
         ),
     )
-
-    return parser

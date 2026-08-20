@@ -9,6 +9,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+from memory_condense.domain._discourse_identity import (
+    canonical_json as _canonical_json,
+)
 from memory_condense.eval.campaign_models import (
     CampaignMergeError,
     LockedValidationPlan,
@@ -37,16 +40,6 @@ _BINARY_JUDGE_VERDICT = re.compile(
 
 def _json_constant(value: str) -> None:
     raise CampaignMergeError(f"non-finite JSON number {value!r} is not allowed")
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
 
 
 def _file_sha256(payload: bytes) -> str:

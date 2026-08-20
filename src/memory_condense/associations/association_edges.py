@@ -11,6 +11,7 @@ from memory_condense.associations.association_models import (
     StoredHeadEdge,
     evidence_weighted_mean,
 )
+from memory_condense.persistence.db import INDEXED_CHUNK_SQL
 
 
 class AssociationEdgeStoreMixin:
@@ -217,7 +218,7 @@ class AssociationEdgeStoreMixin:
             "FROM chunk_head_edges AS e "
             "JOIN chunks AS c ON c.chunk_id = e.destination_chunk_id "
             f"WHERE e.source_chunk_id IN ({placeholders}) AND e.artifact_id = ? "
-            "AND c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL",
+            f"AND {INDEXED_CHUNK_SQL}",
             (*sources, artifact_id),
         ).fetchall()
         edges_by_source: dict[str, list[StoredHeadEdge]] = {

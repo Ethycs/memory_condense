@@ -14,11 +14,11 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 from pydantic import BaseModel, Field
 
-from memory_condense.domain.schemas import Turn
+from memory_condense.persistence.transcript_store import format_source_metadata
 
 # .txt format: "User:\n<text>" / "Claude:\n <text>"
 _TXT_TURN_RE = re.compile(
@@ -226,6 +226,43 @@ def _normalize_role(raw: Any, index: int) -> str:
     return "user" if index % 2 == 0 else "assistant"
 
 
+def _append_session_turns(
+    sample_turns: list[tuple[str, str]],
+    turn_source_ids: list[str | None],
+    *,
+    source_id: str,
+    boundary_timestamp: str | None,
+    session_turns: Sequence[Any],
+    text_keys: tuple[str, str],
+    role_for: Callable[[dict[str, Any], int], str],
+    turn_created_at: list[datetime | None] | None = None,
+    created_at: datetime | None = None,
+) -> None:
+    """Flatten one benchmark session onto a sample's parallel turn lists.
+
+    Emits the synthetic boundary turn first when the session carries a
+    timestamp, then every well-formed turn.  Format differences stay at the
+    call site: which content key wins (``text_keys``) and how a raw turn maps
+    to a role (``role_for``).
+    """
+
+    def record(role: str, text: str) -> None:
+        sample_turns.append((role, text))
+        turn_source_ids.append(source_id)
+        if turn_created_at is not None:
+            turn_created_at.append(created_at)
+
+    if boundary_timestamp:
+        record("system", format_source_metadata(source_id, boundary_timestamp))
+    for index, turn in enumerate(session_turns):
+        if not isinstance(turn, dict):
+            continue
+        text = _as_text(turn.get(text_keys[0], turn.get(text_keys[1])))
+        if not text:
+            continue
+        record(role_for(turn, index), text)
+
+
 _LONGMEMEVAL_WEEKDAY_RE = re.compile(r"\([^)]*\)")
 
 
@@ -331,24 +368,17 @@ def parse_longmemeval(data: Any) -> list[BenchmarkSample]:
             session_date,
             parsed_date,
         ) in session_rows:
-            if session_date:
-                turns.append(
-                    (
-                        "system",
-                        f"[{source_id} took place at {session_date}]",
-                    )
-                )
-                turn_source_ids.append(source_id)
-                turn_created_at.append(parsed_date)
-            for j, turn in enumerate(session):
-                if not isinstance(turn, dict):
-                    continue
-                text = _as_text(turn.get("content", turn.get("text")))
-                if not text:
-                    continue
-                turns.append((_normalize_role(turn.get("role"), j), text))
-                turn_source_ids.append(source_id)
-                turn_created_at.append(parsed_date)
+            _append_session_turns(
+                turns,
+                turn_source_ids,
+                source_id=source_id,
+                boundary_timestamp=session_date or None,
+                session_turns=session,
+                text_keys=("content", "text"),
+                role_for=lambda turn, j: _normalize_role(turn.get("role"), j),
+                turn_created_at=turn_created_at,
+                created_at=parsed_date,
+            )
 
         answer = _as_answer_text(record.get("answer"))
         if not answer:
@@ -434,6 +464,16 @@ def parse_locomo(data: Any) -> list[BenchmarkSample]:
         turn_source_ids: list[str | None] = []
         first_speaker: str | None = None
 
+        def speaker_role(turn: dict[str, Any], index: int) -> str:
+            nonlocal first_speaker
+            speaker = turn.get("speaker")
+            if isinstance(speaker, str) and speaker.strip():
+                speaker = speaker.strip()
+                if first_speaker is None:
+                    first_speaker = speaker
+                return "user" if speaker == first_speaker else "assistant"
+            return _normalize_role(None, index)
+
         for _, key in session_keys:
             # Ingest the session's timestamp as its own turn.
             #
@@ -446,28 +486,17 @@ def parse_locomo(data: Any) -> list[BenchmarkSample]:
             # categories. A benchmark run on that corpus would have scored the
             # retrieval system for information it was never given.
             date_time = conversation.get(f"{key}_date_time")
-            if isinstance(date_time, str) and date_time.strip():
-                turns.append(("system", f"[{key} took place at {date_time.strip()}]"))
-                turn_source_ids.append(key)
-
-            for j, turn in enumerate(conversation[key]):
-                if not isinstance(turn, dict):
-                    continue
-                text = _as_text(turn.get("text", turn.get("content")))
-                if not text:
-                    continue
-
-                speaker = turn.get("speaker")
-                if isinstance(speaker, str) and speaker.strip():
-                    speaker = speaker.strip()
-                    if first_speaker is None:
-                        first_speaker = speaker
-                    role = "user" if speaker == first_speaker else "assistant"
-                else:
-                    role = _normalize_role(None, j)
-
-                turns.append((role, text))
-                turn_source_ids.append(key)
+            _append_session_turns(
+                turns,
+                turn_source_ids,
+                source_id=key,
+                boundary_timestamp=(
+                    date_time.strip() if isinstance(date_time, str) else None
+                ),
+                session_turns=conversation[key],
+                text_keys=("text", "content"),
+                role_for=speaker_role,
+            )
 
         questions: list[BenchmarkQuestion] = []
         qa_list = record.get("qa") or []

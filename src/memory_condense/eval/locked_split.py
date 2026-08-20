@@ -13,7 +13,15 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from memory_condense.domain.integrity import file_sha256
 from memory_condense.ingest.loader import BenchmarkSample
+
+__all__ = [
+    "LockedSplitManifest",
+    "file_sha256",
+    "load_split_manifest",
+    "select_locked_split",
+]
 
 
 class LockedSplitManifest(BaseModel):
@@ -28,14 +36,6 @@ class LockedSplitManifest(BaseModel):
     def model_post_init(self, __context) -> None:
         if not self.splits or any(count < 1 for count in self.splits.values()):
             raise ValueError("locked split counts must all be positive")
-
-
-def file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def load_split_manifest(path: str | Path) -> LockedSplitManifest:

@@ -18,7 +18,6 @@ from memory_condense.search.selectors.coverage_models import (
     CoverageSelectionReport,
 )
 from memory_condense.search.selectors.evidence_features import (
-    _source_id,
     _timestamp_key,
 )
 from memory_condense.search.selectors.set_program import (
@@ -218,7 +217,7 @@ class QueryConditionedCoverageSelector:
         rows: list[str] = []
         accepted = 0
         for index, result in enumerate(candidates[: self.candidate_pool]):
-            source_id = _source_id(result)
+            source_id = result.durable_source_id
             fields = (
                 source_id,
                 (source_timestamps or {}).get(source_id),

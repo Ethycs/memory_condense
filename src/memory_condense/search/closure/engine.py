@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from memory_condense.domain.discourse import (
@@ -14,21 +14,22 @@ from memory_condense.domain.discourse import (
     DiscourseUnit,
     Episode,
     EpisodeSeed,
-    EvidenceSpan,
     QueryProgram,
 )
-from memory_condense.search.closure.bundles import BundleAssembly, assemble_bundles
+from memory_condense.search.closure.bundles import assemble_bundles
 from memory_condense.search.closure.request import (
     bound_closure_inputs,
     resolve_artifact_id,
     resolve_program,
 )
 from memory_condense.search.closure.results import completion, obligation_results
-from memory_condense.search.closure.scope_scan import scan_artifact_units
+from memory_condense.search.closure.scope_scan import (
+    PROBE_OVERFLOW_MESSAGE,
+    scan_artifact_units,
+)
 from memory_condense.search.closure.semantics import (
     relation_confers_subject_connection,
     relation_is_useful,
-    relation_obligation_ids,
     relation_priority,
     unit_obligation_ids,
     unit_priority,
@@ -64,7 +65,11 @@ class _Walk:
     relation_budget_exhaustive: bool = True
     hop_budget_exhaustive: bool = True
     max_visited_hop: int = 0
-    capped: bool = False
+
+
+#: One scope witness to record: (subject_id, returned_count, exhaustive, detail).
+_WitnessRow = tuple[str, int, bool, Mapping[str, object]]
+_WitnessRows = Sequence[_WitnessRow]
 
 
 class EvidenceClosureEngine:
@@ -133,13 +138,13 @@ class EvidenceClosureEngine:
             walk = _Walk({}, [], {}, [], {}, [], set())
             unit_routes: dict[str, _UnitRoute] = {}
         else:
-            walk, unit_routes = self._walk(
-                program,
+            walk, unit_routes = _ClosureWalk(
+                self.store,
+                policy=self.policy,
+                program=program,
                 artifact_id=selected_artifact_id,
                 snapshot=snapshot,
-                seeds=normalized_seeds,
-                raw_chunk_ids=raw_chunk_ids,
-            )
+            ).run(seeds=normalized_seeds, raw_chunk_ids=raw_chunk_ids)
         walk.scope_witnesses.extend(bounded_inputs.scope_witnesses)
         if expansion_receipt_sha256 is not None:
             _record_witness(
@@ -173,7 +178,7 @@ class EvidenceClosureEngine:
                 program,
                 connected=(
                     unit_id in walk.connected_unit_ids
-                    or unit_routes.get(unit_id, _UnitRoute(unit, 0, 3, False)).connected
+                    or ((route := unit_routes.get(unit_id)) is not None and route.connected)
                 ),
             )
             for unit_id, unit in walk.units.items()
@@ -238,539 +243,106 @@ class EvidenceClosureEngine:
             artifact_id=selected_artifact_id,
         )
 
-    def _walk(
+
+class _ClosureWalk:
+    """Single-use owner of one bounded graph walk over an artifact scope.
+
+    Phases, in receipt order: scan the artifact-wide scope, seed episodes and
+    hop-0 unit routes, expand relations hop by hop, then emit the walk-wide
+    budget receipts.  Every store probe funnels through :func:`_probe`, so no
+    phase can skip the scope witnesses that ``completion()`` relies on.
+    """
+
+    __slots__ = (
+        "artifact_id", "policy", "program", "routes", "snapshot", "store", "walk",
+    )
+
+    def __init__(
         self,
-        program: QueryProgram,
+        store: EvidenceClosureStore,
         *,
+        policy: ClosurePolicy,
+        program: QueryProgram,
         artifact_id: str,
         snapshot: DiscourseSnapshot,
+    ) -> None:
+        self.store = store
+        self.policy = policy
+        self.program = program
+        self.artifact_id = artifact_id
+        self.snapshot = snapshot
+        self.walk = _Walk({}, [], {}, [], {}, [], set())
+        self.routes: dict[str, _UnitRoute] = {}
+
+    def run(
+        self,
+        *,
         seeds: Sequence[EpisodeSeed],
         raw_chunk_ids: Sequence[str],
     ) -> tuple[_Walk, dict[str, _UnitRoute]]:
-        walk = _Walk({}, [], {}, [], {}, [], set())
-        global_units = self._artifact_scope(
-            walk,
-            program,
-            artifact_id=artifact_id,
-            snapshot=snapshot,
-        )
-        trusted_episode_ids = self._seed_episodes(
-            walk,
-            artifact_id=artifact_id,
-            seeds=seeds,
-            raw_chunk_ids=raw_chunk_ids,
-        )
-        if trusted_episode_ids:
-            episode_chunks = tuple(
-                sorted(
-                    {
-                        span.chunk_id
-                        for episode_id in trusted_episode_ids
-                        for span in walk.episodes[episode_id].evidence
-                    }
-                )
-            )
-            self._annotation_coverage(
-                walk,
-                artifact_id=artifact_id,
-                chunks=episode_chunks,
-                coverage_kind="episode",
-                witness_kind="episode_coverage",
-                completion_critical=False,
-            )
-        neighbor_ids = self._temporal_neighbors(
-            walk,
-            artifact_id=artifact_id,
-            trusted_episode_ids=trusted_episode_ids,
-        )
-        _record_witness(
-            walk,
-            kind="episode_budget",
-            subject_id=artifact_id,
-            requested_limit=self.policy.max_frontier,
-            returned_count=len(walk.episodes),
-            exhaustive=True,
-            detail={
-                "seed_count": len(seeds),
-                "neighbor_radius": self.policy.max_episode_neighbors,
-                "route_truncated": not walk.episode_budget_exhaustive,
-            },
-        )
-        trusted_chunks = tuple(
-            sorted(
-                set(raw_chunk_ids)
-                | {
-                    span.chunk_id
-                    for episode_id in trusted_episode_ids
-                    if episode_id in walk.episodes
-                    for span in walk.episodes[episode_id].evidence
-                }
-            )
-        )
-        neighbor_chunks = tuple(
-            sorted(
-                {
-                    span.chunk_id
-                    for episode_id in neighbor_ids
-                    if episode_id in walk.episodes
-                    for span in walk.episodes[episode_id].evidence
-                }
-                - set(trusted_chunks)
-            )
-        )
-        graph_chunks = tuple(sorted(set(trusted_chunks) | set(neighbor_chunks)))
-        self._annotation_coverage(
-            walk,
-            artifact_id=artifact_id,
-            chunks=graph_chunks,
-            coverage_kind="discourse",
-            witness_kind="annotation_coverage",
-        )
+        """Execute the walk once and return its state plus the offered routes."""
 
-        unit_routes: dict[str, _UnitRoute] = {}
-        for unit in global_units:
-            matched = bool(unit_obligation_ids(unit, program, connected=False))
-            if matched:
-                _offer_route(
-                    unit_routes,
-                    unit,
-                    hop=0,
-                    route_rank=3,
-                    connected=True,
-                )
-        candidate_limit = self.policy.max_units + 1
-        trusted_units = self._units_for_chunks(
-            walk,
-            program,
-            artifact_id=artifact_id,
-            chunks=trusted_chunks,
-            route_rank=0,
-            witness_subject="trusted_chunks",
-            limit=candidate_limit,
-        )
-        for unit in trusted_units:
-            _offer_route(
-                unit_routes,
-                unit,
-                hop=0,
-                route_rank=0,
-                connected=bool(
-                    unit_obligation_ids(unit, program, connected=False)
-                ),
-            )
-        if neighbor_chunks:
-            temporal_units = self._units_for_chunks(
-                walk,
-                program,
-                artifact_id=artifact_id,
-                chunks=neighbor_chunks,
-                route_rank=2,
-                witness_subject="temporal_chunks",
-                limit=candidate_limit,
-            )
-            for unit in temporal_units:
-                _offer_route(unit_routes, unit, hop=0, route_rank=2, connected=False)
+        global_units = self._scan_artifact_scope()
+        trusted_chunks, neighbor_chunks = self._seed(seeds, raw_chunk_ids)
+        self._seed_unit_routes(global_units, trusted_chunks, neighbor_chunks)
+        pending_direct = self._direct_relations(trusted_chunks)
+        self._expand(pending_direct)
+        self._budget_receipts()
+        return self.walk, self.routes
 
-        relation_probe_limit = self.policy.max_relations + 1
-        try:
-            probed_direct_relations = self.store.relations_for_chunks(
-                trusted_chunks,
-                artifact_id=artifact_id,
-                limit=relation_probe_limit,
+    def _witness(self, **kwargs) -> None:
+        _record_witness(self.walk, **kwargs)
+
+    def _probe(self, **kwargs) -> object:
+        return _probe(self.walk, **kwargs)
+
+    def _scan_artifact_scope(self) -> tuple[DiscourseUnit, ...]:
+        """Witness artifact coverage and scan the artifact-wide unit scope."""
+
+        def _coverage_outcome(coverage, failure_name):
+            if coverage is not None:
+                _validate_artifact(
+                    coverage, self.artifact_id, "artifact coverage receipt"
+                )
+                if coverage.coverage_kind != "discourse":
+                    raise ValueError("artifact coverage receipt has the wrong kind")
+            coverage_current = bool(
+                coverage is not None
+                and coverage.source_revision == self.snapshot.source_revision
+                and coverage.chunk_count == self.snapshot.chunk_count
             )
-        except Exception as exc:
-            probed_direct_relations = ()
-            _record_witness(
-                walk,
-                kind="chunk_relation_lookup",
-                subject_id="trusted_chunks",
-                requested_limit=self.policy.max_relations,
-                returned_count=0,
-                exhaustive=False,
-                detail={"failure": type(exc).__name__},
-            )
-        else:
-            if len(probed_direct_relations) > relation_probe_limit:
-                raise ValueError(
-                    "store returned more relations than the requested probe limit"
-                )
-            _validate_artifacts(probed_direct_relations, artifact_id, "relation")
-
-        direct_probe_count = len(probed_direct_relations)
-        direct_member_units = dict(unit_routes)
-        priority_units = {
-            unit_id: route.unit for unit_id, route in direct_member_units.items()
-        }
-        valid_direct_relations: list[DiscourseRelation] = []
-        for relation in probed_direct_relations:
-            try:
-                for member in relation.members:
-                    if member.unit_id not in priority_units:
-                        priority_units[member.unit_id] = _get_member_unit(
-                            self.store,
-                            member.unit_id,
-                            artifact_id=artifact_id,
-                        )
-            except _AnnotationLookupFailure as failure:
-                _record_member_failure(walk, relation.relation_id, failure)
-                continue
-            valid_direct_relations.append(relation)
-        probed_direct_relations = tuple(valid_direct_relations)
-        direct_relations = tuple(
-            sorted(
-                probed_direct_relations,
-                key=lambda relation: relation_priority(
-                    relation,
-                    program,
-                    priority_units,
-                    min_confidence=self.policy.min_relation_confidence,
-                ),
-            )[: self.policy.max_relations]
-        )
-        if not any(
-            witness.kind == "chunk_relation_lookup"
-            and witness.subject_id == "trusted_chunks"
-            for witness in walk.scope_witnesses
-        ):
-            _record_witness(
-                walk,
-                kind="chunk_relation_lookup",
-                subject_id="trusted_chunks",
-                requested_limit=self.policy.max_relations,
-                returned_count=len(direct_relations),
-                exhaustive=direct_probe_count <= self.policy.max_relations,
-                detail={
-                    "artifact_id": artifact_id,
-                    "chunk_count": len(trusted_chunks),
-                    "probe_limit": relation_probe_limit,
-                    "probe_count": direct_probe_count,
-                },
-            )
-        # Relation members are valid starting points even when a unit's own
-        # evidence is outside the seed chunk.
-        for relation in direct_relations:
-            if not _as_of_relation(relation, program):
-                continue
-            member_units = tuple(
-                priority_units[member.unit_id] for member in relation.members
-            )
-            for unit in member_units:
-                directly_matches = bool(
-                    unit_obligation_ids(unit, program, connected=False)
-                )
-                _offer_route(
-                    unit_routes,
-                    unit,
-                    hop=0,
-                    route_rank=1,
-                    # The relation may still lose a bounded priority cut.  It
-                    # confers semantic credit only once it is actually visited.
-                    connected=directly_matches,
-                )
-
-        pending_direct = {
-            relation.relation_id: relation
-            for relation in direct_relations
-            if _as_of_relation(relation, program)
-        }
-        for hop in range(self.policy.max_hops + 1):
-            current = [
-                route
-                for route in unit_routes.values()
-                if route.hop == hop and route.unit.unit_id not in walk.units
-                and _as_of_unit(route.unit, program)
-            ]
-            current.sort(
-                key=lambda route: unit_priority(
-                    route.unit,
-                    program,
-                    connected=route.connected,
-                    route_rank=route.route_rank,
-                )
-            )
-            frontier_limit = min(self.policy.beam_width, self.policy.max_frontier)
-            frontier_exhaustive = len(current) <= frontier_limit
-            current = current[:frontier_limit]
-            if current:
-                _record_witness(
-                    walk,
-                    kind="unit_frontier",
-                    subject_id=f"{artifact_id}:hop:{hop}",
-                    requested_limit=frontier_limit,
-                    returned_count=len(current),
-                    exhaustive=frontier_exhaustive,
-                    detail={
-                        "beam_width": self.policy.beam_width,
-                        "max_frontier": self.policy.max_frontier,
-                    },
-                )
-            remaining_units = self.policy.max_units - len(walk.units)
-            if len(current) > remaining_units:
-                current = current[: max(0, remaining_units)]
-                walk.unit_budget_exhaustive = False
-            if not current and not (hop == 0 and pending_direct):
-                continue
-
-            for route in current:
-                unit_id = route.unit.unit_id
-                walk.units[unit_id] = route.unit
-                walk.unit_order.append(unit_id)
-                walk.max_visited_hop = max(walk.max_visited_hop, hop)
-                if route.connected:
-                    walk.connected_unit_ids.add(unit_id)
-
-            requested_unit_ids = tuple(route.unit.unit_id for route in current)
-            incident: Mapping[str, Sequence[DiscourseRelation]] = {}
-            if requested_unit_ids:
-                try:
-                    incident = self.store.incident_relations(
-                        requested_unit_ids,
-                        artifact_id=artifact_id,
-                        max_degree=self.policy.max_degree + 1,
-                    )
-                except Exception as exc:
-                    incident = {unit_id: () for unit_id in requested_unit_ids}
-                    for unit_id in requested_unit_ids:
-                        _record_witness(
-                            walk,
-                            kind="incident_relations",
-                            subject_id=unit_id,
-                            requested_limit=self.policy.max_degree,
-                            returned_count=0,
-                            exhaustive=False,
-                            detail={"failure": type(exc).__name__},
-                        )
-                else:
-                    _validate_incident(
-                        incident,
-                        requested_unit_ids,
-                        artifact_id=artifact_id,
-                    )
-                    for unit_id in requested_unit_ids:
-                        probed = tuple(incident[unit_id])
-                        if len(probed) > self.policy.max_degree + 1:
-                            raise ValueError(
-                                "store returned more incident relations than the probe limit"
-                            )
-                        _record_witness(
-                            walk,
-                            kind="incident_relations",
-                            subject_id=unit_id,
-                            requested_limit=self.policy.max_degree,
-                            returned_count=min(len(probed), self.policy.max_degree),
-                            exhaustive=len(probed) <= self.policy.max_degree,
-                            detail={
-                                "artifact_id": artifact_id,
-                                "probe_limit": self.policy.max_degree + 1,
-                                "probe_count": len(probed),
-                            },
-                        )
-
-            probed_candidates: dict[str, DiscourseRelation] = {}
-            if hop == 0:
-                probed_candidates.update(pending_direct)
-            for unit_id in sorted(incident):
-                for relation in incident[unit_id]:
-                    probed_candidates.setdefault(relation.relation_id, relation)
-
-            known_units = dict(walk.units)
-            invalid_relation_ids: set[str] = set()
-            for relation in probed_candidates.values():
-                try:
-                    for member in relation.members:
-                        if member.unit_id not in known_units:
-                            known_units[member.unit_id] = _get_member_unit(
-                                self.store,
-                                member.unit_id,
-                                artifact_id=artifact_id,
-                            )
-                except _AnnotationLookupFailure as failure:
-                    invalid_relation_ids.add(relation.relation_id)
-                    _record_member_failure(walk, relation.relation_id, failure)
-            candidates: dict[str, DiscourseRelation] = {}
-            if hop == 0:
-                candidates.update(
-                    (relation_id, relation)
-                    for relation_id, relation in pending_direct.items()
-                    if relation_id not in invalid_relation_ids
-                )
-            for unit_id in sorted(incident):
-                ordered_incident = sorted(
-                    (
-                        relation
-                        for relation in incident[unit_id]
-                        if relation.relation_id not in invalid_relation_ids
-                    ),
-                    key=lambda relation: relation_priority(
-                        relation,
-                        program,
-                        known_units,
-                        min_confidence=self.policy.min_relation_confidence,
-                    ),
-                )[: self.policy.max_degree]
-                for relation in ordered_incident:
-                    candidates.setdefault(relation.relation_id, relation)
-            ordered_relations = sorted(
-                (
-                    relation
-                    for relation in candidates.values()
-                    if relation.relation_id not in walk.relations
-                    and _as_of_relation(relation, program)
-                    and relation_is_useful(
-                        relation,
-                        program,
-                        known_units,
-                        connected=True,
-                    )
-                ),
-                key=lambda relation: relation_priority(
-                    relation,
-                    program,
-                    known_units,
-                    min_confidence=self.policy.min_relation_confidence,
-                ),
-            )
-            remaining_relations = self.policy.max_relations - len(walk.relations)
-            if len(ordered_relations) > remaining_relations:
-                ordered_relations = ordered_relations[: max(0, remaining_relations)]
-                walk.relation_budget_exhaustive = False
-            for relation in ordered_relations:
-                walk.relations[relation.relation_id] = relation
-                walk.relation_order.append(relation.relation_id)
-                member_units = [
-                    known_units[member.unit_id]
-                    for member in relation.members
-                    if member.unit_id in known_units
-                ]
-                anchor_connected = any(
-                    unit.unit_id in walk.connected_unit_ids
-                    or unit_routes.get(
-                        unit.unit_id,
-                        _UnitRoute(unit, hop, 3, False),
-                    ).connected
-                    or bool(unit_obligation_ids(unit, program, connected=False))
-                    for unit in member_units
-                )
-                edge_connects = anchor_connected and relation_confers_subject_connection(
-                    relation,
-                    program,
-                    min_confidence=self.policy.min_relation_confidence,
-                )
-                if edge_connects:
-                    walk.connected_relation_ids.add(relation.relation_id)
-                for member in relation.members:
-                    unit = known_units.get(member.unit_id)
-                    if unit is None or not _as_of_unit(unit, program):
-                        continue
-                    directly_matches = bool(
-                        unit_obligation_ids(unit, program, connected=False)
-                    )
-                    member_connects = edge_connects or directly_matches
-                    if member_connects:
-                        walk.connected_unit_ids.add(unit.unit_id)
-                    if unit.unit_id in walk.units:
-                        continue
-                    if hop >= self.policy.max_hops:
-                        walk.hop_budget_exhaustive = False
-                        continue
-                    _offer_route(
-                        unit_routes,
-                        unit,
-                        hop=hop + 1,
-                        route_rank=1,
-                        connected=member_connects,
-                    )
-
-        if any(
-            route.unit.unit_id not in walk.units and _as_of_unit(route.unit, program)
-            for route in unit_routes.values()
-        ):
-            walk.unit_budget_exhaustive = False
-        _record_witness(
-            walk,
-            kind="unit_budget",
-            subject_id=artifact_id,
-            requested_limit=self.policy.max_units,
-            returned_count=len(walk.units),
-            exhaustive=walk.unit_budget_exhaustive,
-        )
-        _record_witness(
-            walk,
-            kind="relation_budget",
-            subject_id=artifact_id,
-            requested_limit=self.policy.max_relations,
-            returned_count=len(walk.relations),
-            exhaustive=walk.relation_budget_exhaustive,
-        )
-        _record_witness(
-            walk,
-            kind="hop_budget",
-            subject_id=artifact_id,
-            requested_limit=self.policy.max_hops,
-            returned_count=min(walk.max_visited_hop, self.policy.max_hops),
-            exhaustive=walk.hop_budget_exhaustive,
-        )
-        return walk, unit_routes
-
-    def _artifact_scope(
-        self,
-        walk: _Walk,
-        program: QueryProgram,
-        *,
-        artifact_id: str,
-        snapshot: DiscourseSnapshot,
-    ) -> tuple[DiscourseUnit, ...]:
-        try:
-            coverage = self.store.artifact_coverage(
-                artifact_id,
-                coverage_kind="discourse",
-            )
-        except Exception as exc:
-            coverage = None
-            coverage_failure = type(exc).__name__
-        else:
-            coverage_failure = None
-        if coverage is not None:
-            _validate_artifact(coverage, artifact_id, "artifact coverage receipt")
-            if coverage.coverage_kind != "discourse":
-                raise ValueError("artifact coverage receipt has the wrong kind")
-        coverage_current = bool(
-            coverage is not None
-            and coverage.source_revision == snapshot.source_revision
-            and coverage.chunk_count == snapshot.chunk_count
-        )
-        _record_witness(
-            walk,
-            kind="artifact_coverage",
-            subject_id=artifact_id,
-            requested_limit=None,
-            returned_count=0 if coverage is None else coverage.chunk_count,
-            exhaustive=coverage_current,
-            detail={
+            detail = {
                 "coverage_kind": "discourse",
-                "failure": coverage_failure,
-                "snapshot_source_revision": snapshot.source_revision,
-                "snapshot_chunk_count": snapshot.chunk_count,
-                "receipt_sha256": (
-                    None if coverage is None else coverage.receipt_sha256
-                ),
-                "coverage_sha256": (
-                    None if coverage is None else coverage.coverage_sha256
-                ),
-            },
+                "failure": failure_name,
+                "snapshot_source_revision": self.snapshot.source_revision,
+                "snapshot_chunk_count": self.snapshot.chunk_count,
+                "receipt_sha256": None if coverage is None else coverage.receipt_sha256,
+                "coverage_sha256": None if coverage is None else coverage.coverage_sha256,
+            }
+            returned = 0 if coverage is None else coverage.chunk_count
+            return coverage, [(self.artifact_id, returned, coverage_current, detail)]
+
+        self._probe(
+            kind="artifact_coverage",
+            requested_limit=None,
+            fetch=lambda: self.store.artifact_coverage(
+                self.artifact_id,
+                coverage_kind="discourse",
+            ),
+            admit=lambda coverage: _coverage_outcome(coverage, None),
+            failure=lambda name: _coverage_outcome(None, name),
         )
 
         probe_limit = self.policy.max_units + 1
         scan = scan_artifact_units(
             self.store,
-            artifact_id=artifact_id,
-            program=program,
+            artifact_id=self.artifact_id,
+            program=self.program,
             max_units=self.policy.max_units,
         )
-        _record_witness(
-            walk,
+        self._witness(
             kind="artifact_unit_scan",
-            subject_id=artifact_id,
+            subject_id=self.artifact_id,
             requested_limit=self.policy.max_units,
             returned_count=len(scan.units),
             exhaustive=scan.exhaustive,
@@ -784,52 +356,246 @@ class EvidenceClosureEngine:
         )
         return scan.units
 
+    def _seed(
+        self,
+        seeds: Sequence[EpisodeSeed],
+        raw_chunk_ids: Sequence[str],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Admit seed episodes plus temporal neighbors; witness their coverage."""
+
+        trusted_episode_ids = self._seed_episodes(seeds, raw_chunk_ids)
+        if trusted_episode_ids:
+            episode_chunks = tuple(
+                sorted(_episode_chunk_ids(self.walk, trusted_episode_ids))
+            )
+            self._annotation_coverage(
+                chunks=episode_chunks,
+                coverage_kind="episode",
+                witness_kind="episode_coverage",
+                completion_critical=False,
+            )
+        neighbor_ids = self._temporal_neighbors(trusted_episode_ids)
+        self._witness(
+            kind="episode_budget",
+            subject_id=self.artifact_id,
+            requested_limit=self.policy.max_frontier,
+            returned_count=len(self.walk.episodes),
+            exhaustive=True,
+            detail={
+                "seed_count": len(seeds),
+                "neighbor_radius": self.policy.max_episode_neighbors,
+                "route_truncated": not self.walk.episode_budget_exhaustive,
+            },
+        )
+        trusted_chunks = tuple(
+            sorted(
+                set(raw_chunk_ids) | _episode_chunk_ids(self.walk, trusted_episode_ids)
+            )
+        )
+        neighbor_chunks = tuple(
+            sorted(_episode_chunk_ids(self.walk, neighbor_ids) - set(trusted_chunks))
+        )
+        graph_chunks = tuple(sorted(set(trusted_chunks) | set(neighbor_chunks)))
+        self._annotation_coverage(
+            chunks=graph_chunks,
+            coverage_kind="discourse",
+            witness_kind="annotation_coverage",
+        )
+        return trusted_chunks, neighbor_chunks
+
+    def _seed_episodes(
+        self,
+        seeds: Sequence[EpisodeSeed],
+        raw_chunk_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        candidates: dict[str, Episode] = {}
+        for seed in seeds:
+            episode = self.store.get_episode(seed.episode_id)
+            if episode is None:
+                raise ValueError(f"episode seed {seed.episode_id!r} does not exist")
+            _validate_artifact(episode, self.artifact_id, "episode seed")
+            if seed.anchor_chunk_id not in {
+                span.chunk_id for span in episode.evidence
+            }:
+                raise ValueError(
+                    f"episode seed {seed.episode_id!r} does not contain anchor "
+                    f"chunk {seed.anchor_chunk_id!r}"
+                )
+            candidates.setdefault(seed.episode_id, episode)
+
+        def _admit_mapping(
+            mapped: Mapping[str, str],
+        ) -> tuple[Mapping[str, str], _WitnessRows]:
+            if any(chunk_id not in set(raw_chunk_ids) for chunk_id in mapped):
+                raise ValueError(
+                    "store returned an episode mapping for an unrequested chunk"
+                )
+            exhaustive = True
+            failures: list[str] = []
+            valid_count = 0
+            for chunk_id in sorted(mapped):
+                episode_id = mapped[chunk_id]
+                try:
+                    episode = self.store.get_episode(episode_id)
+                except Exception as exc:
+                    exhaustive = False
+                    failures.append(type(exc).__name__)
+                    continue
+                if episode is None:
+                    exhaustive = False
+                    failures.append("missing_episode")
+                    continue
+                _validate_artifact(episode, self.artifact_id, "episode")
+                if chunk_id not in {span.chunk_id for span in episode.evidence}:
+                    raise ValueError("episode mapping does not contain its mapped chunk")
+                candidates.setdefault(episode_id, episode)
+                valid_count += 1
+            detail = {"chunk_count": len(raw_chunk_ids), "failures": failures}
+            return mapped, [(self.artifact_id, valid_count, exhaustive, detail)]
+
+        mapped = self._probe(
+            kind="episode_mapping",
+            requested_limit=None,
+            fetch=lambda: self.store.episode_ids_for_chunks(
+                raw_chunk_ids,
+                artifact_id=self.artifact_id,
+            ),
+            admit=_admit_mapping,
+            failure=lambda name: ({}, [(self.artifact_id, 0, False, {
+                "chunk_count": len(raw_chunk_ids),
+                "failures": [name],
+            })]),
+        )
+
+        episode_ids: list[str] = [seed.episode_id for seed in seeds]
+        episode_ids.extend(mapped[chunk_id] for chunk_id in sorted(mapped))
+        ordered_ids = tuple(dict.fromkeys(episode_ids))
+        if len(ordered_ids) > self.policy.max_frontier:
+            ordered_ids = ordered_ids[: self.policy.max_frontier]
+            self.walk.episode_budget_exhaustive = False
+        for episode_id in ordered_ids:
+            episode = candidates.get(episode_id)
+            if episode is None:
+                # A failed optional annotation lookup is recorded above; the
+                # verified raw chunk remains available to bundle assembly.
+                continue
+            self.walk.episodes[episode_id] = episode
+            self.walk.episode_order.append(episode_id)
+        return tuple(self.walk.episode_order)
+
+    def _temporal_neighbors(
+        self,
+        trusted_episode_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        candidates: dict[str, Episode] = {}
+        allowed_radius = self.policy.max_episode_neighbors
+        probe_radius = allowed_radius + 1
+        for episode_id in trusted_episode_ids:
+            seed = self.walk.episodes.get(episode_id)
+            if seed is None:
+                continue
+
+            def _admit_neighbors(
+                neighbors: Sequence[Episode],
+                *,
+                seed: Episode = seed,
+                episode_id: str = episode_id,
+            ) -> tuple[tuple[Episode, ...], _WitnessRows]:
+                prior: list[Episode] = []
+                following: list[Episode] = []
+                seen_neighbor_ids: set[str] = set()
+                for neighbor in neighbors:
+                    if neighbor.source_id != seed.source_id or neighbor.artifact_id != seed.artifact_id:
+                        raise ValueError("temporal closure crossed a source or artifact boundary")
+                    _validate_artifact(neighbor, self.artifact_id, "episode neighbor")
+                    if neighbor.episode_id == episode_id:
+                        raise ValueError("store returned the seed as its own adjacent episode")
+                    if neighbor.episode_id in seen_neighbor_ids:
+                        raise ValueError("store returned a duplicate adjacent episode")
+                    seen_neighbor_ids.add(neighbor.episode_id)
+                    if neighbor.sequence_no < seed.sequence_no:
+                        prior.append(neighbor)
+                    elif neighbor.sequence_no > seed.sequence_no:
+                        following.append(neighbor)
+                    else:
+                        raise ValueError(
+                            "adjacent episode reused the seed sequence coordinate"
+                        )
+                if len(prior) > probe_radius or len(following) > probe_radius:
+                    raise ValueError("store returned more episodes than the per-side probe radius")
+                admitted = tuple(
+                    sorted(prior, key=lambda item: (-item.sequence_no, item.episode_id))[
+                        :allowed_radius
+                    ]
+                    + sorted(
+                        following,
+                        key=lambda item: (item.sequence_no, item.episode_id),
+                    )[:allowed_radius]
+                )
+                outside_radius = (
+                    len(prior) > allowed_radius or len(following) > allowed_radius
+                )
+                detail = {
+                    "artifact_id": self.artifact_id,
+                    "source_id": seed.source_id,
+                    "radius": allowed_radius,
+                    "probe_radius": probe_radius,
+                    "probe_count": len(neighbors),
+                    "outside_requested_radius": outside_radius,
+                }
+                # This receipt is exhaustive for the requested local radius.
+                # A corpus-wide unit scan is the global completeness proof;
+                # farther episodes are diagnostic, not a hidden corpus tail.
+                return admitted, [(episode_id, len(admitted), True, detail)]
+
+            admitted = self._probe(
+                kind="temporal_neighbors",
+                requested_limit=None,
+                fetch=lambda episode_id=episode_id: self.store.adjacent_episodes(
+                    episode_id,
+                    radius=probe_radius,
+                ),
+                admit=_admit_neighbors,
+                failure=lambda name, episode_id=episode_id: ((), [(episode_id, 0, False, {
+                    "radius": allowed_radius,
+                    "probe_radius": probe_radius,
+                    "failure": name,
+                })]),
+            )
+            for neighbor in admitted:
+                if neighbor.episode_id not in self.walk.episodes:
+                    candidates.setdefault(neighbor.episode_id, neighbor)
+        ordered = sorted(
+            candidates.values(),
+            key=lambda item: (item.source_id, item.sequence_no, item.episode_id),
+        )
+        available = max(0, self.policy.max_frontier - len(self.walk.episodes))
+        if len(ordered) > available:
+            ordered = ordered[:available]
+            self.walk.episode_budget_exhaustive = False
+        for episode in ordered:
+            self.walk.episodes[episode.episode_id] = episode
+            self.walk.episode_order.append(episode.episode_id)
+        return tuple(episode.episode_id for episode in ordered)
+
     def _annotation_coverage(
         self,
-        walk: _Walk,
         *,
-        artifact_id: str,
         chunks: Sequence[str],
         coverage_kind: str,
         witness_kind: str,
         completion_critical: bool = True,
     ) -> None:
-        try:
-            coverage = self.store.coverage_for_chunks(
-                artifact_id,
-                chunks,
-                coverage_kind=coverage_kind,
-            )
-        except Exception as exc:
-            _record_witness(
-                walk,
-                kind=witness_kind,
-                subject_id=artifact_id,
-                requested_limit=None,
-                returned_count=0,
-                exhaustive=not completion_critical,
-                detail={
-                    "chunk_count": len(chunks),
-                    "failure": type(exc).__name__,
-                    "coverage_complete": False,
-                    "completion_critical": completion_critical,
-                },
-            )
-            return
-        requested = set(chunks)
-        if any(chunk_id not in requested for chunk_id in coverage):
-            raise ValueError("coverage result contains an unrequested chunk")
-        if any(status not in {"annotated", "no_output"} for status in coverage.values()):
-            raise ValueError("coverage result contains an unsupported status")
-        missing = tuple(sorted(requested - set(coverage)))
-        _record_witness(
-            walk,
-            kind=witness_kind,
-            subject_id=artifact_id,
-            requested_limit=None,
-            returned_count=len(coverage),
-            exhaustive=(not missing) or not completion_critical,
-            detail={
+        def _admit_coverage(
+            coverage: Mapping[str, str],
+        ) -> tuple[None, _WitnessRows]:
+            requested = set(chunks)
+            if any(chunk_id not in requested for chunk_id in coverage):
+                raise ValueError("coverage result contains an unrequested chunk")
+            if any(status not in {"annotated", "no_output"} for status in coverage.values()):
+                raise ValueError("coverage result contains an unsupported status")
+            missing = tuple(sorted(requested - set(coverage)))
+            detail = {
                 "coverage_kind": coverage_kind,
                 "chunk_count": len(chunks),
                 "missing_chunk_ids": missing,
@@ -841,252 +607,446 @@ class EvidenceClosureEngine:
                 ),
                 "coverage_complete": not missing,
                 "completion_critical": completion_critical,
-            },
+            }
+            exhaustive = (not missing) or not completion_critical
+            return None, [(self.artifact_id, len(coverage), exhaustive, detail)]
+
+        self._probe(
+            kind=witness_kind,
+            requested_limit=None,
+            fetch=lambda: self.store.coverage_for_chunks(
+                self.artifact_id,
+                chunks,
+                coverage_kind=coverage_kind,
+            ),
+            admit=_admit_coverage,
+            failure=lambda name: (None, [(self.artifact_id, 0, not completion_critical, {
+                "chunk_count": len(chunks),
+                "failure": name,
+                "coverage_complete": False,
+                "completion_critical": completion_critical,
+            })]),
         )
+
+    def _seed_unit_routes(
+        self,
+        global_units: Sequence[DiscourseUnit],
+        trusted_chunks: Sequence[str],
+        neighbor_chunks: Sequence[str],
+    ) -> None:
+        """Offer hop-0 routes from scope matches and seed-evidenced chunks."""
+
+        for unit in global_units:
+            if unit_obligation_ids(unit, self.program, connected=False):
+                _offer_route(self.routes, unit, hop=0, route_rank=3, connected=True)
+        candidate_limit = self.policy.max_units + 1
+        for unit in self._units_for_chunks(
+            trusted_chunks,
+            route_rank=0,
+            witness_subject="trusted_chunks",
+            limit=candidate_limit,
+        ):
+            matched = bool(unit_obligation_ids(unit, self.program, connected=False))
+            _offer_route(self.routes, unit, hop=0, route_rank=0, connected=matched)
+        if neighbor_chunks:
+            for unit in self._units_for_chunks(
+                neighbor_chunks,
+                route_rank=2,
+                witness_subject="temporal_chunks",
+                limit=candidate_limit,
+            ):
+                _offer_route(self.routes, unit, hop=0, route_rank=2, connected=False)
 
     def _units_for_chunks(
         self,
-        walk: _Walk,
-        program: QueryProgram,
-        *,
-        artifact_id: str,
         chunks: Sequence[str],
+        *,
         route_rank: int,
         witness_subject: str,
         limit: int,
     ) -> tuple[DiscourseUnit, ...]:
-        try:
-            probed = self.store.units_for_chunks(
-                chunks,
-                artifact_id=artifact_id,
-                limit=limit,
+        def _admit_units(
+            probed: Sequence[DiscourseUnit],
+        ) -> tuple[tuple[DiscourseUnit, ...], _WitnessRows]:
+            if len(probed) > limit:
+                raise ValueError(PROBE_OVERFLOW_MESSAGE)
+            _validate_artifacts(probed, self.artifact_id, "unit")
+            ordered = sorted(
+                probed,
+                key=lambda unit: unit_priority(
+                    unit,
+                    self.program,
+                    connected=bool(
+                        unit_obligation_ids(unit, self.program, connected=False)
+                    ),
+                    route_rank=route_rank,
+                ),
             )
-        except Exception as exc:
-            _record_witness(
-                walk,
-                kind="chunk_unit_lookup",
-                subject_id=witness_subject,
-                requested_limit=self.policy.max_units,
-                returned_count=0,
-                exhaustive=False,
-                detail={"failure": type(exc).__name__},
-            )
-            return ()
-        if len(probed) > limit:
-            raise ValueError("store returned more units than the requested probe limit")
-        _validate_artifacts(probed, artifact_id, "unit")
-        ordered = sorted(
-            probed,
-            key=lambda unit: unit_priority(
-                unit,
-                program,
-                connected=bool(unit_obligation_ids(unit, program, connected=False)),
-                route_rank=route_rank,
-            ),
-        )
-        exhaustive = len(ordered) <= self.policy.max_units
-        admitted = tuple(ordered[: self.policy.max_units])
-        _record_witness(
-            walk,
-            kind="chunk_unit_lookup",
-            subject_id=witness_subject,
-            requested_limit=self.policy.max_units,
-            returned_count=len(admitted),
-            exhaustive=exhaustive,
-            detail={
-                "artifact_id": artifact_id,
+            admitted = tuple(ordered[: self.policy.max_units])
+            detail = {
+                "artifact_id": self.artifact_id,
                 "chunk_count": len(chunks),
                 "probe_limit": limit,
                 "probe_count": len(probed),
-            },
-        )
-        return admitted
+            }
+            exhaustive = len(ordered) <= self.policy.max_units
+            return admitted, [(witness_subject, len(admitted), exhaustive, detail)]
 
-    def _seed_episodes(
-        self,
-        walk: _Walk,
-        *,
-        artifact_id: str,
-        seeds: Sequence[EpisodeSeed],
-        raw_chunk_ids: Sequence[str],
-    ) -> tuple[str, ...]:
-        candidates: dict[str, Episode] = {}
-        for seed in seeds:
-            episode = self.store.get_episode(seed.episode_id)
-            if episode is None:
-                raise ValueError(f"episode seed {seed.episode_id!r} does not exist")
-            _validate_artifact(episode, artifact_id, "episode seed")
-            if seed.anchor_chunk_id not in {
-                span.chunk_id for span in episode.evidence
-            }:
-                raise ValueError(
-                    f"episode seed {seed.episode_id!r} does not contain anchor "
-                    f"chunk {seed.anchor_chunk_id!r}"
-                )
-            candidates.setdefault(seed.episode_id, episode)
-
-        mapping_exhaustive = True
-        mapping_failures: list[str] = []
-        try:
-            mapped = self.store.episode_ids_for_chunks(
-                raw_chunk_ids,
-                artifact_id=artifact_id,
-            )
-        except Exception as exc:
-            mapped = {}
-            mapping_exhaustive = False
-            mapping_failures.append(type(exc).__name__)
-        if any(chunk_id not in set(raw_chunk_ids) for chunk_id in mapped):
-            raise ValueError("store returned an episode mapping for an unrequested chunk")
-        valid_mapping_count = 0
-        for chunk_id in sorted(mapped):
-            episode_id = mapped[chunk_id]
-            try:
-                episode = self.store.get_episode(episode_id)
-            except Exception as exc:
-                mapping_exhaustive = False
-                mapping_failures.append(type(exc).__name__)
-                continue
-            if episode is None:
-                mapping_exhaustive = False
-                mapping_failures.append("missing_episode")
-                continue
-            _validate_artifact(episode, artifact_id, "episode")
-            if chunk_id not in {span.chunk_id for span in episode.evidence}:
-                raise ValueError("episode mapping does not contain its mapped chunk")
-            candidates.setdefault(episode_id, episode)
-            valid_mapping_count += 1
-        _record_witness(
-            walk,
-            kind="episode_mapping",
-            subject_id=artifact_id,
-            requested_limit=None,
-            returned_count=valid_mapping_count,
-            exhaustive=mapping_exhaustive,
-            detail={
-                "chunk_count": len(raw_chunk_ids),
-                "failures": mapping_failures,
-            },
+        return self._probe(
+            kind="chunk_unit_lookup",
+            requested_limit=self.policy.max_units,
+            fetch=lambda: self.store.units_for_chunks(
+                chunks,
+                artifact_id=self.artifact_id,
+                limit=limit,
+            ),
+            admit=_admit_units,
+            failure=lambda name: ((), [(witness_subject, 0, False, {"failure": name})]),
         )
 
-        episode_ids: list[str] = [seed.episode_id for seed in seeds]
-        episode_ids.extend(mapped[chunk_id] for chunk_id in sorted(mapped))
-        ordered_ids = tuple(dict.fromkeys(episode_ids))
-        if len(ordered_ids) > self.policy.max_frontier:
-            ordered_ids = ordered_ids[: self.policy.max_frontier]
-            walk.episode_budget_exhaustive = False
-        for episode_id in ordered_ids:
-            episode = candidates.get(episode_id)
-            if episode is None:
-                # A failed optional annotation lookup is recorded above; the
-                # verified raw chunk remains available to bundle assembly.
-                continue
-            walk.episodes[episode_id] = episode
-            walk.episode_order.append(episode_id)
-        return tuple(walk.episode_order)
-
-    def _temporal_neighbors(
+    def _direct_relations(
         self,
-        walk: _Walk,
-        trusted_episode_ids: Sequence[str],
-        *,
-        artifact_id: str,
-    ) -> tuple[str, ...]:
-        candidates: dict[str, Episode] = {}
-        allowed_radius = self.policy.max_episode_neighbors
-        probe_radius = allowed_radius + 1
-        for episode_id in trusted_episode_ids:
-            seed = walk.episodes.get(episode_id)
-            if seed is None:
-                continue
-            try:
-                neighbors = self.store.adjacent_episodes(
-                    episode_id,
-                    radius=probe_radius,
-                )
-            except Exception as exc:
-                _record_witness(
-                    walk,
-                    kind="temporal_neighbors",
-                    subject_id=episode_id,
-                    requested_limit=None,
-                    returned_count=0,
-                    exhaustive=False,
-                    detail={
-                        "radius": allowed_radius,
-                        "probe_radius": probe_radius,
-                        "failure": type(exc).__name__,
-                    },
-                )
-                continue
-            prior: list[Episode] = []
-            following: list[Episode] = []
-            seen_neighbor_ids: set[str] = set()
-            for neighbor in neighbors:
-                if neighbor.source_id != seed.source_id or neighbor.artifact_id != seed.artifact_id:
-                    raise ValueError("temporal closure crossed a source or artifact boundary")
-                _validate_artifact(neighbor, artifact_id, "episode neighbor")
-                if neighbor.episode_id == episode_id:
-                    raise ValueError("store returned the seed as its own adjacent episode")
-                if neighbor.episode_id in seen_neighbor_ids:
-                    raise ValueError("store returned a duplicate adjacent episode")
-                seen_neighbor_ids.add(neighbor.episode_id)
-                if neighbor.sequence_no < seed.sequence_no:
-                    prior.append(neighbor)
-                elif neighbor.sequence_no > seed.sequence_no:
-                    following.append(neighbor)
-                else:
-                    raise ValueError(
-                        "adjacent episode reused the seed sequence coordinate"
-                    )
-            if len(prior) > probe_radius or len(following) > probe_radius:
-                raise ValueError("store returned more episodes than the per-side probe radius")
+        trusted_chunks: Sequence[str],
+    ) -> dict[str, DiscourseRelation]:
+        """Probe relations anchored on trusted chunks and offer member routes."""
+
+        relation_probe_limit = self.policy.max_relations + 1
+        priority_units = {
+            unit_id: route.unit for unit_id, route in self.routes.items()
+        }
+
+        def _admit_direct_relations(
+            probed: Sequence[DiscourseRelation],
+        ) -> tuple[tuple[DiscourseRelation, ...], _WitnessRows]:
+            if len(probed) > relation_probe_limit:
+                raise ValueError(PROBE_OVERFLOW_MESSAGE)
+            _validate_artifacts(probed, self.artifact_id, "relation")
+            valid: list[DiscourseRelation] = []
+            for relation in probed:
+                try:
+                    for member in relation.members:
+                        if member.unit_id not in priority_units:
+                            priority_units[member.unit_id] = _get_member_unit(
+                                self.store,
+                                member.unit_id,
+                                artifact_id=self.artifact_id,
+                            )
+                except _AnnotationLookupFailure as failure:
+                    _record_member_failure(self.walk, relation.relation_id, failure)
+                    continue
+                valid.append(relation)
             admitted = tuple(
-                sorted(prior, key=lambda item: (-item.sequence_no, item.episode_id))[
-                    :allowed_radius
-                ]
-                + sorted(
-                    following,
-                    key=lambda item: (item.sequence_no, item.episode_id),
-                )[:allowed_radius]
+                sorted(
+                    valid,
+                    key=lambda relation: relation_priority(
+                        relation,
+                        self.program,
+                        priority_units,
+                        min_confidence=self.policy.min_relation_confidence,
+                    ),
+                )[: self.policy.max_relations]
             )
-            outside_radius = (
-                len(prior) > allowed_radius or len(following) > allowed_radius
+            detail = {
+                "artifact_id": self.artifact_id,
+                "chunk_count": len(trusted_chunks),
+                "probe_limit": relation_probe_limit,
+                "probe_count": len(probed),
+            }
+            exhaustive = len(probed) <= self.policy.max_relations
+            return admitted, [("trusted_chunks", len(admitted), exhaustive, detail)]
+
+        direct_relations = self._probe(
+            kind="chunk_relation_lookup",
+            requested_limit=self.policy.max_relations,
+            fetch=lambda: self.store.relations_for_chunks(
+                trusted_chunks,
+                artifact_id=self.artifact_id,
+                limit=relation_probe_limit,
+            ),
+            admit=_admit_direct_relations,
+            failure=lambda name: ((), [("trusted_chunks", 0, False, {"failure": name})]),
+        )
+        # Relation members are valid starting points even when a unit's own
+        # evidence is outside the seed chunk.
+        for relation in direct_relations:
+            if not _as_of_relation(relation, self.program):
+                continue
+            for member in relation.members:
+                unit = priority_units[member.unit_id]
+                # The relation may still lose a bounded priority cut.  It
+                # confers semantic credit only once it is actually visited.
+                matched = bool(unit_obligation_ids(unit, self.program, connected=False))
+                _offer_route(self.routes, unit, hop=0, route_rank=1, connected=matched)
+        return {
+            relation.relation_id: relation
+            for relation in direct_relations
+            if _as_of_relation(relation, self.program)
+        }
+
+    def _expand(self, pending_direct: dict[str, DiscourseRelation]) -> None:
+        """Visit frontier units hop by hop, admitting bounded relation cuts."""
+
+        for hop in range(self.policy.max_hops + 1):
+            current = self._frontier(hop)
+            if not current and not (hop == 0 and pending_direct):
+                continue
+            for route in current:
+                unit_id = route.unit.unit_id
+                self.walk.units[unit_id] = route.unit
+                self.walk.unit_order.append(unit_id)
+                self.walk.max_visited_hop = max(self.walk.max_visited_hop, hop)
+                if route.connected:
+                    self.walk.connected_unit_ids.add(unit_id)
+            incident = self._incident_relations(
+                tuple(route.unit.unit_id for route in current)
             )
-            for neighbor in admitted:
-                if neighbor.episode_id not in walk.episodes:
-                    candidates.setdefault(neighbor.episode_id, neighbor)
-            _record_witness(
-                walk,
-                kind="temporal_neighbors",
-                subject_id=episode_id,
-                requested_limit=None,
-                returned_count=len(admitted),
-                # This receipt is exhaustive for the requested local radius.
-                # A corpus-wide unit scan is the global completeness proof;
-                # farther episodes are diagnostic, not a hidden corpus tail.
-                exhaustive=True,
+            self._admit_relations(
+                hop,
+                incident,
+                pending_direct=pending_direct if hop == 0 else {},
+            )
+        if any(
+            route.unit.unit_id not in self.walk.units
+            and _as_of_unit(route.unit, self.program)
+            for route in self.routes.values()
+        ):
+            self.walk.unit_budget_exhaustive = False
+
+    def _frontier(self, hop: int) -> list[_UnitRoute]:
+        """Select this hop's bounded, priority-ordered unit frontier."""
+
+        current = [
+            route
+            for route in self.routes.values()
+            if route.hop == hop
+            and route.unit.unit_id not in self.walk.units
+            and _as_of_unit(route.unit, self.program)
+        ]
+        current.sort(
+            key=lambda route: unit_priority(
+                route.unit,
+                self.program,
+                connected=route.connected,
+                route_rank=route.route_rank,
+            )
+        )
+        frontier_limit = min(self.policy.beam_width, self.policy.max_frontier)
+        frontier_exhaustive = len(current) <= frontier_limit
+        current = current[:frontier_limit]
+        if current:
+            self._witness(
+                kind="unit_frontier",
+                subject_id=f"{self.artifact_id}:hop:{hop}",
+                requested_limit=frontier_limit,
+                returned_count=len(current),
+                exhaustive=frontier_exhaustive,
                 detail={
-                    "artifact_id": artifact_id,
-                    "source_id": seed.source_id,
-                    "radius": allowed_radius,
-                    "probe_radius": probe_radius,
-                    "probe_count": len(neighbors),
-                    "outside_requested_radius": outside_radius,
+                    "beam_width": self.policy.beam_width,
+                    "max_frontier": self.policy.max_frontier,
                 },
             )
-        ordered = sorted(
-            candidates.values(),
-            key=lambda item: (item.source_id, item.sequence_no, item.episode_id),
+        remaining_units = self.policy.max_units - len(self.walk.units)
+        if len(current) > remaining_units:
+            current = current[: max(0, remaining_units)]
+            self.walk.unit_budget_exhaustive = False
+        return current
+
+    def _incident_relations(
+        self,
+        requested_unit_ids: Sequence[str],
+    ) -> Mapping[str, Sequence[DiscourseRelation]]:
+        """Probe bounded incident relations for the just-visited units."""
+
+        if not requested_unit_ids:
+            return {}
+
+        def _admit_incident(
+            probed: Mapping[str, Sequence[DiscourseRelation]],
+        ) -> tuple[Mapping[str, Sequence[DiscourseRelation]], _WitnessRows]:
+            _validate_incident(probed, requested_unit_ids, artifact_id=self.artifact_id)
+            rows: list[_WitnessRow] = []
+            for unit_id in requested_unit_ids:
+                count = len(probed[unit_id])
+                if count > self.policy.max_degree + 1:
+                    raise ValueError(PROBE_OVERFLOW_MESSAGE)
+                rows.append((
+                    unit_id,
+                    min(count, self.policy.max_degree),
+                    count <= self.policy.max_degree,
+                    {
+                        "artifact_id": self.artifact_id,
+                        "probe_limit": self.policy.max_degree + 1,
+                        "probe_count": count,
+                    },
+                ))
+            return probed, rows
+
+        return self._probe(
+            kind="incident_relations",
+            requested_limit=self.policy.max_degree,
+            fetch=lambda: self.store.incident_relations(
+                requested_unit_ids,
+                artifact_id=self.artifact_id,
+                max_degree=self.policy.max_degree + 1,
+            ),
+            admit=_admit_incident,
+            failure=lambda name: (
+                {unit_id: () for unit_id in requested_unit_ids},
+                [(unit_id, 0, False, {"failure": name}) for unit_id in requested_unit_ids],
+            ),
         )
-        available = max(0, self.policy.max_frontier - len(walk.episodes))
-        if len(ordered) > available:
-            ordered = ordered[:available]
-            walk.episode_budget_exhaustive = False
-        for episode in ordered:
-            walk.episodes[episode.episode_id] = episode
-            walk.episode_order.append(episode.episode_id)
-        return tuple(episode.episode_id for episode in ordered)
+
+    def _admit_relations(
+        self,
+        hop: int,
+        incident: Mapping[str, Sequence[DiscourseRelation]],
+        *,
+        pending_direct: Mapping[str, DiscourseRelation],
+    ) -> None:
+        """Admit this hop's relation budget cut and offer next-hop routes."""
+
+        probed_candidates: dict[str, DiscourseRelation] = dict(pending_direct)
+        for unit_id in sorted(incident):
+            for relation in incident[unit_id]:
+                probed_candidates.setdefault(relation.relation_id, relation)
+
+        known_units = dict(self.walk.units)
+        invalid_relation_ids: set[str] = set()
+        for relation in probed_candidates.values():
+            try:
+                for member in relation.members:
+                    if member.unit_id not in known_units:
+                        known_units[member.unit_id] = _get_member_unit(
+                            self.store,
+                            member.unit_id,
+                            artifact_id=self.artifact_id,
+                        )
+            except _AnnotationLookupFailure as failure:
+                invalid_relation_ids.add(relation.relation_id)
+                _record_member_failure(self.walk, relation.relation_id, failure)
+        candidates: dict[str, DiscourseRelation] = {
+            relation_id: relation
+            for relation_id, relation in pending_direct.items()
+            if relation_id not in invalid_relation_ids
+        }
+        for unit_id in sorted(incident):
+            ordered_incident = sorted(
+                (
+                    relation
+                    for relation in incident[unit_id]
+                    if relation.relation_id not in invalid_relation_ids
+                ),
+                key=lambda relation: relation_priority(
+                    relation,
+                    self.program,
+                    known_units,
+                    min_confidence=self.policy.min_relation_confidence,
+                ),
+            )[: self.policy.max_degree]
+            for relation in ordered_incident:
+                candidates.setdefault(relation.relation_id, relation)
+        ordered_relations = sorted(
+            (
+                relation
+                for relation in candidates.values()
+                if relation.relation_id not in self.walk.relations
+                and _as_of_relation(relation, self.program)
+                and relation_is_useful(
+                    relation,
+                    self.program,
+                    known_units,
+                    connected=True,
+                )
+            ),
+            key=lambda relation: relation_priority(
+                relation,
+                self.program,
+                known_units,
+                min_confidence=self.policy.min_relation_confidence,
+            ),
+        )
+        remaining_relations = self.policy.max_relations - len(self.walk.relations)
+        if len(ordered_relations) > remaining_relations:
+            ordered_relations = ordered_relations[: max(0, remaining_relations)]
+            self.walk.relation_budget_exhaustive = False
+        for relation in ordered_relations:
+            self._visit_relation(relation, hop=hop, known_units=known_units)
+
+    def _visit_relation(
+        self,
+        relation: DiscourseRelation,
+        *,
+        hop: int,
+        known_units: Mapping[str, DiscourseUnit],
+    ) -> None:
+        """Record one admitted relation and propagate member connectivity."""
+
+        self.walk.relations[relation.relation_id] = relation
+        self.walk.relation_order.append(relation.relation_id)
+        member_units = [
+            known_units[member.unit_id]
+            for member in relation.members
+            if member.unit_id in known_units
+        ]
+        anchor_connected = any(
+            unit.unit_id in self.walk.connected_unit_ids
+            or ((route := self.routes.get(unit.unit_id)) is not None and route.connected)
+            or bool(unit_obligation_ids(unit, self.program, connected=False))
+            for unit in member_units
+        )
+        edge_connects = anchor_connected and relation_confers_subject_connection(
+            relation,
+            self.program,
+            min_confidence=self.policy.min_relation_confidence,
+        )
+        if edge_connects:
+            self.walk.connected_relation_ids.add(relation.relation_id)
+        for member in relation.members:
+            unit = known_units.get(member.unit_id)
+            if unit is None or not _as_of_unit(unit, self.program):
+                continue
+            member_connects = edge_connects or bool(
+                unit_obligation_ids(unit, self.program, connected=False)
+            )
+            if member_connects:
+                self.walk.connected_unit_ids.add(unit.unit_id)
+            if unit.unit_id in self.walk.units:
+                continue
+            if hop >= self.policy.max_hops:
+                self.walk.hop_budget_exhaustive = False
+                continue
+            _offer_route(
+                self.routes,
+                unit,
+                hop=hop + 1,
+                route_rank=1,
+                connected=member_connects,
+            )
+
+    def _budget_receipts(self) -> None:
+        """Emit the walk-wide unit, relation, and hop budget witnesses."""
+
+        self._witness(
+            kind="unit_budget",
+            subject_id=self.artifact_id,
+            requested_limit=self.policy.max_units,
+            returned_count=len(self.walk.units),
+            exhaustive=self.walk.unit_budget_exhaustive,
+        )
+        self._witness(
+            kind="relation_budget",
+            subject_id=self.artifact_id,
+            requested_limit=self.policy.max_relations,
+            returned_count=len(self.walk.relations),
+            exhaustive=self.walk.relation_budget_exhaustive,
+        )
+        self._witness(
+            kind="hop_budget",
+            subject_id=self.artifact_id,
+            requested_limit=self.policy.max_hops,
+            returned_count=min(self.walk.max_visited_hop, self.policy.max_hops),
+            exhaustive=self.walk.hop_budget_exhaustive,
+        )
 
 
 def close_evidence(
@@ -1211,8 +1171,54 @@ def _record_witness(
             f"duplicate closure scope witness for {kind!r}/{subject_id!r}"
         )
     walk.scope_witnesses.append(witness)
-    if not exhaustive:
-        walk.capped = True
+
+
+def _probe(
+    walk: _Walk,
+    *,
+    kind: str,
+    requested_limit: int | None,
+    fetch: Callable[[], object],
+    admit: Callable[..., tuple[object, _WitnessRows]],
+    failure: Callable[..., tuple[object, _WitnessRows]],
+) -> object:
+    """Run one bounded store probe; every outcome ends in recorded witnesses.
+
+    ``admit`` validates the probed value (raising on invariant violations) and
+    returns the admitted value plus its witness rows; ``failure`` maps a store
+    failure name to a fallback value plus its witness rows.  Because both
+    branches must yield rows that are recorded here, a probe site cannot
+    forget the scope witness that ``completion()`` relies on.
+    """
+
+    try:
+        probed = fetch()
+    except Exception as exc:
+        value, rows = failure(type(exc).__name__)
+    else:
+        value, rows = admit(probed)
+    for subject_id, returned_count, exhaustive, detail in rows:
+        _record_witness(
+            walk,
+            kind=kind,
+            subject_id=subject_id,
+            requested_limit=requested_limit,
+            returned_count=returned_count,
+            exhaustive=exhaustive,
+            detail=detail,
+        )
+    return value
+
+
+def _episode_chunk_ids(walk: _Walk, episode_ids: Iterable[str]) -> set[str]:
+    """Chunk ids evidenced by the given already-visited episodes."""
+
+    return {
+        span.chunk_id
+        for episode_id in episode_ids
+        if episode_id in walk.episodes
+        for span in walk.episodes[episode_id].evidence
+    }
 
 
 def _offer_route(

@@ -379,6 +379,22 @@ def _load_source(path: Path, relative_path: str, raw: bytes) -> CorpusSource | N
     digest = hashlib.sha256(raw).hexdigest()
     family = _family(path)
 
+    def build(
+        kind: str,
+        format: str,
+        turns: tuple[tuple[str, str], ...],
+    ) -> CorpusSource:
+        """Bind the shared source-location fields once for every format."""
+        return CorpusSource(
+            relative_path=relative_path,
+            kind=kind,
+            format=format,
+            turns=turns,
+            sha256=digest,
+            byte_size=len(raw),
+            source_family=family,
+        )
+
     if suffix == ".ipynb":
         try:
             turns = _notebook_turns(json.loads(raw.decode("utf-8")))
@@ -386,15 +402,7 @@ def _load_source(path: Path, relative_path: str, raw: bytes) -> CorpusSource | N
             return None
         if not turns:
             return None
-        return CorpusSource(
-            relative_path,
-            "document",
-            "jupyter-notebook",
-            tuple(turns),
-            digest,
-            len(raw),
-            family,
-        )
+        return build("document", "jupyter-notebook", tuple(turns))
 
     if suffix == ".json":
         try:
@@ -404,29 +412,13 @@ def _load_source(path: Path, relative_path: str, raw: bytes) -> CorpusSource | N
         turns = parse_chatgpt_json(data)
         if not turns:
             return None
-        return CorpusSource(
-            relative_path,
-            "conversation",
-            "chatgpt-json",
-            tuple(turns),
-            digest,
-            len(raw),
-            family,
-        )
+        return build("conversation", "chatgpt-json", tuple(turns))
 
     if suffix == ".docx":
         text = _docx_text(path)
         if not text:
             return None
-        return CorpusSource(
-            relative_path,
-            "document",
-            "docx",
-            (("system", text),),
-            digest,
-            len(raw),
-            family,
-        )
+        return build("document", "docx", (("system", text),))
 
     text = raw.decode("utf-8", errors="replace").strip()
     if not text:
@@ -434,24 +426,8 @@ def _load_source(path: Path, relative_path: str, raw: bytes) -> CorpusSource | N
     conversation = parse_conversation_text(text)
     if conversation is not None:
         format_name, turns = conversation
-        return CorpusSource(
-            relative_path,
-            "conversation",
-            format_name,
-            tuple(turns),
-            digest,
-            len(raw),
-            family,
-        )
-    return CorpusSource(
-        relative_path,
-        "document",
-        f"plain-{suffix.lstrip('.')}",
-        (("system", text),),
-        digest,
-        len(raw),
-        family,
-    )
+        return build("conversation", format_name, tuple(turns))
+    return build("document", f"plain-{suffix.lstrip('.')}", (("system", text),))
 
 
 def _iter_files(root: Path) -> Iterable[Path]:

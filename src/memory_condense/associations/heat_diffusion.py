@@ -8,8 +8,7 @@ chunk IDs, scalar heat, and one compact explanatory path cross iterations.
 
 from __future__ import annotations
 
-import math
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -18,9 +17,15 @@ from memory_condense.associations.associative_composition import (
     compose_associative_candidates,
 )
 from memory_condense.associations.associative_retrieval import expand_associative_results
+from memory_condense.associations.expansion_guards import (
+    exceeds_prompt_budget,
+    guard_expansion_request,
+    require_artifact,
+)
 from memory_condense.associations.head_memory_models import (
     AssociativeMemoryCandidate,
 )
+from memory_condense.domain.ranking import softmax, weighted_fair_order
 from memory_condense.domain.schemas import RetrievalResult
 
 
@@ -61,20 +66,11 @@ class _MutableHeat:
     supporting_transitions: int = 0
 
 
-def _softmax(values: Sequence[float], temperature: float) -> list[float]:
-    if not values:
-        return []
-    maximum = max(values)
-    exponentials = [math.exp((value - maximum) / temperature) for value in values]
-    total = sum(exponentials)
-    return [value / total for value in exponentials]
-
-
 def _seed_distribution(
     anchors: Sequence[RetrievalResult], temperature: float
 ) -> dict[str, float]:
     scores = [float(anchor.score) for anchor in anchors]
-    weights = _softmax(scores, temperature)
+    weights = softmax(scores, temperature=temperature)
     return {
         anchor.chunk.chunk_id: weight
         for anchor, weight in zip(anchors, weights, strict=True)
@@ -112,8 +108,7 @@ def diffuse_association_heat(
         raise ValueError("restart_probability must lie in [0, 1]")
     if seed_temperature <= 0.0 or edge_temperature <= 0.0:
         raise ValueError("diffusion temperatures must be positive")
-    if store.get_artifact(artifact_id) is None:
-        raise KeyError(f"unknown association artifact: {artifact_id}")
+    require_artifact(store, artifact_id)
 
     unique_anchors: dict[str, RetrievalResult] = {}
     for anchor in anchors:
@@ -197,7 +192,7 @@ def diffuse_association_heat(
             utilities = [edge.utility(now_turn=now_turn) for edge in edges]
             for edge, probability in zip(
                 edges,
-                _softmax(utilities, edge_temperature),
+                softmax(utilities, temperature=edge_temperature),
                 strict=True,
             ):
                 contribution = walk_heat * probability
@@ -264,37 +259,16 @@ def _source_fair_order(
 ) -> list[AssociativeMemoryCandidate]:
     """Weighted-fair order whose early prefix spends tokens by source heat."""
 
-    queues: dict[str, deque[AssociativeMemoryCandidate]] = defaultdict(deque)
-    for candidate in candidates:
-        queues[str(candidate.metadata["memory_source_id"])].append(candidate)
-    served: dict[str, int] = defaultdict(int)
-    ordered: list[AssociativeMemoryCandidate] = []
-    source_cap = max(1, math.ceil(total_token_budget * max_source_token_fraction))
-
-    while any(queues.values()):
-        choices: list[tuple[float, float, str, AssociativeMemoryCandidate]] = []
-        capped_choices: list[tuple[float, float, str, AssociativeMemoryCandidate]] = []
-        for source_id, queue in queues.items():
-            if not queue:
-                continue
-            candidate = queue[0]
-            cost = max(1, int(candidate.metadata["token_count"]))
-            weight = max(source_heat.get(source_id, 0.0), 1e-12)
-            choice = (
-                (served[source_id] + cost) / weight,
-                -float(candidate.metadata["diffusion_heat"]),
-                source_id,
-                candidate,
-            )
-            choices.append(choice)
-            if served[source_id] == 0 or served[source_id] + cost <= source_cap:
-                capped_choices.append(choice)
-        pool = capped_choices or choices
-        _, _, source_id, candidate = min(pool)
-        queues[source_id].popleft()
-        served[source_id] += max(1, int(candidate.metadata["token_count"]))
-        ordered.append(candidate)
-    return ordered
+    return weighted_fair_order(
+        candidates,
+        source_key=lambda candidate: str(candidate.metadata["memory_source_id"]),
+        source_weight=source_heat,
+        item_cost=lambda candidate: int(candidate.metadata["token_count"]),
+        item_priority=lambda candidate: float(candidate.metadata["diffusion_heat"]),
+        total_budget=total_token_budget,
+        max_source_fraction=max_source_token_fraction,
+        # No cost_clip: this arm bills each candidate's full chunk token count.
+    )
 
 
 def expand_heat_diffusion_results(
@@ -322,7 +296,13 @@ def expand_heat_diffusion_results(
 ) -> list[RetrievalResult]:
     """Allocate bounded association slots using diffused per-source heat."""
 
-    result_cap = len(anchors) if k is None else int(k)
+    guards = guard_expansion_request(
+        anchors,
+        k=k,
+        lexical_protection_threshold=lexical_protection_threshold,
+        max_prompt_token_increase=max_prompt_token_increase,
+    )
+    result_cap = guards.result_cap
     if result_cap <= 0:
         return []
     if association_slots < 0 or qk_reserve < 0 or ranked_qk_reserve < 0:
@@ -331,14 +311,8 @@ def expand_heat_diffusion_results(
         raise ValueError("ranked_qk_reserve cannot exceed qk_reserve")
     if not 0.0 < max_source_token_fraction <= 1.0:
         raise ValueError("max_source_token_fraction must lie in (0, 1]")
-    if lexical_protection_threshold is not None and not (
-        0.0 <= lexical_protection_threshold <= 1.0
-    ):
-        raise ValueError("lexical_protection_threshold must lie in [0, 1]")
-    if max_prompt_token_increase is not None and max_prompt_token_increase < 0:
-        raise ValueError("max_prompt_token_increase must be non-negative")
 
-    bounded_anchors = list(anchors[:result_cap])
+    bounded_anchors = guards.bounded_anchors
     if not bounded_anchors:
         return []
     diffusion = diffuse_association_heat(
@@ -582,10 +556,13 @@ def expand_heat_diffusion_results(
                 )
             results.append(base.model_copy(update=update))
 
-        if max_prompt_token_increase is None:
-            break
-        composed_tokens = sum(result.chunk.token_count for result in results)
-        if composed_tokens <= direct_tokens + max_prompt_token_increase:
+        if not exceeds_prompt_budget(
+            results,
+            # Denominator: like hebbian, this arm spends against all
+            # bounded_anchors; associative windows to [:result_cap].
+            direct_anchors=bounded_anchors,
+            max_prompt_token_increase=max_prompt_token_increase,
+        ):
             break
         selected_heat = {
             candidate.episode_id

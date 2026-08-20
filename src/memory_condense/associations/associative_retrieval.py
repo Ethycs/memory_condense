@@ -8,6 +8,11 @@ from memory_condense.associations.association_store import AssociationStore
 from memory_condense.associations.associative_composition import (
     compose_associative_candidates,
 )
+from memory_condense.associations.expansion_guards import (
+    exceeds_prompt_budget,
+    guard_expansion_request,
+    require_artifact,
+)
 from memory_condense.associations.head_memory_models import (
     AssociativeMemoryCandidate,
 )
@@ -36,7 +41,13 @@ def expand_associative_results(
     touch: bool = True,
 ) -> list[RetrievalResult]:
     """Expand already-ranked anchors without invoking an embedding or LLM."""
-    result_cap = len(anchors) if k is None else int(k)
+    guards = guard_expansion_request(
+        anchors,
+        k=k,
+        lexical_protection_threshold=lexical_protection_threshold,
+        max_prompt_token_increase=max_prompt_token_increase,
+    )
+    result_cap = guards.result_cap
     if result_cap <= 0:
         return []
     if neighbors_per_anchor < 0:
@@ -47,15 +58,8 @@ def expand_associative_results(
         raise ValueError("max_association_candidates must be positive")
     if cav_candidates < 0:
         raise ValueError("cav_candidates must be non-negative")
-    if lexical_protection_threshold is not None and not (
-        0.0 <= lexical_protection_threshold <= 1.0
-    ):
-        raise ValueError("lexical_protection_threshold must lie in [0, 1]")
-    if max_prompt_token_increase is not None and max_prompt_token_increase < 0:
-        raise ValueError("max_prompt_token_increase must be non-negative")
-    if store.get_artifact(artifact_id) is None:
-        raise KeyError(f"unknown association artifact: {artifact_id}")
-    bounded_anchors = list(anchors[:result_cap])
+    require_artifact(store, artifact_id)
+    bounded_anchors = guards.bounded_anchors
     if not bounded_anchors:
         return []
 
@@ -233,15 +237,16 @@ def expand_associative_results(
         elif candidate.route == "cav":
             used_cav_ids.append(candidate.episode_id)
 
-    if max_prompt_token_increase is not None:
-        direct_tokens = sum(
-            result.chunk.token_count for result in bounded_anchors[:result_cap]
-        )
-        composed_tokens = sum(result.chunk.token_count for result in results)
-        if composed_tokens > direct_tokens + max_prompt_token_increase:
-            # Admission is decided before touches, so a rejected exploration
-            # cannot reinforce the very edge that exceeded the prompt budget.
-            return bounded_anchors[:result_cap]
+    if exceeds_prompt_budget(
+        results,
+        # Denominator: this arm windows to bounded_anchors[:result_cap] while
+        # hebbian spends against all bounded_anchors (open author decision).
+        direct_anchors=bounded_anchors[:result_cap],
+        max_prompt_token_increase=max_prompt_token_increase,
+    ):
+        # Admission is decided before touches, so a rejected exploration
+        # cannot reinforce the very edge that exceeded the prompt budget.
+        return bounded_anchors[:result_cap]
 
     if touch:
         if used_edge_pairs:

@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import math
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
 from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.domain._discourse_identity import _nonempty, normalize_fields
 from memory_condense.domain.discourse import (
     ClosurePolicy,
     EvidenceSpan,
@@ -63,12 +63,15 @@ from memory_condense.eval.diffuse_longmemeval_inputs import (
     LegacyDiffuseCandidates,
     LegacyDiffuseInputReceipt,
     _assert_deterministic_sample_loaded,
+    _question_probe,
     capture_legacy_diffuse_inputs,
     gold_blind_longmemeval_sample,
     ingest_gold_blind_sample_deterministically,
 )
+from memory_condense.domain.sealed import SealedIdentity
+from memory_condense.eval._identity import exact_int, sha256_digest
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
-from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.ingest.loader import BenchmarkSample
 from memory_condense.search.episodes import (
     EpisodeRepresentativeRetrievalPolicy,
     EpisodeRetrievalPolicy,
@@ -120,38 +123,6 @@ class FreshCondenserFactory(Protocol):
 RepresentativePolicyFactory = Callable[
     [str], EpisodeRepresentativeRetrievalPolicy
 ]
-
-
-def _digest(value: object, label: str) -> str:
-    normalized = str(value)
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return normalized
-
-
-def _nonnegative_int(value: object, label: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be a non-negative integer")
-    try:
-        normalized = int(value)  # type: ignore[arg-type]
-        exact = (
-            math.isfinite(float(value))  # type: ignore[arg-type]
-            and float(value) == normalized  # type: ignore[arg-type]
-        )
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be a non-negative integer") from exc
-    if not exact or normalized < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
-    return normalized
-
-
-def _positive_int(value: object, label: str) -> int:
-    normalized = _nonnegative_int(value, label)
-    if normalized < 1:
-        raise ValueError(f"{label} must be a positive integer")
-    return normalized
 
 
 def analysis_callable_identity_payload(
@@ -262,14 +233,11 @@ class DiffuseLongMemEvalArm:
     require_owned_representative_runtime: bool = False
 
     def __post_init__(self) -> None:
-        normalized = str(self.arm_id).strip()
-        if not normalized:
-            raise ValueError("arm_id must be non-empty")
-        if normalized != self.compilation.boundary_mode:
+        normalize_fields(self, arm_id=_nonempty)
+        if self.arm_id != self.compilation.boundary_mode:
             raise ValueError(
                 "arm_id must equal the declared compilation boundary_mode"
             )
-        object.__setattr__(self, "arm_id", normalized)
         if self.episode.artifact_id is not None:
             raise ValueError(
                 "analysis episode policy must be artifact-agnostic"
@@ -288,14 +256,15 @@ class DiffuseLongMemEvalArm:
         object.__setattr__(
             self,
             "max_context_tokens",
-            _positive_int(self.max_context_tokens, "max_context_tokens"),
+            exact_int(self.max_context_tokens, "max_context_tokens", minimum=1),
         )
         object.__setattr__(
             self,
             "responder_output_token_reserve",
-            _nonnegative_int(
+            exact_int(
                 self.responder_output_token_reserve,
                 "responder_output_token_reserve",
+                minimum=0,
             ),
         )
 
@@ -363,7 +332,9 @@ def _evaluation_policy_sha256(config: EvalConfig) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseLongMemEvalAnalysisQueryReceipt:
+class DiffuseLongMemEvalAnalysisQueryReceipt(SealedIdentity):
+    _SEAL_MISMATCH = "diffuse analysis query receipt does not match"
+
     corpus_sha256: str
     question_probe_sha256: str
     analysis_arm_sha256: str
@@ -397,7 +368,7 @@ class DiffuseLongMemEvalAnalysisQueryReceipt:
             "diffuse_query_receipt_sha256",
             "snapshot_sha256",
         ):
-            _digest(getattr(self, name), name)
+            sha256_digest(getattr(self, name), name)
         representative_fields = (
             "representative_linker_identity_sha256",
             "representative_policy_factory_identity_sha256",
@@ -414,23 +385,10 @@ class DiffuseLongMemEvalAnalysisQueryReceipt:
         for name in representative_fields:
             value = getattr(self, name)
             if value is not None:
-                _digest(value, name)
+                sha256_digest(value, name)
         if not self.artifact_id.strip():
             raise ValueError("artifact_id must be non-empty")
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("diffuse analysis query receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
-
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
-        payload = {
-            name: getattr(self, name)
-            for name in self.__dataclass_fields__
-            if name != "receipt_sha256"
-        }
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,7 +471,9 @@ class DiffuseLongMemEvalGoldBlindQuery:
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseLongMemEvalRetrievalPhase:
+class DiffuseLongMemEvalRetrievalPhase(SealedIdentity):
+    _SEAL_MISMATCH = "diffuse retrieval phase receipt does not match"
+
     sample_id: str
     corpus_sha256: str
     deterministic_turn_ids: tuple[str, ...]
@@ -527,8 +487,8 @@ class DiffuseLongMemEvalRetrievalPhase:
     def __post_init__(self) -> None:
         if self.format != DIFFUSE_ANALYSIS_PHASE_FORMAT:
             raise ValueError("unsupported diffuse retrieval phase format")
-        _digest(self.corpus_sha256, "corpus_sha256")
-        _digest(self.evaluation_policy_sha256, "evaluation_policy_sha256")
+        sha256_digest(self.corpus_sha256, "corpus_sha256")
+        sha256_digest(self.evaluation_policy_sha256, "evaluation_policy_sha256")
         if not str(self.sample_id).strip():
             raise ValueError("sample_id must be non-empty")
         turn_ids = tuple(str(value).strip() for value in self.deterministic_turn_ids)
@@ -615,10 +575,7 @@ class DiffuseLongMemEvalRetrievalPhase:
                     )
         object.__setattr__(self, "questions", questions)
         object.__setattr__(self, "deterministic_turn_ids", turn_ids)
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("diffuse retrieval phase receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
+        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
         payload = {
@@ -642,7 +599,9 @@ class DiffuseLongMemEvalRetrievalPhase:
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseLongMemEvalMeasuredQuestion:
+class DiffuseLongMemEvalMeasuredQuestion(SealedIdentity):
+    _SEAL_MISMATCH = "diffuse measurement receipt does not match"
+
     gold_blind: DiffuseLongMemEvalGoldBlindQuery
     metrics: LongMemEvalDiffuseMetrics
     gold_answer_sha256: str
@@ -650,18 +609,15 @@ class DiffuseLongMemEvalMeasuredQuestion:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        _digest(self.gold_answer_sha256, "gold_answer_sha256")
-        _digest(self.evidence_sources_sha256, "evidence_sources_sha256")
+        sha256_digest(self.gold_answer_sha256, "gold_answer_sha256")
+        sha256_digest(self.evidence_sources_sha256, "evidence_sources_sha256")
         if self.metrics.question_id != self.gold_blind.probe.question_id:
             raise ValueError("metrics belong to another question")
         if self.metrics.retrieval_receipt_sha256 != (
             self.gold_blind.retrieval.receipt.receipt_sha256
         ):
             raise ValueError("metrics belong to another diffuse retrieval")
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("diffuse measurement receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
+        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
         payload = {
@@ -676,7 +632,9 @@ class DiffuseLongMemEvalMeasuredQuestion:
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseLongMemEvalAnalysis:
+class DiffuseLongMemEvalAnalysis(SealedIdentity):
+    _SEAL_MISMATCH = "diffuse analysis receipt does not match"
+
     retrieval_phase: DiffuseLongMemEvalRetrievalPhase
     questions: tuple[DiffuseLongMemEvalMeasuredQuestion, ...]
     format: str = DIFFUSE_ANALYSIS_FORMAT
@@ -691,10 +649,7 @@ class DiffuseLongMemEvalAnalysis:
         ):
             raise ValueError("measurements do not cover the frozen phase exactly")
         object.__setattr__(self, "questions", questions)
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("diffuse analysis receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
+        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
         payload = {
@@ -896,14 +851,6 @@ def retrieve_diffuse_longmemeval_sample(
         evaluation_policy_sha256=evaluation_policy_sha256,
         compilation=compilation,
         questions=tuple(rows),
-    )
-
-
-def _question_probe(question: BenchmarkQuestion) -> GoldBlindLongMemEvalQuestion:
-    return GoldBlindLongMemEvalQuestion(
-        question_id=question.question_id,
-        retrieval_query=question.question,
-        prompt_question=question.dated_question,
     )
 
 

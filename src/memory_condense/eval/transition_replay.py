@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from memory_condense.associations.transition_policy import (
     CausalTransitionPolicy,
     TransitionCandidate,
+    _cosine,
 )
 
 
@@ -108,17 +109,6 @@ def _delta(left: Sequence[float], right: Sequence[float]) -> tuple[float, ...]:
     if len(left) != len(right):
         raise ValueError("CAV vectors need equal dimensions")
     return tuple(float(b) - float(a) for a, b in zip(left, right, strict=True))
-
-
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    if len(left) != len(right):
-        raise ValueError("CAV deltas need equal dimensions")
-    numerator = sum(float(a) * float(b) for a, b in zip(left, right, strict=True))
-    left_norm = math.sqrt(sum(float(value) ** 2 for value in left))
-    right_norm = math.sqrt(sum(float(value) ** 2 for value in right))
-    if left_norm == 0.0 or right_norm == 0.0:
-        return 0.0
-    return max(-1.0, min(1.0, numerator / (left_norm * right_norm)))
 
 
 def _read_only_connection(path: str | Path) -> sqlite3.Connection:

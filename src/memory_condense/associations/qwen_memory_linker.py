@@ -103,7 +103,6 @@ class QwenMemoryLinker:
         candidates: Sequence[AssociativeMemoryCandidate],
         *,
         top_k: int | None = None,
-        include_transport_signature: bool = False,
     ) -> MemoryLinkResult:
         """Score a bounded candidate workspace and immediately shed activations."""
         torch = self.encoder._torch
@@ -200,13 +199,6 @@ class QwenMemoryLinker:
                 update = decoder_attention.o_proj(
                     moved_values.reshape(1, moved_values.shape[0], -1)
                 )
-                transport_signature = None
-                if include_transport_signature:
-                    pooled_update = update.float().mean(dim=1)[0]
-                    norm = pooled_update.square().sum().sqrt().clamp_min(1e-12)
-                    transport_signature = (
-                        (pooled_update / norm).to(dtype=torch.float16).cpu()
-                    )
                 metadata = dict(candidate.metadata)
                 if self.cav_bank is not None and cav_capture is not None:
                     candidate_signature = self.cav_bank.signature(
@@ -239,7 +231,6 @@ class QwenMemoryLinker:
                             float(value) for value in head_weights.cpu().tolist()
                         ),
                         metadata=metadata,
-                        transport_signature=transport_signature,
                     )
                 )
         hits.sort(

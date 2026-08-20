@@ -7,13 +7,10 @@ from typing import Sequence
 import numpy as np
 
 from memory_condense.domain import ranking
-from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.persistence.db import INDEXED_CHUNK_SQL, TURN_SOURCE_ID_SQL
 from memory_condense.search.indexes.lexical import LexicalIndex
-from memory_condense.search.indexes.retrieval_models import (
-    hydrate_chunk_result,
-    load_chunk_payload,
-    load_turn_payload,
-)
+from memory_condense.search.indexes.retrieval_models import hydrate_chunk_result
 
 
 class HybridQueryMixin:
@@ -170,7 +167,7 @@ class HybridQueryMixin:
         query /= query_norm
 
         source_placeholders = ",".join("?" for _ in selected)
-        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        source_expr = TURN_SOURCE_ID_SQL
         dense_buffers: dict[str, list[tuple[float, str]]] = {
             source_id: [] for source_id in selected
         }
@@ -178,7 +175,7 @@ class HybridQueryMixin:
             "SELECT c.chunk_id, c.embedding, " + source_expr + " "
             "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
             f"WHERE {source_expr} IN ({source_placeholders}) "
-            "AND c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            f"AND {INDEXED_CHUNK_SQL} "
             "ORDER BY c.chunk_id",
             tuple(selected),
         )
@@ -495,22 +492,6 @@ class HybridQueryMixin:
                 + ", ".join(missing[:3])
             )
         return {chunk_id: found[chunk_id] for chunk_id in ids}
-
-
-    def _load_chunk(self, chunk_id: str) -> Chunk | None:
-        """Load retrieval payload only; the 1024-float source vector stays put.
-
-        Returning every stored embedding made each candidate hydration decode
-        ~4 KiB of data that ranking and context assembly never read.  The ANN
-        index already consumed the vector before this point, so retrieval
-        results intentionally carry ``embedding=None``. Lexical weights remain
-        because they are part of the hydrated chunk's public contract.
-        """
-        return load_chunk_payload(self._db, chunk_id)
-
-    def _load_turn(self, turn_id: str) -> Turn | None:
-        """Load a turn from SQLite by ID."""
-        return load_turn_payload(self._db, turn_id)
 
 
 __all__ = ["HybridQueryMixin"]

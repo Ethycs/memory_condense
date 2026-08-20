@@ -10,7 +10,6 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from memory_condense.application.condenser_contracts import (
-    ActivePartitionHypothesis as _ActivePartitionHypothesis,
     ActivePartitionRoutingSnapshot as _ActivePartitionRoutingSnapshot,
     SourceCandidateReranker,
     SourceCompanionSelector,
@@ -320,14 +319,7 @@ class MemoryCondenser(
         recent = [(t.role, t.text) for t in turns]
         source_metadata: dict[str, str] = {}
         if self._packer.budget.source_metadata_expansions:
-            source_ids = [
-                str(
-                    result.memory_source_id
-                    or (result.turn.source_id if result.turn is not None else None)
-                    or result.chunk.turn_id
-                )
-                for result in expansions
-            ]
+            source_ids = [result.durable_source_id for result in expansions]
             source_metadata = self._transcript.source_metadata(source_ids)
             if orphan_metadata_sources and _DIRECT_DATE_QUERY_RE.search(user_text):
                 for source_id in orphan_metadata_sources:

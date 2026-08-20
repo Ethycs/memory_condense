@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from memory_condense.domain._tokenizer import count_tokens, truncate_to_tokens
@@ -19,6 +20,87 @@ from memory_condense.search.packing.expansion_ordering import (
     _ExpansionOrderingMixin,
 )
 from memory_condense.search.packing.packing_contracts import EXPANSION_PREFIX
+
+# Sentinel for _trace_row: rows for selector-injected results historically
+# omit the ``selector_output_rejection`` key entirely instead of carrying it
+# as ``None``.  Preserve that shape difference exactly.
+_OMIT = object()
+
+_DETAIL_FIELDS = (
+    "cross_encoder_input_rank",
+    "cross_encoder_score",
+    "cross_encoder_rank",
+    "group_id",
+    "group_role",
+    "representative_chunk_id",
+    "merge_similarity",
+    "merge_threshold",
+    "qk_score",
+    "ov_transport",
+    "prefix_utility",
+    "semantic_score",
+    "answer_object_key_present",
+    "semantic_score_kind",
+    "answerability_score",
+    "answerability_score_kind",
+    "membership_score",
+    "preferred_evidence_role",
+    "role_match",
+    "value_evidence",
+    "assignment_hypothesis",
+    "p_existing",
+    "p_new",
+    "p_null",
+    "existing_energy",
+    "new_energy",
+    "null_energy",
+    "temporal_in_scope",
+    "posterior_entropy",
+    "posterior_kind",
+    "semantic_surprisal",
+    "posterior_uncertain",
+    "credible_cluster",
+    "coverage_reserved",
+    "reservation_basis",
+)
+
+
+@dataclass
+class _ExpansionPass:
+    """Cross-phase state for a single ``_build_expansions`` invocation."""
+
+    query: str
+    original: list[RetrievalResult]
+    source_metadata: dict[str, str] | None
+    active_partition_total: int | None
+    active_partition_inspected: int | None
+    active_partition_scan: Mapping[str, Any] | None
+    # Phase 1: candidate ordering.
+    original_rank: dict[str, int] = field(default_factory=dict)
+    ranked: list[RetrievalResult] = field(default_factory=list)
+    source_timestamps: dict[str, str] = field(default_factory=dict)
+    metadata_rank: dict[str, int] = field(default_factory=dict)
+    # Phase 2: selector negotiation.
+    selector_input: list[RetrievalResult] = field(default_factory=list)
+    rejected_selector_rows: list[tuple[RetrievalResult, str, int]] = field(
+        default_factory=list
+    )
+    selector_report: Any = None
+    selector_report_is_current: bool = False
+    selector_output_rejected: bool = False
+    returned_ids: set[str] = field(default_factory=set)
+    # Phase 3: diagnostic trace construction.
+    trace_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+    selector_trace_rows: list[Mapping[str, Any]] = field(default_factory=list)
+    reserved_ids: set[str] = field(default_factory=set)
+    packing_ranked: list[RetrievalResult] = field(default_factory=list)
+    # Phase 4: coverage reservation planning.
+    used_tokens: int = 0
+    requested_reserved_rows: list[RetrievalResult] = field(default_factory=list)
+    reservation_bodies: dict[str, str] = field(default_factory=dict)
+    reservation_snippets: dict[str, str] = field(default_factory=dict)
+    active_reserved_rows: list[RetrievalResult] = field(default_factory=list)
+    active_reserved_ids: set[str] = field(default_factory=set)
 
 
 class _ExpansionPackingMixin(
@@ -48,31 +130,59 @@ class _ExpansionPackingMixin(
             "closure_scope": "",
             "closure_global_recall_guaranteed": False,
         }
-        original = list(expansions)
-        original_rank: dict[str, int] = {}
-        for rank, result in enumerate(original, start=1):
-            original_rank.setdefault(result.chunk.chunk_id, rank)
+        state = _ExpansionPass(
+            query=query,
+            original=list(expansions),
+            source_metadata=source_metadata,
+            active_partition_total=active_partition_total,
+            active_partition_inspected=active_partition_inspected,
+            active_partition_scan=active_partition_scan,
+        )
+        self._order_expansion_candidates(state, expansions)
+        self._negotiate_expansion_selector(state)
+        self._build_expansion_trace(state)
+        self._plan_coverage_reservations(state)
+        self._apply_post_coverage_closure(state)
+        return self._pack_expansion_rows(state, len(expansions))
+
+    def _order_expansion_candidates(
+        self,
+        state: _ExpansionPass,
+        expansions: list[RetrievalResult],
+    ) -> None:
+        """Phase 1: baseline order, provenance binding, and rank indexes."""
+        for rank, result in enumerate(state.original, start=1):
+            state.original_rank.setdefault(result.chunk.chunk_id, rank)
         ranked = (
             self._heat_weighted_order(expansions)
             if self.budget.heat_weighted_expansions
             else expansions
         )
-        source_timestamps: dict[str, str] = {}
         if self.budget.source_metadata_expansions:
             # Provenance is not evidence. Resolve synthetic timestamp rows
             # before estimating information gain so their unique source IDs
             # and date numbers cannot crowd real conversational content out
             # of the packet. The timestamp remains attached to every emitted
             # excerpt from that source below.
-            source_timestamps, ranked = self._bind_source_metadata(
+            state.source_timestamps, ranked = self._bind_source_metadata(
                 ranked,
                 candidate_pool=ranked,
-                source_metadata=source_metadata,
+                source_metadata=state.source_metadata,
             )
-        metadata_rank = {
+        state.metadata_rank = {
             result.chunk.chunk_id: rank
             for rank, result in enumerate(ranked, start=1)
         }
+        state.ranked = ranked
+
+    def _negotiate_expansion_selector(self, state: _ExpansionPass) -> None:
+        """Phase 2: run the selector and validate its output fail-open."""
+        query = state.query
+        ranked = state.ranked
+        source_timestamps = state.source_timestamps
+        active_partition_total = state.active_partition_total
+        active_partition_inspected = state.active_partition_inspected
+        active_partition_scan = state.active_partition_scan
         selector_report: Any = None
         selector_report_is_current = False
         selector_output_rejected = False
@@ -230,6 +340,54 @@ class _ExpansionPackingMixin(
         else:
             selector_input = list(ranked)
             rejected_selector_rows = []
+        state.ranked = ranked
+        state.selector_input = selector_input
+        state.rejected_selector_rows = rejected_selector_rows
+        state.selector_report = selector_report
+        state.selector_report_is_current = selector_report_is_current
+        state.selector_output_rejected = selector_output_rejected
+        state.returned_ids = returned_ids
+
+    def _trace_row(
+        self,
+        result: RetrievalResult,
+        *,
+        original_rank: int | None,
+        selector_input_rank: int | None,
+        post_selector_rank: int | None,
+        cutoff_reason: str,
+        selector_output_rejection: Any = _OMIT,
+    ) -> dict[str, Any]:
+        """Text-free diagnostic row shared by every trace entry.
+
+        ``selector_output_rejection`` is only present when the caller passes
+        it: rows for results that entered through the original ranking always
+        carry the key (possibly ``None``), while rows for selector-injected
+        results omit it and record the rejection as their ``cutoff_reason``.
+        """
+        row: dict[str, Any] = {
+            "chunk_id": result.chunk.chunk_id,
+            "source_id": self._result_source_id(result),
+            "route": result.route or "",
+            "anchor_chunk_id": result.anchor_chunk_id,
+            "original_rank": original_rank,
+            "selector_input_rank": selector_input_rank,
+            "post_selector_rank": post_selector_rank,
+            "packed_rank": None,
+            "cutoff_reason": cutoff_reason,
+            "chunk_tokens": int(result.chunk.token_count),
+            "content_tokens": None,
+            "rendered_tokens": None,
+            "cumulative_tokens": None,
+        }
+        if selector_output_rejection is not _OMIT:
+            row["selector_output_rejection"] = selector_output_rejection
+        return row
+
+    def _build_expansion_trace(self, state: _ExpansionPass) -> None:
+        """Phase 3: temporal conflict filter plus the per-candidate trace."""
+        query = state.query
+        original_rank = state.original_rank
 
         # A derived duration query needs two explicit temporal boundaries, not
         # exhaustive set coverage.  The normal IG path above restores those
@@ -238,14 +396,15 @@ class _ExpansionPackingMixin(
         # returns the exact surviving RetrievalResult objects unchanged.
         ranked, temporal_conflicts = (
             filter_conflicting_approximate_duration_recaps(
-                ranked,
+                state.ranked,
                 query=query,
-                source_timestamps=source_timestamps,
+                source_timestamps=state.source_timestamps,
             )
         )
+        state.ranked = ranked
 
         selector_input_rank: dict[str, int] = {}
-        for result in selector_input:
+        for result in state.selector_input:
             selector_input_rank.setdefault(
                 result.chunk.chunk_id,
                 len(selector_input_rank) + 1,
@@ -272,53 +431,16 @@ class _ExpansionPackingMixin(
                     selector_details[chunk_id] = row
         rejected_input_reason = {
             result.chunk.chunk_id: reason
-            for result, reason, _rank in rejected_selector_rows
+            for result, reason, _rank in state.rejected_selector_rows
             if result.chunk.chunk_id in original_rank
         }
 
-        detail_fields = (
-            "cross_encoder_input_rank",
-            "cross_encoder_score",
-            "cross_encoder_rank",
-            "group_id",
-            "group_role",
-            "representative_chunk_id",
-            "merge_similarity",
-            "merge_threshold",
-            "qk_score",
-            "ov_transport",
-            "prefix_utility",
-            "semantic_score",
-            "answer_object_key_present",
-            "semantic_score_kind",
-            "answerability_score",
-            "answerability_score_kind",
-            "membership_score",
-            "preferred_evidence_role",
-            "role_match",
-            "value_evidence",
-            "assignment_hypothesis",
-            "p_existing",
-            "p_new",
-            "p_null",
-            "existing_energy",
-            "new_energy",
-            "null_energy",
-            "temporal_in_scope",
-            "posterior_entropy",
-            "posterior_kind",
-            "semantic_surprisal",
-            "posterior_uncertain",
-            "credible_cluster",
-            "coverage_reserved",
-            "reservation_basis",
-        )
         trace_by_id: dict[str, dict[str, Any]] = {}
-        for result in original:
+        for result in state.original:
             chunk_id = result.chunk.chunk_id
             if chunk_id in trace_by_id:
                 continue
-            if chunk_id not in metadata_rank:
+            if chunk_id not in state.metadata_rank:
                 reason = "source_metadata_filtered"
             elif chunk_id not in selector_input_rank:
                 if self.budget.information_gain_expansions:
@@ -338,27 +460,19 @@ class _ExpansionPackingMixin(
                 )
             else:
                 reason = "pending"
-            row: dict[str, Any] = {
-                "chunk_id": chunk_id,
-                "source_id": self._result_source_id(result),
-                "route": result.route or "",
-                "anchor_chunk_id": result.anchor_chunk_id,
-                "original_rank": original_rank[chunk_id],
-                "selector_input_rank": selector_input_rank.get(chunk_id),
-                "post_selector_rank": post_selector_rank.get(chunk_id),
-                "packed_rank": None,
-                "cutoff_reason": reason,
-                "chunk_tokens": int(result.chunk.token_count),
-                "content_tokens": None,
-                "rendered_tokens": None,
-                "cumulative_tokens": None,
-                "selector_output_rejection": rejected_input_reason.get(chunk_id),
-            }
+            row = self._trace_row(
+                result,
+                original_rank=original_rank[chunk_id],
+                selector_input_rank=selector_input_rank.get(chunk_id),
+                post_selector_rank=post_selector_rank.get(chunk_id),
+                cutoff_reason=reason,
+                selector_output_rejection=rejected_input_reason.get(chunk_id),
+            )
             details = selector_details.get(chunk_id, {})
-            for field in detail_fields:
-                value = details.get(field)
+            for field_name in _DETAIL_FIELDS:
+                value = details.get(field_name)
                 if value is None or isinstance(value, (str, int, float, bool)):
-                    row[field] = value
+                    row[field_name] = value
             conflict = temporal_conflicts.get(chunk_id)
             if conflict is not None:
                 row.update(
@@ -374,25 +488,17 @@ class _ExpansionPackingMixin(
         # A selector is an ordering policy, not an evidence source. Retain a
         # text-free diagnostic for rejected fabrications without ever letting
         # their payload reach the prompt.
-        for result, rejection_reason, returned_rank in rejected_selector_rows:
+        for result, rejection_reason, returned_rank in state.rejected_selector_rows:
             chunk_id = result.chunk.chunk_id
             if chunk_id in trace_by_id:
                 continue
-            trace_by_id[chunk_id] = {
-                "chunk_id": chunk_id,
-                "source_id": self._result_source_id(result),
-                "route": result.route or "",
-                "anchor_chunk_id": result.anchor_chunk_id,
-                "original_rank": None,
-                "selector_input_rank": None,
-                "post_selector_rank": returned_rank,
-                "packed_rank": None,
-                "cutoff_reason": rejection_reason,
-                "chunk_tokens": int(result.chunk.token_count),
-                "content_tokens": None,
-                "rendered_tokens": None,
-                "cumulative_tokens": None,
-            }
+            trace_by_id[chunk_id] = self._trace_row(
+                result,
+                original_rank=None,
+                selector_input_rank=None,
+                post_selector_rank=returned_rank,
+                cutoff_reason=rejection_reason,
+            )
         reserved_ids = {
             result.chunk.chunk_id
             for result in ranked
@@ -416,33 +522,39 @@ class _ExpansionPackingMixin(
         )
         for rank, result in enumerate(packing_ranked, start=1):
             trace_by_id[result.chunk.chunk_id]["coverage_pack_rank"] = rank
+        state.trace_by_id = trace_by_id
+        state.selector_trace_rows = selector_trace_rows
+        state.reserved_ids = reserved_ids
+        state.packing_ranked = packing_ranked
 
-        def expansion_label(result: RetrievalResult, ordinal: int) -> str:
-            source_id = self._result_source_id(result)
-            timestamp = source_timestamps.get(source_id)
-            role = (
-                result.turn.role.strip().lower()
-                if result.turn is not None and result.turn.role.strip()
-                else ""
-            )
-            provenance = ""
-            if timestamp:
-                provenance += f" @ {timestamp}"
-            if role:
-                provenance += f" | {role}"
-            return f"[{ordinal}{provenance}] "
+    def _expansion_label(
+        self,
+        state: _ExpansionPass,
+        result: RetrievalResult,
+        ordinal: int,
+    ) -> str:
+        source_id = self._result_source_id(result)
+        timestamp = state.source_timestamps.get(source_id)
+        role = (
+            result.turn.role.strip().lower()
+            if result.turn is not None and result.turn.role.strip()
+            else ""
+        )
+        provenance = ""
+        if timestamp:
+            provenance += f" @ {timestamp}"
+        if role:
+            provenance += f" | {role}"
+        return f"[{ordinal}{provenance}] "
 
-        texts: list[str] = []
-        chunk_ids: list[str] = []
+    def _plan_coverage_reservations(self, state: _ExpansionPass) -> None:
+        """Phase 4: admit a feasible reserved prefix and water-fill its caps."""
         used = count_tokens(EXPANSION_PREFIX)
-        source_tokens: dict[str, int] = defaultdict(int)
-        direct_kept = 0
-        consolidation_kept = 0
-        token_cutoff = False
+        state.used_tokens = used
         requested_reserved_rows = [
             result
-            for result in packing_ranked
-            if result.chunk.chunk_id in reserved_ids
+            for result in state.packing_ranked
+            if result.chunk.chunk_id in state.reserved_ids
         ]
         # Query-aware sentence packing is a lossy optimization.  A coverage
         # representative has already been selected as the one row that must
@@ -475,7 +587,7 @@ class _ExpansionPackingMixin(
             minimum_snippet = truncate_to_tokens(body, required_content)
             minimum_snippet_tokens = count_tokens(minimum_snippet)
             required_cost = count_tokens(
-                expansion_label(result, ordinal) + minimum_snippet
+                self._expansion_label(state, result, ordinal) + minimum_snippet
             ) + 1
             if minimum_snippet_tokens < required_content:
                 # ``truncate_to_tokens`` is expected to round-trip token
@@ -513,7 +625,7 @@ class _ExpansionPackingMixin(
                 }
                 rendered_cost = used + sum(
                     count_tokens(
-                        expansion_label(result, index)
+                        self._expansion_label(state, result, index)
                         + candidate_snippets[result.chunk.chunk_id]
                     )
                     + 1
@@ -544,7 +656,7 @@ class _ExpansionPackingMixin(
         for result in requested_reserved_rows:
             chunk_id = result.chunk.chunk_id
             active = chunk_id in active_reserved_ids
-            trace_by_id[chunk_id].update(
+            state.trace_by_id[chunk_id].update(
                 {
                     "coverage_reservation_requested": True,
                     "coverage_reservation_active": active,
@@ -559,19 +671,28 @@ class _ExpansionPackingMixin(
                     ),
                 }
             )
+        state.requested_reserved_rows = requested_reserved_rows
+        state.reservation_bodies = reservation_bodies
+        state.reservation_snippets = reservation_snippets
+        state.active_reserved_rows = active_reserved_rows
+        state.active_reserved_ids = active_reserved_ids
 
+    def _apply_post_coverage_closure(self, state: _ExpansionPass) -> None:
+        """Phase 5: stamp closure provenance and suppress non-members."""
+        selector_report = state.selector_report
+        selector_report_is_current = state.selector_report_is_current
         closure = self._post_coverage_closure_ids(
             selector_report=selector_report,
             selector_report_is_current=selector_report_is_current,
-            selector_output_rejected=selector_output_rejected,
-            selector_input=selector_input,
-            returned_ids=returned_ids,
-            selector_trace_rows=selector_trace_rows,
-            requested_reserved_rows=requested_reserved_rows,
-            active_reserved_ids=active_reserved_ids,
-            reservation_bodies=reservation_bodies,
-            reservation_snippets=reservation_snippets,
-            source_timestamps=source_timestamps,
+            selector_output_rejected=state.selector_output_rejected,
+            selector_input=state.selector_input,
+            returned_ids=state.returned_ids,
+            selector_trace_rows=state.selector_trace_rows,
+            requested_reserved_rows=state.requested_reserved_rows,
+            active_reserved_ids=state.active_reserved_ids,
+            reservation_bodies=state.reservation_bodies,
+            reservation_snippets=state.reservation_snippets,
+            source_timestamps=state.source_timestamps,
         )
         closure_chunk_ids, closure_scope, closure_global_recall_guaranteed = (
             closure if closure is not None else ((), "", False)
@@ -621,7 +742,7 @@ class _ExpansionPackingMixin(
             ),
             **scope_provenance,
         }
-        for diagnostic in trace_by_id.values():
+        for diagnostic in state.trace_by_id.values():
             diagnostic["post_coverage_closure_applied"] = closure_applied
             diagnostic["post_coverage_closed"] = False
             diagnostic["closure_scope"] = closure_scope
@@ -634,19 +755,33 @@ class _ExpansionPackingMixin(
             # member, so no ordinary alternative is needed to complete this
             # exact FIXED answer set. Keep the exact trusted objects and mark
             # every suppressed row explicitly in the text-free trace.
-            for chunk_id, diagnostic in trace_by_id.items():
+            for chunk_id, diagnostic in state.trace_by_id.items():
                 if chunk_id not in closure_id_set:
                     diagnostic["cutoff_reason"] = "post_coverage_closed"
                     diagnostic["post_coverage_closed"] = True
-            packing_ranked = [
+            state.packing_ranked = [
                 result
-                for result in active_reserved_rows
+                for result in state.active_reserved_rows
                 if result.chunk.chunk_id in closure_id_set
             ]
 
-        for result in packing_ranked:
+    def _pack_expansion_rows(
+        self,
+        state: _ExpansionPass,
+        expansion_count: int,
+    ) -> tuple[list[str], list[str], int, int, dict[str, int]]:
+        """Phase 6: emit budgeted excerpts and finalize the trace."""
+        trace_by_id = state.trace_by_id
+        texts: list[str] = []
+        chunk_ids: list[str] = []
+        used = state.used_tokens
+        source_tokens: dict[str, int] = defaultdict(int)
+        direct_kept = 0
+        consolidation_kept = 0
+        token_cutoff = False
+        for result in state.packing_ranked:
             diagnostic = trace_by_id[result.chunk.chunk_id]
-            is_reserved = result.chunk.chunk_id in active_reserved_ids
+            is_reserved = result.chunk.chunk_id in state.active_reserved_ids
             is_consolidation = result.route == "live_consolidation"
             if is_consolidation:
                 if (
@@ -661,12 +796,12 @@ class _ExpansionPackingMixin(
                 continue
             remaining = self.budget.expansion_tokens - used
             source_id = self._result_source_id(result)
-            label = expansion_label(result, len(texts) + 1)
+            label = self._expansion_label(state, result, len(texts) + 1)
             if is_reserved:
                 # This exact raw-body snippet was preflighted together with
                 # every other active representative.  Never shrink it based
                 # on what earlier rows happened to consume.
-                snippet = reservation_snippets[result.chunk.chunk_id]
+                snippet = state.reservation_snippets[result.chunk.chunk_id]
                 content_budget = count_tokens(snippet)
             else:
                 # Reserve the label and newline accounted for by this packer.
@@ -678,7 +813,9 @@ class _ExpansionPackingMixin(
                     diagnostic["cutoff_reason"] = "token_budget_exhausted"
                     token_cutoff = True
                     break
-                prepared = self._prepare_expansion_text(result.chunk.text, query)
+                prepared = self._prepare_expansion_text(
+                    result.chunk.text, state.query
+                )
                 snippet = truncate_to_tokens(prepared, content_budget)
             if not snippet:
                 diagnostic["cutoff_reason"] = "empty_after_prepare"
@@ -723,12 +860,12 @@ class _ExpansionPackingMixin(
         self.last_expansion_trace = list(trace_by_id.values())
 
         if not texts:
-            return [], [], 0, len(expansions), {}
+            return [], [], 0, expansion_count, {}
 
         return (
             texts,
             chunk_ids,
             used,
-            len(expansions) - len(texts),
+            expansion_count - len(texts),
             dict(source_tokens),
         )

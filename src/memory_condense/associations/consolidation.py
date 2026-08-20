@@ -27,11 +27,14 @@ from memory_condense.associations.association_models import (
 from memory_condense.associations.coaccess_graph import (
     accumulate_neighbor_evidence,
     decayed_mass,
+    edge_endpoint_keys,
+    positive_seed_activations,
     rank_discount,
     ranked_neighbor_states,
     score_coaccess_edges,
     select_prune_victims,
     validate_observation_params,
+    validated_recall_params,
 )
 from memory_condense.associations.head_memory_models import (
     AssociativeMemoryCandidate,
@@ -622,30 +625,28 @@ class LiveConsolidationStore:
     ) -> tuple[ConsolidationNeighbor, ...]:
         """Recall nodes supported by repetition or a completed interaction."""
 
-        if top_k < 0:
-            raise ValueError("top_k must be non-negative")
-        if top_k == 0:
+        window = validated_recall_params(
+            top_k=top_k,
+            min_score=min_score,
+            half_life_turns=half_life_turns,
+            now_turn=now_turn,
+            current_turn=self._db.current_turn,
+        )
+        if window is None:
             return ()
         if min_coactivation_count < 1:
             raise ValueError("min_coactivation_count must be positive")
         if min_causal_count < 1:
             raise ValueError("min_causal_count must be positive")
-        if not 0.0 <= min_score <= 1.0:
-            raise ValueError("min_score must lie in [0, 1]")
-        half_life = float(half_life_turns)
-        if not math.isfinite(half_life) or half_life <= 0.0:
-            raise ValueError("half_life_turns must be finite and positive")
-        turn = self._db.current_turn() if now_turn is None else int(now_turn)
-        if turn < 0:
-            raise ValueError("now_turn must be non-negative")
+        half_life, turn = window
 
-        seeds: dict[str, float] = {}
-        for node, raw_activation in activations.items():
-            activation = float(raw_activation)
-            if not math.isfinite(activation) or not 0.0 <= activation <= 1.0:
-                raise ValueError("node activations must be finite and in [0, 1]")
-            if activation > 0.0:
-                seeds[node.key] = max(seeds.get(node.key, 0.0), activation)
+        seeds = positive_seed_activations(
+            (
+                (node.key, activation)
+                for node, activation in activations.items()
+            ),
+            what="node activations",
+        )
         if not seeds:
             return ()
 
@@ -661,10 +662,7 @@ class LiveConsolidationStore:
         if not edge_rows:
             return ()
 
-        endpoint_keys = sorted(
-            {str(row[0]) for row in edge_rows}
-            | {str(row[1]) for row in edge_rows}
-        )
+        endpoint_keys = edge_endpoint_keys(edge_rows)
         endpoint_placeholders = ",".join("?" for _ in endpoint_keys)
         node_rows = self._db.execute(
             "SELECT node_key, node_kind, memory_id, chunk_id, access_mass, "
@@ -817,7 +815,6 @@ def expand_context_associations(
     min_score: float = 0.05,
     min_coactivation_count: int = 2,
     min_causal_count: int = 1,
-    max_chunk_token_increase: int | None = None,
     diffusion_hops: int = 1,
     diffusion_width: int = 32,
     chunk_relevance: ScoreChunks | None = None,
@@ -832,8 +829,6 @@ def expand_context_associations(
         raise ValueError("diffusion_hops must be positive")
     if diffusion_width < 1:
         raise ValueError("diffusion_width must be positive")
-    if max_chunk_token_increase is not None and max_chunk_token_increase < 0:
-        raise ValueError("max_chunk_token_increase must be non-negative")
 
     direct_memories = list(memories)
     direct_chunks = list(chunks)
@@ -1010,12 +1005,5 @@ def expand_context_associations(
                 break
         if learned_chunks:
             expanded_chunks = [*direct_chunks, *learned_chunks]
-            if max_chunk_token_increase is not None:
-                direct_tokens = sum(result.chunk.token_count for result in direct_chunks)
-                expanded_tokens = sum(
-                    result.chunk.token_count for result in expanded_chunks
-                )
-                if expanded_tokens > direct_tokens + max_chunk_token_increase:
-                    expanded_chunks = direct_chunks
 
     return expanded_memories, expanded_chunks

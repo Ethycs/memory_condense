@@ -16,6 +16,9 @@ from memory_condense.search.closure.semantics import (
 )
 from memory_condense.search.closure.store import EvidenceClosureStore
 
+#: Shared invariant message for any store probe returning more than requested.
+PROBE_OVERFLOW_MESSAGE = "store returned more results than the requested probe limit"
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactUnitScan:
@@ -59,7 +62,7 @@ def scan_artifact_units(
         for route in values:
             scanned_count += 1
             if not streaming and scanned_count > probe_limit:
-                raise ValueError("store exceeded the bounded legacy unit probe")
+                raise ValueError(PROBE_OVERFLOW_MESSAGE)
             if route.artifact_id != artifact_id:
                 raise ValueError("artifact unit belongs to another artifact")
             if (

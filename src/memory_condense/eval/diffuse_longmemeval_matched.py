@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from memory_condense.domain._discourse_identity import _as_tuple, normalize_fields
 from memory_condense.domain.discourse import identity_sha256
+from memory_condense.domain.sealed import SealedIdentity
+from memory_condense.eval._identity import sha256_digest
 from memory_condense.eval.diffuse_compilation import BoundaryMode
 
 if TYPE_CHECKING:
@@ -27,15 +30,6 @@ MATCHED_BOUNDARY_MODES: tuple[BoundaryMode, ...] = (
     "lexical_embedding",
     "qwen_head",
 )
-
-
-def _digest(value: object, label: str) -> str:
-    normalized = str(value)
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return normalized
 
 
 def _matched_source_scope_sha256(
@@ -63,8 +57,10 @@ def _matched_source_scope_sha256(
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseLongMemEvalMatchedProbeReceipt:
+class DiffuseLongMemEvalMatchedProbeReceipt(SealedIdentity):
     """Shared, arm-independent retrieval inputs for one matched probe."""
+
+    _SEAL_MISMATCH = "matched diffuse probe receipt does not match"
 
     question_id: str
     question_probe_sha256: str
@@ -103,34 +99,20 @@ class DiffuseLongMemEvalMatchedProbeReceipt:
             "episode_policy_sha256",
             "closure_policy_sha256",
         ):
-            _digest(getattr(self, name), name)
-        object.__setattr__(self, "anchor_chunk_ids", tuple(self.anchor_chunk_ids))
-        object.__setattr__(
+            sha256_digest(getattr(self, name), name)
+        normalize_fields(
             self,
-            "source_candidate_ids",
-            tuple(self.source_candidate_ids),
+            anchor_chunk_ids=_as_tuple,
+            source_candidate_ids=_as_tuple,
         )
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("matched diffuse probe receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
-
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
-        payload = {
-            name: getattr(self, name)
-            for name in self.__dataclass_fields__
-            if name != "receipt_sha256"
-        }
-        payload["anchor_chunk_ids"] = list(self.anchor_chunk_ids)
-        payload["source_candidate_ids"] = list(self.source_candidate_ids)
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+        self._seal()
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseLongMemEvalMatchedSuiteReceipt:
+class DiffuseLongMemEvalMatchedSuiteReceipt(SealedIdentity):
     """Proof that three whole-pipeline arms form one matched comparison."""
+
+    _SEAL_MISMATCH = "matched diffuse suite receipt does not match"
 
     sample_id: str
     corpus_sha256: str
@@ -160,11 +142,10 @@ class DiffuseLongMemEvalMatchedSuiteReceipt:
             "evaluation_policy_sha256",
             "matched_controls_sha256",
         ):
-            _digest(getattr(self, name), name)
-        modes = tuple(self.pipeline_modes)
-        if modes != MATCHED_BOUNDARY_MODES:
+            sha256_digest(getattr(self, name), name)
+        normalize_fields(self, pipeline_modes=_as_tuple)
+        if self.pipeline_modes != MATCHED_BOUNDARY_MODES:
             raise ValueError("matched suite requires the three canonical arms")
-        object.__setattr__(self, "pipeline_modes", modes)
         for name in (
             "pipeline_arm_sha256s",
             "compilation_receipt_sha256s",
@@ -173,7 +154,7 @@ class DiffuseLongMemEvalMatchedSuiteReceipt:
         ):
             values = tuple(getattr(self, name))
             for index, value in enumerate(values):
-                _digest(value, f"{name}[{index}]")
+                sha256_digest(value, f"{name}[{index}]")
             object.__setattr__(self, name, values)
         if not self.qwen_source_signal_receipt_sha256s:
             raise ValueError("matched suite requires Qwen source signal receipts")
@@ -187,12 +168,11 @@ class DiffuseLongMemEvalMatchedSuiteReceipt:
             MATCHED_BOUNDARY_MODES
         ):
             raise ValueError("matched suite receipts must cover every arm")
-        probes = tuple(self.probes)
-        if not probes:
+        normalize_fields(self, probes=_as_tuple)
+        if not self.probes:
             raise ValueError("matched suite requires at least one probe")
-        if len({item.question_id for item in probes}) != len(probes):
+        if len({item.question_id for item in self.probes}) != len(self.probes):
             raise ValueError("matched suite probes must be unique")
-        object.__setattr__(self, "probes", probes)
         for name in (
             "qwen_owned_representative_runtime",
             "zero_returned_transformer_state",
@@ -200,44 +180,7 @@ class DiffuseLongMemEvalMatchedSuiteReceipt:
         ):
             if getattr(self, name) is not True:
                 raise ValueError(f"{name} must be certified true")
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("matched diffuse suite receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
-
-    def identity_payload(self, *, include_receipt: bool = True) -> dict[str, Any]:
-        payload = {
-            "format": self.format,
-            "sample_id": self.sample_id,
-            "corpus_sha256": self.corpus_sha256,
-            "deterministic_turn_ids_sha256": self.deterministic_turn_ids_sha256,
-            "evaluation_policy_sha256": self.evaluation_policy_sha256,
-            "matched_controls_sha256": self.matched_controls_sha256,
-            "pipeline_modes": list(self.pipeline_modes),
-            "pipeline_arm_sha256s": list(self.pipeline_arm_sha256s),
-            "compilation_receipt_sha256s": list(
-                self.compilation_receipt_sha256s
-            ),
-            "retrieval_phase_receipt_sha256s": list(
-                self.retrieval_phase_receipt_sha256s
-            ),
-            "probes": [item.identity_payload() for item in self.probes],
-            "qwen_source_signal_receipt_sha256s": list(
-                self.qwen_source_signal_receipt_sha256s
-            ),
-            "qwen_owned_representative_runtime": (
-                self.qwen_owned_representative_runtime
-            ),
-            "zero_returned_transformer_state": (
-                self.zero_returned_transformer_state
-            ),
-            "zero_persisted_transformer_state": (
-                self.zero_persisted_transformer_state
-            ),
-        }
-        if include_receipt:
-            payload["receipt_sha256"] = self.receipt_sha256
-        return payload
+        self._seal()
 
 
 def validate_matched_diffuse_retrieval_phases(

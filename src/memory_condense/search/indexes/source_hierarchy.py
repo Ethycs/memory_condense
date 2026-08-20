@@ -14,7 +14,11 @@ from typing import Sequence
 
 import numpy as np
 
-from memory_condense.persistence.db import Database
+from memory_condense.persistence.db import (
+    INDEXED_CHUNK_SQL,
+    TURN_SOURCE_ID_SQL,
+    Database,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,10 +74,10 @@ class SourceContractionIndex:
 
     def _load_source_vectors(self) -> dict[str, tuple[np.ndarray, int]]:
         rows = self._db.execute(
-            "SELECT COALESCE(t.source_id, t.turn_id), c.embedding "
+            f"SELECT {TURN_SOURCE_ID_SQL}, c.embedding "
             "FROM chunks AS c JOIN turns AS t ON t.turn_id = c.turn_id "
-            "WHERE c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
-            "ORDER BY COALESCE(t.source_id, t.turn_id), c.rowid"
+            f"WHERE {INDEXED_CHUNK_SQL} "
+            f"ORDER BY {TURN_SOURCE_ID_SQL}, c.rowid"
         )
         sums: dict[str, np.ndarray] = {}
         counts: dict[str, int] = {}

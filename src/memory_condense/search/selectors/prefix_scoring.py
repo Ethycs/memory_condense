@@ -14,7 +14,6 @@ from memory_condense.search.selectors.evidence_features import (
     _normalized_scalars,
     _normalized_transport,
     _optional_probability,
-    _source_id,
     resolve_surface_value_evidence,
 )
 from memory_condense.search.selectors.prefix_models import (
@@ -69,16 +68,16 @@ def score_prefix_coverage(
                     text=truncate_to_tokens(
                         (
                             f"[Source time: "
-                            f"{timestamps[_source_id(result)]}]\n"
+                            f"{timestamps[result.durable_source_id]}]\n"
                             f"{result.chunk.text}"
-                            if _source_id(result) in timestamps
+                            if result.durable_source_id in timestamps
                             else result.chunk.text
                         ),
                         self.candidate_tokens,
                     ),
                     score=float(result.score),
                     route=result.route or "coverage_frontier",
-                    metadata={"source_id": _source_id(result)},
+                    metadata={"source_id": result.durable_source_id},
                 )
                 for result in batch
             ]
@@ -150,7 +149,7 @@ def score_prefix_coverage(
     surface_value_scores = [
         surface_value_evidence(
             result.chunk.text,
-            timestamps.get(_source_id(result)),
+            timestamps.get(result.durable_source_id),
         )
         for result in scored
     ]
@@ -256,7 +255,7 @@ def score_prefix_coverage(
             # into a shape error during pairwise comparison.
             uncertain.append((index, result))
             continue
-        source_id = _source_id(result)
+        source_id = result.durable_source_id
         timestamp = timestamps.get(source_id)
         answer_object_key = answer_object_keys_by_id.get(
             result.chunk.chunk_id

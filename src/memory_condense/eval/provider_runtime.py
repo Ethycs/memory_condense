@@ -6,25 +6,13 @@ import os
 import re
 import time
 
+from memory_condense.eval._completion import _content, build_completion_request
 from memory_condense.eval.benchmark import (
     BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
     build_judge_prompt,
 )
 from memory_condense.eval.judge import JUDGE_MAX_TOKENS
 from memory_condense.eval.schemas import UsageStats
-
-def _content(response) -> str:
-    """The assistant text, or "" if the provider returned none.
-
-    A refusal, a content filter, or a `max_tokens` stop before any visible text
-    all yield ``content=None``. Reaching ``.strip()`` on that raises
-    ``AttributeError`` deep in a paid run, after every preceding call has
-    already been billed.
-    """
-    try:
-        return (response.choices[0].message.content or "").strip()
-    except (AttributeError, IndexError, TypeError):
-        return ""
 
 
 _BINARY_JUDGE_VERDICT = re.compile(
@@ -102,19 +90,16 @@ def _make_answer_fn(
         messages: list[dict[str, str]],
     ) -> tuple[str, UsageStats]:
         started = time.perf_counter()
-        request = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
-            "num_retries": retries,
-        }
-        # Codex GPT-5 routes reject non-default temperature values. Omitting
-        # the field keeps the central-dev codex_sdk gateway compatible while
-        # preserving deterministic temperature=0 for historical model routes.
-        if "codex_sdk/" not in model:
-            request["temperature"] = 0.0
-        if central_dev_client is not None:
-            request["client"] = central_dev_client
+        # temperature=0.0 keeps historical routes deterministic; the shared
+        # builder omits it for codex_sdk routes, which reject it with a 400.
+        request = build_completion_request(
+            model,
+            messages,
+            max_tokens=BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
+            num_retries=retries,
+            temperature=0.0,
+            client=central_dev_client,
+        )
         response = litellm.completion(**request)
         content = _content(response)
         if not content:
@@ -152,14 +137,13 @@ def _make_judge_fn(
         prediction: str,
     ) -> tuple[bool, str, UsageStats]:
         started = time.perf_counter()
-        request = {
-            "model": model,
-            "messages": build_judge_prompt(question, gold, prediction),
-            "max_tokens": JUDGE_MAX_TOKENS,
-            "num_retries": retries,
-        }
-        if central_dev_client is not None:
-            request["client"] = central_dev_client
+        request = build_completion_request(
+            model,
+            build_judge_prompt(question, gold, prediction),
+            max_tokens=JUDGE_MAX_TOKENS,
+            num_retries=retries,
+            client=central_dev_client,
+        )
         response = litellm.completion(**request)
         text = _content(response)
         return (
@@ -191,14 +175,13 @@ def _make_sufficiency_fn(
         context: list[str],
     ) -> tuple[bool, str, UsageStats]:
         started = time.perf_counter()
-        request = {
-            "model": model,
-            "messages": build_sufficiency_prompt(question, gold, context),
-            "max_tokens": JUDGE_MAX_TOKENS,
-            "num_retries": retries,
-        }
-        if central_dev_client is not None:
-            request["client"] = central_dev_client
+        request = build_completion_request(
+            model,
+            build_sufficiency_prompt(question, gold, context),
+            max_tokens=JUDGE_MAX_TOKENS,
+            num_retries=retries,
+            client=central_dev_client,
+        )
         response = litellm.completion(**request)
         verdict = _content(response)
         return (

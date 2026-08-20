@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from memory_condense.domain._discourse_identity import (
+    identity_sha256 as _canonical_sha256,
+)
 from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.eval.benchmark import (
@@ -25,16 +26,6 @@ from memory_condense.ingest.loader import BenchmarkSample
 
 
 TRACE_FORMAT = "memory-condense-transition-candidate-trace-v1"
-
-
-def _canonical_sha256(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 class TransitionTraceCandidate(BaseModel):

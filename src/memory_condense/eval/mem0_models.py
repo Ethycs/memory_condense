@@ -203,12 +203,6 @@ class Mem0IngestResult:
     runtime_identity: Mapping[str, Any]
     stats: Mem0AdapterStats
 
-    @property
-    def pairs_added(self) -> tuple[SourceRef, ...]:
-        """Compatibility alias; batches may be singleton or assistant-first."""
-
-        return self.batches_added
-
 
 @dataclass(frozen=True, slots=True)
 class Mem0Candidate:

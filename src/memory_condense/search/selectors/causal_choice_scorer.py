@@ -20,6 +20,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from memory_condense.domain._tokenizer import truncate_to_tokens
+from memory_condense.domain.integrity import file_sha256 as _file_sha256
+from memory_condense.domain.ranking import (
+    round_robin_unique,
+    source_rows_with_fallback,
+)
 from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.search.selectors.coverage_models import ReportDumpMixin
 
@@ -217,16 +222,6 @@ def _weight_paths(root: Path) -> list[Path]:
         return []
     names = sorted({str(value) for value in weight_map.values()})
     return [root / name for name in names]
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as source:
-        buffer = bytearray(8 * 1024 * 1024)
-        view = memoryview(buffer)
-        while size := source.readinto(buffer):
-            digest.update(view[:size])
-    return digest.hexdigest()
 
 
 def _checkpoint_paths(root: Path) -> tuple[list[Path], list[str]]:
@@ -559,11 +554,7 @@ class CausalChoiceScorer:
                 continue
             seen.add(candidate_id)
             role = result.turn.role if result.turn is not None else ""
-            source_id = str(
-                result.memory_source_id
-                or (result.turn.source_id if result.turn is not None else "")
-                or result.chunk.turn_id
-            )
+            source_id = result.durable_source_id
             timestamp = str(timestamps.get(source_id, "")).strip()
             text = result.chunk.text
             if timestamp:
@@ -838,26 +829,10 @@ class CausalChoiceScorer:
             compile_set_program,
         )
 
-        source_rows = [
-            (str(source_id), list(candidates))
-            for source_id, candidates in candidates_by_source.items()
-            if candidates
-        ]
-        fallback = {
-            source_id: candidates[0] for source_id, candidates in source_rows
-        }
-        flattened: list[RetrievalResult] = []
-        depth = 0
-        while True:
-            added = False
-            for _source_id, candidates in source_rows:
-                if depth >= len(candidates):
-                    continue
-                flattened.append(candidates[depth])
-                added = True
-            if not added:
-                break
-            depth += 1
+        source_rows, fallback = source_rows_with_fallback(candidates_by_source)
+        flattened = round_robin_unique(
+            [candidates for _source_id, candidates in source_rows]
+        )
 
         selected = dict(fallback)
         fallback_reason = ""

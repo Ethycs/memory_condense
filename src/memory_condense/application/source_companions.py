@@ -9,6 +9,7 @@ import numpy as np
 
 from memory_condense.application.query_routing import _retrieval_source_id
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.persistence.db import TURN_SOURCE_ID_SQL
 from memory_condense.persistence.transcript_store import parse_source_metadata
 from memory_condense.search.packing.performance_events import (
     is_direct_past_performance,
@@ -94,7 +95,7 @@ class SourceCompanionWorkflowMixin:
             dict.fromkeys(str(source_id) for source_id in source_ids if source_id)
         )
         placeholders = ",".join("?" for _ in selected_sources)
-        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        source_expr = TURN_SOURCE_ID_SQL
         excluded = {str(chunk_id) for chunk_id in excluded_chunk_ids}
         selected_ids: dict[str, list[str]] = {
             source_id: [] for source_id in selected_sources
@@ -175,7 +176,7 @@ class SourceCompanionWorkflowMixin:
             dict.fromkeys(str(source_id) for source_id in source_ids if source_id)
         )
         placeholders = ",".join("?" for _ in selected_sources)
-        source_expr = "COALESCE(t.source_id, t.turn_id)"
+        source_expr = TURN_SOURCE_ID_SQL
         excluded = {str(chunk_id) for chunk_id in excluded_chunk_ids}
         selected_ids: dict[str, str] = {}
         rows = self._db.execute(

@@ -7,6 +7,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from memory_condense.eval._identity import sha256_digest
+
 
 COMPILED_RECEIPT_FIELDS = (
     "manifest_sha256",
@@ -52,17 +54,6 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _sha256(value: object, label: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    digest = value.casefold()
-    if len(digest) != 64 or any(
-        character not in "0123456789abcdef" for character in digest
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return digest
-
-
 def validated_cache_receipts(
     value: object,
     *,
@@ -102,7 +93,7 @@ def validated_cache_receipts(
                     )
                 receipt[field] = raw
             else:
-                receipt[field] = _sha256(
+                receipt[field] = sha256_digest(
                     raw,
                     f"{cache_kind} cache receipt {field}",
                 )
@@ -129,7 +120,7 @@ def validated_cache_receipts(
     for field, raw_expected in expected.items():
         if raw_expected is None:
             continue
-        expected_digest = _sha256(raw_expected, f"expected {field}")
+        expected_digest = sha256_digest(raw_expected, f"expected {field}")
         if compiled[field] != expected_digest:
             raise ValueError(f"cache receipts do not match expected {field}")
     return result

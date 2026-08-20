@@ -18,7 +18,6 @@ from memory_condense.search.selectors.evidence_features import (
     _normalized_scalars,
     _normalized_transport,
     _optional_probability,
-    _source_id,
     _surface_value_evidence,
     _timestamp_key,
 )

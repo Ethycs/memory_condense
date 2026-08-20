@@ -20,17 +20,21 @@ from memory_condense.application.discourse_sources import (
     build_episode_source_candidate_scope,
 )
 from memory_condense.associations.qwen_memory_linker import QwenMemoryLinker
+from memory_condense.domain._discourse_identity import (
+    _as_tuple,
+    _nonempty,
+    normalize_fields,
+)
 from memory_condense.domain.discourse import canonical_json, identity_sha256, quote_sha256
+from memory_condense.domain.sealed import SealedIdentity
 from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.eval.diffuse_longmemeval_analysis import (
-    DiffuseLongMemEvalArm,
     DiffuseLongMemEvalRetrievalPhase,
     GoldBlindLongMemEvalQuestion,
     GoldBlindLongMemEvalSample,
     LegacyDiffuseCandidates,
-    ingest_gold_blind_sample_deterministically,
-    retrieve_diffuse_longmemeval_sample,
 )
+from memory_condense.eval._identity import exact_int, sha256_digest
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
 from memory_condense.modeling.embedding import (
     BGE_M3_CHECKPOINT_SHA256,
@@ -73,6 +77,12 @@ _PACKED_CONTEXT_MODES = {
 }
 
 
+def _positive_int(value: object, label: str) -> int:
+    """Exact positive integer, spelled once for ``normalize_fields``."""
+
+    return exact_int(value, label, minimum=1)
+
+
 class TreatmentQuestionLike(Protocol):
     """Structural view of the evaluator firebreak's treatment question."""
 
@@ -89,28 +99,6 @@ class TreatmentSampleLike(Protocol):
     turn_source_ids: Sequence[str | None]
     turn_created_at: Sequence[datetime | None]
     questions: Sequence[TreatmentQuestionLike]
-
-
-def _positive_int(value: object, label: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be a positive integer")
-    try:
-        normalized = int(value)  # type: ignore[arg-type]
-        exact = math.isfinite(float(value)) and float(value) == normalized  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be a positive integer") from exc
-    if not exact or normalized < 1:
-        raise ValueError(f"{label} must be a positive integer")
-    return normalized
-
-
-def _digest(value: object, label: str) -> str:
-    normalized = str(value).casefold()
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
-    ):
-        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
-    return normalized
 
 
 def _callable_identity(value: object) -> dict[str, str | None]:
@@ -387,8 +375,10 @@ def _source_streams_identity(condenser: Any) -> tuple[tuple[str, ...], str]:
 
 
 @dataclass(frozen=True, slots=True)
-class FrozenLegacyQueryInputs:
+class FrozenLegacyQueryInputs(SealedIdentity):
     """Artifact-agnostic legacy rows frozen before a staged Qwen load."""
+
+    _SEAL_MISMATCH = "frozen legacy query receipt does not match"
 
     query: str
     retrieval_policy_sha256: str
@@ -400,16 +390,12 @@ class FrozenLegacyQueryInputs:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        query = str(self.query).strip()
-        if not query:
-            raise ValueError("query must be non-empty")
-        object.__setattr__(self, "query", query)
-        _digest(self.retrieval_policy_sha256, "retrieval_policy_sha256")
-        _digest(self.source_streams_sha256, "source_streams_sha256")
-        anchors = tuple(self.anchors)
-        if any(not isinstance(item, RetrievalResult) for item in anchors):
+        normalize_fields(self, query=_nonempty)
+        sha256_digest(self.retrieval_policy_sha256, "retrieval_policy_sha256")
+        sha256_digest(self.source_streams_sha256, "source_streams_sha256")
+        normalize_fields(self, anchors=_as_tuple)
+        if any(not isinstance(item, RetrievalResult) for item in self.anchors):
             raise TypeError("anchors must contain RetrievalResult values")
-        object.__setattr__(self, "anchors", anchors)
         lexical: list[tuple[str, float]] = []
         for source_id, score in self.lexical_sources:
             normalized_id = str(source_id).strip()
@@ -422,10 +408,7 @@ class FrozenLegacyQueryInputs:
         if any(not item for item in universe) or len(set(universe)) != len(universe):
             raise ValueError("source universe must contain unique non-empty IDs")
         object.__setattr__(self, "universe_source_ids", universe)
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("frozen legacy query receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
+        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -487,8 +470,7 @@ class ResidentLegacyDiffuseInputProvider:
     rrf_constant: int = 60
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "max_sources", _positive_int(self.max_sources, "max_sources"))
-        object.__setattr__(self, "rrf_constant", _positive_int(self.rrf_constant, "rrf_constant"))
+        normalize_fields(self, max_sources=_positive_int, rrf_constant=_positive_int)
 
     def analysis_identity_payload(self) -> Mapping[str, object]:
         return {
@@ -548,12 +530,15 @@ class FrozenLegacyDiffuseInputProvider:
     _by_query: Mapping[str, _FrozenLegacyQuerySnapshot] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "max_sources", _positive_int(self.max_sources, "max_sources"))
-        object.__setattr__(self, "rrf_constant", _positive_int(self.rrf_constant, "rrf_constant"))
-        rows = tuple(self.inputs)
+        normalize_fields(
+            self,
+            max_sources=_positive_int,
+            rrf_constant=_positive_int,
+            inputs=_as_tuple,
+        )
         snapshots: list[_FrozenLegacyQuerySnapshot] = []
         by_query: dict[str, _FrozenLegacyQuerySnapshot] = {}
-        for row in rows:
+        for row in self.inputs:
             if not isinstance(row, FrozenLegacyQueryInputs):
                 raise TypeError("inputs must contain FrozenLegacyQueryInputs")
             receipt = identity_sha256(row.identity_payload(include_receipt=False))
@@ -574,7 +559,6 @@ class FrozenLegacyDiffuseInputProvider:
             previous = by_query.setdefault(row.query, snapshot)
             if previous.receipt_sha256 != receipt:
                 raise ValueError("duplicate staged query has different frozen inputs")
-        object.__setattr__(self, "inputs", rows)
         object.__setattr__(self, "_snapshots", tuple(snapshots))
         object.__setattr__(self, "_by_query", MappingProxyType(by_query))
 
@@ -665,29 +649,29 @@ class DiffuseLongMemEvalRuntimeConfig:
             "staged_bge_then_qwen",
         }:
             raise ValueError("unsupported model residency mode")
-        for name in (
-            "embedding_batch_size",
-            "qwen_max_candidates",
-            "qwen_max_workspace_tokens",
-            "resident_min_free_mib",
-            "source_router_max_sources",
-            "source_router_rrf_constant",
-            "surprise_max_spans",
-            "surprise_span_tokens",
-            "surprise_probe_tokens",
-            "surprise_max_transport_dimension",
-            "representative_max_input_sources",
-            "representative_max_source_groups",
-            "representative_max_episodes_per_source",
-            "representative_max_total_episodes",
-            "representative_max_per_episode",
-            "representative_group_size",
-            "representative_beam_per_group",
-            "representative_top_k",
-            "representative_tokens",
-            "representative_query_tokens",
-        ):
-            object.__setattr__(self, name, _positive_int(getattr(self, name), name))
+        normalize_fields(
+            self,
+            embedding_batch_size=_positive_int,
+            qwen_max_candidates=_positive_int,
+            qwen_max_workspace_tokens=_positive_int,
+            resident_min_free_mib=_positive_int,
+            source_router_max_sources=_positive_int,
+            source_router_rrf_constant=_positive_int,
+            surprise_max_spans=_positive_int,
+            surprise_span_tokens=_positive_int,
+            surprise_probe_tokens=_positive_int,
+            surprise_max_transport_dimension=_positive_int,
+            representative_max_input_sources=_positive_int,
+            representative_max_source_groups=_positive_int,
+            representative_max_episodes_per_source=_positive_int,
+            representative_max_total_episodes=_positive_int,
+            representative_max_per_episode=_positive_int,
+            representative_group_size=_positive_int,
+            representative_beam_per_group=_positive_int,
+            representative_top_k=_positive_int,
+            representative_tokens=_positive_int,
+            representative_query_tokens=_positive_int,
+        )
         if self.representative_max_input_sources < self.source_router_max_sources:
             raise ValueError("representative input cap must cover the source-router cap")
         if self.representative_max_source_groups < self.source_router_max_sources:
@@ -827,8 +811,13 @@ class _OwnedQwenRuntime:
     reranker: Any | None
 
 
-class RepresentativePolicyFactory:
-    """Callable object whose immutable controls are visible to receipts."""
+class EpisodeRepresentativePolicyFactory:
+    """Callable object whose immutable controls are visible to receipts.
+
+    Builds one :class:`EpisodeRepresentativeRetrievalPolicy` per artifact and
+    satisfies the ``RepresentativePolicyFactory`` callable alias exported by
+    :mod:`memory_condense.eval.diffuse_longmemeval_analysis`.
+    """
 
     def __init__(self, runtime: DiffuseLongMemEvalRuntimeConfig) -> None:
         self._runtime = runtime
@@ -920,7 +909,9 @@ class DiffuseLongMemEvalExecutionBinding:
             "normalize_embeddings": False,
             "output_dtype": "float32",
         }
-        self.representative_policy_factory = RepresentativePolicyFactory(runtime)
+        self.representative_policy_factory = EpisodeRepresentativePolicyFactory(
+            runtime
+        )
         self._qwen: _OwnedQwenRuntime | None = None
         self._preflight: ResidencyPreflightObservation | None = None
         self._staged_consumed = False
@@ -1142,7 +1133,9 @@ def build_diffuse_longmemeval_execution_binding(
 
 
 @dataclass(frozen=True, slots=True)
-class DiffuseLongMemEvalRuntimeResult:
+class DiffuseLongMemEvalRuntimeResult(SealedIdentity):
+    _SEAL_MISMATCH = "runtime result receipt does not match"
+
     phase: DiffuseLongMemEvalRetrievalPhase
     runtime_binding_sha256: str
     runtime_binding_certified: bool
@@ -1151,17 +1144,14 @@ class DiffuseLongMemEvalRuntimeResult:
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        _digest(self.runtime_binding_sha256, "runtime_binding_sha256")
+        sha256_digest(self.runtime_binding_sha256, "runtime_binding_sha256")
         if type(self.runtime_binding_certified) is not bool:
             raise ValueError("runtime_binding_certified must be boolean")
         if not isinstance(self.residency_preflight, ResidencyPreflightObservation):
             raise TypeError(
                 "residency_preflight must be a ResidencyPreflightObservation"
             )
-        expected = identity_sha256(self.identity_payload(include_receipt=False))
-        if self.receipt_sha256 and self.receipt_sha256 != expected:
-            raise ValueError("runtime result receipt does not match")
-        object.__setattr__(self, "receipt_sha256", expected)
+        self._seal()
 
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -1182,99 +1172,6 @@ class DiffuseLongMemEvalRuntimeResult:
         return payload
 
 
-def run_diffuse_treatment_sample(
-    sample: TreatmentSampleLike,
-    *,
-    binding: DiffuseLongMemEvalExecutionBinding,
-    arm: DiffuseLongMemEvalArm,
-    data_dir: str | Path,
-) -> DiffuseLongMemEvalRuntimeResult:
-    """Run one sanitized treatment sample; benchmark gold cannot enter."""
-
-    if not isinstance(binding, DiffuseLongMemEvalExecutionBinding):
-        raise TypeError("binding must be a DiffuseLongMemEvalExecutionBinding")
-    if not binding.runtime_binding_certified:
-        raise RuntimeError(
-            "sanitized canary execution requires the exact certified local runtime"
-        )
-    store_path = Path(data_dir)
-    if store_path.exists():
-        raise FileExistsError("diffuse runtime requires a fresh store path")
-    if (
-        binding.runtime.residency_mode == "staged_bge_then_qwen"
-        and binding._staged_consumed
-    ):
-        raise RuntimeError("a staged binding is single-sample; construct a fresh binding")
-    blind = gold_blind_from_treatment_sample(sample)
-    condenser = binding.new_condenser(store_path)
-    if type(condenser) is not MemoryCondenser:
-        close = getattr(condenser, "close", None)
-        if callable(close):
-            close()
-        raise TypeError(
-            "certified condenser factory must return the exact MemoryCondenser"
-        )
-    shadowed = {
-        method_name
-        for owner, method_name, _expected in _OWNED_CRITICAL_METHODS
-        if owner is MemoryCondenser and method_name in vars(condenser)
-    }
-    if shadowed:
-        condenser.close()
-        raise RuntimeError(
-            f"certified condenser has shadowed methods: {sorted(shadowed)}"
-        )
-    try:
-        ingest_gold_blind_sample_deterministically(condenser, blind)
-        if binding.runtime.residency_mode == "staged_bge_then_qwen":
-            frozen = freeze_legacy_query_inputs(
-                condenser,
-                [item.retrieval_query for item in blind.questions],
-                binding.config.retrieval,
-            )
-            observation = binding._staged_release()
-            provider: Any = FrozenLegacyDiffuseInputProvider(
-                frozen,
-                max_sources=binding.runtime.source_router_max_sources,
-                rrf_constant=binding.runtime.source_router_rrf_constant,
-            )
-            binding._staged_consumed = True
-        else:
-            observation = binding._resident_preflight()
-            provider = ResidentLegacyDiffuseInputProvider(
-                max_sources=binding.runtime.source_router_max_sources,
-                rrf_constant=binding.runtime.source_router_rrf_constant,
-            )
-        qwen = binding.ensure_qwen_runtime()
-        if qwen.reranker is not None:
-            condenser.set_source_candidate_reranker(qwen.reranker)
-        phase = retrieve_diffuse_longmemeval_sample(
-            condenser,
-            blind,
-            config=binding.config,
-            arm=arm,
-            legacy_input_provider=provider,
-            qwen_scorer=(
-                qwen.scorer
-                if arm.compilation.boundary_mode == "qwen_head"
-                else None
-            ),
-            embedding_identity=binding.embedding_identity,
-            representative_linker=qwen.linker,
-            representative_policy_factory=(
-                binding.representative_policy_factory
-            ),
-        )
-        return DiffuseLongMemEvalRuntimeResult(
-            phase=phase,
-            runtime_binding_sha256=binding.binding_sha256,
-            runtime_binding_certified=binding.runtime_binding_certified,
-            residency_preflight=observation,
-        )
-    finally:
-        condenser.close()
-
-
 __all__ = [
     "DIFFUSE_RUNTIME_FORMAT",
     "DIFFUSE_RUNTIME_RESULT_FORMAT",
@@ -1282,9 +1179,9 @@ __all__ = [
     "DiffuseLongMemEvalRuntimeConfig",
     "DiffuseLongMemEvalRuntimeFactories",
     "DiffuseLongMemEvalRuntimeResult",
+    "EpisodeRepresentativePolicyFactory",
     "FrozenLegacyDiffuseInputProvider",
     "FrozenLegacyQueryInputs",
-    "RepresentativePolicyFactory",
     "ResidencyMode",
     "ResidencyPreflightObservation",
     "ResidentLegacyDiffuseInputProvider",
@@ -1294,5 +1191,4 @@ __all__ = [
     "freeze_legacy_query_inputs",
     "gold_blind_from_treatment_sample",
     "retrieve_exact_legacy_anchors",
-    "run_diffuse_treatment_sample",
 ]

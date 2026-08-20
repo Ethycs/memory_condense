@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from memory_condense.modeling.qwen_prefix import Qwen3PrefixEncoder
+from memory_condense.modeling.qwen_prefix import (
+    add_prefix_encoder_arguments,
+    prefix_encoder_from_args,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,16 +230,13 @@ def _parse_layers(raw: str, available: int) -> tuple[int, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, required=True)
+    add_prefix_encoder_arguments(parser)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--layers", default="all")
-    parser.add_argument("--prefix-layers", type=int, default=7)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--bootstrap-repeats", type=int, default=64)
     parser.add_argument("--control-repeats", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -252,12 +252,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     text_to_index = {text: index for index, text in enumerate(unique_texts)}
 
-    encoder = Qwen3PrefixEncoder(
-        args.model_dir,
-        layers=args.prefix_layers,
-        device=args.device,
-        dtype=args.dtype,
-    )
+    encoder = prefix_encoder_from_args(args)
     activations = encoder.encode_layers(
         unique_texts,
         layers=layers,

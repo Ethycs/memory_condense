@@ -9,6 +9,7 @@ from typing import Sequence
 
 from memory_condense.associations.association_store import AssociationArtifact
 from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.persistence.db import INDEXED_CHUNK_SQL
 
 
 def _bind_explicit_chunk_ids(
@@ -158,7 +159,6 @@ class IngestWorkflowMixin:
         *,
         batch_size: int = 8,
         overwrite: bool = False,
-        conceptual_spans: bool = True,
     ) -> dict[str, int]:
         """Compile event/concept memberships into bounded durable scalars.
 
@@ -194,11 +194,7 @@ class IngestWorkflowMixin:
         span_texts: list[str] = []
         span_owners: list[str] = []
         for chunk in pending:
-            spans = (
-                self._chunker.conceptual_spans(chunk.text)
-                if conceptual_spans
-                else [chunk.text]
-            )
+            spans = self._chunker.conceptual_spans(chunk.text)
             for span in spans or [chunk.text]:
                 span_texts.append(span)
                 span_owners.append(chunk.chunk_id)
@@ -264,7 +260,7 @@ class IngestWorkflowMixin:
             "SELECT c.chunk_id, c.turn_id, c.text, c.start_char, c.end_char, "
             "c.token_count FROM chunks AS c "
             "JOIN turns AS t ON t.turn_id = c.turn_id "
-            "WHERE c.embedding IS NOT NULL AND c.hnsw_label IS NOT NULL "
+            f"WHERE {INDEXED_CHUNK_SQL} "
             f"AND t.role IN ({placeholders}) ORDER BY c.hnsw_label",
             selected_roles,
         ).fetchall()

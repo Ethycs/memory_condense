@@ -14,6 +14,7 @@ from memory_condense.associations.association_models import (
     StoredCAVSignature,
     _canonical_json,
 )
+from memory_condense.persistence.db import INDEXED_CHUNK_SQL, TURN_SOURCE_ID_SQL
 
 
 class AssociationArtifactStoreMixin:
@@ -217,8 +218,7 @@ class AssociationArtifactStoreMixin:
         params: list[Any] = [artifact.artifact_id]
         where = [
             "s.artifact_id = ?",
-            "c.embedding IS NOT NULL",
-            "c.hnsw_label IS NOT NULL",
+            INDEXED_CHUNK_SQL,
         ]
         select = "SELECT s.chunk_id, s.signature"
         join = (
@@ -226,11 +226,11 @@ class AssociationArtifactStoreMixin:
             "JOIN chunks AS c ON c.chunk_id = s.chunk_id "
         )
         if with_sources:
-            select += ", COALESCE(t.source_id, t.turn_id)"
+            select += f", {TURN_SOURCE_ID_SQL}"
             join += "JOIN turns AS t ON t.turn_id = c.turn_id "
             if source_ids:
                 placeholders = ",".join("?" for _ in source_ids)
-                where.append(f"COALESCE(t.source_id, t.turn_id) IN ({placeholders})")
+                where.append(f"{TURN_SOURCE_ID_SQL} IN ({placeholders})")
                 params.extend(source_ids)
         rows = self._db.execute(
             f"{select} {join}WHERE " + " AND ".join(where),

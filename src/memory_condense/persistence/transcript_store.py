@@ -11,6 +11,18 @@ _SOURCE_METADATA_RE = re.compile(
     r"^\[(?P<source>.+?) took place at (?P<timestamp>.+?)\]\s*$"
 )
 
+#: The one column list every ``Turn`` hydration query selects, in
+#: ``_row_to_turn`` order.
+_TURN_SELECT = "SELECT turn_id, role, text, source_id, created_at FROM turns"
+
+
+def format_source_metadata(source_id: str, timestamp: str) -> str:
+    """Render the synthetic boundary turn that :func:`parse_source_metadata`
+    recognizes.  Producer and parser live together so the template cannot
+    drift apart from the regex."""
+
+    return f"[{source_id} took place at {timestamp}]"
+
 
 def parse_source_metadata(text: str) -> tuple[str, str] | None:
     """Parse the synthetic timestamp turn emitted at a source boundary.
@@ -105,7 +117,7 @@ class TranscriptStore:
     def get_turn(self, turn_id: str) -> Turn | None:
         """Retrieve a single turn by ID."""
         cur = self._db.execute(
-            "SELECT turn_id, role, text, source_id, created_at FROM turns WHERE turn_id = ?",
+            f"{_TURN_SELECT} WHERE turn_id = ?",
             (turn_id,),
         )
         row = cur.fetchone()
@@ -116,8 +128,7 @@ class TranscriptStore:
     def get_recent(self, n: int = 20) -> list[Turn]:
         """Return the N most recent turns, ordered oldest-first."""
         cur = self._db.execute(
-            "SELECT turn_id, role, text, source_id, created_at FROM turns "
-            "ORDER BY ordinal DESC LIMIT ?",
+            f"{_TURN_SELECT} ORDER BY ordinal DESC LIMIT ?",
             (n,),
         )
         rows = cur.fetchall()
@@ -126,7 +137,7 @@ class TranscriptStore:
     def get_all(self) -> list[Turn]:
         """Return all turns, ordered by created_at."""
         cur = self._db.execute(
-            "SELECT turn_id, role, text, source_id, created_at FROM turns ORDER BY ordinal"
+            f"{_TURN_SELECT} ORDER BY ordinal"
         )
         return [self._row_to_turn(r) for r in cur.fetchall()]
 
@@ -162,8 +173,8 @@ class TranscriptStore:
         # match turns that never said it.
         escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         cur = self._db.execute(
-            "SELECT turn_id, role, text, source_id, created_at FROM turns "
-            "WHERE text LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT 1",
+            f"{_TURN_SELECT} WHERE text LIKE ? ESCAPE '\\' "
+            "ORDER BY created_at DESC LIMIT 1",
             (f"%{escaped}%",),
         )
         row = cur.fetchone()

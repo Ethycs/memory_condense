@@ -11,6 +11,11 @@ from typing import Callable, Sequence
 
 from memory_condense.associations.association_store import AssociationStore
 from memory_condense.associations.coaccess_graph import rank_discount
+from memory_condense.associations.expansion_guards import (
+    exceeds_prompt_budget,
+    guard_expansion_request,
+    require_artifact,
+)
 from memory_condense.domain.schemas import RetrievalResult
 
 
@@ -60,7 +65,13 @@ def expand_hebbian_results(
     learned arm is also rolled back if its replacement chunks contain more
     tokens than the direct retrieval it would displace.
     """
-    result_cap = len(anchors) if k is None else int(k)
+    guards = guard_expansion_request(
+        anchors,
+        k=k,
+        lexical_protection_threshold=lexical_protection_threshold,
+        max_prompt_token_increase=max_prompt_token_increase,
+    )
+    result_cap = guards.result_cap
     if result_cap <= 0:
         return []
     if hebbian_slots < 0:
@@ -69,16 +80,9 @@ def expand_hebbian_results(
         raise ValueError("max_candidates must be positive")
     if not 0.0 <= min_score <= 1.0:
         raise ValueError("min_score must lie in [0, 1]")
-    if lexical_protection_threshold is not None and not (
-        0.0 <= lexical_protection_threshold <= 1.0
-    ):
-        raise ValueError("lexical_protection_threshold must lie in [0, 1]")
-    if max_prompt_token_increase is not None and max_prompt_token_increase < 0:
-        raise ValueError("max_prompt_token_increase must be non-negative")
-    if store.get_artifact(artifact_id) is None:
-        raise KeyError(f"unknown association artifact: {artifact_id}")
+    require_artifact(store, artifact_id)
 
-    bounded_anchors = list(anchors[:result_cap])
+    bounded_anchors = guards.bounded_anchors
     if not bounded_anchors or hebbian_slots == 0:
         return bounded_anchors
     activations = retrieval_concept_activations(
@@ -144,9 +148,12 @@ def expand_hebbian_results(
     composed = [
         result for index, result in enumerate(bounded_anchors) if index not in removed
     ] + learned
-    if max_prompt_token_increase is not None:
-        direct_tokens = sum(result.chunk.token_count for result in bounded_anchors)
-        composed_tokens = sum(result.chunk.token_count for result in composed)
-        if composed_tokens > direct_tokens + max_prompt_token_increase:
-            return bounded_anchors
+    if exceeds_prompt_budget(
+        composed,
+        # Denominator: this arm spends against all bounded_anchors while
+        # associative windows to [:result_cap] (open author decision).
+        direct_anchors=bounded_anchors,
+        max_prompt_token_increase=max_prompt_token_increase,
+    ):
+        return bounded_anchors
     return composed[:result_cap]

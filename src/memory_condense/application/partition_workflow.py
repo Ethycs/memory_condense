@@ -447,9 +447,7 @@ class PartitionWorkflowMixin:
             key=lambda item: (
                 item.chunk_id not in primary_ids,
                 -dense_scores.get(item.chunk_id, float("-inf")),
-                -item.surface_score,
-                item.ordinal,
-                item.chunk_id,
+                *hypothesis_rank(item),
             )
         )
         candidates: list[RetrievalResult] = []

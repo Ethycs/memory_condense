@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from memory_condense.domain._tokenizer import tokenizer_proxy_identity
+from memory_condense.eval import campaign_merge
 from memory_condense.eval.campaign import (
     CampaignMergeError,
     build_locked_validation_plan,
@@ -987,3 +988,146 @@ def test_locked_plan_rejects_cherry_picked_population(tmp_path: Path):
             policy_manifest=policy_path,
             repository_root=tmp_path,
         )
+
+# --- Stage-level unit tests for the decomposed merge pipeline ---
+
+
+def test_stage_validate_shard_policy_returns_graded_status():
+    status = campaign_merge._validate_shard_policy(
+        _report(0), "report[shard-00.json]", min_questions=100, accuracy_target=0.95
+    )
+    assert status == "insufficient_questions"
+
+
+def test_stage_validate_shard_policy_rejects_threshold_drift():
+    with pytest.raises(CampaignMergeError, match="accuracy_target drift"):
+        campaign_merge._validate_shard_policy(
+            _report(0),
+            "report[shard-00.json]",
+            min_questions=100,
+            accuracy_target=0.9,
+        )
+    with pytest.raises(CampaignMergeError, match="min_target_questions drift"):
+        campaign_merge._validate_shard_policy(
+            _report(0),
+            "report[shard-00.json]",
+            min_questions=50,
+            accuracy_target=0.95,
+        )
+
+
+def test_stage_record_report_identity_pins_then_detects_drift():
+    accumulator = campaign_merge._MergeAccumulator()
+    identity = campaign_merge._record_report_identity(
+        accumulator, _report(0), "report[a.json]", None
+    )
+    assert accumulator.expected_identity == identity
+
+    drifted = _report(1)
+    drifted["config"]["recent_window"] = 5
+    with pytest.raises(
+        CampaignMergeError,
+        match=r"locked campaign identity drift in report\[b\.json\]\.recent_window",
+    ):
+        campaign_merge._record_report_identity(
+            accumulator, drifted, "report[b.json]", None
+        )
+
+
+def test_stage_ingest_question_accumulates_and_rejects_duplicates():
+    accumulator = campaign_merge._MergeAccumulator()
+    identity = campaign_merge._record_report_identity(
+        accumulator, _report(0), "report[a.json]", None
+    )
+    kwargs = dict(
+        identity=identity,
+        locked_plan=None,
+        expected_shard=None,
+        expected_questions_by_id={},
+        path_label="a.json",
+        portable_name="a.json",
+        report_sha256="0" * 64,
+        sample_id="sample-00",
+        sample_sha256="",
+    )
+    question = campaign_merge._ingest_question(
+        accumulator, _question("q-dup"), "q[0]", **kwargs
+    )
+    assert accumulator.questions_by_id == {"q-dup": question}
+    assert accumulator.question_sources["q-dup"] == {
+        "report_name": "a.json",
+        "report_sha256": "0" * 64,
+        "sample_id": "sample-00",
+        "sample_sha256": "",
+    }
+    assert accumulator.responder_usage_by_question["q-dup"]["calls"] == 1
+    assert accumulator.judge_usage_by_question["q-dup"]["calls"] == 1
+
+    with pytest.raises(
+        CampaignMergeError,
+        match="duplicate question_id 'q-dup' in b.json; already present in a.json",
+    ):
+        campaign_merge._ingest_question(
+            accumulator,
+            _question("q-dup"),
+            "q[0]",
+            **{**kwargs, "path_label": "b.json", "portable_name": "b.json"},
+        )
+
+
+def test_stage_validate_shard_totals_recomputes_prompt_maximum():
+    report = _report(0)
+    prompt_counts = [
+        question["prompt_token_proxy"]
+        for question in report["samples"][0]["question_results"]
+    ]
+    campaign_merge._validate_shard_totals(
+        report,
+        "report[a.json]",
+        question_count=10,
+        prompt_counts=prompt_counts,
+        provider_compliances=[True] * len(prompt_counts),
+        locked_plan=None,
+    )
+    with pytest.raises(
+        CampaignMergeError,
+        match=r"max_prompt_tokens_observed=209 but the question rows have maximum 1",
+    ):
+        campaign_merge._validate_shard_totals(
+            report,
+            "report[a.json]",
+            question_count=10,
+            prompt_counts=[1],
+            provider_compliances=[True],
+            locked_plan=None,
+        )
+
+
+def test_stage_finalize_population_enforces_question_floor():
+    accumulator = campaign_merge._MergeAccumulator()
+    accumulator.questions_by_id = {
+        "q-b": {"question_id": "q-b"},
+        "q-a": {"question_id": "q-a"},
+    }
+    question_ids, questions = campaign_merge._finalize_population(
+        accumulator, None, 2
+    )
+    assert question_ids == ["q-a", "q-b"]
+    assert questions == [{"question_id": "q-a"}, {"question_id": "q-b"}]
+
+    with pytest.raises(
+        CampaignMergeError,
+        match="campaign has 2 unique questions; at least 3 are required",
+    ):
+        campaign_merge._finalize_population(accumulator, None, 3)
+
+
+def test_stage_resolve_expected_shard_is_noop_without_locked_plan():
+    accumulator = campaign_merge._MergeAccumulator()
+    assert (
+        campaign_merge._resolve_expected_shard(
+            accumulator, _report(0), "report[a.json]", 1, None
+        )
+        is None
+    )
+    assert accumulator.observed_offsets == set()

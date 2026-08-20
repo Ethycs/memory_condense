@@ -486,6 +486,26 @@ The first renderer must:
 7. Fall back deterministically to the original packet context if either cap is
    exceeded.
 
+The first renderer uses neutral ordinal group boundaries (`G1`, `G2`, ...)
+with the same fixed syntax in both arms. Group numbers follow the sealed group
+sequence only; the rendered context must not expose latent indices, weights,
+labels, or inferred semantics. Bundle labels remain anchored to the original
+packet bundle order.
+
+Fallback is atomic across the matched pair. Both candidate contexts are
+rendered and measured first. If either candidate exceeds the context cap or
+the complete framed-prompt cap, both effective contexts become
+`packet.context` byte-for-byte. The receipts still bind both candidate hashes,
+counts, and overflow reasons, but a comparison never mixes one fused context
+with one fallback context.
+
+Prompt framing is an explicit call-time input: encoding, base messages,
+evidence-message role, prefix, and suffix. The renderer must reproduce the
+tokenizer and framing hashes already sealed in `ClosureReceipt` before it
+renders either arm. A mismatch rejects; it is not a fallback condition. The
+returned receipts retain only hashes and counts, never the raw base messages,
+question, prefix, or suffix.
+
 The existing renderer canonically re-sorts atoms, so it cannot consume a
 learned permutation unchanged. Renderer integration is a separate, narrow
 tranche after the resident matched-pair operation is verified.

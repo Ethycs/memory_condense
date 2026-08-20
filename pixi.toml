@@ -45,6 +45,7 @@ qwen-cav-probe = "python -m memory_condense.tooling.cav_probe --model-dir .cache
 qwen-head-memory-smoke = "python -m memory_condense.associations.head_memory --model-dir .cache/models/Qwen3-8B --cav-report eval_results/qwen3_prefix_cav_probe.json --cav-vectors eval_results/qwen3_prefix_cav_probe.safetensors --dataset examples/cav/live_head_memory_smoke.json --layer 5 --output eval_results/qwen3_live_head_memory_smoke.json"
 qwen-head-association-smoke = "python -m memory_condense.associations.head_memory --model-dir .cache/models/Qwen3-8B --cav-report eval_results/qwen3_prefix_cav_probe.json --cav-vectors eval_results/qwen3_prefix_cav_probe.safetensors --dataset examples/cav/live_head_association_smoke.json --layer 5 --association-layer 1 --output eval_results/qwen3_live_head_association_layer_5_1.json"
 qwen-prefix-coverage-smoke = "python -u -m memory_condense.tooling.qwen_coverage_smoke --model-dir .cache/models/Qwen3-8B --layers 6 --attention-layer 5 --dtype float16 --candidates 2 --workspace-tokens 1024"
+qwen-matched-fusion-smoke = "python -m memory_condense.tooling.qwen_matched_fusion_smoke"
 qwen-consolidate = "python -m memory_condense.tooling.qwen_consolidation"
 qwen-consolidation-replay = "python -m memory_condense.eval.consolidation_replay"
 

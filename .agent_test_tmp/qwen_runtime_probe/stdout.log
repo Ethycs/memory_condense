@@ -1,4 +1,0 @@
-load_s=13.343 layers=0..1 readout_layer=1 lm_head=absent
-read_s=0.442 inspected=2 workspace_tokens=60 passes=1
-candidate-0 qk=16.039886 ov=0.011586 signature=(4096,) device=cpu dtype=torch.float16
-candidate-1 qk=15.905716 ov=0.011392 signature=(4096,) device=cpu dtype=torch.float16

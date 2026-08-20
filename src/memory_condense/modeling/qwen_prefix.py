@@ -16,10 +16,13 @@ import argparse
 import hmac
 import json
 import re
+import threading
+import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from memory_condense.modeling.checkpoint_identity import (
     checkpoint_manifest_sha256,
@@ -58,6 +61,69 @@ _PREFIX_METADATA_FILES = (
 _PREFIX_MANIFEST_FORMAT = "memory-condense-qwen3-prefix-checkpoint-v1"
 
 _LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.")
+
+
+class _QwenPrefixGateToken:
+    """Unforgeable-by-public-API token for one fusion-provider operation."""
+
+    __slots__ = ()
+
+
+class _QwenPrefixGateState:
+    __slots__ = ("lock", "active_token")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.active_token: _QwenPrefixGateToken | None = None
+
+
+_QWEN_PREFIX_GATE_REGISTRY_LOCK = threading.Lock()
+_QWEN_PREFIX_GATE_REGISTRY: weakref.WeakKeyDictionary[Any, _QwenPrefixGateState] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _qwen_prefix_gate_state(encoder: Any) -> _QwenPrefixGateState:
+    """Return the module-owned gate without adding encoder instance fields."""
+
+    with _QWEN_PREFIX_GATE_REGISTRY_LOCK:
+        state = _QWEN_PREFIX_GATE_REGISTRY.get(encoder)
+        if state is None:
+            state = _QwenPrefixGateState()
+            _QWEN_PREFIX_GATE_REGISTRY[encoder] = state
+        return state
+
+
+@contextmanager
+def _qwen_prefix_execution_gate(
+    encoder: Any,
+) -> Iterator[_QwenPrefixGateToken]:
+    """Fail closed on concurrent fusion-provider use of one encoder.
+
+    Legacy hook-using encoder APIs do not yet participate in this gate.  The
+    resident fusion provider therefore requires exclusive synchronous
+    ownership of its encoder and does not claim general concurrency safety.
+    """
+
+    state = _qwen_prefix_gate_state(encoder)
+    if not state.lock.acquire(blocking=False):
+        raise RuntimeError("Qwen prefix encoder already has an active fusion operation")
+    token = _QwenPrefixGateToken()
+    state.active_token = token
+    try:
+        yield token
+    finally:
+        state.active_token = None
+        state.lock.release()
+
+
+def _require_qwen_prefix_gate(
+    encoder: Any,
+    token: _QwenPrefixGateToken,
+) -> None:
+    state = _qwen_prefix_gate_state(encoder)
+    if type(token) is not _QwenPrefixGateToken or state.active_token is not token:
+        raise RuntimeError("Qwen final-readout primitive requires its active provider gate")
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +546,136 @@ class Qwen3PrefixEncoder:
     @property
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.model.parameters())
+
+    def _encode_selected_layer_final_readout(
+        self,
+        rows: Sequence[Sequence[int]],
+        *,
+        layer: int,
+        _gate_token: _QwenPrefixGateToken,
+    ) -> Any:
+        """Privately encode exact token rows and return final-token residuals.
+
+        This is the narrow resident-fusion primitive, not a public feature
+        API.  Rows are already bounded and end at the complete readout marker.
+        They are right-padded only after validation, and the returned
+        ``[B, D]`` tensor remains on the encoder's CUDA device.  The caller
+        must hold the module-owned fusion-provider gate for the whole token
+        construction and multi-forward operation.
+        """
+
+        _require_qwen_prefix_gate(self, _gate_token)
+        if getattr(self.device, "type", None) != "cuda":
+            raise RuntimeError("Qwen final-readout encoding requires CUDA")
+        selected_layer = _validated_layers((layer,), self.layers)[0]
+        vocabulary_size = int(self.model.embed_tokens.num_embeddings)
+        if vocabulary_size < 1:
+            raise RuntimeError("Qwen embedding vocabulary must be positive")
+        normalized_rows: list[tuple[int, ...]] = []
+        for row in rows:
+            normalized: list[int] = []
+            for token_id in row:
+                if isinstance(token_id, bool) or not isinstance(token_id, int):
+                    raise TypeError("Qwen token rows must contain exact integers")
+                if not 0 <= token_id < vocabulary_size:
+                    raise ValueError("Qwen token ID lies outside the embedding vocabulary")
+                normalized.append(token_id)
+            if not normalized:
+                raise ValueError("Qwen token rows must be non-empty")
+            normalized_rows.append(tuple(normalized))
+        if not normalized_rows:
+            raise ValueError("at least one Qwen token row is required")
+
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if isinstance(pad_token_id, bool) or not isinstance(pad_token_id, int):
+            raise RuntimeError("Qwen tokenizer requires an exact integer pad token ID")
+        if not 0 <= pad_token_id < vocabulary_size:
+            raise RuntimeError("Qwen tokenizer pad token lies outside the vocabulary")
+        batch_size = len(normalized_rows)
+        padded_width = max(len(row) for row in normalized_rows)
+        input_ids = self._torch.full(
+            (batch_size, padded_width),
+            pad_token_id,
+            dtype=self._torch.long,
+            device="cpu",
+        )
+        attention_mask = self._torch.zeros(
+            (batch_size, padded_width),
+            dtype=self._torch.long,
+            device="cpu",
+        )
+        readout_indices = self._torch.empty(
+            batch_size,
+            dtype=self._torch.long,
+            device="cpu",
+        )
+        for row_index, row in enumerate(normalized_rows):
+            width = len(row)
+            input_ids[row_index, :width] = self._torch.tensor(
+                row,
+                dtype=self._torch.long,
+                device="cpu",
+            )
+            attention_mask[row_index, :width] = 1
+            readout_indices[row_index] = width - 1
+
+        captured: dict[str, Any] = {}
+
+        def save_layer(_module: Any, _args: Any, output: Any) -> None:
+            captured["residual"] = output
+
+        handle = self.model.layers[selected_layer].register_forward_hook(save_layer)
+        residual = None
+        features = None
+        batch_indices = None
+        try:
+            input_ids = input_ids.to(self.device)
+            attention_mask = attention_mask.to(self.device)
+            readout_indices = readout_indices.to(self.device)
+            with self._torch.inference_mode(), self._torch.autocast(
+                device_type="cuda",
+                enabled=False,
+            ):
+                self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                )
+                residual = captured.get("residual")
+                if type(residual) is not self._torch.Tensor:
+                    raise RuntimeError("Qwen selected layer did not return an exact tensor")
+                expected_shape = (batch_size, padded_width, int(self.config.hidden_size))
+                if tuple(int(value) for value in residual.shape) != expected_shape:
+                    raise RuntimeError("Qwen selected-layer residual has the wrong shape")
+                batch_indices = self._torch.arange(
+                    batch_size,
+                    dtype=self._torch.long,
+                    device=self.device,
+                )
+                # Advanced indexing allocates only [B, D], so the result does
+                # not retain the full selected-layer [B, L, D] activation.
+                features = residual[batch_indices, readout_indices, :]
+                if type(features) is not self._torch.Tensor:
+                    raise RuntimeError("Qwen final readout did not return an exact tensor")
+                if getattr(features, "_base", None) is not None:
+                    features = features.clone()
+                return features
+        finally:
+            try:
+                handle.remove()
+            finally:
+                captured.clear()
+                normalized_rows.clear()
+                rows = ()
+                residual = None
+                features = None
+                batch_indices = None
+                input_ids = None
+                attention_mask = None
+                readout_indices = None
+                _require_qwen_prefix_gate(self, _gate_token)
 
     def encode(self, text: str) -> Any:
         """Return the actual last-layer residual before the synthetic final norm."""

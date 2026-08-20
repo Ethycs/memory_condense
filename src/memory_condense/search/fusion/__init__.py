@@ -23,6 +23,14 @@ from memory_condense.search.fusion.planner import (
     build_evidence_fusion_plan,
     validate_matched_fusion_pair,
 )
+from memory_condense.search.fusion.qwen_feature_models import (
+    QwenAtomBatchReceipt,
+    QwenAtomFeatureCaps,
+    QwenAtomFeatureOperationReceipt,
+    QwenAtomFeatureProviderReceipt,
+    QwenAtomRowReceipt,
+)
+from memory_condense.search.fusion.qwen_features import QwenAtomFeatureProvider
 
 __all__ = [
     "AuthoritativeHyperedge",
@@ -40,6 +48,12 @@ __all__ = [
     "RouterArchitectureReceipt",
     "RouterStateReceipt",
     "RouterTrainingStatus",
+    "QwenAtomBatchReceipt",
+    "QwenAtomFeatureCaps",
+    "QwenAtomFeatureOperationReceipt",
+    "QwenAtomFeatureProvider",
+    "QwenAtomFeatureProviderReceipt",
+    "QwenAtomRowReceipt",
     "build_evidence_fusion_plan",
     "validate_matched_fusion_pair",
 ]

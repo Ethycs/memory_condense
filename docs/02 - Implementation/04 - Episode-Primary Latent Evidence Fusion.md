@@ -234,9 +234,11 @@ Once frozen in code, any later change is a named treatment change and must be
 bound in receipts.
 
 `QwenAtomFeatureCaps` must also carry explicit batch-invariance `atol` and
-`rtol` fields. Provider-free tensor fakes should be exactly invariant. The
-execution-dtype tolerances are predeclared and sealed before the first
-real-checkpoint smoke; that smoke may only pass or fail, not tune them.
+`rtol` fields. Provider-free tensor fakes should be exactly invariant. These
+tolerances are reserved for a separately named real-checkpoint batch-invariance
+diagnostic, which may only pass or fail, not tune them. The ordinary feature
+execution smoke processes every selected atom exactly once in its primary
+forward partition and does not run or attest that diagnostic.
 
 ## 6. GPU residency and lifetime
 

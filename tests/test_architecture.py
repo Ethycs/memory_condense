@@ -329,3 +329,31 @@ def test_executable_module_is_not_preimported_by_package(module_name):
         check=True,
     )
     assert result.stdout.strip() == "False", result.stdout
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "memory_condense.search.fusion",
+        "memory_condense.search.fusion.qwen_feature_models",
+        "memory_condense.search.fusion.qwen_feature_runtime",
+        "memory_condense.search.fusion.qwen_feature_executor",
+        "memory_condense.search.fusion.qwen_features",
+    ],
+)
+def test_qwen_fusion_feature_modules_keep_heavy_runtimes_cold(module_name):
+    import subprocess
+    import sys
+
+    code = (
+        "import importlib, sys; "
+        f"importlib.import_module({module_name!r}); "
+        "print('torch' in sys.modules, 'transformers' in sys.modules)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "False False", result.stdout

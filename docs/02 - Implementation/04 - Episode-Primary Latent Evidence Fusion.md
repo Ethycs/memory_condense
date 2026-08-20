@@ -136,9 +136,9 @@ check fails.
 
 The fusion primitive is route-agnostic: neither `EvidencePacket` nor
 `ClosurePlan` currently binds `episodic_route`. The primitive must not attest
-that its packet came from `episode_primary`. Only a route-bearing v2 campaign
-wrapper may make that claim after binding the retrieval route and its parent
-receipts.
+that its packet came from `episode_primary`. Only an owned route-bearing v2
+wrapper, such as the pre-training corpus or later matched campaign, may make
+that claim after binding the retrieval route and its parent receipts.
 
 ## 4. Query-conditioned atom rows
 
@@ -535,34 +535,318 @@ legacy atom and bundle formatting.
 
 The K-latent block is not expected to help while randomly initialized.
 
-The first training run should:
+Tranche D has three ordered gates. D0 may implement and test provider-free
+synthetic trainer plumbing. It may not issue a receipt or checkpoint accepted
+as evidence of a real Qwen training run. D1 may start only after a
+route-bearing v2 corpus has frozen the exact `episode_primary` retrieval,
+closure plan, packet, and population role for every analysis row. D2 may expose
+analysis labels only after the D1 checkpoint, matched fusion/render outputs,
+and answer responses used by the canary are frozen.
 
-- freeze the Qwen prefix completely;
-- train only latent slots and the two cross-attention blocks;
-- use only the evaluator-approved analysis population;
-- exclude the confirmation population;
-- perform no per-query or online updates;
-- bind the population projection, split, objective, optimizer, seed, code,
-  Qwen checkpoint, router architecture, and produced checkpoint digest;
-- freeze the adapter before any confirmation evaluation.
+### 13.1 Frozen D1 population
 
-The default training boundary consumes only enumerated packet/query structural
-targets. Gold answers, annotated source IDs, and category labels do not enter
-feature extraction, training, or fusion. If an explicitly named experiment
-later uses analysis labels, that result is development-only and must declare
-the additional treatment exposure before any run.
+The route-bearing v2 analysis corpus contains exactly 300 rows in the existing
+locked order:
 
-A candidate low-risk objective family combines:
+- fit: `development`, 200 questions, ordered-ID SHA-256
+  `533aa545efb8032f7b181f39264c6d10a49471bd460414f420e37dc840a19c55`;
+- structural validation and later answer-stage canary: `validation`, 100
+  questions, ordered-ID SHA-256
+  `7a67aa6f43ffb94d487fb9184f871735bd9edac1974a3154898846d1140c83a1`;
+- excluded from the trainer: `confirmation`, 200 memberships, ordered-ID
+  SHA-256
+  `6270b044792dbda79cd79a104ab6a519b2f81980c47522c19a196583d8c0d102`.
 
-- reconstruction of packet bundle co-membership;
-- reconstruction of obligation membership/dependency neighborhoods;
-- query-relevance ranking over already-selected bundles;
-- redundancy-aware ordering under the existing evidence budget.
+The combined analysis order remains
+`cf5e8648b71634e4e22be872881766e37e0dc24a2931d0c63365e075b2742046`.
+Validation is analysis-exposed, not a pristine confirmation population. It
+does not select a D1 checkpoint: the fixed final fit state is chosen before
+its structural loss is computed.
 
-Loss weights, negative sampling, supervision sources, and the ordering target
-must be specified and frozen before tranche D. These candidate objectives
-train relational organization, not factual storage. Exact spans remain
-authoritative.
+Each v2 row must explicitly bind `episodic_route = "episode_primary"`, its
+route receipt, population role and ordinal, query/retrieval receipt, closure
+plan, packet receipt, exact ordered atom-reference identity, and authoritative
+hyperedge identity. Missing, failed, duplicated, reordered, or cap-ineligible
+rows reject the complete corpus; D1 does not silently skip them. The complete
+300-row corpus is sealed before router initialization. Its manifest and
+receipts are text-free, but its content-addressed payload shards necessarily
+contain the authorized analysis query and exact packet/plan/atom text required
+by the pinned Qwen row producer. Those payloads contain no answer, annotated
+source label, category, prediction, score, or judge output. The route-agnostic
+v1 replay cannot supply this authority and is not upgraded in place.
+
+An owned corpus producer accepts only the exact verified
+`AnalysisTreatmentInput`, derives development positions 0--199 and validation
+positions 200--299 from the locked order, and publishes the closed route-v2
+package without accepting a caller-supplied partition or sample filter. Its
+production launcher owns every expected treatment-file, projection, dataset,
+split-manifest, population-order, count, and partition digest; callers supply
+no replacement expected hashes, and a merely well-formed constructed object
+is not production-authorized. The certified trainer accepts only the
+independently verified fit member of that package, the pinned Qwen
+checkpoint/tokenizer inputs, and one dedicated router checkpoint output root.
+Its public API and CLI
+accept no original dataset, split-manifest path, confirmation treatment,
+exposure-audit path, analysis scoring-label artifact, score report, answerer
+output, or judge output. Opaque IDs are used only for joins and hashes; they
+are never embedded or parsed as semantic inputs.
+
+The production exposure ledger names 15 of the 200 confirmation answers as
+potentially exposed. A later confirmation report must disclose that fact and
+predeclare a sensitivity result over the 185 confirmation rows not named in
+the ledger, without describing those 185 as proven untouched. The D1 trainer
+receives neither confirmation content nor the exposure-audit artifact; it
+binds only the closed membership count and digest from the owned production
+lock or a separate text-free firebreak receipt. `AnalysisTreatmentInput` does
+not supply that confirmation-exposure identity.
+
+### 13.2 Frozen structural supervision
+
+D1 uses only packet atom order and direct selected-bundle atom co-membership.
+For atom positions $i<j$, $y_{ij}=1$ exactly when at least one selected packet
+bundle directly contains both atom IDs; otherwise $y_{ij}=0$. Multiple bundles
+do not multiply a positive, no transitive closure is inferred, duplicate text
+in distinct atoms remains distinct, and self- or cross-packet pairs are absent.
+
+Every non-co-member unordered pair is a negative. There is no stochastic
+negative sampling and no negative-sampling seed. The frozen target receipt
+binds the ordered atom-reference identity, sorted positive and negative
+position-pair hashes, both counts, and their combined target hash. Pairs use
+lexicographic `(left_position, right_position)` order. Each neighborhood lists
+self plus direct co-members in ascending packet position; stacked float32
+losses and neighborhood features are reduced in those exact orders.
+
+Bundle utility, `required`, obligation IDs or dependencies, unit/relation IDs,
+roles, timestamps, gold answers, annotated source IDs, and category labels do
+not change the target or its weight. Existing source coordinates remain bound
+only as provenance required to identify exact packet atoms. The closed trainer
+API accepts no scorer-label object.
+
+### 13.3 Frozen objective
+
+Let extraction attention $E$ have shape $[K,N]$ and reinjection attention $R$
+have shape $[N,K]$. The assignment-invariant route used by the objective is
+aligned with the existing inference-time geometric joint weight:
+
+```text
+route_product_floor = torch.finfo(torch.float32).tiny
+J[i,k] = sqrt(clamp_min(E[k,i] * R[i,k], route_product_floor))
+P[i,k] = J[i,k] / sum_l J[i,l]
+A[i,j] = sum_k P[i,k] * P[j,k]
+```
+
+A training forward first requires exact float32 $E:[K,N]$ and $R:[N,K]$
+shapes after removing the required batch dimension of one, every value in
+`[0,1]`, and every softmax row sum equal to one under `rtol=1e-5` and
+`atol=1e-6`. Wrong dtype, shape, range, or normalization rejects before the
+product floor. A non-finite attention value, joint value, or denominator
+rejects. The exact float32 smallest-normal floor prevents softmax-product
+underflow from creating an infinite square-root gradient; it is part of the
+frozen objective, not an inference-time membership change. $A$ is clamped to
+`[1e-7, 1 - 1e-7]` only inside the logarithm. Define:
+
+```text
+L_pos = mean(-log(A[i,j]))       for y[i,j] = 1
+L_neg = mean(-log(1-A[i,j]))     for y[i,j] = 0
+L_route = equal mean of the non-empty classes
+```
+
+If only one class exists, it has weight one; for $N=1$, `L_route = 0`. Pair
+scores are gathered as a bounded $[P,K]$ workspace with
+$P\leq N(N-1)/2\leq 2016$, not as an $[N,N]$ content-attention matrix.
+
+A route-only loss does not train the reinjection value and output projections,
+because those parameters do not affect attention weights. D1 therefore adds
+one structural-neighborhood term. Let $X_i$ be the detached frozen-Qwen atom
+feature, let $C_i$ contain $i$ and every atom directly co-bundled with it, and
+let $S_i$ be `steered_nodes[i]`:
+
+```text
+unit(v) = v / max(norm_2(v), 1e-12)
+T[i] = unit(mean(unit(X[j]) for j in C[i]))
+L_neighbor = mean_i(1 - dot(unit(S[i]), stop_gradient(T[i])))
+L = 1.0 * L_route + 0.1 * L_neighbor
+```
+
+Each $X_i$ norm and each pre-normalized neighborhood-mean norm must be finite
+and greater than `1e-12`; a zero/degenerate target rejects rather than silently
+contributing zero gradient. The `unit(S_i)` denominator still uses the frozen
+floor so a finite zero steered row remains defined and trainable. Loss
+arithmetic and router training use float32. No obligation, query-relevance, or ordering loss is active:
+`ordering_target = "none"` and `ordering_loss_weight = 0`. The existing
+inference-time joint-mass, topology-degree, latent-index, and packet-order
+tie-breaks remain unchanged and acquire no semantic interpretation.
+
+`L_neighbor` is auxiliary training pressure, not a current D2 output. The
+resident planner discards `steered_nodes`; reinjection value/output parameters
+affect that auxiliary term but not the emitted E/R-derived groups directly.
+Therefore a changed checkpoint or a lower neighborhood loss is not evidence
+of a changed treatment. D1 must additionally change at least one extraction
+or reinjection route-matrix digest, or the resulting latent plan, on a
+predeclared nondegenerate responsiveness fixture that is not used for model
+selection. This comparison uses equivalently cast and sealed initial and final
+states at the exact D2 inference dtype; a float32-only change that disappears
+after the inference cast is insufficient.
+
+The Qwen prefix is frozen, in eval mode, and executed under inference/no-grad.
+Only the latent slots and the two existing cross-attention blocks are
+trainable. All packet atoms enter once under the sealed row/truncation policy;
+features may be cast privately from the provider dtype to float32 but are
+never returned, cached, or persisted. No per-query or online update is allowed.
+
+D1 uses a separate private training-only feature consumer. It reuses the
+pinned row construction, batching, execution gate, checkpoint identity, and
+cleanup rules, then hands one resident feature tensor directly to one unsealed
+float32 training router forward. It returns no feature tensor and constructs
+no A/B production operation receipt. The existing discard-only Tranche A seam,
+sealed same-dtype Tranche B builder, and all A/B/C public identities remain
+unchanged.
+
+The Qwen result originates under `torch.inference_mode()`. After that scope has
+closed, the training consumer allocates a fresh normal contiguous float32 CUDA
+tensor on the same indexed device and copies the detached feature values into
+it. Before routing it requires exact `torch.Tensor` type, shape `[N,4096]`,
+finite values, exact device/dtype, `requires_grad=False`, `grad_fn is None`,
+and `is_inference() is False`. It never relies on `.to()` returning new storage.
+The inference tensor is released before backward, and every success or failure
+path releases both workspaces and the shared gate.
+
+This is label-free structural supervision, not a non-memorization guarantee.
+The approximately 134-million-parameter adapter is exposed to query-conditioned
+analysis features and may memorize information recoverable from them. Its
+checkpoint is therefore analysis-exposed learned state, not state guaranteed
+to be free of factual storage and not an untouched evaluation artifact.
+
+### 13.4 Optimizer, batching, and deterministic runtime
+
+The first real D1 run is one fixed execution, not a sweep:
+
+- initialization seed `20260820`; after deterministic backend preflight and
+  before router construction, call `random.seed`, `torch.manual_seed`, then
+  `torch.cuda.manual_seed_all` in that order; NumPy is not used;
+- exact router architecture $D=4096$, $K=16$, four heads;
+- `torch.optim.AdamW`, learning rate `1e-4`, betas `(0.9, 0.999)`, epsilon
+  `1e-8`, weight decay `0.01` over the exact sorted router parameter sequence;
+- `amsgrad=false`, `foreach=false`, `fused=false`, `maximize=false`,
+  `capturable=false`, and `differentiable=false`;
+- constant learning rate, no warm-up, one epoch, exact development order, no
+  shuffle, packet batch size one, no gradient accumulation;
+- set the router to training mode only for fit; use
+  `zero_grad(set_to_none=True)`, finite loss/gradient checks, then
+  `clip_grad_norm_(..., max_norm=1.0, norm_type=2.0, foreach=False,
+  error_if_nonfinite=True)` before exactly one optimizer step per development
+  row;
+- no early stopping, resume, best-of-run selection, or optimizer-state output;
+- release the fit router, gradients, and complete Adam state after checkpoint
+  verification; a fresh reloaded router runs in eval mode for one no-grad
+  structural-validation pass in exact validation order after the final fit
+  state has already been selected.
+
+The provider remains in its pinned execution dtype; the trainable router and
+loss use float32 with no AMP or gradient scaler. The run requires
+`torch.use_deterministic_algorithms(True)`, TF32 disabled, flash and
+memory-efficient SDP disabled, math SDP enabled, and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA initialization. The receipt binds
+Torch, CUDA, device, driver, dtype, backend flags, and the exact Qwen batching
+partition. Determinism is scoped to that bound runtime, not claimed across
+hardware or library versions.
+
+The existing `FusionCaps` and `QwenAtomFeatureCaps` remain authoritative. D1
+additionally requires exactly 200 fit rows, 100 validation rows, one epoch,
+200 optimizer steps, 300 feature operations, at most 2,016 unordered pairs per
+packet, at most 4,800 Qwen forwards under the current four-row feature batch,
+and at most 600,000,000 checkpoint bytes. Before the first optimizer step,
+global preflight covers only inputs available without feature execution:
+population membership, route/packet joins, structural pair and
+neighborhood-membership projections, token/batch plans, and static caps. Each
+row's X/T dtype, shape, finiteness, and norm checks run exactly once,
+immediately after that row's sole Qwen feature operation and before its fit
+step or validation diagnostic. Failure emits no accepted checkpoint or run
+receipt and never triggers a second feature pass.
+
+The exact current architecture has 134,316,032 parameters: 537,264,128 bytes
+of float32 weights, at most the same bytes of gradients, and at most
+1,074,528,256 bytes of Adam first/second moments. Persistent router training
+state is capped at 2,200,000,000 bytes, exclusive of the separately bound
+frozen Qwen weights and bounded transient activations. Exceeding any component
+or aggregate cap aborts rather than changing precision or optimizer policy.
+
+D1 is orchestrated as two isolated child processes. The fit process receives
+only the verified development payload, read-only owned code/runtime and
+Python/CUDA/shared-library roots, the pinned Qwen checkpoint/tokenizer roots,
+and one dedicated no-clobber checkpoint/fit-receipt output root. It has no
+validation mount. After fit bytes are frozen, the validation process receives
+only the verified validation payload, the same read-only code/runtime and Qwen
+roots, the immutable checkpoint/fit receipt, and a separate diagnostics output
+root. It has no optimizer construction, checkpoint-write permission, or fit
+payload. Network access is denied in both. A parent orchestrator performs no
+model work and joins their independently sealed receipts into the final D1
+receipt.
+
+### 13.5 Checkpoint and receipt identity
+
+D1 writes one no-clobber float32 safetensors checkpoint with exact sorted state
+keys and one final canonical, text-free training receipt that joins a sealed
+fit-checkpoint receipt and a sealed structural-validation receipt. It writes
+no optimizer state, feature tensor, query/evidence text, answer, category, or
+annotated source label.
+
+Immediately after development step 200, and before the first validation
+feature operation, the runner serializes the fit state, closes the file,
+hashes its exact bytes, reloads it into a fresh float32 router, and verifies
+the exact keys, shapes, dtypes, architecture, and canonical state digest. The
+checkpoint path and bytes are thereafter immutable. The locked validation
+pass uses only that independently reloaded state under eval/no-grad and cannot
+rewrite it. The final training receipt is sealed after the validation
+diagnostics, rehashes the checkpoint, requires the byte count and SHA-256 to
+equal the pre-validation snapshot, and binds the already-frozen checkpoint.
+
+Checkpoint metadata is an exact closed mapping containing only the checkpoint
+format/schema, pre-run specification SHA-256, router architecture SHA-256,
+initial and final canonical float32 state SHA-256 values, ordered state-key
+SHA-256, tensor count, and `dtype = "float32"`. It does not embed the later fit,
+validation, or final training receipt hashes: those receipts bind the frozen
+checkpoint file hash in one direction, avoiding a circular identity.
+
+A sealed pre-run specification binds the firebreak, dataset, split-manifest,
+sanitized-treatment, route-bearing v2 corpus, population-role, packet/plan,
+and structural-target sequence identities; objective and loss constants;
+negative and ordering policies; optimizer, seed, batching, caps, and runtime
+policy; Qwen provider/checkpoint; router architecture and initial canonical
+state; and owned implementation identity.
+
+The post-run receipt additionally binds ordered row/batch/feature-operation
+receipt hashes; packet, atom, pair, forward, and optimizer-step counts; the
+canonical ordered training- and validation-loss sequence hashes and finite
+aggregate values; final canonical float32 state SHA-256; and safetensors byte
+count and file SHA-256. It explicitly records genuine
+`episode_primary` route attestation from the v2 corpus while keeping answer
+quality, generalization, and performance attestation false. It also records
+`gold_labels_accessed = false`, `annotated_source_labels_accessed = false`,
+`category_labels_accessed = false`, and
+`confirmation_content_accessed = false`.
+
+Closed schemas and receipts prove which inputs were admitted through the owned
+training API; they do not prove a process made no unrelated filesystem or
+network reads. Each D1 child therefore audits file opens against its exact
+allowlisted input/output files and resolved code/runtime/checkpoint roots in
+addition to the mount and network controls above. Only that runtime
+enforcement may support a scoped no-external-access statement; the training
+receipt alone cannot.
+
+The post-training inference loader hashes the checkpoint before parsing,
+validates the final receipt, architecture, exact keys/shapes/dtypes, metadata,
+and canonical float32 state, then constructs a conservative
+`trained_declared` router, casts it to the pinned inference device/dtype, seals
+it, and returns a separate load receipt joining the training receipt,
+checkpoint bytes, and actual post-cast `RouterStateReceipt`. It never
+synthesizes `trained_verified`. The D2 campaign must prove that this
+loaded-state receipt equals the matched pair's resident router state.
+
+D0 synthetic artifacts use a separate `synthetic_only` format and false Qwen,
+route, checkpoint-procedure, quality, generalization, and performance claims.
+The D1 loader and D2 campaign reject that format even if its bytes are
+well-formed.
 
 ## 14. Evaluation boundary
 
@@ -577,6 +861,13 @@ query-conditioned K-latent fusion
 Both arms share the same episode-primary packet, atom features, renderer,
 prompt budget, answerer, and scorer. All retrieval and fusion outputs are
 frozen before analysis labels enter measurement.
+
+The first answer-stage canary uses only the locked 100-row validation
+partition. Its labels remain unavailable to D1 fitting and enter only after
+both matched contexts, their prompt-budget receipts, the router checkpoint,
+and every fixed-answerer response and provider receipt are frozen. Structural
+validation loss is a training diagnostic, not model selection or an
+answer-quality outcome.
 
 Report at least:
 
@@ -605,6 +896,11 @@ identities.
 Do not change retrieval breadth, closure caps, answerer, or prompt budget in
 the same comparison.
 
+Any later confirmation report must show both the predeclared full-200 result
+and the sensitivity result over the 185 rows not named in the production
+exposure ledger. The report must disclose the 15 potentially exposed answers;
+neither slice repairs an unfrozen D1/D2 decision.
+
 The existing sample-169 result is an important warning: every tested arm
 reached the annotated source, but the literal answer was absent from every
 corpus chunk. Wider retrieval did not create the missing expression. This
@@ -612,6 +908,8 @@ motivates fusion as the next relational experiment, but extractive grouping
 alone still cannot prove answer generation or synthesize absent wording.
 
 ## 15. Claim boundary
+
+Freezing the D contract changes none of the current A/B/C claims.
 
 After provider-free tests pass, we may claim only:
 
@@ -639,9 +937,17 @@ The separate real-checkpoint smoke additionally established:
   and sealed order in both arms with no fallback or added model forwards, and
   returning text-free, tensor-free receipts.
 
+Only after a genuine route-bearing D1 run may its receipt additionally support
+the narrow claim that the owned runner applied the frozen label-free objective
+to the exact development corpus, changed and content-addressed a bounded router
+state, and reloaded that state under an exact joined receipt. Finite or lower
+structural loss does not establish useful grouping, ordering, answers, or
+generalization.
+
 We may not yet claim:
 
-- the router is trained or improves retrieval/answer accuracy;
+- before a genuine D1 receipt, that the router is trained;
+- even after D1, that structural training improves retrieval/answer accuracy;
 - latent slots are interpretable concepts;
 - latent grouping discovers true directed relations;
 - the latent router follows closure-graph adjacency or discovers semantic or
@@ -680,16 +986,30 @@ Implement in four bounded tranches:
 
 ### D. Training and analysis-only canary
 
-- Train/freeze the adapter on the permitted analysis population.
-- Run the matched comparison over frozen episode-primary packets.
-- Score only after all packets and fusion plans are frozen.
+- D0: implement provider-free target, loss, optimizer, lifecycle, checkpoint,
+  and receipt plumbing. Synthetic execution cannot mint a D1 checkpoint claim.
+- D1: first freeze and verify the exact 300-row route-bearing v2
+  `episode_primary` corpus; then fit on development 200, select the fixed final
+  state without validation feedback, write/hash/reload and freeze the fit
+  checkpoint, then run structural diagnostics on validation 100 without
+  changing those bytes.
+- D2: build matched pairs and rendered prompts for validation 100 with the
+  frozen loaded checkpoint, run the fixed answerer, freeze every response and
+  provider receipt, and only then admit analysis labels for paired scoring.
+- After every treatment choice is frozen, a separately authorized confirmation
+  run must apply the exposure-ledger reporting rule from Section 14.
 
-Do not integrate this into the v1 replay format. A route-bearing v2 campaign
-receipt must identify `episode_primary`, the feature operation, router
-checkpoint, and fusion output explicitly. The v1 artifact remains a valid
-record of the legacy route.
+Do not integrate this into the v1 replay format. The pre-training route-v2
+corpus receipt identifies `episode_primary`, `seeded_graph`, the exact
+population, plans, packets, and structural targets, and contains no nullable
+future checkpoint or fusion fields. A separate D2 matched-campaign receipt
+joins that corpus to the loaded router checkpoint, feature operation, fusion
+output, renderer, answer responses, and later scoring. The v1 artifact remains
+a valid record of the legacy route.
 
-## 17. Acceptance tests for tranches A, B, and C
+## 17. Acceptance tests
+
+### 17.1 Tranches A, B, and C
 
 Provider-free tests must prove:
 
@@ -719,8 +1039,8 @@ Provider-free tests must prove:
 13. Untrained and merely declared checkpoints cannot be mislabeled verified.
 14. The resident receipt carries null full-feature/steered hashes, false
     tensor-content-attestation flags, and true input-operation-attestation.
-15. The route-agnostic primitive cannot attest `episode_primary`; only a
-    route-bound v2 campaign wrapper can.
+15. The route-agnostic primitive cannot attest `episode_primary`; only an
+    owned route-bearing v2 wrapper, such as the corpus or campaign, can.
 16. Cold import loads neither Torch nor Transformers.
 17. Existing generic fusion, Qwen linker, retrieval, replay, and scoring tests
     remain unchanged and green.
@@ -738,3 +1058,82 @@ The pinned real-model renderer smoke passed these gates. Its diagnostic-v2
 output remains explicitly non-artifactual and sets `performance_attested` to
 false; its operational timing and CUDA-residency fields are not scientific
 performance claims.
+
+### 17.2 Tranche D
+
+Before a real D1 run, provider-free tests must prove:
+
+1. D0 synthetic execution cannot mint a D1 training receipt, accepted
+   checkpoint, Qwen execution claim, or `episode_primary` claim.
+2. The v2 corpus requires exactly 200 development and 100 validation rows in
+   the locked orders, each with an exact route/plan/packet join and literal
+   `episode_primary`; omission, duplication, reordering, route tampering, or a
+   v1-only receipt rejects before router initialization. Its owned producer
+   accepts only an exact verified `AnalysisTreatmentInput` and derives both
+   partitions without caller-supplied membership or filtering.
+3. The trainer cannot accept confirmation rows, scorer labels, or the exposure
+   audit. Gold answers, annotated source IDs, and categories are absent from
+   its closed input schema.
+4. Positive targets are exactly the deduplicated direct co-bundle unordered
+   pairs and negatives are their exhaustive unordered complement. No
+   transitive, self, cross-packet, utility-weighted, or sampled pair appears.
+5. Every exact packet atom participates once. Duplicate text under different
+   atom IDs remains distinct, and targets bind packet positions plus the exact
+   atom-reference identity.
+6. Hand-computed extraction/reinjection matrices reproduce `J`, `P`, `A`, both
+   class-balanced route losses, the neighborhood target, and the final
+   `1.0/0.1` weighted loss, including the frozen float32 product floor and
+   zero-target rejection rules. Latent-slot permutation leaves the scalar
+   route loss unchanged within `rtol=0`, `atol=1e-6` under the bound runtime.
+   Wrong E/R shape, dtype, range, non-finite value, or softmax row sum rejects
+   before flooring.
+7. On a nondegenerate fixture, the complete objective supplies finite
+   gradients to every trainable parameter and nonzero gradients to the latent
+   slots and each extraction/reinjection query/key/value/output weight family.
+   Uniform key-bias slices are exempt from the nonzero rule because softmax
+   cancels a shared key bias. Qwen parameters receive no gradients and their
+   exact state is unchanged before and after training.
+8. Full-nonedge work stays within the bounded indexed $[P,K]$ workspace and
+   does not create an $[N,N]$ content-attention tensor.
+9. Static caps and the complete 300-row structural projection preflight before
+   the first optimizer step. X/T checks occur once per row after its sole
+   feature operation. Any exception releases features, graphs, tokenizer
+   state, and the shared execution gate and publishes no accepted output.
+10. Fixed seed, runtime, corpus, and implementation reproduce the
+    provider-free synthetic identity. Every bound-input change alters the
+    specification/receipt identity; checkpoint bytes are required to change
+    only for separately curated math-affecting changes.
+11. D1 performs exactly one development epoch and 200 optimizer steps in
+    locked order. Checkpoint serialization, byte hashing, and independent
+    float32 reload/state verification occur before validation begins.
+    Validation performs no update, checkpoint write, selection, or
+    hyperparameter decision.
+12. Non-finite loss, gradients, parameters, or validation diagnostics reject.
+    The final state must differ from the initial state and must change E/R or
+    the latent plan on the frozen responsiveness fixture after both states are
+    cast and sealed at the exact D2 inference dtype, without requiring a
+    validation-loss improvement. Auxiliary-only steered-node change is
+    insufficient.
+13. Checkpoint bytes, metadata, state keys, shapes, dtypes, architecture,
+    training receipt, and final-state digests fail closed under tampering. The
+    loader returns only `trained_declared` plus the separate post-cast load
+    receipt.
+14. Training and load receipts contain no request text or scorer labels and
+    keep answer-quality, generalization, and performance attestation false.
+15. D2 cannot open validation labels until the checkpoint, matched pairs,
+    rendered contexts, prompt receipts, answer responses, and answer-provider
+    receipts are frozen. Later confirmation reporting enforces the full-200
+    plus ledger-excluded-185 sensitivity rule.
+16. The restricted real-run smoke enforces separate fit and validation
+    allowlists exactly as Section 13.4 defines, including owned code/runtime
+    roots and phase-specific output paths; it audits file opens and rejects
+    socket creation. This is runtime enforcement, not a cryptographic receipt
+    claim. A failure while copying an inference tensor into normal training
+    storage releases both tensors and the shared gate.
+17. Cold import continues to load neither Torch, Transformers, nor
+    safetensors, and every existing A/B/C, retrieval, replay, and scoring test
+    remains green.
+
+The certified D1 branch requires a genuine pinned-Qwen execution over the
+frozen v2 corpus. Provider-free fakes exercise structure and failure behavior
+only; they cannot establish that a scientific checkpoint was trained.

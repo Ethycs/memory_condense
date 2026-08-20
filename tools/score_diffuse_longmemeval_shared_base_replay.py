@@ -14,7 +14,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import memory_condense.eval.diffuse_longmemeval_replay as replay_module
 from memory_condense.domain.discourse import identity_sha256, quote_sha256
+from memory_condense.eval._diffuse_replay_provider_history import (
+    certify_historical_provider_identity,
+)
 from memory_condense.eval.diffuse_longmemeval_base import (
     owned_build_runtime_identity,
     verify_diffuse_longmemeval_base,
@@ -164,6 +168,11 @@ def _score_campaign(
         expected_runtime_binding_sha256=runtime_sha256,
     )
     nested = _load_nested_replay_manifest(root / "replay" / "replay-manifest.json")
+    provider_identity_proof = certify_historical_provider_identity(
+        execution_identity=campaign.launcher,
+        recorded_identity=nested.verified_base_provider_identity,
+        current_source_path=Path(replay_module.__file__),
+    )
     blind = gold_blind_from_treatment_sample(sample)
     base = verify_diffuse_longmemeval_base(
         root / "cache",
@@ -209,6 +218,7 @@ def _score_campaign(
         base=base,
         expected_runtime_binding_sha256=runtime_sha256,
         label_loader=load_bound_label,
+        historical_provider_identity_proof=provider_identity_proof,
     )
     if (
         report.replay_receipt_sha256 != campaign.artifacts.replay_receipt_sha256

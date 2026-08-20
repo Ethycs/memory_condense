@@ -289,6 +289,29 @@ def test_provider_free_shared_base_replay_is_closed_and_reconstructable(
             "lexical_embedding",
             "qwen_head",
         )
+        original_callable_identity = replay_module.analysis_callable_identity_payload
+
+        def shifted_provider_identity(value, label):
+            payload = original_callable_identity(value, label)
+            if label == "verified_base_provider":
+                payload["python_code_sha256"] = "0" * 64
+            return payload
+
+        with monkeypatch.context() as strict_provider_patch:
+            strict_provider_patch.setattr(
+                replay_module,
+                "analysis_callable_identity_payload",
+                shifted_provider_identity,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="provider implementation identity changed",
+            ):
+                verify_diffuse_longmemeval_replay_package(
+                    target,
+                    base=base,
+                    expected_runtime_binding_sha256=binding.binding_sha256,
+                )
         assert all(
             packet.hydrate_span(atom.span) == atom.text
             for packet in reconstructed.packets

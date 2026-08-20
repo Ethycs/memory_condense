@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import memory_condense.eval._diffuse_replay_provider_history as provider_history
+import memory_condense.search.packing.evidence_packet as evidence_packing
 from memory_condense.application.discourse_sources import (
     build_episode_source_candidate_scope,
     scan_discourse_source_chunks,
@@ -112,25 +114,18 @@ from memory_condense.persistence.discourse_store import DiscourseStore
 from memory_condense.search.closure.compiler import compile_query_program
 from memory_condense.search.closure.engine import close_evidence
 from memory_condense.search.episodes import EpisodeRetrievalPolicy, expand_episode_seeds
-from memory_condense.search.packing.evidence_packet import (
-    pack_evidence_plan,
-    packet_identity,
-)
 
 
 _MODES = ("fixed_interval", "lexical_embedding", "qwen_head")
-_ARM_FILES = (DERIVED_FINALIZATION_NAME, DERIVED_LEASE_NAME, DERIVED_ORIGIN_NAME, INDEX_NAME, DATABASE_NAME)
+_ARM_FILES = (DERIVED_FINALIZATION_NAME, DERIVED_LEASE_NAME,
+              DERIVED_ORIGIN_NAME, INDEX_NAME, DATABASE_NAME)
 
 
 def _canonical_identity(
-    payload: dict[str, object],
-    digest: str,
-    *,
-    self_hash_field: str | None = None,
+    payload: dict[str, object], digest: str, *, self_hash_field: str | None = None,
 ) -> CanonicalIdentityBody:
     return CanonicalIdentityBody.seal(
-        payload,
-        identity_sha256_value=digest,
+        payload, identity_sha256_value=digest,
         self_hash_field=self_hash_field,  # type: ignore[arg-type]
     )
 
@@ -515,7 +510,7 @@ def _query_record(
         "matched_source_scope_identity_sha256": (
             matched_probe.source_scope_identity_sha256
         ),
-        "packet_identity_sha256": packet_identity(packet),
+        "packet_identity_sha256": evidence_packing.packet_identity(packet),
     }
     record_sha256 = identity_sha256(
         {
@@ -814,7 +809,7 @@ def _verify_reconstructed_query(
     ):
         raise RuntimeError("arm and query packet budgets disagree")
     prefix, suffix = qa_packet_framing(question.prompt_question)
-    packet = pack_evidence_plan(
+    packet = evidence_packing.pack_evidence_plan(
         plan,
         max_context_tokens=context_cap,
         base_messages=({"role": "system", "content": QA_SYSTEM_PROMPT},),
@@ -830,7 +825,7 @@ def _verify_reconstructed_query(
         _closure_receipt(packet.receipt) != record.closure_receipt
         or coordinates != record.evidence_coordinates
         or bundles != record.selected_bundles
-        or packet_identity(packet) != record.packet_identity_sha256
+        or evidence_packing.packet_identity(packet) != record.packet_identity_sha256
     ):
         raise RuntimeError("deterministic packet differs from the replay record")
 
@@ -1128,6 +1123,7 @@ def _verify_diffuse_longmemeval_replay_package(
     base: VerifiedDiffuseLongMemEvalBase,
     expected_runtime_binding_sha256: str,
     _packet_sink: list[VerifiedDiffuseReplayPacket] | None = None,
+    _provider_identity_proof: provider_history.HistoricalProviderIdentityProof | None = None,
 ) -> DiffuseLongMemEvalReplayReceipt:
     """Verify and optionally retain packets without rerunning Qwen."""
     root = Path(path)
@@ -1192,11 +1188,15 @@ def _verify_diffuse_longmemeval_replay_package(
         expected_provider,
         "verified_base_provider",
     )
-    if receipt.verified_base_provider_identity != _canonical_identity(
-        expected_provider_payload,
-        identity_sha256(expected_provider_payload),
-    ):
-        raise RuntimeError("verified-base provider implementation identity changed")
+    expected_provider_identity = _canonical_identity(
+        expected_provider_payload, identity_sha256(expected_provider_payload))
+    if receipt.verified_base_provider_identity != expected_provider_identity:
+        # Reconstruction never invokes this execution-time provider.
+        provider_history.require_historical_provider_compatibility(
+            _provider_identity_proof, execution_identity=receipt.execution_identity,
+            recorded_identity=receipt.verified_base_provider_identity,
+            current_identity_payload=expected_provider_payload,
+        )
     runtime_payload = json.loads(receipt.runtime_binding.canonical_identity_json)
     representative_query_tokens = int(
         runtime_payload["representative"]["query_tokens"]

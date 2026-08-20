@@ -24,6 +24,9 @@ from memory_condense.eval._diffuse_base_contracts import (
 from memory_condense.eval._diffuse_replay_packets import (
     VerifiedDiffuseReplayPacket,
 )
+from memory_condense.eval._diffuse_replay_provider_history import (
+    HistoricalProviderIdentityProof,
+)
 from memory_condense.eval._diffuse_replay_contracts import (
     DiffuseLongMemEvalReplayReceipt,
 )
@@ -237,6 +240,7 @@ def verify_and_reconstruct_diffuse_longmemeval_replay_package(
     *,
     base: VerifiedDiffuseLongMemEvalBase,
     expected_runtime_binding_sha256: str,
+    historical_provider_identity_proof: HistoricalProviderIdentityProof | None = None,
 ) -> VerifiedDiffuseReplayPackage:
     """Run the authoritative verifier once and retain its exact packet outputs."""
 
@@ -246,6 +250,7 @@ def verify_and_reconstruct_diffuse_longmemeval_replay_package(
         base=base,
         expected_runtime_binding_sha256=expected_runtime_binding_sha256,
         _packet_sink=packets,
+        _provider_identity_proof=historical_provider_identity_proof,
     )
     # The verifier proved canonical equality and stability for its full pass;
     # bind a fresh physical-file read as well, rejecting an intervening change.
@@ -267,6 +272,7 @@ def score_diffuse_longmemeval_replay_package(
     base: VerifiedDiffuseLongMemEvalBase,
     expected_runtime_binding_sha256: str,
     label_loader: Callable[[], SupportsAnalysisScoringLabel],
+    historical_provider_identity_proof: HistoricalProviderIdentityProof | None = None,
 ) -> DiffuseReplayPosthocScoreReport:
     """Reconstruct every packet, then load one label and score in memory."""
 
@@ -277,6 +283,7 @@ def score_diffuse_longmemeval_replay_package(
         path,
         base=base,
         expected_runtime_binding_sha256=expected_runtime_binding_sha256,
+        historical_provider_identity_proof=historical_provider_identity_proof,
     )
     receipt = package.receipt
     if receipt.query_manifest.query_count != 1 or len(package.packets) != 3:

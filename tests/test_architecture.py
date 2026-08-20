@@ -339,6 +339,10 @@ def test_executable_module_is_not_preimported_by_package(module_name):
         "memory_condense.search.fusion.qwen_feature_runtime",
         "memory_condense.search.fusion.qwen_feature_executor",
         "memory_condense.search.fusion.qwen_features",
+        "memory_condense.search.fusion.planning_core",
+        "memory_condense.search.fusion.resident_models",
+        "memory_condense.search.fusion.resident_executor",
+        "memory_condense.search.fusion.qwen_matched",
     ],
 )
 def test_qwen_fusion_feature_modules_keep_heavy_runtimes_cold(module_name):

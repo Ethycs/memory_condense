@@ -136,41 +136,58 @@ class LatentEvidenceRouter:
                 )
 
             def forward(self, node_features: Any) -> LatentRouterForward:
-                if getattr(node_features, "ndim", None) != 3:
-                    raise ValueError("node_features must have shape [B, N, D]")
-                batch, atom_count, width = tuple(int(v) for v in node_features.shape)
-                if batch != 1 or atom_count < 1 or width != hidden_dim:
-                    raise ValueError(
-                        f"node_features must have shape [1, N, {hidden_dim}] "
-                        "with N positive"
+                latents = None
+                concepts_updated = None
+                extraction = None
+                reinjected = None
+                reinjection = None
+                try:
+                    if getattr(node_features, "ndim", None) != 3:
+                        raise ValueError("node_features must have shape [B, N, D]")
+                    batch, atom_count, width = tuple(
+                        int(v) for v in node_features.shape
                     )
-                if atom_count > max_atoms:
-                    raise MemoryError("node count exceeds router max_atoms")
-                if atom_count * num_latents > max_route_cells:
-                    raise MemoryError("K*N exceeds router max_route_cells")
-                latents = self.latent_concepts.unsqueeze(0).expand(batch, -1, -1)
+                    if batch != 1 or atom_count < 1 or width != hidden_dim:
+                        raise ValueError(
+                            f"node_features must have shape [1, N, {hidden_dim}] "
+                            "with N positive"
+                        )
+                    if atom_count > max_atoms:
+                        raise MemoryError("node count exceeds router max_atoms")
+                    if atom_count * num_latents > max_route_cells:
+                        raise MemoryError("K*N exceeds router max_route_cells")
+                    latents = self.latent_concepts.unsqueeze(0).expand(
+                        batch, -1, -1
+                    )
 
-                # Extraction: K latent queries read N evidence-node keys/values.
-                concepts_updated, extraction = self.extract_attention(
-                    query=latents,
-                    key=node_features,
-                    value=node_features,
-                    need_weights=True,
-                    average_attn_weights=True,
-                )
-                # Reinjection: N evidence-node queries read K updated latents.
-                reinjected, reinjection = self.reinject_attention(
-                    query=node_features,
-                    key=concepts_updated,
-                    value=concepts_updated,
-                    need_weights=True,
-                    average_attn_weights=True,
-                )
-                return LatentRouterForward(
-                    steered_nodes=node_features + reinjected,
-                    extraction_attention=extraction,
-                    reinjection_attention=reinjection,
-                )
+                    # Extraction: K latent queries read N evidence-node keys/values.
+                    concepts_updated, extraction = self.extract_attention(
+                        query=latents,
+                        key=node_features,
+                        value=node_features,
+                        need_weights=True,
+                        average_attn_weights=True,
+                    )
+                    # Reinjection: N evidence-node queries read K updated latents.
+                    reinjected, reinjection = self.reinject_attention(
+                        query=node_features,
+                        key=concepts_updated,
+                        value=concepts_updated,
+                        need_weights=True,
+                        average_attn_weights=True,
+                    )
+                    return LatentRouterForward(
+                        steered_nodes=node_features + reinjected,
+                        extraction_attention=extraction,
+                        reinjection_attention=reinjection,
+                    )
+                finally:
+                    node_features = None
+                    latents = None
+                    concepts_updated = None
+                    extraction = None
+                    reinjected = None
+                    reinjection = None
 
         self._module = _TwoPassModule()
         self._torch = torch
@@ -246,6 +263,55 @@ class LatentEvidenceRouter:
         assert self._sealed_state_receipt is not None
         return self._sealed_state_receipt
 
+    @property
+    def resident_runtime_receipt(self) -> Any:
+        """Recompute a tensor-free identity for one CUDA-resident seal.
+
+        Generic CPU inference remains supported.  Only this resident-specific
+        view requires one indexed CUDA device, one dtype, and frozen parameters.
+        """
+
+        from memory_condense.search.fusion.resident_models import (
+            ResidentRouterRuntimeReceipt,
+        )
+
+        self._assert_inference_seal()
+        parameters = tuple(self._module.parameters())
+        if not parameters:
+            raise RuntimeError("resident router has no parameters")
+        devices = {str(parameter.device) for parameter in parameters}
+        dtypes = {str(parameter.dtype) for parameter in parameters}
+        if len(devices) != 1 or len(dtypes) != 1:
+            raise RuntimeError("resident router parameters mix devices or dtypes")
+        if any(bool(getattr(parameter, "is_meta", False)) for parameter in parameters):
+            raise RuntimeError("resident router parameters cannot remain meta tensors")
+        if any(parameter.requires_grad for parameter in parameters):
+            raise RuntimeError("resident router parameters must be frozen")
+        buffers = tuple(self._module.buffers())
+        if any(bool(getattr(buffer, "is_meta", False)) for buffer in buffers):
+            raise RuntimeError("resident router buffers cannot remain meta tensors")
+        if any(str(buffer.device) not in devices for buffer in buffers):
+            raise RuntimeError("resident router buffers left the parameter device")
+        if any(
+            bool(buffer.is_floating_point()) and str(buffer.dtype) not in dtypes
+            for buffer in buffers
+        ):
+            raise RuntimeError("resident router buffers changed execution dtype")
+        device_value = self._torch.device(parameters[0].device)
+        if device_value.type != "cuda" or device_value.index is None:
+            raise RuntimeError("resident router requires one indexed CUDA device")
+        receipt = ResidentRouterRuntimeReceipt(
+            architecture=self._architecture_receipt,
+            state=self.state_receipt,
+            device=f"cuda:{device_value.index}",
+            execution_dtype=str(parameters[0].dtype),
+            max_atoms=self._max_atoms,
+            max_hidden_dim=self._max_hidden_dim,
+            max_route_cells=self._max_route_cells,
+        )
+        self._assert_inference_seal()
+        return receipt
+
     @staticmethod
     def _reject_runtime_hooks(module: Any) -> None:
         hook_fields = (
@@ -257,11 +323,25 @@ class LatentEvidenceRouter:
         if any(getattr(module, name, ()) for name in hook_fields):
             raise RuntimeError("sealed router modules cannot carry execution hooks")
 
+    def _reject_global_runtime_hooks(self) -> None:
+        module_runtime = self._torch.nn.modules.module
+        registry_names = (
+            "_global_forward_pre_hooks",
+            "_global_forward_hooks",
+            "_global_forward_hooks_always_called",
+            "_global_forward_hooks_with_kwargs",
+            "_global_forward_pre_hooks_with_kwargs",
+            "_global_backward_pre_hooks",
+            "_global_backward_hooks",
+        )
+        if any(getattr(module_runtime, name, ()) for name in registry_names):
+            raise RuntimeError("sealed router cannot run with global module hooks")
+
     def _runtime_structure(self) -> tuple[Any, ...]:
         module = self._module
         extract = module.extract_attention
         reinject = module.reinject_attention
-        modules = (module, extract, reinject)
+        modules = tuple(module.named_modules())
         mha_config = tuple(
             (
                 attention.embed_dim,
@@ -277,22 +357,26 @@ class LatentEvidenceRouter:
         return (
             tuple(
                 (
+                    name,
                     id(child),
                     type(child),
                     id(type(child).forward),
                     id(getattr(type(child).forward, "__code__", None)),
                 )
-                for child in modules
+                for name, child in modules
             ),
             mha_config,
         )
 
-    def _runtime_fingerprint(self) -> tuple[Any, ...]:
+    def _runtime_fingerprint(
+        self,
+        *,
+        state_receipt: RouterStateReceipt | None = None,
+    ) -> tuple[Any, ...]:
         module = self._module
-        extract = module.extract_attention
-        reinject = module.reinject_attention
-        modules = (module, extract, reinject)
-        for child in modules:
+        modules = tuple(module.named_modules())
+        self._reject_global_runtime_hooks()
+        for _name, child in modules:
             self._reject_runtime_hooks(child)
             if "forward" in getattr(child, "__dict__", {}):
                 raise RuntimeError("sealed router modules cannot shadow forward")
@@ -301,6 +385,12 @@ class LatentEvidenceRouter:
         structure = self._runtime_structure()
         if structure != self._expected_runtime_structure:
             raise RuntimeError("sealed router runtime changed")
+        named_parameters = tuple(module.named_parameters())
+        if any(
+            bool(getattr(parameter, "is_meta", False))
+            for _name, parameter in named_parameters
+        ):
+            raise RuntimeError("sealed router parameters cannot remain meta tensors")
         parameters = tuple(
             (
                 name,
@@ -312,8 +402,16 @@ class LatentEvidenceRouter:
                 bool(parameter.requires_grad),
                 int(parameter._version),
             )
-            for name, parameter in module.named_parameters()
+            for name, parameter in named_parameters
         )
+        if any(item[6] for item in parameters):
+            raise RuntimeError("sealed router parameters must remain frozen")
+        named_buffers = tuple(module.named_buffers())
+        if any(
+            bool(getattr(buffer, "is_meta", False))
+            for _name, buffer in named_buffers
+        ):
+            raise RuntimeError("sealed router buffers cannot remain meta tensors")
         buffers = tuple(
             (
                 name,
@@ -324,12 +422,26 @@ class LatentEvidenceRouter:
                 str(buffer.device),
                 int(buffer._version),
             )
-            for name, buffer in module.named_buffers()
+            for name, buffer in named_buffers
         )
+        bound_state = state_receipt or self._sealed_state_receipt
+        if bound_state is None:
+            raise RuntimeError("sealed router runtime requires a state receipt")
+        self._architecture_receipt._seal()
+        bound_state._seal()
         return (
             structure,
             parameters,
             buffers,
+            id(self._torch),
+            id(self._architecture_receipt),
+            self._architecture_receipt.architecture_sha256,
+            id(bound_state),
+            bound_state.state_receipt_sha256,
+            self._training_status,
+            self._max_atoms,
+            self._max_hidden_dim,
+            self._max_route_cells,
         )
 
     def _assert_inference_seal(self) -> None:
@@ -359,11 +471,8 @@ class LatentEvidenceRouter:
             self._assert_inference_seal()
             return self
         module = self._module
-        for child in (
-            module,
-            module.extract_attention,
-            module.reinject_attention,
-        ):
+        self._reject_global_runtime_hooks()
+        for _name, child in module.named_modules():
             self._reject_runtime_hooks(child)
             if "forward" in getattr(child, "__dict__", {}):
                 raise RuntimeError("sealed router modules cannot shadow forward")
@@ -373,6 +482,7 @@ class LatentEvidenceRouter:
         isolated = copy.deepcopy(module)
         if device is not None or dtype is not None:
             isolated.to(device=device, dtype=dtype)
+        isolated.requires_grad_(False)
         isolated.eval()
         self._module = isolated
         self._expected_runtime_structure = self._runtime_structure()
@@ -390,7 +500,7 @@ class LatentEvidenceRouter:
             ),
             training_status=self._training_status,
         )
-        fingerprint = self._runtime_fingerprint()
+        fingerprint = self._runtime_fingerprint(state_receipt=receipt)
         self._sealed_state_receipt = receipt
         self._sealed_runtime_fingerprint = fingerprint
         return self
@@ -403,20 +513,34 @@ class LatentEvidenceRouter:
     def route_one(self, node_features: Any) -> LatentRouterForward:
         """Run one bounded packet and return transient two-dimensional tensors."""
 
-        self._assert_inference_seal()
-        if type(node_features) is not self._torch.Tensor:
-            raise TypeError("node_features must be an exact torch.Tensor")
-        if getattr(node_features, "ndim", None) != 2:
-            raise ValueError("node_features must have shape [N, D]")
-        with self._torch.inference_mode():
-            routed = self._module(node_features.unsqueeze(0))
-        result = LatentRouterForward(
-            steered_nodes=routed.steered_nodes[0],
-            extraction_attention=routed.extraction_attention[0],
-            reinjection_attention=routed.reinjection_attention[0],
-        )
-        self._assert_inference_seal()
-        return result
+        batched = None
+        routed = None
+        result = None
+        try:
+            self._assert_inference_seal()
+            if type(node_features) is not self._torch.Tensor:
+                raise TypeError("node_features must be an exact torch.Tensor")
+            if getattr(node_features, "ndim", None) != 2:
+                raise ValueError("node_features must have shape [N, D]")
+            device_type = str(node_features.device.type)
+            with self._torch.inference_mode(), self._torch.autocast(
+                device_type=device_type,
+                enabled=False,
+            ):
+                batched = node_features.unsqueeze(0)
+                routed = self._module(batched)
+            result = LatentRouterForward(
+                steered_nodes=routed.steered_nodes[0],
+                extraction_attention=routed.extraction_attention[0],
+                reinjection_attention=routed.reinjection_attention[0],
+            )
+            self._assert_inference_seal()
+            return result
+        finally:
+            node_features = None
+            batched = None
+            routed = None
+            result = None
 
     def __call__(self, node_features: Any) -> LatentRouterForward:
         return self.forward(node_features)

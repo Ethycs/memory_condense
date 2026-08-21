@@ -559,6 +559,14 @@ locked order:
 
 The combined analysis order remains
 `cf5e8648b71634e4e22be872881766e37e0dc24a2931d0c63365e075b2742046`.
+Its source identities are also frozen: sanitized treatment file
+`b4d1d34538fdabbd6127c339bff8167293d290eb732afc18a5d8963d12b15001`,
+sanitized projection
+`58a1982122d259e046ac5268de8fc3c2857a63d24c859e3bc13e4e6b9aa52ad8`,
+cleaned dataset
+`d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442`,
+and split manifest
+`8d5c1885903b199a4ab0859ccabc5ce41d9a105d0c755d3daf33cbfd959995f4`.
 Validation is analysis-exposed, not a pristine confirmation population. It
 does not select a D1 checkpoint: the fixed final fit state is chosen before
 its structural loss is computed.
@@ -571,25 +579,166 @@ rows reject the complete corpus; D1 does not silently skip them. The complete
 300-row corpus is sealed before router initialization. Its manifest and
 receipts are text-free, but its content-addressed payload shards necessarily
 contain the authorized analysis query and exact packet/plan/atom text required
-by the pinned Qwen row producer. Those payloads contain no answer, annotated
-source label, category, prediction, score, or judge output. The route-agnostic
-v1 replay cannot supply this authority and is not upgraded in place.
+by the pinned Qwen row producer. Their closed schema admits no evaluator or
+gold-answer, annotated benchmark source-label, category, prediction,
+scoring-label, or judge-output field or artifact. This is a schema and artifact
+claim, not a claim that authorized query or evidence text cannot contain the
+same literal words as an answer. The payloads retain the packet's structural
+routing provenance, including retrieval scores and `EvidenceAtom.label`;
+neither is evaluator supervision. The route-agnostic v1 replay cannot supply
+this authority and is not upgraded in place.
 
-An owned corpus producer accepts only the exact verified
-`AnalysisTreatmentInput`, derives development positions 0--199 and validation
-positions 200--299 from the locked order, and publishes the closed route-v2
-package without accepting a caller-supplied partition or sample filter. Its
-production launcher owns every expected treatment-file, projection, dataset,
-split-manifest, population-order, count, and partition digest; callers supply
-no replacement expected hashes, and a merely well-formed constructed object
-is not production-authorized. The certified trainer accepts only the
-independently verified fit member of that package, the pinned Qwen
-checkpoint/tokenizer inputs, and one dedicated router checkpoint output root.
-Its public API and CLI
-accept no original dataset, split-manifest path, confirmation treatment,
+#### 13.1a Future production route-v2 corpus-launcher lock
+
+For population input, the production public entry accepts a sanitized analysis
+treatment artifact path only. It snapshots the exact
+`load_analysis_treatment_input` callable and invokes it internally; that pinned
+loader snapshots the artifact once and checks the expected treatment-file,
+projection, dataset, split-manifest, combined population-order, and count
+owned by the launcher. It never accepts a caller-supplied
+`AnalysisTreatmentInput`, expected hash, partition, or sample filter. The
+internal adapter requires the loader's exact returned type, derives development
+positions 0--199 and validation positions 200--299, exact-checks both partition
+counts and ordered-ID digests, and publishes the closed route-v2 package. A
+merely well-formed constructed object is not
+production-authorized. The certified trainer accepts only the phase-scoped
+production fit authority described below, the pinned Qwen checkpoint/tokenizer
+inputs, and one dedicated router checkpoint output root. Its public API and
+CLI accept no original dataset, split-manifest path, confirmation treatment,
 exposure-audit path, analysis scoring-label artifact, score report, answerer
 output, or judge output. Opaque IDs are used only for joins and hashes; they
 are never embedded or parsed as semantic inputs.
+
+The future tracked `tools/run_diffuse_latent_training_corpus.py` launcher owns
+one `fixed_interval` base arm wrapped by literal
+`episodic_route = "episode_primary"` and
+`closure_routing_scope = "seeded_graph"`. Its canonical shared-base control
+bodies reproduce `_campaign_config("cuda:0")` and `_reference_arm()` from
+`tools/run_diffuse_longmemeval_shared_base_replay.py` at source commit
+`92e4a1baa80a234d974ac1a2f5af6e46d447e152`, plus `FusionCaps()` and
+`QwenAtomFeatureCaps()` at that commit. They are frozen by these identities; a
+mismatch is a named treatment change, not a compatible corpus:
+
+| Control body | SHA-256 |
+| --- | --- |
+| compilation policy | `b310b8f2abded1e8ce296b8c1dffb0fca99308cff38a742e08f40eb810d704c4` |
+| episode policy | `bdcc3b5aef5c961c6229a6b8ee77a19e45056913fb04533880efe86e61837118` |
+| closure policy | `c9eea134c827b508fb8092d207ed55be00ea5d9a96b0937ef960cc08b7977461` |
+| base arm | `ff4e843ddc6985eb2c97a9a7247881723792e7d4549be90204ab8e424336a6a0` |
+| episode-primary v2 arm | `fe7fb2526fb8b8e46ef934d4e2a7cf0b09fa66f8dc617d456383e6df58e0fd25` |
+| matched controls | `c7935ad61497f2591a6e2be513a3fe769164cb634a6fb85ec15d6c9678e2a06b` |
+| representative-policy controls | `780bf148e69ddbbfa4583ba188b64954778a2582534a4b4d624fe777ac2e77c8` |
+| `RetrievalConfig` canonical projection | `062f2e52a6500545f35b6e17293a074589c4e68c7c4bdf3aee46dd073ab3f2ed` |
+| evaluation-policy projection | `4fbb199b99aa7f60fc042d30cc7e5d09034d92d7a816c304b53471cac3a68634` |
+| `FusionCaps` | `e2e453ffd238a87d536c931b57e024e6c69ab6c740bb8e3a2b2c931de7146284` |
+| `QwenAtomFeatureCaps` | `535b2df0bf8732cca2d0df615cbbb011ea3e5dd30c1a49d8752230a57378b6ad` |
+
+The corresponding bodies use chunk limits 120/250; `hybrid_graph` retrieval
+with `k=10`, `ef_search=50`, 100 candidates, `alpha=0.65`, next-neighbor
+radius/slots 5/24, source slots/pool/activation 48/750/65, role-aware, TF-ISF,
+HSC, source-local, and four-slot partition routing; and an 8,000-token prompt
+cap. Legacy Qwen reranking and feedback remain false. Compilation uses episode
+sizes 2--16 and fixed interval 8. Episode expansion uses 96 anchors, one
+previous and next episode, 256 seeds, 96 direct fallbacks, and decay 0.85.
+Closure uses hop/unit/relation/degree/episode-neighbor/frontier/bundle/beam
+limits 3/1024/2048/32/2/1024/256/128 and confidence 0.5. The arm uses a
+7,000-token context cap, 256 responder-token reserve, and requires the owned
+representative runtime. Fields not abbreviated here remain exactly those in
+the canonical projections above, not whatever future schema defaults become.
+
+The local runtime is `resident_bge_qwen` on canonical `cuda:0`, with BGE batch
+32, Qwen `float16`, eight Qwen candidates, 2,048 Qwen workspace tokens, and a
+3,072 MiB resident free-memory preflight. Source-router caps are 64 sources and
+RRF constant 60; surprise caps are 256 spans, 64 span tokens, 96 probe tokens,
+and transport dimension 8,192; representative caps are 64 input sources, 64
+source groups, 64 episodes per source, 256 total episodes, two representatives
+per episode, group/beam/top-k 8/2/8, 96 representative/query tokens, and
+`qk_ov` scoring. BGE is `BAAI/bge-m3` revision
+`5617a9f61b028005a4858fdac845db406aefb181`, checkpoint
+`a3d5c49f064ab58d7cf5bba1c2085918f529778e88535aca7de674c9094af0b7`,
+dimension 1,024, unnormalized float32 output.
+Qwen is `Qwen/Qwen3-8B` revision
+`b968826d9c46dd6066d109eabc6255188de91218`, prefix checkpoint
+`76273516aa6924b12344d5e83daa485b66459b663c745cb3b9ef51cc17c7440d`;
+retrieval retains two layers and reads attention layer 1, while D1 atom
+features retain one layer and read output layer 0. The BGE and Qwen checkpoint
+manifests are separately verified locally before model work; filesystem paths
+are not identities.
+The two- and one-layer contracts independently bind their retained-layer count
+and selected attention/output layer even though both prefixes currently use
+the same verified metadata and first shard and therefore have the same
+checkpoint-manifest digest. Digest equality does not make those layer
+contracts interchangeable.
+
+`FusionCaps` is exactly 64 atoms, 16 latents, width 4,096, 1,024 route cells,
+2,048 topology links, 64 hyperedges, 64 groups, 16 atoms per group, and two
+latent memberships per atom. `QwenAtomFeatureCaps` is exactly 128 row tokens,
+64 query-tail tokens, four rows and 512 padded positions per forward, 4,096
+evidence characters, 2,048 query characters, and batch-invariance
+`atol = rtol = 1e-3`.
+
+The provider-free generic corpus core at commit
+`92e4a1baa80a234d974ac1a2f5af6e46d447e152` remains structurally verified
+only: `source_treatment_exact_type_verified`,
+`production_authorized`, `d1_eligible`, and `qwen_execution_attested` remain
+false wherever those fields apply, and neither callers nor a verifier may
+upgrade them. The tracked launcher must exact-type-check the firebreak's
+loader-returned `AnalysisTreatmentInput` before adapting it, exact-check every
+lock above, then publish and independently reopen the generic package.
+
+After that generic reopen, a separate production verifier independently
+projects every decoded row against the external lock. It exact-checks the base
+and episode-primary v2 arm identities, evaluation-policy projection,
+artifact-normalized representative-policy controls, literal
+`episode_primary`/`seeded_graph` route, route receipt's live implementation
+identity, and structural target's exact `FusionCaps` identity. Generic seals
+and their false authority fields are necessary inputs, not substitutes for
+this independent production projection. For every row, its persisted
+legacy-input-provider, representative-linker, and
+representative-policy-factory identities must also equal identities freshly
+derived from the exact owned runtime. Its persisted runtime BGE and Qwen
+checkpoint fields must equal the two separately reverified checkpoint
+manifests.
+
+Immediately before issuing any authority, the launcher re-snapshots the
+treatment artifact, re-certifies the tracked launcher from a clean committed
+tree, rederives the package, route, and corpus implementation identities, and
+rehashes both checkpoint manifests. Any drift from the pre-run locks or the
+verified generic package emits no production authority and no phase package.
+
+The resulting closed production-publication authority lives outside the
+generic corpus inventory. Its canonical identity hashes its body with its own
+receipt field excluded and points one way to the already-frozen generic root
+manifest bytes, corpus identity, and inventory identity, plus the launcher,
+committed source, runtime, checkpoint, and external-lock projection. Neither
+the generic root nor its inventory contains the outer authority's identity,
+and issuing the authority never rewrites the generic package.
+
+The launcher then emits distinct phase-scoped fit and validation authority
+packages and inventories. Each points one way to the already-verified full
+generic root and external production authority by immutable identity, contains
+only its own partition's manifest, row, and payload projection, and can be
+verified without mounting or opening the other partition. Future D1-eligible
+fit and validation types derive only from those respective phase packages,
+never from the generic verifier's full-root fit/validation views. The fit child
+receives only the fit package; the later validation child receives only the
+validation package and the already-frozen checkpoint/fit receipt.
+
+The launcher's cold import is treatment-only:
+`tools.v4_population_firebreak.scoring` must remain absent from `sys.modules`,
+and `AnalysisScoringLabel` must not enter the launcher or imported package
+namespace. The current eager scoring exports must therefore become lazy, or
+the treatment verifier must be isolated behind a scoring-free import path,
+before the production launcher is accepted.
+
+The launcher may be implemented and tested provider-free now, but it must not
+generate or freeze the production corpus until all D0 `src` work is committed,
+because the current route/corpus implementation identity covers every
+`src/memory_condense/**/*.py` file. Alternatively, that identity contract must
+first be intentionally narrowed and versioned. No current route/corpus
+implementation, launcher, runtime-binding, or output-package digest is frozen
+here; those identities are derived from the final clean committed launcher
+tree and verified runtime.
 
 The production exposure ledger names 15 of the 200 confirmation answers as
 potentially exposed. A later confirmation report must disclose that fact and
@@ -1068,9 +1217,18 @@ Before a real D1 run, provider-free tests must prove:
 2. The v2 corpus requires exactly 200 development and 100 validation rows in
    the locked orders, each with an exact route/plan/packet join and literal
    `episode_primary`; omission, duplication, reordering, route tampering, or a
-   v1-only receipt rejects before router initialization. Its owned producer
-   accepts only an exact verified `AnalysisTreatmentInput` and derives both
-   partitions without caller-supplied membership or filtering.
+   v1-only receipt rejects before router initialization. Its production public
+   entry accepts only the treatment artifact path, snapshots and invokes the
+   pinned loader internally, and derives both partitions without accepting a
+   caller-built `AnalysisTreatmentInput`, membership, filtering, or expected
+   hash. After generic reopen, its production verifier independently rechecks
+   every row against the arm, evaluation, representative, route/implementation,
+   and `FusionCaps` locks. The one-way outer authority is outside the generic
+   inventory, and the phase-scoped fit and validation packages each verify
+   without mounting the other partition. Persisted provider/linker/factory and
+   runtime-checkpoint identities must equal fresh owned-runtime and manifest
+   derivations. Final treatment/source/implementation/checkpoint drift emits no
+   authority or phase package.
 3. The trainer cannot accept confirmation rows, scorer labels, or the exposure
    audit. Gold answers, annotated source IDs, and categories are absent from
    its closed input schema.
@@ -1133,6 +1291,10 @@ Before a real D1 run, provider-free tests must prove:
 17. Cold import continues to load neither Torch, Transformers, nor
     safetensors, and every existing A/B/C, retrieval, replay, and scoring test
     remains green.
+18. Cold-importing the production corpus launcher leaves
+    `tools.v4_population_firebreak.scoring` absent from `sys.modules` and
+    `AnalysisScoringLabel` absent from its imported namespaces; the
+    treatment-only path does not gain scorer schema through package exports.
 
 The certified D1 branch requires a genuine pinned-Qwen execution over the
 frozen v2 corpus. Provider-free fakes exercise structure and failure behavior

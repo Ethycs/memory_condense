@@ -429,6 +429,80 @@ def verify_structural_latent_training_validation_corpus(
     return verify_structural_latent_training_corpus(path).validation
 
 
+def validate_structural_latent_training_partition_rows(
+    partition: LatentTrainingCorpusPartitionManifest,
+    rows: tuple[DecodedLatentTrainingCorpusRow, ...],
+) -> tuple[DecodedLatentTrainingCorpusRow, ...]:
+    """Validate one detached generic partition without granting authority.
+
+    Production phase packages need to recheck their byte-copied structural
+    rows without opening the full corpus or the sibling phase.  This narrow
+    validator deliberately accepts no production receipt and returns the same
+    generic, non-authoritative row tuple.
+    """
+
+    from memory_condense.eval._diffuse_latent_training_corpus_route import (
+        live_route_v2_implementation_sha256,
+        validate_persisted_route,
+    )
+
+    if type(partition) is not LatentTrainingCorpusPartitionManifest:
+        raise TypeError("partition must be an exact structural partition manifest")
+    if type(rows) is not tuple or any(
+        type(item) is not DecodedLatentTrainingCorpusRow for item in rows
+    ):
+        raise TypeError("rows must be a tuple of exact decoded structural rows")
+    partition.__post_init__()
+    if partition.production_authorized is not False or partition.d1_eligible is not False:
+        raise LatentTrainingCorpusError("generic partition cannot contain authority")
+    if len(rows) != partition.row_count:
+        raise LatentTrainingCorpusError("detached partition row count changed")
+    route_implementation = live_route_v2_implementation_sha256()
+    question_ids: list[str] = []
+    for index, item in enumerate(rows):
+        item.__post_init__()
+        row = item.manifest
+        row.__post_init__()
+        item.payload.__post_init__()
+        expected_ordinal = partition.start_ordinal + index
+        if (
+            row.partition != partition.partition
+            or row.partition_ordinal != index
+            or row.ordinal != expected_ordinal
+            or row.row_sha256 != partition.row_sha256s[index]
+            or partition.row_relative_paths[index]
+            != f"rows/{expected_ordinal:06d}.json"
+        ):
+            raise LatentTrainingCorpusError(
+                "detached partition row order differs from its manifest"
+            )
+        payload = encode_latent_training_payload(
+            item.payload.retrieval_query,
+            item.payload.plan,
+            item.payload.packet,
+            question_id=item.payload.question_id,
+            prompt_question=item.payload.prompt_question,
+        )
+        if (
+            len(payload) != row.payload_bytes
+            or hashlib.sha256(payload).hexdigest() != row.payload_sha256
+        ):
+            raise LatentTrainingCorpusError(
+                "detached partition payload is no longer canonical"
+            )
+        validate_persisted_route(
+            row,
+            item.payload,
+            expected_route_implementation_sha256=route_implementation,
+        )
+        question_ids.append(row.question_id)
+    if _ids_sha256(tuple(question_ids)) != partition.ordered_question_ids_sha256:
+        raise LatentTrainingCorpusError("detached partition question order changed")
+    if live_route_v2_implementation_sha256() != route_implementation:
+        raise RuntimeError("route implementation changed during detached validation")
+    return rows
+
+
 __all__ = [
     "ANALYSIS_POPULATION_PROJECTION_FORMAT",
     "LATENT_TRAINING_CORPUS_FORMAT",
@@ -455,6 +529,7 @@ __all__ = [
     "VerifiedLatentTrainingValidationCorpus",
     "latent_training_corpus_implementation_sha256",
     "publish_structural_latent_training_corpus",
+    "validate_structural_latent_training_partition_rows",
     "verify_structural_latent_training_corpus",
     "verify_structural_latent_training_fit_corpus",
     "verify_structural_latent_training_validation_corpus",

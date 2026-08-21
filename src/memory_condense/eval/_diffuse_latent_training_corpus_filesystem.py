@@ -256,6 +256,7 @@ def _win_info(handle: int) -> tuple[tuple[int, ...], int, int]:
         size,
         write_time,
         int(value.dwFileAttributes),
+        int(value.nNumberOfLinks),
     )
     return identity, size, int(value.dwFileAttributes)
 

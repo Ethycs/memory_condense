@@ -717,8 +717,8 @@ def _validate_view(manifest: Any, partition: Any, rows: Any, role: str, authorit
         raise TypeError("verified manifest has the wrong exact type")
     if type(partition) is not LatentTrainingCorpusPartitionManifest:
         raise TypeError("verified partition has the wrong exact type")
-    manifest._seal()
-    partition._seal()
+    manifest.__post_init__()
+    partition.__post_init__()
     if manifest.implementation_sha256 != latent_training_corpus_implementation_sha256():
         raise ValueError("verified corpus implementation identity is no longer current")
     if any(
@@ -742,9 +742,17 @@ def _validate_view(manifest: Any, partition: Any, rows: Any, role: str, authorit
     ):
         raise TypeError("verified partition rows have the wrong role/count/type")
     for index, item in enumerate(values):
-        item.manifest._seal()
-        if item.manifest.partition != role or item.manifest.partition_ordinal != index or (
-            item.manifest.row_sha256 != partition.row_sha256s[index]
+        item.__post_init__()
+        item.manifest.__post_init__()
+        item.payload.__post_init__()
+        expected_ordinal = partition.start_ordinal + index
+        if (
+            item.manifest.partition != role
+            or item.manifest.partition_ordinal != index
+            or item.manifest.ordinal != expected_ordinal
+            or item.manifest.row_sha256 != partition.row_sha256s[index]
+            or partition.row_relative_paths[index]
+            != f"rows/{expected_ordinal:06d}.json"
         ):
             raise ValueError("verified row order differs from its partition")
         payload = encode_latent_training_payload(

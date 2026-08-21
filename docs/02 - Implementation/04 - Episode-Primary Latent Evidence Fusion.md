@@ -609,7 +609,7 @@ exposure-audit path, analysis scoring-label artifact, score report, answerer
 output, or judge output. Opaque IDs are used only for joins and hashes; they
 are never embedded or parsed as semantic inputs.
 
-The future tracked `tools/run_diffuse_latent_training_corpus.py` launcher owns
+The tracked `tools/run_diffuse_latent_training_corpus.py` design owns
 one `fixed_interval` base arm wrapped by literal
 `episodic_route = "episode_primary"` and
 `closure_routing_scope = "seeded_graph"`. Its canonical shared-base control
@@ -686,59 +686,88 @@ upgrade them. The tracked launcher must exact-type-check the firebreak's
 loader-returned `AnalysisTreatmentInput` before adapting it, exact-check every
 lock above, then publish and independently reopen the generic package.
 
-After that generic reopen, a separate production verifier independently
+After that generic reopen, a separate candidate verifier independently
 projects every decoded row against the external lock. It exact-checks the base
 and episode-primary v2 arm identities, evaluation-policy projection,
 artifact-normalized representative-policy controls, literal
 `episode_primary`/`seeded_graph` route, route receipt's live implementation
 identity, and structural target's exact `FusionCaps` identity. Generic seals
 and their false authority fields are necessary inputs, not substitutes for
-this independent production projection. For every row, its persisted
-legacy-input-provider, representative-linker, and
-representative-policy-factory identities must also equal identities freshly
+this independent candidate projection. For every row, its persisted
+legacy-input-provider identity must equal the identity freshly derived for
+that exact row, while the persisted representative-linker and
+representative-policy-factory identities must equal identities freshly
 derived from the exact owned runtime. Its persisted runtime BGE and Qwen
 checkpoint fields must equal the two separately reverified checkpoint
 manifests.
 
-Immediately before issuing any authority, the launcher re-snapshots the
-treatment artifact, re-certifies the tracked launcher from a clean committed
-tree, rederives the package, route, and corpus implementation identities, and
-rehashes both checkpoint manifests. Any drift from the pre-run locks or the
-verified generic package emits no production authority and no phase package.
+Immediately before completing a candidate publication, the launcher
+re-snapshots the treatment artifact, re-certifies the tracked launcher from a
+clean committed tree, rederives the package, route, and corpus implementation
+identities, and rehashes both checkpoint manifests. Any drift from the pre-run
+locks or the verified generic package emits no complete candidate receipt or
+phase candidate.
 
-The resulting closed production-publication authority lives outside the
-generic corpus inventory. Its canonical identity hashes its body with its own
-receipt field excluded and points one way to the already-frozen generic root
-manifest bytes, corpus identity, and inventory identity, plus the launcher,
-committed source, runtime, checkpoint, and external-lock projection. Neither
-the generic root nor its inventory contains the outer authority's identity,
-and issuing the authority never rewrites the generic package.
+The first genuine clean run emits a closed, text-free production *candidate*
+outside the generic corpus inventory. Its canonical identity hashes its body
+with its own receipt field excluded and points one way to the already-frozen
+generic root manifest bytes, corpus identity, and inventory identity, plus the
+launcher, committed source, runtime, checkpoint, and external-lock projection.
+Neither the generic root nor its inventory points back to the candidate, and
+candidate publication never rewrites the generic package. Every candidate
+field that could imply source-treatment authority, production authorization,
+D1 or validation eligibility, optimizer or diagnostic authorization,
+checkpoint selection, or Qwen execution attestation remains literal false.
+Self-hashed candidate files prove internal integrity, not genuine-run
+provenance.
 
-The launcher then emits distinct phase-scoped fit and validation authority
-packages and inventories. Each points one way to the already-verified full
-generic root and external production authority by immutable identity, contains
-only its own partition's manifest, row, and payload projection, and can be
-verified without mounting or opening the other partition. Future D1-eligible
-fit and validation types derive only from those respective phase packages,
-never from the generic verifier's full-root fit/validation views. The fit child
-receives only the fit package; the later validation child receives only the
-validation package and the already-frozen checkpoint/fit receipt.
+That run also emits distinct false-only fit and validation candidate packages
+and inventories. Each points one way to the same full generic root and
+candidate identity, contains only its own partition's manifest, rows, and
+payloads, and can be structurally verified without mounting or opening the
+other partition. No provider-free path or first-run candidate verifier may
+return a production-authorized or D1-eligible type.
 
-The launcher's cold import is treatment-only:
-`tools.v4_population_firebreak.scoring` must remain absent from `sys.modules`,
-and `AnalysisScoringLabel` must not enter the launcher or imported package
-namespace. The current eager scoring exports must therefore become lazy, or
-the treatment verifier must be isolated behind a scoring-free import path,
-before the production launcher is accepted.
+After the candidate is independently audited, a separate clean tracked commit
+must freeze the exact candidate publication, outer-candidate, and role-specific
+phase identities. Only code-owned pins from that later commit may enable the
+standalone production, fit, and validation verifiers to issue accepted
+authority views; callers cannot supply or override an expected digest. The fit
+child then receives only the pin-enabled fit package. The later validation
+child receives only the pin-enabled validation package and the already-frozen
+checkpoint/fit receipt. Until those genuine-output pins exist, all public
+production/fit/validation verifiers fail before opening candidate bytes.
 
-The launcher may be implemented and tested provider-free now, but it must not
-generate or freeze the production corpus until all D0 `src` work is committed,
-because the current route/corpus implementation identity covers every
-`src/memory_condense/**/*.py` file. Alternatively, that identity contract must
-first be intentionally narrowed and versioned. No current route/corpus
-implementation, launcher, runtime-binding, or output-package digest is frozen
-here; those identities are derived from the final clean committed launcher
-tree and verified runtime.
+The launcher's cold import is scoring-, provider-, and model-runtime-free:
+`tools.v4_population_firebreak.scoring`, provider SDKs, torch, and transformers
+must remain absent from `sys.modules`, and `AnalysisScoringLabel` must not enter
+the launcher or imported firebreak package namespace. Lightweight modeling
+identity modules may load transitively; no model weights or executable model
+runtime does. The scoring exports are lazy, and the cold-import gate enforces
+that treatment-only access does not resolve the scoring module or schema.
+
+The current public launcher is intentionally closed before it coerces an
+argument or performs filesystem, loader, checkpoint, model, or network work.
+Its exact false status reason is
+`unsafe_upstream_base_publication_not_hardened`: the existing base store,
+query, and derived-package publishers still contain path-authorized rollback
+and recursive cleanup paths. A later tranche must replace those paths with
+held-identity, capability-authorized publication and cleanup before real
+candidate generation can be enabled. The private source-aware projection is
+retained only for static audit and does not certify an execution. False-only
+candidate structural inspection remains available separately; production,
+fit, and validation verifiers remain closed before path access while genuine
+output pins are absent. No real candidate has been generated by this state.
+
+Provider-free tests may exercise the closed launcher and false-only candidate
+schemas, but they must not generate or freeze a production corpus. After the
+upstream publication boundary is hardened, a genuine run must also wait until
+all D0 `src` work is committed, because the current route/corpus implementation
+identity covers every `src/memory_condense/**/*.py` file. Alternatively, that
+identity contract must first be intentionally narrowed and versioned. No
+current route/corpus implementation, launcher, runtime-binding, or
+output-package digest is frozen here; those identities are derived from the
+final clean committed launcher tree and verified runtime.
 
 The production exposure ledger names 15 of the 200 confirmation answers as
 potentially exposed. A later confirmation report must disclose that fact and
@@ -1221,14 +1250,25 @@ Before a real D1 run, provider-free tests must prove:
    entry accepts only the treatment artifact path, snapshots and invokes the
    pinned loader internally, and derives both partitions without accepting a
    caller-built `AnalysisTreatmentInput`, membership, filtering, or expected
-   hash. After generic reopen, its production verifier independently rechecks
+   hash. After generic reopen, its candidate verifier independently rechecks
    every row against the arm, evaluation, representative, route/implementation,
-   and `FusionCaps` locks. The one-way outer authority is outside the generic
-   inventory, and the phase-scoped fit and validation packages each verify
-   without mounting the other partition. Persisted provider/linker/factory and
-   runtime-checkpoint identities must equal fresh owned-runtime and manifest
-   derivations. Final treatment/source/implementation/checkpoint drift emits no
-   authority or phase package.
+   and `FusionCaps` locks. The one-way false-only candidate is outside the
+   generic inventory, and the phase-scoped fit and validation candidates each
+   verify structurally without mounting the other partition. Persisted
+   per-row provider and owned linker/factory/runtime-checkpoint identities must
+   equal fresh runtime and manifest derivations. Final
+   treatment/source/implementation/checkpoint drift emits no complete candidate
+   or phase candidate. Provider-free and first-run verification leaves every
+   authority, eligibility, training/diagnostic, checkpoint-selection, and Qwen
+   attestation flag false. Public production/fit/validation verifiers reject
+   before filesystem traversal until a later clean commit pins the independently
+   audited genuine candidate publication, outer-candidate, and role-specific
+   phase identities; only those code-owned pins can enable accepted authority
+   views. In the current tracked state, both the Python launcher and CLI stop
+   before argument coercion with the exact false reason
+   `unsafe_upstream_base_publication_not_hardened`. Real candidate generation
+   remains blocked until base store, query, and derived-package publication
+   use capability-authorized, held-identity cleanup and rollback.
 3. The trainer cannot accept confirmation rows, scorer labels, or the exposure
    audit. Gold answers, annotated source IDs, and categories are absent from
    its closed input schema.

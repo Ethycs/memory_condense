@@ -104,6 +104,29 @@ def test_source_modules_remain_reviewably_sized():
     assert not oversized, f"split oversized source modules: {oversized}"
 
 
+def test_production_corpus_tool_modules_remain_reviewably_sized():
+    """Keep the path-only launcher and its private mechanisms auditable."""
+
+    root = Path(__file__).resolve().parents[1]
+    paths = (
+        root / "tools" / "run_diffuse_latent_training_corpus.py",
+        root / "tools" / "_diffuse_latent_training_corpus_authority.py",
+        root / "tools" / "_diffuse_latent_training_corpus_authority_models.py",
+        root / "tools" / "_diffuse_latent_training_corpus_authority_codec.py",
+        root / "tools" / "_diffuse_latent_training_corpus_authority_filesystem.py",
+        root / "tools" / "_diffuse_latent_training_corpus_candidate_verification.py",
+        root / "tools" / "_diffuse_latent_training_corpus_workspace.py",
+    )
+    oversized = {
+        path.relative_to(root).as_posix(): len(
+            path.read_text(encoding="utf-8").splitlines()
+        )
+        for path in paths
+        if len(path.read_text(encoding="utf-8").splitlines()) > 1_300
+    }
+    assert not oversized, f"split oversized production-corpus modules: {oversized}"
+
+
 def _module_scope_imports(path: Path) -> set[str]:
     """Top-level import names only — imports inside a function body are fine."""
     tree = ast.parse(path.read_text(encoding="utf-8"))

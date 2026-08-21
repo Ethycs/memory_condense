@@ -44,9 +44,11 @@ from memory_condense.eval.diffuse_compilation import (
     compile_diffuse_artifact,
 )
 from memory_condense.eval.diffuse_longmemeval import (
+    DiffuseEpisodicRoute,
     LongMemEvalDiffuseMetrics,
     LongMemEvalDiffuseRetrieval,
     _anchor_payload as _diffuse_anchor_payload,
+    _diffuse_episodic_route,
     measure_longmemeval_diffuse_packet,
     retrieve_longmemeval_diffuse_packet,
 )
@@ -687,7 +689,7 @@ class DiffuseLongMemEvalAnalysis(SealedIdentity):
         return payload
 
 
-def retrieve_diffuse_longmemeval_sample(
+def _retrieve_diffuse_longmemeval_sample_with_route(
     condenser: MemoryCondenser,
     sample: GoldBlindLongMemEvalSample,
     *,
@@ -698,11 +700,15 @@ def retrieve_diffuse_longmemeval_sample(
     embedding_identity: Mapping[str, object] | None = None,
     representative_linker: NestedEpisodeLinker | None = None,
     representative_policy_factory: RepresentativePolicyFactory | None = None,
+    episodic_route: DiffuseEpisodicRoute,
+    _packet_retriever: Any = retrieve_longmemeval_diffuse_packet,
+    _packet_retriever_guard: Callable[[], None] | None = None,
 ) -> DiffuseLongMemEvalRetrievalPhase:
-    """Compile and retrieve every probe without accepting benchmark gold."""
+    """Route-aware implementation behind the frozen legacy public facade."""
 
     if not isinstance(condenser, MemoryCondenser):
         raise TypeError("diffuse analysis requires a MemoryCondenser")
+    active_episodic_route = _diffuse_episodic_route(episodic_route)
     _assert_deterministic_sample_loaded(condenser, sample)
     if config.max_prompt_tokens is None:
         raise ValueError("diffuse analysis requires an explicit prompt cap")
@@ -712,6 +718,10 @@ def retrieve_diffuse_longmemeval_sample(
         raise ValueError(
             "representative linker and policy factory must be supplied together"
         )
+    if _packet_retriever_guard is not None and not callable(
+        _packet_retriever_guard
+    ):
+        raise TypeError("_packet_retriever_guard must be callable")
     provider_identity_sha256 = _callable_implementation_sha256(
         legacy_input_provider,
         "legacy_input_provider",
@@ -795,7 +805,17 @@ def retrieve_diffuse_longmemeval_sample(
                 representative_policy
             )
         )
-        retrieval = retrieve_longmemeval_diffuse_packet(
+        # Preserve the legacy downstream call shape.  Historical cross-commit
+        # receipt bytes are intentionally not claimed because implementation
+        # identities bind the package source tree.
+        route_kwargs = (
+            {}
+            if active_episodic_route == "legacy_union"
+            else {"episodic_route": active_episodic_route}
+        )
+        if _packet_retriever_guard is not None:
+            _packet_retriever_guard()
+        retrieval = _packet_retriever(
             condenser,
             query=probe.retrieval_query,
             prompt_question=probe.prompt_question,
@@ -817,6 +837,7 @@ def retrieve_diffuse_longmemeval_sample(
                 arm.require_owned_representative_runtime
             ),
             closure_policy=arm.closure,
+            **route_kwargs,
         )
         receipt = DiffuseLongMemEvalAnalysisQueryReceipt(
             corpus_sha256=sample.corpus_sha256,
@@ -872,6 +893,35 @@ def retrieve_diffuse_longmemeval_sample(
         evaluation_policy_sha256=evaluation_policy_sha256,
         compilation=compilation,
         questions=tuple(rows),
+    )
+
+
+def retrieve_diffuse_longmemeval_sample(
+    condenser: MemoryCondenser,
+    sample: GoldBlindLongMemEvalSample,
+    *,
+    config: EvalConfig,
+    arm: DiffuseLongMemEvalArm,
+    legacy_input_provider: LegacyDiffuseInputProvider,
+    qwen_scorer: QwenAttentionHeadSurpriseScorer | None = None,
+    embedding_identity: Mapping[str, object] | None = None,
+    representative_linker: NestedEpisodeLinker | None = None,
+    representative_policy_factory: RepresentativePolicyFactory | None = None,
+) -> DiffuseLongMemEvalRetrievalPhase:
+    """Compile and retrieve every probe without accepting benchmark gold."""
+
+    return _retrieve_diffuse_longmemeval_sample_with_route(
+        condenser,
+        sample,
+        config=config,
+        arm=arm,
+        legacy_input_provider=legacy_input_provider,
+        qwen_scorer=qwen_scorer,
+        embedding_identity=embedding_identity,
+        representative_linker=representative_linker,
+        representative_policy_factory=representative_policy_factory,
+        episodic_route="legacy_union",
+        _packet_retriever=retrieve_longmemeval_diffuse_packet,
     )
 
 

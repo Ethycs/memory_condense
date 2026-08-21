@@ -345,6 +345,8 @@ def test_executable_module_is_not_preimported_by_package(module_name):
         "memory_condense.search.fusion.qwen_matched",
         "memory_condense.search.fusion.render_models",
         "memory_condense.search.fusion.renderer",
+        "memory_condense.eval._diffuse_route_v2_validation",
+        "memory_condense.eval.diffuse_longmemeval_route_v2",
     ],
 )
 def test_qwen_fusion_feature_modules_keep_heavy_runtimes_cold(module_name):

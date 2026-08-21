@@ -268,6 +268,7 @@ def _win_open(
     write: bool = False,
     delete_access: bool = False,
     share_delete: bool = False,
+    share_write: bool = False,
 ) -> _OpenEntry:
     access = _FILE_READ_ATTRIBUTES | (
         _FILE_LIST_DIRECTORY if directory else _GENERIC_READ
@@ -283,7 +284,7 @@ def _win_open(
         str(path),
         access,
         _FILE_SHARE_READ
-        | (_FILE_SHARE_WRITE if directory else 0)
+        | (_FILE_SHARE_WRITE if directory or share_write else 0)
         | (_FILE_SHARE_DELETE if share_delete else 0),
         None,
         _OPEN_EXISTING,

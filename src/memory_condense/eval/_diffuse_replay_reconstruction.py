@@ -67,6 +67,12 @@ from memory_condense.eval._diffuse_replay_packets import (
     VerifiedDiffuseReplayPackage,
     VerifiedDiffuseReplayPacket,
 )
+from memory_condense.eval._diffuse_base_derived import (
+    _held_verified_diffuse_longmemeval_finalized_store,
+)
+from memory_condense.eval._diffuse_base_publication_guard import (
+    freeze_callable_guard,
+)
 from memory_condense.eval.benchmark import QA_SYSTEM_PROMPT, build_qa_prompt
 from memory_condense.eval.diffuse_compilation import DiffuseCompilationPolicy
 from memory_condense.eval.diffuse_longmemeval import (
@@ -82,7 +88,6 @@ from memory_condense.eval.diffuse_longmemeval_analysis import (
 from memory_condense.eval.diffuse_longmemeval_base import (
     DATABASE_NAME,
     INDEX_NAME,
-    verify_diffuse_longmemeval_finalized_store,
 )
 from memory_condense.eval.diffuse_longmemeval_inputs import (
     legacy_anchor_sequence_sha256,
@@ -669,12 +674,14 @@ def _rehydrate_arm(record: DiffuseReplayArmRecord) -> DiffuseLongMemEvalArm:
     return arm
 
 
-def _verify_and_reconstruct_replay_package(
+def _verify_and_reconstruct_replay_package_implementation(
     path: str | Path,
     *,
     base: VerifiedDiffuseLongMemEvalBase,
     expected_runtime_binding_sha256: str,
     resolve_provider_parameters: _ProviderParameterResolver,
+    _held_verifier,
+    _assert_held_verifier,
 ) -> VerifiedDiffuseReplayPackage:
     """Verify a replay package and return its exact reconstructed packets."""
 
@@ -772,14 +779,13 @@ def _verify_and_reconstruct_replay_package(
             **snapshot_payload,
             snapshot_sha256=arm.final_snapshot.identity_sha256,
         )
-        verify_diffuse_longmemeval_finalized_store(
+        _assert_held_verifier()
+        with _held_verifier(
             clone,
             expected_finalization=arm.finalization,
             expected_snapshot=snapshot,
-        )
-        with Database(arm_path / DATABASE_NAME, read_only=True) as database:
-            _verify_compilation_store_coordinates(database, arm)
-            store = DiscourseStore(database)
+        ) as held:
+            _verify_compilation_store_coordinates(held.database, arm)
             packets.extend(
                 _verify_reconstructed_query(
                     record=record,
@@ -791,7 +797,7 @@ def _verify_and_reconstruct_replay_package(
                     representative_query_tokens=representative_query_tokens,
                     question=question,
                     frozen=frozen,
-                    store=store,
+                    store=held.store,
                 )
                 for record, question, frozen in zip(
                     arm.queries,
@@ -822,6 +828,53 @@ def _verify_and_reconstruct_replay_package(
         manifest_file_sha256=manifest_final[0],
         packets=tuple(packets),
     )
+
+
+def _seal_reconstruction_entrypoint(implementation, held_verifier):
+    assert_implementation = freeze_callable_guard(
+        implementation,
+        error_type=RuntimeError,
+        label="replay reconstruction implementation",
+    )
+    assert_held = freeze_callable_guard(
+        held_verifier,
+        error_type=RuntimeError,
+        label="held replay verifier",
+    )
+
+    def _verify_and_reconstruct_replay_package(
+        path: str | Path,
+        *,
+        base: VerifiedDiffuseLongMemEvalBase,
+        expected_runtime_binding_sha256: str,
+        resolve_provider_parameters: _ProviderParameterResolver,
+    ) -> VerifiedDiffuseReplayPackage:
+        assert_implementation(implementation)
+        assert_held(held_verifier)
+
+        def assert_held_verifier() -> None:
+            assert_held(held_verifier)
+
+        return implementation(
+            path,
+            base=base,
+            expected_runtime_binding_sha256=expected_runtime_binding_sha256,
+            resolve_provider_parameters=resolve_provider_parameters,
+            _held_verifier=held_verifier,
+            _assert_held_verifier=assert_held_verifier,
+        )
+
+    return _verify_and_reconstruct_replay_package
+
+
+_verify_and_reconstruct_replay_package = _seal_reconstruction_entrypoint(
+    _verify_and_reconstruct_replay_package_implementation,
+    _held_verified_diffuse_longmemeval_finalized_store,
+)
+del (
+    _seal_reconstruction_entrypoint,
+    _verify_and_reconstruct_replay_package_implementation,
+)
 
 
 __all__ = [

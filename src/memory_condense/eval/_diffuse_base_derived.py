@@ -52,6 +52,24 @@ from memory_condense.eval._diffuse_base_publication_guard import (
     freeze_callable_guard,
     freeze_namespace_guard,
 )
+from memory_condense.eval._diffuse_base_derived_lifecycle_filesystem import (
+    _abort_derived_lifecycle_for_clone,
+    derived_lifecycle_operation_guard,
+    discard_derived_registration,
+    register_derived_publication,
+)
+from memory_condense.eval._diffuse_base_derived_finalization import (
+    _finalize_owned_derived_store,
+)
+from memory_condense.eval._diffuse_base_derived_phase import (
+    validated_finalization_phase as _validated_finalization_phase,
+)
+from memory_condense.eval._diffuse_base_derived_runtime import (
+    _open_owned_derived_store,
+)
+from memory_condense.eval._diffuse_base_derived_verified import (
+    held_verified_finalized_store,
+)
 from memory_condense.eval._diffuse_base_queries import (
     load_query_manifest,
     verify_query_entry,
@@ -207,8 +225,15 @@ def _clone_diffuse_longmemeval_base(
     commit_owned = commit_publication
     rollback_owned = rollback_publication
     abandon_owned = abandon_publication
+    register_lifecycle = register_derived_publication
+    discard_lifecycle = discard_derived_registration
     assert_import_seam = _sealed_import_guard
     assert_capability_intact, emergency_abandon = publication_operation_guard()
+    (
+        assert_lifecycle_intact,
+        _emergency_lifecycle,
+        emergency_registration,
+    ) = derived_lifecycle_operation_guard()
     module_namespace = globals()
     guarded_globals = {
         name: value
@@ -229,6 +254,7 @@ def _clone_diffuse_longmemeval_base(
                 "derived publication module was rebound: " + ", ".join(changed)
             )
         assert_capability_intact()
+        assert_lifecycle_intact()
 
     def quarantine(owner: object, original: BaseException) -> None:
         try:
@@ -264,6 +290,7 @@ def _clone_diffuse_longmemeval_base(
     owner = create_owned(target, role="derived")
     staging = owned_path(owner)
     owner_live = True
+    lifecycle_clone: DiffuseDerivedStore | None = None
     try:
         for name in (DATABASE_NAME, INDEX_NAME):
             source = base_store / name
@@ -303,10 +330,40 @@ def _clone_diffuse_longmemeval_base(
         }
         if before != after:
             raise DiffuseBaseArtifactError("cloning mutated the shared base")
+        lifecycle_clone = DiffuseDerivedStore(
+            path=target,
+            origin=origin,
+            base=verified,
+        )
+        register_lifecycle(lifecycle_clone, owner)
         assert_operations_intact()
         commit_owned(owner)
         owner_live = False
     except BaseException as original:
+        if lifecycle_clone is not None:
+            try:
+                assert_operations_intact()
+            except BaseException as guard_error:
+                original.add_note(
+                    "derived lifecycle operations changed; registration "
+                    f"quarantined: {guard_error!r}"
+                )
+                try:
+                    emergency_registration(lifecycle_clone)
+                except BaseException as lifecycle_error:
+                    original.add_note(
+                        "derived lifecycle emergency registration release failed: "
+                        f"{lifecycle_error!r}"
+                    )
+            else:
+                try:
+                    discard_lifecycle(lifecycle_clone)
+                except BaseException as lifecycle_error:
+                    original.add_note(
+                        "derived lifecycle registration could not be released: "
+                        f"{lifecycle_error!r}"
+                    )
+            lifecycle_clone = None
         if owner_live:
             try:
                 assert_operations_intact()
@@ -328,7 +385,8 @@ def _clone_diffuse_longmemeval_base(
                         quarantine(owner, original)
             owner_live = False
         raise
-    return DiffuseDerivedStore(path=target, origin=origin, base=verified)
+    assert lifecycle_clone is not None
+    return lifecycle_clone
 
 
 def _seal_clone_entrypoint(implementation, import_guard):
@@ -414,162 +472,82 @@ def _verify_derived_store(
     return rows
 
 
-def open_diffuse_longmemeval_derived_store(
+def _open_diffuse_longmemeval_derived_store(
     clone: DiffuseDerivedStore,
     *,
     config: EvalConfig,
     embedder: object,
+    _sealed_import_guard=None,
 ) -> MemoryCondenser:
-    """Claim and open an exact clone once, permanently disabling index saves."""
+    """Claim a current-process clone and open its held SQLite image once."""
 
     if not isinstance(clone, DiffuseDerivedStore):
         raise TypeError("clone must be a DiffuseDerivedStore")
     if not isinstance(config, EvalConfig):
         raise TypeError("config must be an EvalConfig")
+    _sealed_import_guard()
+    _assert_verified_bundle_current(clone.base)
+    if (
+        chunker_identity(config) != clone.base.store_manifest.chunker_identity
+        or config_identity(config) != clone.base.query_manifest.config_identity
+    ):
+        raise ValueError("derived open config differs from frozen base/query inputs")
     validate_live_embedder(embedder, clone.base._embedding_identity)
+    _sealed_import_guard()
     validate_embedder_certification(
         embedder,
         clone.base.store_manifest.build_runtime_identity,
     )
-    lease_payload = canonical_json_bytes(
-        {
-            "format": "memory-condense-longmemeval-derived-open-claim-v1",
-            "origin_receipt_sha256": clone.origin.receipt_sha256,
-        }
+    _sealed_import_guard()
+    return _open_owned_derived_store(
+        clone,
+        config=config,
+        embedder=embedder,
+        assert_base_current=_assert_verified_bundle_current,
+        expected_origin=_derived_origin,
+        assert_outer_intact=_sealed_import_guard,
     )
-    lease_path = clone.path / DERIVED_LEASE_NAME
-    if lease_path.exists():
-        require_regular_file(lease_path, "derived open claim")
-        if lease_path.read_bytes() != lease_payload:
-            raise DiffuseBaseArtifactError("derived open claim is invalid")
-        raise DiffuseBaseArtifactError(
-            "derived store has already been claimed for writable use"
-        )
-    rows = _verify_derived_store(clone, config=config)
-    try:
-        write_new_bytes(lease_path, lease_payload)
-    except FileExistsError as exc:
-        raise DiffuseBaseArtifactError(
-            "derived store has already been claimed for writable use"
-        ) from exc
-    index_path = clone.path / INDEX_NAME
-    index_before = (file_sha256(index_path), index_path.stat().st_mtime_ns)
-    condenser: MemoryCondenser | None = None
-    try:
-        condenser = MemoryCondenser(
-            data_dir=clone.path,
-            model_name=clone.base._embedding_identity.model_id,
-            chunker_min_tokens=config.chunker.min_tokens,
-            chunker_max_tokens=config.chunker.max_tokens,
-            device=config.embedding_device,
-            auto_extract=False,
+
+
+def _seal_open_entrypoint(implementation, import_guard):
+    assert_implementation = freeze_callable_guard(
+        implementation,
+        error_type=DiffuseBaseArtifactError,
+        label="derived open implementation",
+    )
+    assert_import_guard = freeze_callable_guard(
+        import_guard,
+        error_type=DiffuseBaseArtifactError,
+        label="derived open guard",
+    )
+
+    def open_diffuse_longmemeval_derived_store(
+        clone: DiffuseDerivedStore,
+        *,
+        config: EvalConfig,
+        embedder: object,
+    ) -> MemoryCondenser:
+        """Claim a current-process clone and open its held SQLite image once.
+
+        The original image stays visible until close publication begins; a
+        successful ``close()`` proves the sealed replacement. A failed close
+        quarantines an unfinalizable clone whose database may already be
+        partially or fully changed. A crash before publication loses in-memory
+        work and leaves the claim fail-closed; reconstructed unfinalized clones
+        cannot be opened.
+        """
+
+        assert_implementation(implementation)
+        assert_import_guard(import_guard)
+        import_guard()
+        return implementation(
+            clone,
+            config=config,
             embedder=embedder,
-            persist_index_on_close=False,
-            retriever_max_elements=(
-                clone.base.store_manifest.build_runtime_identity.index_max_elements
-            ),
-            read_only=False,
+            _sealed_import_guard=import_guard,
         )
-        runtime = clone.base.store_manifest.build_runtime_identity
-        retriever = condenser._retriever  # noqa: SLF001
-        # The clone is a one-shot graph-compilation workspace. Loading needs
-        # the path, but no public retriever.save() call may rewrite its frozen
-        # base index after that load succeeds.
-        retriever._index_path = None  # noqa: SLF001
-        observable = (
-            int(retriever._dim),  # noqa: SLF001
-            int(retriever._ef_construction),  # noqa: SLF001
-            int(retriever._M),  # noqa: SLF001
-            int(retriever._max_elements),  # noqa: SLF001
-        )
-        expected = (
-            runtime.index_dimension,
-            runtime.index_ef_construction,
-            runtime.index_m,
-            runtime.index_max_elements,
-        )
-        if observable != expected:
-            raise DiffuseBaseArtifactError(
-                "derived HNSW runtime differs from immutable base"
-            )
-        if condenser._embedder is not embedder:  # noqa: SLF001
-            raise DiffuseBaseArtifactError("derived store replaced the embedder")
-        if condenser._persist_index_on_close is not False:  # noqa: SLF001
-            raise DiffuseBaseArtifactError("derived index persistence is enabled")
-        if retriever._index_path is not None:  # noqa: SLF001
-            raise DiffuseBaseArtifactError("derived retriever can persist HNSW")
-        if (file_sha256(index_path), index_path.stat().st_mtime_ns) != index_before:
-            raise DiffuseBaseArtifactError("opening the derived store rewrote HNSW")
-        origin_payload = clone.origin.model_dump(mode="json")
-        condenser.diffuse_base_origin_receipt = origin_payload  # type: ignore[attr-defined]
-        condenser.diffuse_base_origin_receipt_sha256 = canonical_sha256(  # type: ignore[attr-defined]
-            origin_payload
-        )
-        condenser.frozen_legacy_query_inputs = rows  # type: ignore[attr-defined]
-        return condenser
-    except BaseException:
-        if condenser is not None:
-            try:
-                condenser.close()
-            except Exception:
-                pass
-        raise
 
-
-def _validated_finalization_phase(clone: DiffuseDerivedStore, phase: object):
-    from memory_condense.eval.diffuse_longmemeval_analysis import (
-        DiffuseLongMemEvalRetrievalPhase,
-    )
-
-    if not isinstance(clone, DiffuseDerivedStore):
-        raise TypeError("clone must be a DiffuseDerivedStore")
-    if type(phase) is not DiffuseLongMemEvalRetrievalPhase:
-        raise TypeError("phase must be an exact diffuse retrieval phase")
-    if (
-        phase.arm.arm_id != clone.origin.arm_id
-        or phase.arm.arm_sha256 != clone.origin.arm_sha256
-    ):
-        raise DiffuseBaseArtifactError("final phase belongs to another clone arm")
-    if (
-        phase.corpus_sha256 != clone.base.store_manifest.corpus_sha256
-        or any(
-            item.receipt.snapshot_sha256
-            != phase.compilation.final_snapshot.snapshot_sha256
-            for item in phase.questions
-        )
-    ):
-        raise DiffuseBaseArtifactError("final phase does not bind this base snapshot")
-    if canonical_sha256(list(phase.deterministic_turn_ids)) != (
-        clone.base.store_manifest.deterministic_turn_ids_sha256
-    ):
-        raise DiffuseBaseArtifactError("final phase changed deterministic ingest")
-    expected_probes = tuple(clone.base._sample.questions)
-    observed_probes = tuple(item.probe for item in phase.questions)
-    if observed_probes != expected_probes or len(observed_probes) != (
-        clone.base.query_manifest.query_count
-    ):
-        raise DiffuseBaseArtifactError("final phase changed the frozen query set")
-    if len(clone.base.frozen_query_inputs) != len(phase.questions):
-        raise DiffuseBaseArtifactError("frozen query rows are incomplete")
-    for frozen, question in zip(
-        clone.base.frozen_query_inputs,
-        phase.questions,
-        strict=True,
-    ):
-        frozen_identity = frozen.identity_payload(include_receipt=False)
-        receipt = question.legacy_inputs.receipt
-        if (
-            receipt.query_sha256 != frozen_identity["query_sha256"]
-            or receipt.retrieval_policy_sha256
-            != frozen.retrieval_policy_sha256
-            or receipt.anchor_chunk_ids
-            != tuple(item.chunk.chunk_id for item in frozen.anchors)
-            or question.legacy_inputs.candidates.anchors != frozen.anchors
-        ):
-            raise DiffuseBaseArtifactError(
-                "final phase changed a frozen query or anchor row"
-            )
-    return phase
+    return open_diffuse_longmemeval_derived_store
 
 
 def _load_derived_finalization(path: Path) -> DiffuseDerivedFinalization:
@@ -737,176 +715,178 @@ def _audit_derived_finalization(
     return expected
 
 
-def finalize_diffuse_longmemeval_derived_store(
+def _finalize_diffuse_longmemeval_derived_store(
     clone: DiffuseDerivedStore,
     *,
     phase: object,
+    _sealed_import_guard=None,
 ) -> DiffuseDerivedFinalization:
     """Seal one closed clone after retrieval and verify its final database."""
 
-    if (clone.path / DERIVED_FINALIZATION_NAME).exists():
-        raise FileExistsError(clone.path / DERIVED_FINALIZATION_NAME)
-    finalization = _audit_derived_finalization(
-        clone,
-        phase=phase,
-        finalized=False,
-    )
-    write_new_bytes(
-        clone.path / DERIVED_FINALIZATION_NAME,
-        model_bytes(finalization),
-    )
-    return verify_diffuse_longmemeval_derived_finalization(
-        clone,
-        phase=phase,
-    )
-
-
-def verify_diffuse_longmemeval_derived_finalization(
-    clone: DiffuseDerivedStore,
-    *,
-    phase: object,
-) -> DiffuseDerivedFinalization:
-    """Read and re-verify a sealed derived store without mutating it."""
-
-    tracked = tuple(clone.path / name for name in (
-        DATABASE_NAME,
-        INDEX_NAME,
-        DERIVED_ORIGIN_NAME,
-        DERIVED_LEASE_NAME,
-        DERIVED_FINALIZATION_NAME,
-    ))
-    before = {path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked}
-    value = _audit_derived_finalization(clone, phase=phase, finalized=True)
-    after = {path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked}
-    if before != after:
-        raise DiffuseBaseArtifactError("read-only finalization verification mutated files")
-    return value
-
-
-def verify_diffuse_longmemeval_finalized_store(
-    clone: DiffuseDerivedStore,
-    *,
-    expected_finalization: DiffuseDerivedFinalization,
-    expected_snapshot: object,
-) -> DiffuseDerivedFinalization:
-    """Verify a replay clone from persisted receipts, without a live phase."""
-
-    from memory_condense.domain.discourse import DiscourseSnapshot
-
     if not isinstance(clone, DiffuseDerivedStore):
         raise TypeError("clone must be a DiffuseDerivedStore")
-    if type(expected_finalization) is not DiffuseDerivedFinalization:
-        raise TypeError("expected_finalization must be exact")
-    if type(expected_snapshot) is not DiscourseSnapshot:
-        raise TypeError("expected_snapshot must be exact")
-    _assert_verified_bundle_current(clone.base)
-    require_regular_directory(clone.path, "finalized derived store")
-    require_exact_children(
-        clone.path,
-        {
-            DATABASE_NAME,
-            INDEX_NAME,
-            DERIVED_ORIGIN_NAME,
-            DERIVED_LEASE_NAME,
-            DERIVED_FINALIZATION_NAME,
-        },
-        "finalized derived store",
+    _sealed_import_guard()
+    return _finalize_owned_derived_store(
+        clone,
+        phase=phase,
+        validate_phase=_validated_finalization_phase,
+        assert_base_current=_assert_verified_bundle_current,
+        assert_outer_intact=_sealed_import_guard,
     )
-    for name in (
-        DATABASE_NAME,
-        INDEX_NAME,
-        DERIVED_ORIGIN_NAME,
-        DERIVED_LEASE_NAME,
-        DERIVED_FINALIZATION_NAME,
-    ):
-        require_regular_file(clone.path / name, f"finalized derived {name}")
-    require_no_sqlite_sidecars(clone.path)
-    if _load_derived_origin(clone.path) != clone.origin:
-        raise DiffuseBaseArtifactError("finalized derived origin changed")
-    if _load_derived_finalization(clone.path) != expected_finalization:
-        raise DiffuseBaseArtifactError("persisted finalization differs from expected")
-    if (
-        expected_finalization.origin_receipt_sha256
-        != clone.origin.receipt_sha256
-        or expected_finalization.arm_id != clone.origin.arm_id
-        or expected_finalization.arm_sha256 != clone.origin.arm_sha256
-        or expected_finalization.final_snapshot_sha256
-        != expected_snapshot.snapshot_sha256
-    ):
-        raise DiffuseBaseArtifactError("finalization identity differs from clone")
-    lease_expected = canonical_json_bytes(
-        {
-            "format": "memory-condense-longmemeval-derived-open-claim-v1",
-            "origin_receipt_sha256": clone.origin.receipt_sha256,
-        }
-    )
-    if (clone.path / DERIVED_LEASE_NAME).read_bytes() != lease_expected:
-        raise DiffuseBaseArtifactError("finalized derived lease changed")
 
-    database_path = clone.path / DATABASE_NAME
-    index_path = clone.path / INDEX_NAME
-    tracked = tuple(clone.path / name for name in (
-        DATABASE_NAME,
-        INDEX_NAME,
-        DERIVED_ORIGIN_NAME,
-        DERIVED_LEASE_NAME,
-        DERIVED_FINALIZATION_NAME,
-    ))
-    before = {path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked}
-    if (
-        before[database_path][0] != expected_finalization.database_sha256
-        or database_path.stat().st_size != expected_finalization.database_bytes
-        or before[index_path][0] != expected_finalization.index_sha256
-        or index_path.stat().st_size != expected_finalization.index_bytes
-        or expected_finalization.index_sha256
-        != clone.origin.initial_index_sha256
-    ):
-        raise DiffuseBaseArtifactError("finalized derived file identity changed")
-    base_store = clone.base.store_path / STORE_DIRECTORY_NAME
-    for name in (DATABASE_NAME, INDEX_NAME):
-        _assert_not_hardlinked(base_store / name, clone.path / name)
-    with Database(base_store / DATABASE_NAME, read_only=True) as base_database:
-        base_source_tables = _immutable_source_tables_sha256(base_database)
-        base_snapshot = DiscourseStore(base_database).snapshot()
-    with Database(database_path, read_only=True) as database:
-        if database.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-            raise DiffuseBaseArtifactError("finalized database integrity failed")
-        if database.execute("PRAGMA foreign_key_check").fetchall():
-            raise DiffuseBaseArtifactError("finalized database foreign keys failed")
-        derived_source_tables = _immutable_source_tables_sha256(database)
-        if any(
-            int(database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-            for table in _FORBIDDEN_DERIVED_TABLES
-        ):
-            raise DiffuseBaseArtifactError("finalized store has forbidden state")
-        observed_snapshot = DiscourseStore(database).snapshot()
-    source_fields = (
-        "max_turn_ordinal",
-        "chunk_count",
-        "schema_version",
-        "source_revision",
-        "source_content_sha256",
+
+def _seal_finalize_entrypoint(implementation, import_guard):
+    assert_implementation = freeze_callable_guard(
+        implementation,
+        error_type=DiffuseBaseArtifactError,
+        label="derived finalization implementation",
     )
-    if (
-        derived_source_tables != base_source_tables
-        or tuple(getattr(observed_snapshot, name) for name in source_fields)
-        != tuple(getattr(base_snapshot, name) for name in source_fields)
-        or observed_snapshot != expected_snapshot
+    assert_import_guard = freeze_callable_guard(
+        import_guard,
+        error_type=DiffuseBaseArtifactError,
+        label="derived finalization guard",
+    )
+
+    def finalize_diffuse_longmemeval_derived_store(
+        clone: DiffuseDerivedStore,
+        *,
+        phase: object,
+    ) -> DiffuseDerivedFinalization:
+        """Seal one closed clone after held final self-verification."""
+
+        assert_implementation(implementation)
+        assert_import_guard(import_guard)
+        import_guard()
+        return implementation(
+            clone,
+            phase=phase,
+            _sealed_import_guard=import_guard,
+        )
+
+    return finalize_diffuse_longmemeval_derived_store
+
+
+def _seal_verify_entrypoints(held_verifier, assert_base_current, import_guard):
+    assert_held_verifier = freeze_callable_guard(
+        held_verifier,
+        error_type=DiffuseBaseArtifactError,
+        label="held finalized verifier",
+    )
+    assert_import_guard = freeze_callable_guard(
+        import_guard,
+        error_type=DiffuseBaseArtifactError,
+        label="derived verification guard",
+    )
+    assert_base_guard = freeze_callable_guard(
+        assert_base_current,
+        error_type=DiffuseBaseArtifactError,
+        label="verified base currentness check",
+    )
+
+    def verify_diffuse_longmemeval_derived_finalization(
+        clone: DiffuseDerivedStore,
+        *,
+        phase: object,
+    ) -> DiffuseDerivedFinalization:
+        """Read and re-verify a sealed derived store without mutating it."""
+
+        assert_held_verifier(held_verifier)
+        assert_import_guard(import_guard)
+        assert_base_guard(assert_base_current)
+        import_guard()
+        with held_verifier(
+            clone,
+            phase=phase,
+            assert_base_current=assert_base_current,
+            assert_outer_intact=import_guard,
+        ) as held:
+            return held.finalization
+
+    def verify_diffuse_longmemeval_finalized_store(
+        clone: DiffuseDerivedStore,
+        *,
+        expected_finalization: DiffuseDerivedFinalization,
+        expected_snapshot: object,
+    ) -> DiffuseDerivedFinalization:
+        """Verify a replay clone from persisted receipts, without a live phase."""
+
+        assert_held_verifier(held_verifier)
+        assert_import_guard(import_guard)
+        assert_base_guard(assert_base_current)
+        import_guard()
+        with held_verifier(
+            clone,
+            expected_finalization=expected_finalization,
+            expected_snapshot=expected_snapshot,
+            assert_base_current=assert_base_current,
+            assert_outer_intact=import_guard,
+        ) as held:
+            return held.finalization
+
+    def _held_verified_diffuse_longmemeval_finalized_store(
+        clone: DiffuseDerivedStore,
+        *,
+        expected_finalization: DiffuseDerivedFinalization,
+        expected_snapshot: object,
     ):
-        raise DiffuseBaseArtifactError("finalized database snapshot changed")
-    require_no_sqlite_sidecars(clone.path)
-    after = {path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked}
-    if before != after:
-        raise DiffuseBaseArtifactError("standalone verification mutated files")
-    for name in (DATABASE_NAME, INDEX_NAME):
-        _assert_not_hardlinked(base_store / name, clone.path / name)
-    return expected_finalization
+        assert_held_verifier(held_verifier)
+        assert_import_guard(import_guard)
+        assert_base_guard(assert_base_current)
+        import_guard()
+        return held_verifier(
+            clone,
+            expected_finalization=expected_finalization,
+            expected_snapshot=expected_snapshot,
+            assert_base_current=assert_base_current,
+            assert_outer_intact=import_guard,
+        )
+
+    return (
+        verify_diffuse_longmemeval_derived_finalization,
+        verify_diffuse_longmemeval_finalized_store,
+        _held_verified_diffuse_longmemeval_finalized_store,
+    )
+
+
+def _seal_abort_entrypoint(
+    abort_for_clone,
+    operation_guard,
+):
+    assert_lifecycle, _emergency_owner, emergency_clone = operation_guard()
+
+    def _abort_diffuse_longmemeval_derived_store(clone: DiffuseDerivedStore) -> None:
+        """Best-effort idempotent cleanup for an unpublished derived clone."""
+
+        try:
+            assert_lifecycle()
+        except BaseException as guard_error:
+            try:
+                emergency_clone(clone)
+            except BaseException as cleanup_error:
+                guard_error.add_note(
+                    "derived registration emergency cleanup also failed: "
+                    f"{cleanup_error!r}"
+                )
+            raise guard_error
+        abort_for_clone(clone)
+
+    return _abort_diffuse_longmemeval_derived_store
 
 
 _DERIVED_GUARD_EXCLUDES = (
     "_seal_clone_entrypoint",
+    "_seal_open_entrypoint",
+    "_seal_finalize_entrypoint",
+    "_seal_verify_entrypoints",
+    "_seal_abort_entrypoint",
     "derived_publication_import_guard",
     "clone_diffuse_longmemeval_base",
+    "open_diffuse_longmemeval_derived_store",
+    "finalize_diffuse_longmemeval_derived_store",
+    "verify_diffuse_longmemeval_derived_finalization",
+    "verify_diffuse_longmemeval_finalized_store",
+    "_held_verified_diffuse_longmemeval_finalized_store",
+    "_abort_diffuse_longmemeval_derived_store",
     "_DERIVED_GUARD_EXCLUDES",
     "_sealed_derived_guard",
 )
@@ -925,4 +905,53 @@ derived_publication_import_guard = freeze_namespace_guard(
 clone_diffuse_longmemeval_base = _seal_clone_entrypoint(
     _clone_diffuse_longmemeval_base, _sealed_derived_guard
 )
-del _seal_clone_entrypoint, _sealed_derived_guard
+open_diffuse_longmemeval_derived_store = _seal_open_entrypoint(
+    _open_diffuse_longmemeval_derived_store, _sealed_derived_guard
+)
+finalize_diffuse_longmemeval_derived_store = _seal_finalize_entrypoint(
+    _finalize_diffuse_longmemeval_derived_store, _sealed_derived_guard
+)
+(
+    verify_diffuse_longmemeval_derived_finalization,
+    verify_diffuse_longmemeval_finalized_store,
+    _held_verified_diffuse_longmemeval_finalized_store,
+) = _seal_verify_entrypoints(
+    held_verified_finalized_store,
+    _assert_verified_bundle_current,
+    _sealed_derived_guard,
+)
+_abort_diffuse_longmemeval_derived_store = _seal_abort_entrypoint(
+    _abort_derived_lifecycle_for_clone,
+    derived_lifecycle_operation_guard,
+)
+for _entrypoint, _entrypoint_name in (
+    (clone_diffuse_longmemeval_base, "clone_diffuse_longmemeval_base"),
+    (
+        open_diffuse_longmemeval_derived_store,
+        "open_diffuse_longmemeval_derived_store",
+    ),
+    (
+        finalize_diffuse_longmemeval_derived_store,
+        "finalize_diffuse_longmemeval_derived_store",
+    ),
+    (
+        verify_diffuse_longmemeval_derived_finalization,
+        "verify_diffuse_longmemeval_derived_finalization",
+    ),
+    (
+        verify_diffuse_longmemeval_finalized_store,
+        "verify_diffuse_longmemeval_finalized_store",
+    ),
+):
+    _entrypoint.__name__ = _entrypoint_name
+    _entrypoint.__qualname__ = _entrypoint_name
+    _entrypoint.__module__ = __name__
+del _entrypoint, _entrypoint_name
+del (
+    _seal_clone_entrypoint,
+    _seal_open_entrypoint,
+    _seal_finalize_entrypoint,
+    _seal_verify_entrypoints,
+    _seal_abort_entrypoint,
+    _sealed_derived_guard,
+)

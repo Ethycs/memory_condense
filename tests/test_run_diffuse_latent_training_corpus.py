@@ -135,6 +135,7 @@ def test_public_run_signature_and_status_are_closed_false() -> None:
 
     status = launcher.candidate_execution_status()
     assert type(status) is models.ProductionCandidateExecutionStatus
+    assert status.reason == "candidate_execution_activation_not_audited"
     assert status.reason == models.CANDIDATE_EXECUTION_DISABLED_REASON
     assert status.candidate_execution_enabled is False
     assert status.source_runtime_verified is False

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import copy
+from dataclasses import fields
 import inspect
 import pickle
 import subprocess
@@ -312,9 +313,16 @@ def test_post_promote_root_replacement_cannot_authorize_rollback(
 def test_public_signatures_and_legacy_cleanup_isolation_are_stable() -> None:
     import memory_condense.eval.diffuse_longmemeval_base as facade
     from memory_condense.eval.diffuse_longmemeval_base import (
+        DiffuseDerivedStore,
         clone_diffuse_longmemeval_base,
+        finalize_diffuse_longmemeval_derived_store,
+        open_diffuse_longmemeval_derived_store,
         publish_diffuse_longmemeval_base,
+        verify_diffuse_longmemeval_derived_finalization,
+        verify_diffuse_longmemeval_finalized_store,
     )
+    from memory_condense.application.condenser import MemoryCondenser
+    from memory_condense.persistence.db import Database
 
     assert str(inspect.signature(publish_diffuse_longmemeval_base)) == (
         "(cache_root: 'str | Path', *, treatment_identity: "
@@ -350,6 +358,69 @@ def test_public_signatures_and_legacy_cleanup_isolation_are_stable() -> None:
         "arm_id",
         "arm_sha256",
     )
+    phase_signature = (
+        "(clone: 'DiffuseDerivedStore', *, phase: 'object') -> "
+        "'DiffuseDerivedFinalization'"
+    )
+    assert str(inspect.signature(open_diffuse_longmemeval_derived_store)) == (
+        "(clone: 'DiffuseDerivedStore', *, config: 'EvalConfig', embedder: "
+        "'object') -> 'MemoryCondenser'"
+    )
+    assert str(inspect.signature(finalize_diffuse_longmemeval_derived_store)) == (
+        phase_signature
+    )
+    assert str(
+        inspect.signature(verify_diffuse_longmemeval_derived_finalization)
+    ) == phase_signature
+    assert str(inspect.signature(verify_diffuse_longmemeval_finalized_store)) == (
+        "(clone: 'DiffuseDerivedStore', *, expected_finalization: "
+        "'DiffuseDerivedFinalization', expected_snapshot: 'object') -> "
+        "'DiffuseDerivedFinalization'"
+    )
+    assert str(inspect.signature(MemoryCondenser.__init__)) == (
+        "(self, data_dir: 'str | Path' = './data', model_name: 'str' = "
+        "'BAAI/bge-m3', chunker_min_tokens: 'int' = 120, "
+        "chunker_max_tokens: 'int' = 250, device: 'str | None' = None, "
+        "extractor: 'Extractor | None' = None, budget: 'ContextBudget | None' "
+        "= None, auto_extract: 'bool' = True, embedder: 'EmbeddingService | "
+        "None' = None, persist_index_on_close: 'bool' = True, "
+        "retriever_max_elements: 'int' = 100000, read_only: 'bool' = False) "
+        "-> 'None'"
+    )
+    assert str(inspect.signature(MemoryCondenser.close)) == "(self) -> 'None'"
+    assert str(inspect.signature(Database.__init__)) == (
+        "(self, db_path: 'str | Path' = 'memory.db', *, read_only: 'bool' = "
+        "False) -> 'None'"
+    )
+    assert str(inspect.signature(Database.close)) == "(self) -> 'None'"
+    assert str(inspect.signature(DiffuseDerivedStore)) == (
+        "(path: 'Path', origin: 'DiffuseDerivedOrigin', base: "
+        "'VerifiedDiffuseLongMemEvalBase') -> None"
+    )
+    assert tuple(field.name for field in fields(DiffuseDerivedStore)) == (
+        "path",
+        "origin",
+        "base",
+    )
+    for entrypoint in (
+        clone_diffuse_longmemeval_base,
+        open_diffuse_longmemeval_derived_store,
+        finalize_diffuse_longmemeval_derived_store,
+        verify_diffuse_longmemeval_derived_finalization,
+        verify_diffuse_longmemeval_finalized_store,
+    ):
+        assert entrypoint.__module__ == (
+            "memory_condense.eval._diffuse_base_derived"
+        )
+        assert entrypoint.__name__ in {
+            "clone_diffuse_longmemeval_base",
+            "open_diffuse_longmemeval_derived_store",
+            "finalize_diffuse_longmemeval_derived_store",
+            "verify_diffuse_longmemeval_derived_finalization",
+            "verify_diffuse_longmemeval_finalized_store",
+        }
+        assert entrypoint.__qualname__ == entrypoint.__name__
+        assert pickle.loads(pickle.dumps(entrypoint)) is entrypoint
     assert tuple(facade.__all__) == (
         "BASE_STORE_FORMAT", "DATABASE_NAME", "DERIVED_FINALIZATION_NAME",
         "DERIVED_LEASE_NAME", "DERIVED_ORIGIN_NAME", "FROZEN_QUERY_INPUTS_NAME",

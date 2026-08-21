@@ -305,7 +305,7 @@ class VerifiedDiffuseLongMemEvalBase:
         return self.query_manifest.query_input_key
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class DiffuseDerivedStore:
     path: Path
     origin: DiffuseDerivedOrigin

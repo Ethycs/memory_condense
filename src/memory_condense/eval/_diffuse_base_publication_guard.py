@@ -137,7 +137,21 @@ def freeze_operation_guard(
     windows: bool,
     error_type: type[Exception],
     attribute_dependencies: tuple[tuple[object, str], ...] = (),
-) -> Callable[[], tuple[Callable[[], None], Callable[[object], Path]]]:
+    additional_namespaces: tuple[tuple[str, dict[str, Any]], ...] = (),
+    registration_state_op: Callable[
+        [object], tuple[Path, tuple[Any, ...]]
+    ] | None = None,
+    emergency_abandon_op: Callable[[object], Path] | None = None,
+    emergency_registration_op: Callable[[object], Path] | None = None,
+) -> Callable[
+    [],
+    tuple[Callable[[], None], Callable[[object], Path]]
+    | tuple[
+        Callable[[], None],
+        Callable[[object], Path],
+        Callable[[object], Path],
+    ],
+]:
     """Freeze both filesystem namespaces and an emergency revoke closure."""
 
     def clone_cell(value: object):
@@ -162,6 +176,21 @@ def freeze_operation_guard(
 
     stable_state_op = clone_function(state_op)
     stable_revoke_op = clone_function(revoke_op)
+    stable_registration_state_op = (
+        clone_function(registration_state_op)
+        if registration_state_op is not None
+        else None
+    )
+    stable_emergency_abandon_op = (
+        clone_function(emergency_abandon_op)
+        if emergency_abandon_op is not None
+        else None
+    )
+    stable_emergency_registration_op = (
+        clone_function(emergency_registration_op)
+        if emergency_registration_op is not None
+        else None
+    )
     if windows:
         import ctypes
         from ctypes import wintypes
@@ -190,12 +219,31 @@ def freeze_operation_guard(
     primitive_fingerprints = tuple(
         (name, fingerprint(value)) for name, value in primitive_expected.items()
     )
+    additional_fingerprints = tuple(
+        (
+            label,
+            additional,
+            tuple(
+                (name, fingerprint(value))
+                for name, value in additional.items()
+                if not name.startswith("__")
+            ),
+        )
+        for label, additional in additional_namespaces
+    )
     attribute_fingerprints = tuple(
-        (owner, name, fingerprint(getattr(owner, name)))
+        (owner, name, fingerprint(getattr(owner, name, None)))
         for owner, name in attribute_dependencies
     )
 
-    def acquire() -> tuple[Callable[[], None], Callable[[object], Path]]:
+    def acquire() -> (
+        tuple[Callable[[], None], Callable[[object], Path]]
+        | tuple[
+            Callable[[], None],
+            Callable[[object], Path],
+            Callable[[object], Path],
+        ]
+    ):
         def assert_intact() -> None:
             changed = [
                 name
@@ -207,6 +255,12 @@ def freeze_operation_guard(
                 for name, value in primitive_fingerprints
                 if fingerprint(primitive_namespace.get(name)) != value
             )
+            for label, additional, expected_values in additional_fingerprints:
+                changed.extend(
+                    f"{label}:{name}"
+                    for name, value in expected_values
+                    if fingerprint(additional.get(name)) != value
+                )
             changed.extend(
                 f"attribute:{name}"
                 for owner, name, value in attribute_fingerprints
@@ -219,6 +273,8 @@ def freeze_operation_guard(
                 )
 
         def emergency_abandon(owner: object) -> Path:
+            if stable_emergency_abandon_op is not None:
+                return stable_emergency_abandon_op(owner)
             state = stable_state_op(owner)
             handles = [*state.held]
             if state.store_child is not None:
@@ -228,19 +284,64 @@ def freeze_operation_guard(
                 handles.append(state.marker)
             handles.extend(state.parent_chain)
             seen: set[int] = set()
+            failure: BaseException | None = None
             for entry in reversed(handles):
                 if entry.handle in seen:
                     continue
-                result = stable_raw_close(entry.handle)
-                if windows and not result:
-                    raise error_type(
-                        "cannot close quarantined publication handle"
-                    )
+                try:
+                    result = stable_raw_close(entry.handle)
+                    if windows and not result:
+                        raise error_type(
+                            "cannot close quarantined publication handle"
+                        )
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
                 seen.add(entry.handle)
-            stable_revoke_op(owner, state)
+            try:
+                stable_revoke_op(owner, state)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+                else:
+                    failure.add_note(
+                        f"publication revoke also failed: {exc!r}"
+                    )
+            if failure is not None:
+                raise failure
             return state.path
 
+        def emergency_discard_registration(clone: object) -> Path:
+            if stable_emergency_registration_op is not None:
+                return stable_emergency_registration_op(clone)
+            if stable_registration_state_op is None:
+                raise TypeError("registration cleanup is unavailable")
+            path, entries = stable_registration_state_op(clone)
+            seen: set[int] = set()
+            failure: BaseException | None = None
+            for entry in reversed(entries):
+                if entry.handle in seen:
+                    continue
+                try:
+                    result = stable_raw_close(entry.handle)
+                    if windows and not result:
+                        raise error_type(
+                            "cannot close quarantined registration handle"
+                        )
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+                seen.add(entry.handle)
+            if failure is not None:
+                raise failure
+            return path
+
         assert_intact()
+        if (
+            stable_registration_state_op is not None
+            or stable_emergency_registration_op is not None
+        ):
+            return assert_intact, emergency_abandon, emergency_discard_registration
         return assert_intact, emergency_abandon
 
     return acquire

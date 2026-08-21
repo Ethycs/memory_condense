@@ -611,6 +611,12 @@ class _RouteV2Mapper:
             owned_build_runtime_identity,
             publish_diffuse_longmemeval_base,
         )
+        from memory_condense.eval._diffuse_base_derived import (
+            _abort_diffuse_longmemeval_derived_store,
+        )
+        from memory_condense.eval._diffuse_base_publication_guard import (
+            freeze_callable_guard,
+        )
         from memory_condense.eval.diffuse_longmemeval_replay import (
             VerifiedBaseLegacyDiffuseInputProvider,
         )
@@ -621,6 +627,12 @@ class _RouteV2Mapper:
             gold_blind_from_treatment_sample,
         )
 
+        abort_clone = _abort_diffuse_longmemeval_derived_store
+        assert_abort_clone = freeze_callable_guard(
+            abort_clone,
+            error_type=RuntimeError,
+            label="derived candidate-row abort helper",
+        )
         if type(row) is not AnalysisPopulationRow:
             raise TypeError("generic publisher supplied another row type")
         expected_ordinal = len(self.provider_identities)
@@ -652,6 +664,7 @@ class _RouteV2Mapper:
             kind="row",
         )
         row_root = candidate_workspace_path(row_owner)
+        clone = None
         try:
             clone = clone_diffuse_longmemeval_base(
                 base,
@@ -666,7 +679,9 @@ class _RouteV2Mapper:
             )
             try:
                 if self.qwen.reranker is not None:
-                    raise RuntimeError("candidate route loaded a legacy Qwen reranker")
+                    raise RuntimeError(
+                        "candidate route loaded a legacy Qwen reranker"
+                    )
                 phase = retrieve_episode_primary_analysis_phase_v2(
                     condenser,
                     blind,
@@ -680,7 +695,15 @@ class _RouteV2Mapper:
                     qwen_scorer=None,
                     embedding_identity=self.binding.embedding_identity,
                 )
-            finally:
+            except BaseException as original:
+                try:
+                    condenser.close()
+                except BaseException as close_error:
+                    original.add_note(
+                        f"derived condenser close also failed: {close_error!r}"
+                    )
+                raise
+            else:
                 condenser.close()
             finalize_diffuse_longmemeval_derived_store(clone, phase=phase)
             inner = phase.questions[0].inner
@@ -706,6 +729,15 @@ class _RouteV2Mapper:
             capture_candidate_row_workspace(row_owner)
             self.provider_identities.append(provider_sha256)
         except BaseException as original:
+            if clone is not None:
+                try:
+                    assert_abort_clone(abort_clone)
+                    abort_clone(clone)
+                except BaseException as cleanup_error:
+                    original.add_note(
+                        "derived lifecycle abort also failed: "
+                        f"{cleanup_error!r}"
+                    )
             try:
                 cleanup_candidate_workspace(row_owner)
             except BaseException as cleanup_error:
@@ -1097,7 +1129,7 @@ def _define_closed_public_surface():
     # Closure-owned literals keep module-global rebinding from opening the
     # public path.  The returned function deliberately does not inspect any
     # argument, including ``restart`` and hostile PathLike implementations.
-    disabled_reason = "unsafe_derived_runtime_lifecycle_not_hardened"
+    disabled_reason = "candidate_execution_activation_not_audited"
     if disabled_reason != CANDIDATE_EXECUTION_DISABLED_REASON:
         raise RuntimeError("candidate execution disabled reason drifted")
     unavailable_type = ProductionCandidateExecutionUnavailable

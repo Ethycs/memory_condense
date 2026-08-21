@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sqlite3 as _owned_sqlite3
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -33,6 +34,9 @@ from memory_condense.application.retrieval_workflow import RetrievalWorkflowMixi
 from memory_condense.application.source_companions import (
     SourceCompanionWorkflowMixin,
     default_source_companion_report,
+)
+from memory_condense.application._owned_condenser_close import (
+    install_owned_close as _install_owned_close,
 )
 from memory_condense.associations.association_store import AssociationStore
 from memory_condense.associations.consolidation import (
@@ -110,7 +114,99 @@ class MemoryCondenser(
         if not read_only:
             data_dir.mkdir(parents=True, exist_ok=True)
 
-        self._db = Database(data_dir / "memory.db", read_only=read_only)
+        database = Database(data_dir / "memory.db", read_only=read_only)
+        self._initialize_components(
+            database=database,
+            index_path=data_dir / "hnsw_index.bin",
+            model_name=model_name,
+            chunker_min_tokens=chunker_min_tokens,
+            chunker_max_tokens=chunker_max_tokens,
+            device=device,
+            extractor=extractor,
+            budget=budget,
+            auto_extract=auto_extract,
+            embedder=embedder,
+            persist_index_on_close=persist_index_on_close,
+            retriever_max_elements=retriever_max_elements,
+            read_only=read_only,
+            owned_embedding_dimension=None,
+        )
+
+    @classmethod
+    def _from_owned_database(
+        cls,
+        database: Database,
+        *,
+        index_path: str | Path,
+        model_name: str,
+        chunker_min_tokens: int,
+        chunker_max_tokens: int,
+        device: str | None,
+        auto_extract: bool,
+        embedder: EmbeddingService,
+        retriever_max_elements: int,
+        owned_embedding_dimension: int,
+        _connection_close=_owned_sqlite3.Connection.close,
+    ) -> MemoryCondenser:
+        """Build the exact facade from explicitly supplied owned components."""
+
+        if cls is not MemoryCondenser or type(database) is not Database:
+            raise TypeError("owned condenser requires exact production types")
+        value = object.__new__(cls)
+        try:
+            value._initialize_components(
+                database=database,
+                index_path=Path(index_path),
+                model_name=model_name,
+                chunker_min_tokens=chunker_min_tokens,
+                chunker_max_tokens=chunker_max_tokens,
+                device=device,
+                extractor=None,
+                budget=None,
+                auto_extract=auto_extract,
+                embedder=embedder,
+                persist_index_on_close=False,
+                retriever_max_elements=retriever_max_elements,
+                read_only=False,
+                owned_embedding_dimension=owned_embedding_dimension,
+            )
+        except BaseException as original:
+            retriever = getattr(value, "_retriever", None)
+            if retriever is not None:
+                try:
+                    object.__setattr__(retriever, "_index", None)
+                except BaseException as cleanup_error:
+                    original.add_note(
+                        f"owned retriever cleanup also failed: {cleanup_error!r}"
+                    )
+            try:
+                _connection_close(object.__getattribute__(database, "_conn"))
+            except BaseException as cleanup_error:
+                original.add_note(
+                    f"owned database cleanup also failed: {cleanup_error!r}"
+                )
+            raise
+        return value
+
+    def _initialize_components(
+        self,
+        *,
+        database: Database,
+        index_path: Path,
+        model_name: str,
+        chunker_min_tokens: int,
+        chunker_max_tokens: int,
+        device: str | None,
+        extractor: Extractor | None,
+        budget: ContextBudget | None,
+        auto_extract: bool,
+        embedder: EmbeddingService | None,
+        persist_index_on_close: bool,
+        retriever_max_elements: int,
+        read_only: bool,
+        owned_embedding_dimension: int | None,
+    ) -> None:
+        self._db = database
         self._init_discourse_workflow()
         self._transcript = TranscriptStore(self._db)
         self._chunker = Chunker(
@@ -118,15 +214,24 @@ class MemoryCondenser(
             max_tokens=chunker_max_tokens,
         )
         # Injectable so tests (and alternate backends) can avoid loading bge-m3.
-        self._embedder = embedder or EmbeddingService(
-            model_name=model_name,
-            device=device,
-        )
+        if owned_embedding_dimension is None:
+            # Preserve the long-standing public behavior for falsey custom
+            # embedders on the ordinary constructor path.
+            self._embedder = embedder or EmbeddingService(
+                model_name=model_name,
+                device=device,
+            )
+            embedding_dimension = self._embedder.dim
+        else:
+            if embedder is None:
+                raise TypeError("owned condenser requires an explicit embedder")
+            self._embedder = embedder
+            embedding_dimension = int(owned_embedding_dimension)
         self._associations = AssociationStore(self._db)
         self._retriever = SimilarityRetriever(
             db=self._db,
-            dim=self._embedder.dim,
-            index_path=data_dir / "hnsw_index.bin",
+            dim=embedding_dimension,
+            index_path=index_path,
             association_store=self._associations,
             max_elements=retriever_max_elements,
         )
@@ -613,7 +718,7 @@ class MemoryCondenser(
         """Current HOT/WARM/COLD distribution of active memory items."""
         return self._memory.heat_counts(now_turn=now_turn)
 
-    def close(self) -> None:
+    def _close_unowned(self) -> None:
         """Persist index and close database."""
         try:
             if self._persist_index_on_close:
@@ -627,6 +732,13 @@ class MemoryCondenser(
 
     def __exit__(self, *args) -> None:
         self.close()
+
+
+_bind_owned_close, MemoryCondenser.close = _install_owned_close(  # type: ignore[method-assign]
+    MemoryCondenser,
+    MemoryCondenser._close_unowned,
+)
+del _install_owned_close
 
 
 __all__ = [

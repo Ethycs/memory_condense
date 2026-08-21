@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import sqlite3
+import sys
 import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -16,8 +18,14 @@ import numpy as np
 import pytest
 
 import memory_condense.eval._diffuse_base_derived as derived_module
+import memory_condense.eval._diffuse_base_derived_finalization as derived_final_module
+import memory_condense.eval._diffuse_base_derived_runtime as derived_runtime_module
 import memory_condense.eval._diffuse_base_store as store_module
 import memory_condense.eval.diffuse_longmemeval_base as base_module
+import memory_condense.search.indexes.index_lifecycle as index_lifecycle_module
+from memory_condense.eval._diffuse_replay_provider_identity import (
+    _OPERATIONAL_PROVIDER_IDENTITY_V2_MARKER,
+)
 
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.domain.schemas import Chunk
@@ -41,6 +49,7 @@ from memory_condense.eval.diffuse_longmemeval_base import (
     publish_diffuse_longmemeval_base,
     verify_diffuse_longmemeval_base,
     verify_diffuse_longmemeval_derived_finalization,
+    verify_diffuse_longmemeval_finalized_store,
 )
 from memory_condense.eval.cache_receipts import canonical_sha256
 from memory_condense.eval.diffuse_compilation import (
@@ -122,6 +131,10 @@ class _DeterministicEmbedder:
 
 
 class _FrozenAnchorOnlyProvider:
+    __memory_condense_operational_identity_v2__ = (
+        _OPERATIONAL_PROVIDER_IDENTITY_V2_MARKER
+    )
+
     def __init__(self, rows: tuple[object, ...]) -> None:
         self._rows = rows
 
@@ -550,6 +563,123 @@ def test_fixed_identity_keys_artifact_bytes_and_tree_match_the_golden(
         DERIVED_ORIGIN_NAME,
     }
     assert (tmp_path / ".derived.publish.lock").read_bytes() == b"0"
+
+
+def test_fixed_compiled_derived_database_and_final_receipt_match_the_golden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if (
+        sys.version_info[:3] != (3, 12, 13)
+        or importlib.util.MAGIC_NUMBER.hex() != "cb0d0d0a"
+    ):
+        pytest.skip("fixed derived bytes pin the frozen pixi CPython ABI")
+    from memory_condense.eval import diffuse_compilation as compilation_module
+
+    monkeypatch.setattr(
+        compilation_module,
+        "implementation_sha256",
+        lambda: "2eef6a41cc70f9eff0e380f6e8691a77c60d6cf36b465ef9a0ac0c345f41f341",
+    )
+    root = tmp_path / "cache"
+    config = _config().model_copy(update={"max_prompt_tokens": 1024})
+    sample = _sample()
+    embedder = _DeterministicEmbedder()
+    calls: list[Path] = []
+    factory = _factory(config=config, embedder=embedder, calls=calls)
+    factory.__module__ = "baseline_test_base"
+    runtime = _build_runtime_identity(
+        factory_digest=callable_build_factory_sha256(factory)
+    )
+    factory.diffuse_build_runtime_identity = runtime  # type: ignore[attr-defined]
+    base = publish_diffuse_longmemeval_base(
+        root,
+        treatment_identity=_treatment(),
+        sample=sample,
+        config=config,
+        embedding_identity=_embedding_identity(),
+        build_runtime_identity=runtime,
+        embedder=embedder,
+        condenser_factory=factory,
+        implementation_digest=_sha("implementation-under-test"),
+        environment_digest=_sha("environment-under-test"),
+    )
+    arm = DiffuseLongMemEvalArm(
+        arm_id="fixed_interval",
+        compilation=DiffuseCompilationPolicy(
+            boundary_mode="fixed_interval",
+            min_episode_size=1,
+            max_episode_size=4,
+            fixed_interval=2,
+        ),
+        max_context_tokens=128,
+        responder_output_token_reserve=16,
+    )
+    clone = clone_diffuse_longmemeval_base(
+        base,
+        tmp_path / "compiled-derived",
+        arm_id=arm.arm_id,
+        arm_sha256=arm.arm_sha256,
+    )
+    condenser = open_diffuse_longmemeval_derived_store(
+        clone,
+        config=config,
+        embedder=_DeterministicEmbedder(),
+    )
+    provider_class_module = _FrozenAnchorOnlyProvider.__module__
+    provider_call_module = _FrozenAnchorOnlyProvider.__call__.__module__
+    provider_identity_module = (
+        _FrozenAnchorOnlyProvider.analysis_identity_payload.__module__
+    )
+    try:
+        _FrozenAnchorOnlyProvider.__module__ = "fixed_derived_golden_provider"
+        _FrozenAnchorOnlyProvider.__call__.__module__ = (
+            "fixed_derived_golden_provider"
+        )
+        _FrozenAnchorOnlyProvider.analysis_identity_payload.__module__ = (
+            "fixed_derived_golden_provider"
+        )
+        phase = retrieve_diffuse_longmemeval_sample(
+            condenser,
+            sample,
+            config=config,
+            arm=arm,
+            legacy_input_provider=_FrozenAnchorOnlyProvider(
+                base.frozen_query_inputs
+            ),
+        )
+    finally:
+        _FrozenAnchorOnlyProvider.__module__ = provider_class_module
+        _FrozenAnchorOnlyProvider.__call__.__module__ = provider_call_module
+        _FrozenAnchorOnlyProvider.analysis_identity_payload.__module__ = (
+            provider_identity_module
+        )
+    assert phase.receipt_sha256 == (
+        "deee81b4da1d75c235541bc68f7986e451b2523a90c971a0e60f784488a23014"
+    )
+    condenser.close()
+    database = clone.path / _DATABASE_NAME
+    assert (database.stat().st_size, file_sha256(database)) == (
+        421888,
+        "88c82ce802ae852c2e1dafd4577054e09a9b688eed04d577490fbdd2d2683594",
+    )
+    finalization = finalize_diffuse_longmemeval_derived_store(
+        clone,
+        phase=phase,
+    )
+    assert finalization.receipt_sha256 == (
+        "4a1246b9011426cd207b8100b107e3b708d9d2c5a8adec229224a3ebdcc48276"
+    )
+    assert file_sha256(clone.path / DERIVED_FINALIZATION_NAME) == (
+        "aa67d08dc8f6af09e9ac78f9548489c8b2065d3ca5c85542d316820b94c69e69"
+    )
+    assert {path.name for path in clone.path.iterdir()} == {
+        _DATABASE_NAME,
+        _INDEX_NAME,
+        DERIVED_ORIGIN_NAME,
+        "derived-open.claim",
+        DERIVED_FINALIZATION_NAME,
+    }
 
 
 def test_sealed_public_publish_rejects_stable_and_callback_rebinding(
@@ -1646,8 +1776,118 @@ def test_finalizer_seals_and_read_only_verifies_exact_phase(tmp_path: Path) -> N
             phase=phase,
         ) == finalization
         assert _bytes_and_mtime(tracked) == before
+        assert verify_diffuse_longmemeval_finalized_store(
+            clone,
+            expected_finalization=finalization,
+            expected_snapshot=phase.compilation.final_snapshot,
+        ) is finalization
+        assert _bytes_and_mtime(tracked) == before
         with pytest.raises(FileExistsError):
             finalize_diffuse_longmemeval_derived_store(clone, phase=phase)
+
+
+@pytest.mark.parametrize(
+    "mutated_receipt",
+    ("phase", "compilation", "expansion", "plan", "packet"),
+)
+def test_finalizer_rejects_post_retrieval_receipt_mutation(
+    tmp_path: Path,
+    mutated_receipt: str,
+) -> None:
+    with _published(
+        tmp_path / "cache",
+        config=_config().model_copy(update={"max_prompt_tokens": 1024}),
+    ) as (base, sample, config, *_rest):
+        arm = DiffuseLongMemEvalArm(
+            arm_id="fixed_interval",
+            compilation=DiffuseCompilationPolicy(
+                boundary_mode="fixed_interval",
+                min_episode_size=1,
+                max_episode_size=4,
+                fixed_interval=2,
+            ),
+            max_context_tokens=128,
+            responder_output_token_reserve=16,
+        )
+        clone = clone_diffuse_longmemeval_base(
+            base,
+            tmp_path / "finalized-arm",
+            arm_id=arm.arm_id,
+            arm_sha256=arm.arm_sha256,
+        )
+        condenser = open_diffuse_longmemeval_derived_store(
+            clone,
+            config=config,
+            embedder=_DeterministicEmbedder(),
+        )
+        phase = retrieve_diffuse_longmemeval_sample(
+            condenser,
+            sample,
+            config=config,
+            arm=arm,
+            legacy_input_provider=_FrozenAnchorOnlyProvider(
+                base.frozen_query_inputs
+            ),
+        )
+        condenser.close()
+        target, field = {
+            "phase": (phase, "receipt_sha256"),
+            "compilation": (phase.compilation, "receipt_sha256"),
+            "expansion": (
+                phase.questions[0].retrieval.expansion,
+                "receipt_sha256",
+            ),
+            "plan": (phase.questions[0].retrieval.plan, "plan_sha256"),
+            "packet": (
+                phase.questions[0].retrieval.packet.receipt,
+                "receipt_sha256",
+            ),
+        }[mutated_receipt]
+        object.__setattr__(target, field, "0" * 64)
+
+        with pytest.raises(DiffuseBaseArtifactError):
+            finalize_diffuse_longmemeval_derived_store(clone, phase=phase)
+        assert not (clone.path / DERIVED_FINALIZATION_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("owner", "name"),
+    (
+        (index_lifecycle_module.LexicalIndex, "__init__"),
+        (index_lifecycle_module.SourceContractionIndex, "__init__"),
+        (index_lifecycle_module.SourceContractionIndex, "invalidate"),
+    ),
+)
+def test_owned_runtime_guard_rejects_nested_index_method_rebinding(
+    owner: type,
+    name: str,
+) -> None:
+    assert_intact, _emergency, _resources = (
+        derived_runtime_module.derived_runtime_operation_guard()
+    )
+    original = owner.__dict__[name]
+    setattr(owner, name, lambda *args, **kwargs: None)
+    try:
+        with pytest.raises(DiffuseBaseArtifactError):
+            assert_intact()
+    finally:
+        setattr(owner, name, original)
+
+
+def test_owned_finalizer_guard_rejects_discourse_snapshot_rebinding() -> None:
+    original = derived_final_module.DiscourseStore.snapshot
+    derived_final_module.DiscourseStore.snapshot = lambda _self: None
+    try:
+        with pytest.raises(DiffuseBaseArtifactError):
+            derived_final_module._finalize_owned_derived_store(
+                object(),
+                phase=object(),
+                validate_phase=lambda _clone, value: value,
+                assert_base_current=lambda _base: None,
+                assert_outer_intact=lambda: None,
+            )
+    finally:
+        derived_final_module.DiscourseStore.snapshot = original
 
 
 def test_short_text_equal_to_route_labels_is_not_mistaken_for_payload(

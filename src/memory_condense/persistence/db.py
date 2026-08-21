@@ -1123,6 +1123,24 @@ class Database:
                         post=_POST_MIGRATIONS.get(target),
                     )
 
+    @classmethod
+    def _from_connection(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        path: str | Path,
+        read_only: bool = False,
+    ) -> Database:
+        """Build the exact facade around an already-owned SQLite connection."""
+
+        if cls is not Database or type(connection) is not sqlite3.Connection:
+            raise TypeError("owned database requires exact production types")
+        value = object.__new__(cls)
+        value._path = Path(path)
+        value._read_only = bool(read_only)
+        value._conn = connection
+        return value
+
     def _read_version(self) -> int | None:
         """Current schema version, or None if the database is empty."""
         try:

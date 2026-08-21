@@ -596,6 +596,21 @@ def publication_path(owner: OwnedBasePublication) -> Path:
     return _state(owner).path
 
 
+def prepare_derived_publication_handoff(
+    owner: OwnedBasePublication,
+) -> tuple[Path, _OpenEntry, tuple[_OpenEntry, ...], tuple[tuple[str, tuple[int, ...]], ...]]:
+    """Release child handles while retaining root/ancestry for handoff."""
+
+    state = _state(owner)
+    if state.role != "derived" or state.phase != "promoted":
+        raise TypeError("derived lifecycle registration requires promotion")
+    assert_publication_unchanged(owner)
+    state = _close_captured_children(owner, _state(owner))
+    return state.path, state.root, state.parent_chain, tuple(
+        (item.relative[0], item.identity) for item in state.inventory
+    )
+
+
 def _close_entries(entries: tuple[_OpenEntry, ...]) -> None:
     seen: set[int] = set()
     for entry in reversed(entries):
@@ -1267,6 +1282,7 @@ __all__ = [
     "commit_publication",
     "copy_publication_file",
     "create_publication",
+    "prepare_derived_publication_handoff",
     "promote_publication",
     "publication_operation_guard",
     "publication_path",

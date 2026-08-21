@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -252,7 +253,8 @@ def _assert_pointer_structure(pointer_payload: object) -> None:
 def _rehydrate_pointer_rows(
     *,
     pointer: FrozenQueryPointerArtifact,
-    database_path: Path,
+    database_path: Path | None,
+    database: Database | None,
     sample: GoldBlindLongMemEvalSample,
     config: EvalConfig,
     store_manifest: DiffuseBaseStoreManifest,
@@ -266,7 +268,14 @@ def _rehydrate_pointer_rows(
     policy_sha256 = identity_sha256(config.retrieval.model_dump(mode="json"))
     rehydrated: list[FrozenLegacyQueryInputs] = []
     duplicate_queries: dict[str, str] = {}
-    with Database(database_path, read_only=True) as db:
+    if (database_path is None) == (database is None):
+        raise TypeError("query rehydration requires exactly one database authority")
+    manager = (
+        nullcontext(database)
+        if database is not None
+        else Database(database_path, read_only=True)
+    )
+    with manager as db:
         for row, question in zip(pointer.rows, sample.questions, strict=True):
             if (
                 row.question_id != question.question_id
@@ -349,7 +358,7 @@ def _rehydrate_pointer_rows(
     return tuple(rehydrated)
 
 
-def verify_query_entry(
+def _verify_query_entry(
     path: Path,
     *,
     store_artifact_path: Path,
@@ -359,6 +368,7 @@ def verify_query_entry(
     config: EvalConfig,
     embedding_identity: DiffuseBaseEmbeddingIdentity,
     database_path: Path | None = None,
+    database: Database | None = None,
 ) -> tuple[
     DiffuseQueryInputManifest,
     tuple["FrozenLegacyQueryInputs", ...],
@@ -446,17 +456,78 @@ def verify_query_entry(
         )
     ):
         raise DiffuseBaseArtifactError("frozen query-set receipt changed")
-    active_database = database_path or (
-        store_artifact_path / STORE_DIRECTORY_NAME / DATABASE_NAME
+    if database is not None and database_path is not None:
+        raise TypeError("query verification received two database authorities")
+    active_database = (
+        database_path
+        if database_path is not None
+        else store_artifact_path / STORE_DIRECTORY_NAME / DATABASE_NAME
     )
     rows = _rehydrate_pointer_rows(
         pointer=pointer,
-        database_path=active_database,
+        database_path=None if database is not None else active_database,
+        database=database,
         sample=sample,
         config=config,
         store_manifest=store_manifest,
     )
     return manifest, rows
+
+
+def verify_query_entry(
+    path: Path,
+    *,
+    store_artifact_path: Path,
+    store_manifest: DiffuseBaseStoreManifest,
+    treatment_identity: DiffuseBaseTreatmentIdentity,
+    sample: GoldBlindLongMemEvalSample,
+    config: EvalConfig,
+    embedding_identity: DiffuseBaseEmbeddingIdentity,
+    database_path: Path | None = None,
+) -> tuple[
+    DiffuseQueryInputManifest,
+    tuple["FrozenLegacyQueryInputs", ...],
+]:
+    return _verify_query_entry(
+        path,
+        store_artifact_path=store_artifact_path,
+        store_manifest=store_manifest,
+        treatment_identity=treatment_identity,
+        sample=sample,
+        config=config,
+        embedding_identity=embedding_identity,
+        database_path=database_path,
+    )
+
+
+def verify_query_entry_with_database(
+    path: Path,
+    *,
+    store_artifact_path: Path,
+    store_manifest: DiffuseBaseStoreManifest,
+    treatment_identity: DiffuseBaseTreatmentIdentity,
+    sample: GoldBlindLongMemEvalSample,
+    config: EvalConfig,
+    embedding_identity: DiffuseBaseEmbeddingIdentity,
+    database: Database,
+) -> tuple[
+    DiffuseQueryInputManifest,
+    tuple["FrozenLegacyQueryInputs", ...],
+]:
+    """Rehydrate frozen rows only through an explicitly owned database."""
+
+    if type(database) is not Database:
+        raise TypeError("owned query verification requires an exact Database")
+    return _verify_query_entry(
+        path,
+        store_artifact_path=store_artifact_path,
+        store_manifest=store_manifest,
+        treatment_identity=treatment_identity,
+        sample=sample,
+        config=config,
+        embedding_identity=embedding_identity,
+        database=database,
+    )
 
 
 def _freeze_against_base(

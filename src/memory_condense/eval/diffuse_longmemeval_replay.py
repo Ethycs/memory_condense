@@ -36,6 +36,12 @@ from memory_condense.eval._diffuse_replay_contracts import (
 from memory_condense.eval._diffuse_replay_packets import (
     VerifiedDiffuseReplayPackage,
 )
+from memory_condense.eval._diffuse_base_derived import (
+    _abort_diffuse_longmemeval_derived_store,
+)
+from memory_condense.eval._diffuse_base_publication_guard import (
+    freeze_callable_guard,
+)
 from memory_condense.eval._diffuse_replay_reconstruction import (
     REPLAY_MODES,
     build_replay_arm_record,
@@ -361,6 +367,12 @@ def run_diffuse_longmemeval_shared_base_replay(
 ) -> DiffuseLongMemEvalReplayReceipt:
     """Run and publish one structurally sanitized matched three-arm replay."""
 
+    abort_clone = _abort_diffuse_longmemeval_derived_store
+    assert_abort_clone = freeze_callable_guard(
+        abort_clone,
+        error_type=RuntimeError,
+        label="derived replay abort helper",
+    )
     binding = _require_owned_binding(binding)
     if type(treatment_identity) is not DiffuseBaseTreatmentIdentity:
         raise TypeError("treatment_identity must be exact")
@@ -426,50 +438,73 @@ def run_diffuse_longmemeval_shared_base_replay(
     try:
         executed: list[_ExecutedArm] = []
         for arm in arms:
-            clone = clone_diffuse_longmemeval_base(
-                base,
-                workspace / arm.arm_id,
-                arm_id=arm.arm_id,
-                arm_sha256=arm.arm_sha256,
-            )
-            condenser = open_diffuse_longmemeval_derived_store(
-                clone,
-                config=binding.config,
-                embedder=binding.embedder,
-            )
+            clone = None
             try:
-                if qwen.reranker is not None:
-                    raise RuntimeError("shared-base replay unexpectedly loaded a reranker")
-                phase = retrieve_diffuse_longmemeval_sample(
-                    condenser,
-                    blind,
-                    config=binding.config,
-                    arm=arm,
-                    legacy_input_provider=provider,
-                    qwen_scorer=(
-                        qwen.scorer
-                        if arm.compilation.boundary_mode == "qwen_head"
-                        else None
-                    ),
-                    embedding_identity=binding.embedding_identity,
-                    representative_linker=qwen.linker,
-                    representative_policy_factory=(
-                        binding.representative_policy_factory
-                    ),
+                clone = clone_diffuse_longmemeval_base(
+                    base,
+                    workspace / arm.arm_id,
+                    arm_id=arm.arm_id,
+                    arm_sha256=arm.arm_sha256,
                 )
-            finally:
-                condenser.close()
-            result = DiffuseLongMemEvalRuntimeResult(
-                phase=phase,
-                runtime_binding_sha256=runtime_binding_sha256,
-                runtime_binding_certified=binding.runtime_binding_certified,
-                residency_preflight=observation,
-            )
-            finalization = finalize_diffuse_longmemeval_derived_store(
-                clone,
-                phase=phase,
-            )
-            executed.append(_ExecutedArm(clone, result, finalization))
+                condenser = open_diffuse_longmemeval_derived_store(
+                    clone,
+                    config=binding.config,
+                    embedder=binding.embedder,
+                )
+                try:
+                    if qwen.reranker is not None:
+                        raise RuntimeError(
+                            "shared-base replay unexpectedly loaded a reranker"
+                        )
+                    phase = retrieve_diffuse_longmemeval_sample(
+                        condenser,
+                        blind,
+                        config=binding.config,
+                        arm=arm,
+                        legacy_input_provider=provider,
+                        qwen_scorer=(
+                            qwen.scorer
+                            if arm.compilation.boundary_mode == "qwen_head"
+                            else None
+                        ),
+                        embedding_identity=binding.embedding_identity,
+                        representative_linker=qwen.linker,
+                        representative_policy_factory=(
+                            binding.representative_policy_factory
+                        ),
+                    )
+                except BaseException as original:
+                    try:
+                        condenser.close()
+                    except BaseException as close_error:
+                        original.add_note(
+                            f"derived condenser close also failed: {close_error!r}"
+                        )
+                    raise
+                else:
+                    condenser.close()
+                result = DiffuseLongMemEvalRuntimeResult(
+                    phase=phase,
+                    runtime_binding_sha256=runtime_binding_sha256,
+                    runtime_binding_certified=binding.runtime_binding_certified,
+                    residency_preflight=observation,
+                )
+                finalization = finalize_diffuse_longmemeval_derived_store(
+                    clone,
+                    phase=phase,
+                )
+                executed.append(_ExecutedArm(clone, result, finalization))
+            except BaseException as original:
+                if clone is not None:
+                    try:
+                        assert_abort_clone(abort_clone)
+                        abort_clone(clone)
+                    except BaseException as cleanup_error:
+                        original.add_note(
+                            "derived lifecycle abort also failed: "
+                            f"{cleanup_error!r}"
+                        )
+                raise
         matched = validate_matched_diffuse_runtime_results(
             tuple(item.result for item in executed)
         )
@@ -574,11 +609,18 @@ def run_diffuse_longmemeval_shared_base_replay(
             target,
             manifest_name=REPLAY_MANIFEST_NAME,
         )
-    except BaseException:
-        if staging.exists():
-            safe_remove_staging(staging, target.parent)
-        if workspace.exists():
-            safe_remove_staging(workspace, target.parent)
+    except BaseException as original:
+        for label, candidate in (
+            ("replay staging", staging),
+            ("replay workspace", workspace),
+        ):
+            try:
+                if candidate.exists():
+                    safe_remove_staging(candidate, target.parent)
+            except BaseException as cleanup_error:
+                original.add_note(
+                    f"{label} cleanup also failed: {cleanup_error!r}"
+                )
         raise
     return verify_diffuse_longmemeval_replay_package(
         target,

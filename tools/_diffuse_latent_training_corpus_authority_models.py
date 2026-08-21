@@ -44,7 +44,7 @@ PHASE_CANDIDATE_NAME = "phase-candidate.json"
 CANDIDATE_RECEIPT_NAME = "candidate-receipt.json"
 AUTHORITY_NOT_PINNED_REASON = "genuine_output_identities_not_pinned"
 CANDIDATE_EXECUTION_DISABLED_REASON = (
-    "candidate_execution_activation_not_audited"
+    "candidate_path_handoffs_not_capability_safe"
 )
 
 
@@ -661,7 +661,7 @@ class ProductionAuthorityStatus:
 
 @dataclass(frozen=True, slots=True)
 class ProductionCandidateExecutionStatus:
-    reason: Literal["candidate_execution_activation_not_audited"] = (
+    reason: Literal["candidate_path_handoffs_not_capability_safe"] = (
         CANDIDATE_EXECUTION_DISABLED_REASON
     )
     candidate_execution_enabled: bool = False

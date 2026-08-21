@@ -135,7 +135,7 @@ def test_public_run_signature_and_status_are_closed_false() -> None:
 
     status = launcher.candidate_execution_status()
     assert type(status) is models.ProductionCandidateExecutionStatus
-    assert status.reason == "candidate_execution_activation_not_audited"
+    assert status.reason == "candidate_path_handoffs_not_capability_safe"
     assert status.reason == models.CANDIDATE_EXECUTION_DISABLED_REASON
     assert status.candidate_execution_enabled is False
     assert status.source_runtime_verified is False
@@ -382,9 +382,12 @@ def test_launcher_cold_import_is_scoring_and_model_free() -> None:
         "import sys;"
         f"sys.path.insert(0,{str(root)!r});"
         "import tools.run_diffuse_latent_training_corpus as launcher;"
+        "denied={'accelerate','anthropic','cohere','google','httpx','litellm',"
+        "'mistralai','openai','requests','safetensors','sentence_transformers',"
+        "'torch','transformers'};"
         "bad=sorted(name for name in sys.modules if "
         "name == 'tools.v4_population_firebreak.scoring' or "
-        "name.split('.')[0] in {'torch','transformers','sentence_transformers'});"
+        "name.split('.')[0] in denied);"
         "assert 'AnalysisScoringLabel' not in launcher.__dict__;"
         "print(','.join(bad))"
     )

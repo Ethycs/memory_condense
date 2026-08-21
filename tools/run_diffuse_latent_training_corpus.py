@@ -1,10 +1,11 @@
 """Closed public launcher and private route-v2 candidate audit plumbing.
 
 The public launcher is disabled before it touches caller arguments because the
-writable derived-store open, lease, and finalization lifecycle does not yet
-satisfy this launcher's owned-capability boundary. The private plumbing remains
-available for static audit only. It does not authenticate an execution or
-authorize D1.
+candidate runner still hands exposed pathnames across independently owned
+workspace, generic-corpus, and outer-candidate publishers. Those handoffs do
+not yet preserve one held object identity against rename-and-replace races.
+The private plumbing remains available for static audit only. It does not
+authenticate an execution or authorize D1.
 
 Run from the repository root with ``python -m``.  Cold import does not resolve
 the evaluator scoring schema, provider SDKs, torch/transformers, or model
@@ -492,6 +493,74 @@ def _certify_source_execution(
         raise ValueError("candidate launcher is outside its git worktree") from exc
     if relative != _LAUNCHER_RELATIVE_PATH:
         raise ValueError("candidate launcher has another tracked path")
+    tracked = subprocess.run(
+        (
+            "git",
+            "ls-files",
+            "-z",
+            "--",
+            "src/memory_condense",
+            "tools",
+        ),
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=False,
+    )
+    if tracked.returncode != 0:
+        raise RuntimeError("candidate tracked-source membership certification failed")
+    try:
+        tracked_python = tuple(
+            sorted(
+                value.decode("utf-8")
+                for value in tracked.stdout.split(b"\0")
+                if value.lower().endswith(b".py")
+            )
+        )
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("candidate tracked Python path is not UTF-8") from exc
+
+    def reject_walk_error(error: OSError) -> None:
+        raise RuntimeError("candidate Python source tree cannot be enumerated") from error
+
+    observed_python: list[str] = []
+    for relative_root in (Path("src/memory_condense"), Path("tools")):
+        source_root = root / relative_root
+        if (
+            not source_root.is_dir()
+            or source_root.is_symlink()
+            or (
+                hasattr(source_root, "is_junction")
+                and source_root.is_junction()
+            )
+        ):
+            raise RuntimeError("candidate Python source root is not a plain directory")
+        for directory, child_directories, files in os.walk(
+            source_root,
+            followlinks=False,
+            onerror=reject_walk_error,
+        ):
+            current = Path(directory)
+            for child_name in child_directories:
+                child = current / child_name
+                if child.is_symlink() or (
+                    hasattr(child, "is_junction") and child.is_junction()
+                ):
+                    raise RuntimeError(
+                        "candidate Python source tree contains a linked directory"
+                    )
+            for file_name in files:
+                if not file_name.casefold().endswith(".py"):
+                    continue
+                source = current / file_name
+                if source.is_symlink() or not source.is_file():
+                    raise RuntimeError("candidate Python source is not a plain file")
+                observed_python.append(source.relative_to(root).as_posix())
+    if tuple(sorted(observed_python)) != tracked_python:
+        raise RuntimeError(
+            "candidate Python source membership differs from tracked files, "
+            "including ignored code"
+        )
     status = subprocess.run(
         (
             "git",
@@ -1129,7 +1198,7 @@ def _define_closed_public_surface():
     # Closure-owned literals keep module-global rebinding from opening the
     # public path.  The returned function deliberately does not inspect any
     # argument, including ``restart`` and hostile PathLike implementations.
-    disabled_reason = "candidate_execution_activation_not_audited"
+    disabled_reason = "candidate_path_handoffs_not_capability_safe"
     if disabled_reason != CANDIDATE_EXECUTION_DISABLED_REASON:
         raise RuntimeError("candidate execution disabled reason drifted")
     unavailable_type = ProductionCandidateExecutionUnavailable
@@ -1157,7 +1226,7 @@ run, candidate_execution_status = _define_closed_public_surface()
 
 def main(argv: list[str] | None = None) -> int:
     # Match the Python API's zero-coercion boundary: even command-line text is
-    # not parsed while the capability-safe upstream publishers are absent.
+    # not parsed while identity-preserving publisher composition is absent.
     del argv
     status = candidate_execution_status()
     print(

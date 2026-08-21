@@ -71,6 +71,7 @@ _WORKFLOW_FACADES = {
     "eval/campaign.py": 250,
     "eval/mem0_adapter.py": 250,
     "eval/recall.py": 200,
+    "eval/diffuse_latent_training_corpus.py": 550,
     "search/indexes/retrieval.py": 200,
     "search/packing/context_packer.py": 300,
     "search/selectors/coverage_selector.py": 200,
@@ -347,6 +348,12 @@ def test_executable_module_is_not_preimported_by_package(module_name):
         "memory_condense.search.fusion.renderer",
         "memory_condense.eval._diffuse_route_v2_validation",
         "memory_condense.eval.diffuse_longmemeval_route_v2",
+        "memory_condense.eval._diffuse_latent_training_corpus_codec",
+        "memory_condense.eval._diffuse_latent_training_corpus_models",
+        "memory_condense.eval._diffuse_latent_training_corpus_filesystem",
+        "memory_condense.eval._diffuse_latent_training_corpus_route",
+        "memory_condense.eval._diffuse_latent_training_corpus_io",
+        "memory_condense.eval.diffuse_latent_training_corpus",
     ],
 )
 def test_qwen_fusion_feature_modules_keep_heavy_runtimes_cold(module_name):

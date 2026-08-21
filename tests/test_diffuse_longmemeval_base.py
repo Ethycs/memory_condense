@@ -15,6 +15,10 @@ import hnswlib
 import numpy as np
 import pytest
 
+import memory_condense.eval._diffuse_base_derived as derived_module
+import memory_condense.eval._diffuse_base_store as store_module
+import memory_condense.eval.diffuse_longmemeval_base as base_module
+
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.domain.schemas import Chunk
 from memory_condense.eval.diffuse_longmemeval_base import (
@@ -419,6 +423,323 @@ def test_store_and_query_addresses_are_separate_and_hits_do_not_reingest(
     assert changed_retrieval.query_input_key != first.query_input_key
     assert len(calls) == 1
     assert embedder.chunk_batches == 1
+
+
+def test_complete_cache_hit_is_byte_mtime_and_callback_read_only(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "cache"
+    with _published(root) as (
+        base,
+        sample,
+        config,
+        treatment,
+        embedding,
+        runtime,
+        embedder,
+        calls,
+        factory,
+    ):
+        files = tuple(sorted(path for path in root.rglob("*") if path.is_file()))
+        before = {
+            path.relative_to(root).as_posix(): (
+                file_sha256(path),
+                path.stat().st_mtime_ns,
+            )
+            for path in files
+        }
+        callback_counts = (
+            len(calls), embedder.chunk_batches, embedder.query_calls
+        )
+        hit = publish_diffuse_longmemeval_base(
+            root,
+            treatment_identity=treatment,
+            sample=sample,
+            config=config,
+            embedding_identity=embedding,
+            build_runtime_identity=runtime,
+            embedder=embedder,
+            condenser_factory=factory,
+            implementation_digest=_sha("implementation-under-test"),
+            environment_digest=_sha("environment-under-test"),
+        )
+        after_files = tuple(
+            sorted(path for path in root.rglob("*") if path.is_file())
+        )
+        after = {
+            path.relative_to(root).as_posix(): (
+                file_sha256(path),
+                path.stat().st_mtime_ns,
+            )
+            for path in after_files
+        }
+        assert hit.store_path == base.store_path
+        assert hit.query_inputs_path == base.query_inputs_path
+        assert after == before
+        assert (len(calls), embedder.chunk_batches, embedder.query_calls) == (
+            callback_counts
+        )
+
+
+def test_fixed_identity_keys_artifact_bytes_and_tree_match_the_golden(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "cache"
+    config = _config()
+    embedder = _DeterministicEmbedder()
+    calls: list[Path] = []
+    factory = _factory(config=config, embedder=embedder, calls=calls)
+    factory.__module__ = "baseline_test_base"
+    runtime = _build_runtime_identity(
+        factory_digest=callable_build_factory_sha256(factory)
+    )
+    factory.diffuse_build_runtime_identity = runtime  # type: ignore[attr-defined]
+    base = publish_diffuse_longmemeval_base(
+        root,
+        treatment_identity=_treatment(),
+        sample=_sample(),
+        config=config,
+        embedding_identity=_embedding_identity(),
+        build_runtime_identity=runtime,
+        embedder=embedder,
+        condenser_factory=factory,
+        implementation_digest=_sha("implementation-under-test"),
+        environment_digest=_sha("environment-under-test"),
+    )
+    assert base.base_store_key == (
+        "552dfabd4db9046503acf3849013dae3b0bcc4ca2dedc73fda2734d573cbf8a7"
+    )
+    assert base.query_input_key == (
+        "07901a4ff709bbaec26c9322bca9d262332d8b1d8d6752ae3fc04bcaa9810ba4"
+    )
+    assert tuple(file_sha256(path) for path in _tracked_files(base)) == (
+        "d7f0b974b84e8cb5cea542fdd141a1915f7c7faea6310261c25eda7e91b2bfc9",
+        "b0c4a2ef76f7968381ddc2fa03a1580db0deb7670141741de113809739f4e353",
+        "8e669becfe7631656212c5b6c9b15f77a1d8450bbc54847a6f4a5e003b9fe311",
+        "13de945f138ba56bf42c203ceea367e01a03a6d8590cc5043ad530be625755b2",
+        "dc8ab215616920c1461d745643e10acb5c550550ddc725f7bce7795f7dac4bac",
+    )
+    expected_tree = {
+        f"stores/.{base.base_store_key}.publish.lock",
+        f"stores/{base.base_store_key}/{STORE_MANIFEST_NAME}",
+        f"stores/{base.base_store_key}/{STORE_DIRECTORY_NAME}/{_DATABASE_NAME}",
+        f"stores/{base.base_store_key}/{STORE_DIRECTORY_NAME}/{_INDEX_NAME}",
+        f"query-inputs/.{base.query_input_key}.publish.lock",
+        f"query-inputs/{base.query_input_key}/{QUERY_MANIFEST_NAME}",
+        f"query-inputs/{base.query_input_key}/{FROZEN_QUERY_INPUTS_NAME}",
+    }
+    assert {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file()
+    } == expected_tree
+    for marker in root.rglob("*.publish.lock"):
+        assert marker.read_bytes() == b"0"
+    clone = clone_diffuse_longmemeval_base(
+        base,
+        tmp_path / "derived",
+        arm_id="fixed_interval",
+        arm_sha256=_sha("fixed-interval-arm"),
+    )
+    assert file_sha256(clone.path / DERIVED_ORIGIN_NAME) == (
+        "bdd27ce47cb497ada16ea0638ce7403ef8b5ae12a07c2d64174baba322573960"
+    )
+    assert {path.name for path in clone.path.iterdir()} == {
+        _DATABASE_NAME,
+        _INDEX_NAME,
+        DERIVED_ORIGIN_NAME,
+    }
+    assert (tmp_path / ".derived.publish.lock").read_bytes() == b"0"
+
+
+def test_sealed_public_publish_rejects_stable_and_callback_rebinding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def redirected(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("redirected publisher ran")
+
+    monkeypatch.setattr(base_module, "publish_store_entry", redirected)
+    with pytest.raises(DiffuseBaseArtifactError, match="rebound"):
+        publish_diffuse_longmemeval_base(
+            tmp_path / "stable",
+            treatment_identity=object(),
+            sample=object(),
+            config=object(),
+            embedding_identity=object(),
+            build_runtime_identity=object(),
+            embedder=object(),
+            condenser_factory=redirected,
+        )
+    assert called is False
+    monkeypatch.undo()
+
+    class RebindingEmbedder(_DeterministicEmbedder):
+        @property
+        def execution_identity(self) -> dict[str, object]:
+            monkeypatch.setattr(base_module, "publish_store_entry", redirected)
+            return super().execution_identity
+
+    config = _config()
+    embedder = RebindingEmbedder()
+    calls: list[Path] = []
+    factory = _factory(config=config, embedder=embedder, calls=calls)
+    runtime = factory.diffuse_build_runtime_identity  # type: ignore[attr-defined]
+    with pytest.raises(DiffuseBaseArtifactError, match="rebound"):
+        publish_diffuse_longmemeval_base(
+            tmp_path / "callback",
+            treatment_identity=_treatment(),
+            sample=_sample(),
+            config=config,
+            embedding_identity=_embedding_identity(),
+            build_runtime_identity=runtime,
+            embedder=embedder,
+            condenser_factory=factory,
+            implementation_digest=_sha("implementation-under-test"),
+            environment_digest=_sha("environment-under-test"),
+        )
+    assert calls == []
+    assert not (tmp_path / "callback").exists()
+
+
+def test_close_failure_quarantines_store_without_marker_or_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    embedder = _DeterministicEmbedder()
+    calls: list[Path] = []
+
+    def create(data_dir: Path) -> MemoryCondenser:
+        calls.append(data_dir)
+        value = MemoryCondenser(
+            data_dir=data_dir,
+            model_name=embedder.model_name,
+            chunker_min_tokens=config.chunker.min_tokens,
+            chunker_max_tokens=config.chunker.max_tokens,
+            device=config.embedding_device,
+            auto_extract=False,
+            embedder=embedder,
+            persist_index_on_close=True,
+            retriever_max_elements=_MAX_ELEMENTS,
+        )
+        return value
+
+    create.diffuse_build_runtime_identity = _build_runtime_identity(  # type: ignore[attr-defined]
+        factory_digest=callable_build_factory_sha256(create)
+    )
+    close = MemoryCondenser.close
+
+    def close_then_fail(value: MemoryCondenser) -> None:
+        close(value)
+        raise RuntimeError("injected close failure")
+
+    monkeypatch.setattr(MemoryCondenser, "close", close_then_fail)
+    with pytest.raises(RuntimeError, match="injected close failure"):
+        publish_diffuse_longmemeval_base(
+            tmp_path / "cache",
+            treatment_identity=_treatment(),
+            sample=_sample(),
+            config=config,
+            embedding_identity=_embedding_identity(),
+            build_runtime_identity=create.diffuse_build_runtime_identity,  # type: ignore[attr-defined]
+            embedder=embedder,
+            condenser_factory=create,
+            implementation_digest=_sha("implementation-under-test"),
+            environment_digest=_sha("environment-under-test"),
+        )
+    stores = tmp_path / "cache" / "stores"
+    names = {item.name for item in stores.iterdir()}
+    assert len(names) == 1
+    assert next(iter(names)).startswith(".")
+    assert not any(name.endswith(".publish.lock") for name in names)
+
+
+def test_callback_code_and_cross_stage_closure_rebinding_are_rejected(
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    embedder = _DeterministicEmbedder()
+    calls: list[Path] = []
+    base_factory = _factory(config=config, embedder=embedder, calls=calls)
+    original_verify_code = store_module.verify_store_entry.__code__
+    replacement_code = (lambda *_args, **_kwargs: None).__code__
+
+    def code_rebinding_factory(path: Path) -> MemoryCondenser:
+        value = base_factory(path)
+        store_module.verify_store_entry.__code__ = replacement_code
+        return value
+
+    code_rebinding_factory.diffuse_build_runtime_identity = (  # type: ignore[attr-defined]
+        _build_runtime_identity(
+            factory_digest=callable_build_factory_sha256(code_rebinding_factory)
+        )
+    )
+    try:
+        with pytest.raises(DiffuseBaseArtifactError, match="rebound"):
+            publish_diffuse_longmemeval_base(
+                tmp_path / "code-rebind",
+                treatment_identity=_treatment(),
+                sample=_sample(),
+                config=config,
+                embedding_identity=_embedding_identity(),
+                build_runtime_identity=(
+                    code_rebinding_factory.diffuse_build_runtime_identity  # type: ignore[attr-defined]
+                ),
+                embedder=embedder,
+                condenser_factory=code_rebinding_factory,
+                implementation_digest=_sha("implementation-under-test"),
+                environment_digest=_sha("environment-under-test"),
+            )
+    finally:
+        store_module.verify_store_entry.__code__ = original_verify_code
+
+    query_wrapper = base_module.publish_query_entry
+    implementation_index = query_wrapper.__code__.co_freevars.index(
+        "implementation"
+    )
+    implementation_cell = query_wrapper.__closure__[implementation_index]  # type: ignore[index]
+    original_implementation = implementation_cell.cell_contents
+    redirected_called = False
+
+    def redirected_query(*_args, **_kwargs):
+        nonlocal redirected_called
+        redirected_called = True
+        raise AssertionError("redirected query publisher ran")
+
+    def closure_rebinding_factory(path: Path) -> MemoryCondenser:
+        value = base_factory(path)
+        implementation_cell.cell_contents = redirected_query
+        return value
+
+    closure_rebinding_factory.diffuse_build_runtime_identity = (  # type: ignore[attr-defined]
+        _build_runtime_identity(
+            factory_digest=callable_build_factory_sha256(closure_rebinding_factory)
+        )
+    )
+    try:
+        with pytest.raises(DiffuseBaseArtifactError, match="publish_query_entry"):
+            publish_diffuse_longmemeval_base(
+                tmp_path / "closure-rebind",
+                treatment_identity=_treatment(),
+                sample=_sample(),
+                config=config,
+                embedding_identity=_embedding_identity(),
+                build_runtime_identity=(
+                    closure_rebinding_factory.diffuse_build_runtime_identity  # type: ignore[attr-defined]
+                ),
+                embedder=embedder,
+                condenser_factory=closure_rebinding_factory,
+                implementation_digest=_sha("implementation-under-test"),
+                environment_digest=_sha("environment-under-test"),
+            )
+    finally:
+        implementation_cell.cell_contents = original_implementation
+    assert redirected_called is False
 
 
 def test_injected_factory_cannot_self_claim_owned_runtime(
@@ -1044,6 +1365,52 @@ def test_clone_is_a_byte_copy_without_hardlinks_and_never_clobbers(
             base.store_manifest.database_sha256
         )
         assert clone.origin.initial_index_sha256 == base.store_manifest.index_sha256
+
+
+def test_sealed_clone_rejects_stable_import_rebinding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def redirected(*_args, **_kwargs):
+        raise AssertionError("redirected clone publisher ran")
+
+    monkeypatch.setattr(derived_module, "create_publication", redirected)
+    with pytest.raises(DiffuseBaseArtifactError, match="rebound"):
+        clone_diffuse_longmemeval_base(
+            object(),  # type: ignore[arg-type]
+            tmp_path / "must-not-exist",
+            arm_id="fixed_interval",
+            arm_sha256=_sha("fixed-interval-arm"),
+        )
+    assert not (tmp_path / "must-not-exist").exists()
+
+
+def test_post_publish_derived_verifier_failure_rolls_back_exact_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _published(tmp_path / "cache") as (base, *_rest):
+        target = tmp_path / "derived"
+        load_origin = derived_module._load_derived_origin
+
+        def fail_published(path: Path):
+            if path == target:
+                raise DiffuseBaseArtifactError("injected published verifier failure")
+            return load_origin(path)
+
+        monkeypatch.setattr(derived_module, "_load_derived_origin", fail_published)
+        with pytest.raises(
+            DiffuseBaseArtifactError, match="injected published verifier failure"
+        ):
+            derived_module._clone_diffuse_longmemeval_base(
+                base,
+                target,
+                arm_id="fixed_interval",
+                arm_sha256=_sha("fixed-interval-arm"),
+                _sealed_import_guard=lambda: None,
+            )
+        assert not target.exists()
+        assert not (tmp_path / ".derived.publish.lock").exists()
 
 
 def test_clone_rejects_destinations_inside_immutable_artifacts(tmp_path: Path) -> None:

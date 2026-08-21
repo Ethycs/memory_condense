@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
-import stat
-import tempfile
 from pathlib import Path
 
 from memory_condense.application.condenser import MemoryCondenser
@@ -29,16 +26,31 @@ from memory_condense.eval._diffuse_base_contracts import (
     chunker_identity,
     config_identity,
     model_bytes,
-    publish_complete_directory,
     require_exact_children,
     require_no_sqlite_sidecars,
     require_regular_directory,
     require_regular_file,
     require_sha256,
-    safe_remove_staging,
     self_sha256,
     validate_live_embedder,
     write_new_bytes,
+)
+from memory_condense.eval._diffuse_base_publication_filesystem import (
+    abandon_publication,
+    capture_publication,
+    commit_publication,
+    copy_publication_file,
+    create_publication,
+    promote_publication,
+    publication_operation_guard,
+    publication_path,
+    rollback_publication,
+    validate_publication_lock_marker,
+    write_publication_bytes,
+)
+from memory_condense.eval._diffuse_base_publication_guard import (
+    freeze_callable_guard,
+    freeze_namespace_guard,
 )
 from memory_condense.eval._diffuse_base_queries import (
     load_query_manifest,
@@ -73,6 +85,8 @@ _FORBIDDEN_DERIVED_TABLES = (
 def _assert_verified_bundle_current(
     base: VerifiedDiffuseLongMemEvalBase,
 ) -> None:
+    validate_publication_lock_marker(base.store_path)
+    validate_publication_lock_marker(base.query_inputs_path)
     require_regular_directory(base.store_path, "base artifact")
     require_exact_children(
         base.store_path,
@@ -174,14 +188,55 @@ def _assert_not_hardlinked(source: Path, destination: Path) -> None:
         raise DiffuseBaseArtifactError("derived store must not hardlink base files")
 
 
-def clone_diffuse_longmemeval_base(
+def _clone_diffuse_longmemeval_base(
     verified: VerifiedDiffuseLongMemEvalBase,
     destination: str | Path,
     *,
     arm_id: str,
     arm_sha256: str,
+    _sealed_import_guard=None,
 ) -> DiffuseDerivedStore:
     """Byte-copy a verified base into one no-clobber writable arm store."""
+
+    create_owned = create_publication
+    owned_path = publication_path
+    copy_owned = copy_publication_file
+    write_owned = write_publication_bytes
+    capture_owned = capture_publication
+    promote_owned = promote_publication
+    commit_owned = commit_publication
+    rollback_owned = rollback_publication
+    abandon_owned = abandon_publication
+    assert_import_seam = _sealed_import_guard
+    assert_capability_intact, emergency_abandon = publication_operation_guard()
+    module_namespace = globals()
+    guarded_globals = {
+        name: value
+        for name, value in module_namespace.items()
+        if not name.startswith("__")
+    }
+    error_type = DiffuseBaseArtifactError
+
+    def assert_operations_intact() -> None:
+        assert_import_seam()
+        changed = [
+            name
+            for name, value in guarded_globals.items()
+            if module_namespace.get(name) is not value
+        ]
+        if changed:
+            raise error_type(
+                "derived publication module was rebound: " + ", ".join(changed)
+            )
+        assert_capability_intact()
+
+    def quarantine(owner: object, original: BaseException) -> None:
+        try:
+            emergency_abandon(owner)  # type: ignore[arg-type]
+        except BaseException as abandon_error:
+            original.add_note(f"publication abandon also failed: {abandon_error!r}")
+
+    assert_operations_intact()
 
     if not isinstance(verified, VerifiedDiffuseLongMemEvalBase):
         raise TypeError("verified must be a VerifiedDiffuseLongMemEvalBase")
@@ -206,18 +261,15 @@ def clone_diffuse_longmemeval_base(
     before = {
         path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked
     }
-    staging = Path(
-        tempfile.mkdtemp(
-            prefix=f".{target.name or 'derived'}.clone-",
-            dir=target.parent,
-        )
-    )
+    owner = create_owned(target, role="derived")
+    staging = owned_path(owner)
+    owner_live = True
     try:
         for name in (DATABASE_NAME, INDEX_NAME):
-            source, copied = base_store / name, staging / name
-            shutil.copyfile(source, copied)
-            copied.chmod(stat.S_IMODE(copied.stat().st_mode) | stat.S_IWUSR)
-            _assert_not_hardlinked(source, copied)
+            source = base_store / name
+            copy_owned(owner, source, name)
+            assert_operations_intact()
+            _assert_not_hardlinked(source, staging / name)
         if (
             file_sha256(staging / DATABASE_NAME)
             != verified.store_manifest.database_sha256
@@ -230,30 +282,88 @@ def clone_diffuse_longmemeval_base(
             arm_id=arm_id,
             arm_sha256=arm_sha256,
         )
-        write_new_bytes(staging / DERIVED_ORIGIN_NAME, model_bytes(origin))
+        write_owned(owner, DERIVED_ORIGIN_NAME, model_bytes(origin))
         require_exact_children(
             staging,
             {DATABASE_NAME, INDEX_NAME, DERIVED_ORIGIN_NAME},
             "derived staging store",
         )
-        publish_complete_directory(
-            staging, target, manifest_name=DERIVED_ORIGIN_NAME
-        )
-    except BaseException:
-        if staging.exists():
-            safe_remove_staging(staging, target.parent)
+        capture_owned(owner)
+        assert_operations_intact()
+        promote_owned(owner)
+        assert_operations_intact()
+        active_origin = _load_derived_origin(target)
+        if active_origin != origin:
+            raise DiffuseBaseArtifactError("published derived origin changed")
+        for name in (DATABASE_NAME, INDEX_NAME):
+            _assert_not_hardlinked(base_store / name, target / name)
+        after = {
+            path: (file_sha256(path), path.stat().st_mtime_ns)
+            for path in tracked
+        }
+        if before != after:
+            raise DiffuseBaseArtifactError("cloning mutated the shared base")
+        assert_operations_intact()
+        commit_owned(owner)
+        owner_live = False
+    except BaseException as original:
+        if owner_live:
+            try:
+                assert_operations_intact()
+            except BaseException as guard_error:
+                original.add_note(
+                    f"publication operations changed; bytes quarantined: {guard_error!r}"
+                )
+                quarantine(owner, original)
+            else:
+                try:
+                    rollback_owned(owner)
+                except BaseException as cleanup_error:
+                    original.add_note(
+                        f"exact rollback refused; bytes quarantined: {cleanup_error!r}"
+                    )
+                    try:
+                        abandon_owned(owner)
+                    except BaseException:
+                        quarantine(owner, original)
+            owner_live = False
         raise
-    after = {
-        path: (file_sha256(path), path.stat().st_mtime_ns) for path in tracked
-    }
-    if before != after:
-        raise DiffuseBaseArtifactError("cloning mutated the shared base")
-    active_origin = _load_derived_origin(target)
-    if active_origin != origin:
-        raise DiffuseBaseArtifactError("published derived origin changed")
-    for name in (DATABASE_NAME, INDEX_NAME):
-        _assert_not_hardlinked(base_store / name, target / name)
     return DiffuseDerivedStore(path=target, origin=origin, base=verified)
+
+
+def _seal_clone_entrypoint(implementation, import_guard):
+    assert_implementation = freeze_callable_guard(
+        implementation,
+        error_type=DiffuseBaseArtifactError,
+        label="derived publication implementation",
+    )
+    assert_import_guard = freeze_callable_guard(
+        import_guard,
+        error_type=DiffuseBaseArtifactError,
+        label="derived publication guard",
+    )
+
+    def clone_diffuse_longmemeval_base(
+        verified: VerifiedDiffuseLongMemEvalBase,
+        destination: str | Path,
+        *,
+        arm_id: str,
+        arm_sha256: str,
+    ) -> DiffuseDerivedStore:
+        """Byte-copy a verified base into one no-clobber writable arm store."""
+
+        assert_implementation(implementation)
+        assert_import_guard(import_guard)
+        import_guard()
+        return implementation(
+            verified,
+            destination,
+            arm_id=arm_id,
+            arm_sha256=arm_sha256,
+            _sealed_import_guard=import_guard,
+        )
+
+    return clone_diffuse_longmemeval_base
 
 
 def _verify_derived_store(
@@ -791,3 +901,28 @@ def verify_diffuse_longmemeval_finalized_store(
     for name in (DATABASE_NAME, INDEX_NAME):
         _assert_not_hardlinked(base_store / name, clone.path / name)
     return expected_finalization
+
+
+_DERIVED_GUARD_EXCLUDES = (
+    "_seal_clone_entrypoint",
+    "derived_publication_import_guard",
+    "clone_diffuse_longmemeval_base",
+    "_DERIVED_GUARD_EXCLUDES",
+    "_sealed_derived_guard",
+)
+_sealed_derived_guard = freeze_namespace_guard(
+    globals(),
+    error_type=DiffuseBaseArtifactError,
+    label="derived publication module",
+    exclude=_DERIVED_GUARD_EXCLUDES,
+)
+derived_publication_import_guard = freeze_namespace_guard(
+    globals(),
+    error_type=DiffuseBaseArtifactError,
+    label="derived publication module",
+    exclude=_DERIVED_GUARD_EXCLUDES,
+)
+clone_diffuse_longmemeval_base = _seal_clone_entrypoint(
+    _clone_diffuse_longmemeval_base, _sealed_derived_guard
+)
+del _seal_clone_entrypoint, _sealed_derived_guard

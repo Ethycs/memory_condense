@@ -1,9 +1,10 @@
 """Closed public launcher and private route-v2 candidate audit plumbing.
 
 The public launcher is disabled before it touches caller arguments because the
-upstream base store/query/derived publishers do not yet satisfy this launcher's
-owned-capability cleanup boundary.  The private plumbing remains available for
-static audit only.  It does not authenticate an execution or authorize D1.
+writable derived-store open, lease, and finalization lifecycle does not yet
+satisfy this launcher's owned-capability boundary. The private plumbing remains
+available for static audit only. It does not authenticate an execution or
+authorize D1.
 
 Run from the repository root with ``python -m``.  Cold import does not resolve
 the evaluator scoring schema, provider SDKs, torch/transformers, or model
@@ -1096,7 +1097,7 @@ def _define_closed_public_surface():
     # Closure-owned literals keep module-global rebinding from opening the
     # public path.  The returned function deliberately does not inspect any
     # argument, including ``restart`` and hostile PathLike implementations.
-    disabled_reason = "unsafe_upstream_base_publication_not_hardened"
+    disabled_reason = "unsafe_derived_runtime_lifecycle_not_hardened"
     if disabled_reason != CANDIDATE_EXECUTION_DISABLED_REASON:
         raise RuntimeError("candidate execution disabled reason drifted")
     unavailable_type = ProductionCandidateExecutionUnavailable

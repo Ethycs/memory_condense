@@ -271,7 +271,7 @@ def _schema(kind: _WorkspaceKind, path: tuple[str, ...], names: tuple[str, ...])
     elif len(path) == 4 and path[:2] == ("cache", "stores") and path[3] == "store":
         expected = {"memory.db", "hnsw_index.bin"}
     elif len(path) == 3 and path[:2] == ("cache", "query-inputs"):
-        expected = {"frozen-query-inputs.json", "query-manifest.json"}
+        expected = {"frozen-legacy-inputs.json", "query-manifest.json"}
     else:
         raise ProductionLatentTrainingCorpusError(
             "execution workspace exceeded its exact schema"

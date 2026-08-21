@@ -749,10 +749,11 @@ that treatment-only access does not resolve the scoring module or schema.
 The current public launcher is intentionally closed before it coerces an
 argument or performs filesystem, loader, checkpoint, model, or network work.
 Its exact false status reason is
-`unsafe_upstream_base_publication_not_hardened`: the existing base store,
-query, and derived-package publishers still contain path-authorized rollback
-and recursive cleanup paths. A later tranche must replace those paths with
-held-identity, capability-authorized publication and cleanup before real
+`unsafe_derived_runtime_lifecycle_not_hardened`. Base store, query-input, and
+derived-package publication now use held-identity, capability-authorized,
+atomic no-clobber publication and exact rollback. The remaining writable
+derived-store open claim, runtime lease, and finalization lifecycle is still a
+separate path-authorized boundary; a later tranche must harden it before real
 candidate generation can be enabled. The private source-aware projection is
 retained only for static audit and does not certify an execution. False-only
 candidate structural inspection remains available separately; production,
@@ -1266,9 +1267,11 @@ Before a real D1 run, provider-free tests must prove:
    phase identities; only those code-owned pins can enable accepted authority
    views. In the current tracked state, both the Python launcher and CLI stop
    before argument coercion with the exact false reason
-   `unsafe_upstream_base_publication_not_hardened`. Real candidate generation
-   remains blocked until base store, query, and derived-package publication
-   use capability-authorized, held-identity cleanup and rollback.
+   `unsafe_derived_runtime_lifecycle_not_hardened`. Base store, query, and
+   derived-package publication already use capability-authorized,
+   held-identity cleanup and rollback; real candidate generation remains
+   blocked until the writable derived-store open, lease, and finalization
+   lifecycle has the same protection.
 3. The trainer cannot accept confirmation rows, scorer labels, or the exposure
    audit. Gold answers, annotated source IDs, and categories are absent from
    its closed input schema.

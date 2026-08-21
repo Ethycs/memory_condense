@@ -204,6 +204,24 @@ def test_cli_reports_disabled_state_without_success_receipt(
     assert not output.exists()
 
 
+def test_private_execution_workspace_uses_the_public_frozen_pointer_name() -> None:
+    from tools._diffuse_latent_training_corpus_workspace import _schema
+
+    _schema(
+        "execution",
+        ("cache", "query-inputs", "a" * 64),
+        ("frozen-legacy-inputs.json", "query-manifest.json"),
+    )
+    with pytest.raises(
+        models.ProductionLatentTrainingCorpusError, match="exact schema"
+    ):
+        _schema(
+            "execution",
+            ("cache", "query-inputs", "a" * 64),
+            ("frozen-query-inputs.json", "query-manifest.json"),
+        )
+
+
 @pytest.mark.parametrize(
     "verifier",
     (

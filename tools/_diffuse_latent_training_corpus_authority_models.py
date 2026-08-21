@@ -44,7 +44,7 @@ PHASE_CANDIDATE_NAME = "phase-candidate.json"
 CANDIDATE_RECEIPT_NAME = "candidate-receipt.json"
 AUTHORITY_NOT_PINNED_REASON = "genuine_output_identities_not_pinned"
 CANDIDATE_EXECUTION_DISABLED_REASON = (
-    "unsafe_upstream_base_publication_not_hardened"
+    "unsafe_derived_runtime_lifecycle_not_hardened"
 )
 
 
@@ -661,7 +661,7 @@ class ProductionAuthorityStatus:
 
 @dataclass(frozen=True, slots=True)
 class ProductionCandidateExecutionStatus:
-    reason: Literal["unsafe_upstream_base_publication_not_hardened"] = (
+    reason: Literal["unsafe_derived_runtime_lifecycle_not_hardened"] = (
         CANDIDATE_EXECUTION_DISABLED_REASON
     )
     candidate_execution_enabled: bool = False

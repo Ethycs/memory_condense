@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
 import types
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -34,15 +33,28 @@ from memory_condense.eval._diffuse_base_contracts import (
     finite_json_mapping,
     identity,
     model_bytes,
-    publish_complete_directory,
     require_exact_children,
     require_no_sqlite_sidecars,
     require_regular_directory,
     require_regular_file,
-    safe_remove_staging,
     sample_store_payload,
     self_sha256,
-    write_new_bytes,
+)
+from memory_condense.eval._diffuse_base_publication_filesystem import (
+    abandon_publication,
+    capture_publication,
+    commit_publication,
+    create_publication,
+    promote_publication,
+    publication_operation_guard,
+    publication_path,
+    rollback_publication,
+    validate_publication_lock_marker,
+    write_publication_bytes,
+)
+from memory_condense.eval._diffuse_base_publication_guard import (
+    freeze_callable_guard,
+    freeze_namespace_guard,
 )
 from memory_condense.eval.cache_receipts import canonical_sha256
 from memory_condense.eval.diffuse_longmemeval_inputs import (
@@ -916,7 +928,7 @@ def verify_store_entry(
     return manifest
 
 
-def publish_store_entry(
+def _publish_store_entry(
     stores_root: Path,
     *,
     sample: GoldBlindLongMemEvalSample,
@@ -927,7 +939,55 @@ def publish_store_entry(
     condenser_factory: Callable[[Path], MemoryCondenser],
     implementation_digest: str,
     environment_digest: str,
+    _sealed_import_guard=None,
 ) -> tuple[Path, DiffuseBaseStoreManifest]:
+    # Pin every capability operation before invoking the caller-supplied
+    # factory.  Callback-time module-global rebinding cannot redirect a later
+    # capture, promotion, verification, commit, or rollback.
+    create_owned = create_publication
+    owned_path = publication_path
+    write_owned = write_publication_bytes
+    capture_owned = capture_publication
+    promote_owned = promote_publication
+    commit_owned = commit_publication
+    rollback_owned = rollback_publication
+    validate_marker = validate_publication_lock_marker
+    abandon_owned = abandon_publication
+    acquire_operation_guard = publication_operation_guard
+    assert_import_seam = _sealed_import_guard
+    verify_active = verify_store_entry
+    assert_capability_intact, emergency_abandon = acquire_operation_guard()
+    module_namespace = globals()
+    guarded_globals = {
+        name: value
+        for name, value in module_namespace.items()
+        if not name.startswith("__")
+    }
+    artifact_error = DiffuseBaseArtifactError
+
+    def assert_module_intact() -> None:
+        changed = [
+            name
+            for name, value in guarded_globals.items()
+            if module_namespace.get(name) is not value
+        ]
+        if changed:
+            raise artifact_error(
+                "store publication module was rebound: " + ", ".join(changed)
+            )
+
+    def assert_operations_intact() -> None:
+        assert_import_seam()
+        assert_module_intact()
+        assert_capability_intact()
+
+    def abandon_after_refusal(owner: object, original: BaseException) -> None:
+        try:
+            emergency_abandon(owner)  # type: ignore[arg-type]
+        except BaseException as abandon_error:
+            original.add_note(f"publication abandon also failed: {abandon_error!r}")
+
+    assert_operations_intact()
     require_regular_directory(stores_root, "base stores root")
     key = diffuse_base_store_key(
         sample,
@@ -939,7 +999,8 @@ def publish_store_entry(
     )
     target = stores_root / key
     if target.exists():
-        return target, verify_store_entry(
+        validate_marker(target)
+        return target, verify_active(
             target,
             sample=sample,
             config=config,
@@ -948,10 +1009,26 @@ def publish_store_entry(
             implementation_digest=implementation_digest,
             environment_digest=environment_digest,
         )
-    temporary = Path(tempfile.mkdtemp(prefix=".building-store-", dir=stores_root))
+    try:
+        owner = create_owned(target, role="store")
+    except FileExistsError:
+        validate_marker(target)
+        return target, verify_active(
+            target,
+            sample=sample,
+            config=config,
+            embedding_identity=embedding_identity,
+            build_runtime_identity=build_runtime_identity,
+            implementation_digest=implementation_digest,
+            environment_digest=environment_digest,
+        )
+    temporary = owned_path(owner)
     built: MemoryCondenser | None = None
+    owner_live = True
+    close_failed = False
     try:
         built = condenser_factory(temporary / STORE_DIRECTORY_NAME)
+        assert_operations_intact()
         _validate_live_condenser(
             built,
             config=config,
@@ -959,8 +1036,13 @@ def publish_store_entry(
             expected=build_runtime_identity,
         )
         ingest_gold_blind_sample_deterministically(built, sample)
-        built.close()
+        try:
+            built.close()
+        except BaseException:
+            close_failed = True
+            raise
         built = None
+        assert_operations_intact()
         manifest = _manifest_for_store(
             temporary,
             sample,
@@ -971,14 +1053,19 @@ def publish_store_entry(
             implementation_digest=implementation_digest,
             environment_digest=environment_digest,
         )
-        write_new_bytes(temporary / STORE_MANIFEST_NAME, model_bytes(manifest))
+        assert_operations_intact()
+        write_owned(owner, STORE_MANIFEST_NAME, model_bytes(manifest))
+        assert_operations_intact()
+        capture_owned(owner)
+        assert_operations_intact()
         try:
-            publish_complete_directory(
-                temporary, target, manifest_name=STORE_MANIFEST_NAME
-            )
+            promote_owned(owner)
         except FileExistsError:
-            safe_remove_staging(temporary, stores_root)
-        return target, verify_store_entry(
+            rollback_owned(owner)
+            owner_live = False
+            validate_marker(target)
+        assert_operations_intact()
+        active = verify_active(
             target,
             sample=sample,
             config=config,
@@ -987,12 +1074,113 @@ def publish_store_entry(
             implementation_digest=implementation_digest,
             environment_digest=environment_digest,
         )
-    except BaseException:
+        assert_operations_intact()
+        if owner_live:
+            commit_owned(owner)
+            owner_live = False
+        return target, active
+    except BaseException as original:
         if built is not None:
             try:
                 built.close()
-            except Exception:
-                pass
-        if temporary.exists():
-            safe_remove_staging(temporary, stores_root)
+            except Exception as close_error:
+                close_failed = True
+                original.add_note(f"store close also failed: {close_error!r}")
+        if owner_live:
+            if close_failed:
+                original.add_note(
+                    "store close failed; publication bytes were quarantined"
+                )
+                abandon_after_refusal(owner, original)
+                owner_live = False
+            else:
+                try:
+                    assert_operations_intact()
+                except BaseException as guard_error:
+                    original.add_note(
+                        f"publication operations changed; bytes quarantined: {guard_error!r}"
+                    )
+                    abandon_after_refusal(owner, original)
+                    owner_live = False
+                else:
+                    try:
+                        rollback_owned(owner)
+                        owner_live = False
+                    except BaseException as cleanup_error:
+                        original.add_note(
+                            f"exact rollback refused; bytes quarantined: {cleanup_error!r}"
+                        )
+                        try:
+                            abandon_owned(owner)
+                        except BaseException:
+                            abandon_after_refusal(owner, original)
+                        owner_live = False
         raise
+
+
+def _seal_store_entrypoint(implementation, import_guard):
+    assert_implementation = freeze_callable_guard(
+        implementation,
+        error_type=DiffuseBaseArtifactError,
+        label="store publication implementation",
+    )
+    assert_import_guard = freeze_callable_guard(
+        import_guard,
+        error_type=DiffuseBaseArtifactError,
+        label="store publication guard",
+    )
+
+    def publish_store_entry(
+        stores_root: Path,
+        *,
+        sample: GoldBlindLongMemEvalSample,
+        config: EvalConfig,
+        embedding_identity: DiffuseBaseEmbeddingIdentity,
+        build_runtime_identity: DiffuseBaseBuildRuntimeIdentity,
+        embedder: object,
+        condenser_factory: Callable[[Path], MemoryCondenser],
+        implementation_digest: str,
+        environment_digest: str,
+    ) -> tuple[Path, DiffuseBaseStoreManifest]:
+        assert_implementation(implementation)
+        assert_import_guard(import_guard)
+        import_guard()
+        return implementation(
+            stores_root,
+            sample=sample,
+            config=config,
+            embedding_identity=embedding_identity,
+            build_runtime_identity=build_runtime_identity,
+            embedder=embedder,
+            condenser_factory=condenser_factory,
+            implementation_digest=implementation_digest,
+            environment_digest=environment_digest,
+            _sealed_import_guard=import_guard,
+        )
+
+    return publish_store_entry
+
+
+_STORE_GUARD_EXCLUDES = (
+    "_seal_store_entrypoint",
+    "store_publication_import_guard",
+    "publish_store_entry",
+    "_STORE_GUARD_EXCLUDES",
+    "_sealed_store_guard",
+)
+_sealed_store_guard = freeze_namespace_guard(
+    globals(),
+    error_type=DiffuseBaseArtifactError,
+    label="store publication module",
+    exclude=_STORE_GUARD_EXCLUDES,
+)
+store_publication_import_guard = freeze_namespace_guard(
+    globals(),
+    error_type=DiffuseBaseArtifactError,
+    label="store publication module",
+    exclude=_STORE_GUARD_EXCLUDES,
+)
+publish_store_entry = _seal_store_entrypoint(
+    _publish_store_entry, _sealed_store_guard
+)
+del _seal_store_entrypoint, _sealed_store_guard

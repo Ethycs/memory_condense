@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import json
-import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,15 +33,28 @@ from memory_condense.eval._diffuse_base_contracts import (
     diffuse_query_input_key,
     identity,
     model_bytes,
-    publish_complete_directory,
     query_sample_payload,
     require_exact_children,
     require_no_sqlite_sidecars,
     require_regular_directory,
     require_regular_file,
-    safe_remove_staging,
     self_sha256,
-    write_new_bytes,
+)
+from memory_condense.eval._diffuse_base_publication_filesystem import (
+    abandon_publication,
+    capture_publication,
+    commit_publication,
+    create_publication,
+    promote_publication,
+    publication_operation_guard,
+    publication_path,
+    rollback_publication,
+    validate_publication_lock_marker,
+    write_publication_bytes,
+)
+from memory_condense.eval._diffuse_base_publication_guard import (
+    freeze_callable_guard,
+    freeze_namespace_guard,
 )
 from memory_condense.eval.cache_receipts import canonical_sha256
 from memory_condense.eval.diffuse_longmemeval_inputs import (
@@ -500,7 +512,7 @@ def _freeze_against_base(
     return tuple(frozen)
 
 
-def publish_query_entry(
+def _publish_query_entry(
     queries_root: Path,
     *,
     store_artifact_path: Path,
@@ -510,11 +522,53 @@ def publish_query_entry(
     config: EvalConfig,
     embedder: object,
     embedding_identity: DiffuseBaseEmbeddingIdentity,
+    _sealed_import_guard=None,
 ) -> tuple[
     Path,
     DiffuseQueryInputManifest,
     tuple["FrozenLegacyQueryInputs", ...],
 ]:
+    create_owned = create_publication
+    owned_path = publication_path
+    write_owned = write_publication_bytes
+    capture_owned = capture_publication
+    promote_owned = promote_publication
+    commit_owned = commit_publication
+    rollback_owned = rollback_publication
+    validate_marker = validate_publication_lock_marker
+    abandon_owned = abandon_publication
+    verify_active = verify_query_entry
+    freeze_active = _freeze_against_base
+    assert_capability_intact, emergency_abandon = publication_operation_guard()
+    assert_import_seam = _sealed_import_guard
+    module_namespace = globals()
+    guarded_globals = {
+        name: value
+        for name, value in module_namespace.items()
+        if not name.startswith("__")
+    }
+    artifact_error = DiffuseBaseArtifactError
+
+    def assert_operations_intact() -> None:
+        assert_import_seam()
+        changed = [
+            name
+            for name, value in guarded_globals.items()
+            if module_namespace.get(name) is not value
+        ]
+        if changed:
+            raise artifact_error(
+                "query publication module was rebound: " + ", ".join(changed)
+            )
+        assert_capability_intact()
+
+    def quarantine(owner: object, original: BaseException) -> None:
+        try:
+            emergency_abandon(owner)  # type: ignore[arg-type]
+        except BaseException as abandon_error:
+            original.add_note(f"publication abandon also failed: {abandon_error!r}")
+
+    assert_operations_intact()
     require_regular_directory(queries_root, "query-inputs root")
     key = diffuse_query_input_key(
         base_store_key=store_manifest.base_store_key,
@@ -525,7 +579,8 @@ def publish_query_entry(
     )
     target = queries_root / key
     if target.exists():
-        manifest, rows = verify_query_entry(
+        validate_marker(target)
+        manifest, rows = verify_active(
             target,
             store_artifact_path=store_artifact_path,
             store_manifest=store_manifest,
@@ -535,7 +590,7 @@ def publish_query_entry(
             embedding_identity=embedding_identity,
         )
         return target, manifest, rows
-    frozen = _freeze_against_base(
+    frozen = freeze_active(
         store_artifact_path,
         sample=sample,
         config=config,
@@ -543,15 +598,32 @@ def publish_query_entry(
         embedding_identity=embedding_identity,
         store_manifest=store_manifest,
     )
+    assert_operations_intact()
     pointer = _pointer_artifact(
         base_store_key=store_manifest.base_store_key,
         sample=sample,
         frozen=frozen,
     )
-    temporary = Path(tempfile.mkdtemp(prefix=".building-query-", dir=queries_root))
     try:
-        write_new_bytes(
-            temporary / FROZEN_QUERY_INPUTS_NAME,
+        owner = create_owned(target, role="query")
+    except FileExistsError:
+        validate_marker(target)
+        manifest, rows = verify_active(
+            target,
+            store_artifact_path=store_artifact_path,
+            store_manifest=store_manifest,
+            treatment_identity=treatment_identity,
+            sample=sample,
+            config=config,
+            embedding_identity=embedding_identity,
+        )
+        return target, manifest, rows
+    temporary = owned_path(owner)
+    owner_live = True
+    try:
+        write_owned(
+            owner,
+            FROZEN_QUERY_INPUTS_NAME,
             model_bytes(pointer),
         )
         manifest = _manifest_for_query_inputs(
@@ -565,14 +637,19 @@ def publish_query_entry(
             embedding_identity=embedding_identity,
             pointer_artifact=pointer,
         )
-        write_new_bytes(temporary / QUERY_MANIFEST_NAME, model_bytes(manifest))
+        assert_operations_intact()
+        write_owned(owner, QUERY_MANIFEST_NAME, model_bytes(manifest))
+        assert_operations_intact()
+        capture_owned(owner)
+        assert_operations_intact()
         try:
-            publish_complete_directory(
-                temporary, target, manifest_name=QUERY_MANIFEST_NAME
-            )
+            promote_owned(owner)
         except FileExistsError:
-            safe_remove_staging(temporary, queries_root)
-        active_manifest, active_rows = verify_query_entry(
+            rollback_owned(owner)
+            owner_live = False
+            validate_marker(target)
+        assert_operations_intact()
+        active_manifest, active_rows = verify_active(
             target,
             store_artifact_path=store_artifact_path,
             store_manifest=store_manifest,
@@ -581,8 +658,102 @@ def publish_query_entry(
             config=config,
             embedding_identity=embedding_identity,
         )
+        assert_operations_intact()
+        if owner_live:
+            commit_owned(owner)
+            owner_live = False
         return target, active_manifest, active_rows
-    except BaseException:
-        if temporary.exists():
-            safe_remove_staging(temporary, queries_root)
+    except BaseException as original:
+        if owner_live:
+            try:
+                assert_operations_intact()
+            except BaseException as guard_error:
+                original.add_note(
+                    f"publication operations changed; bytes quarantined: {guard_error!r}"
+                )
+                quarantine(owner, original)
+                owner_live = False
+            else:
+                try:
+                    rollback_owned(owner)
+                    owner_live = False
+                except BaseException as cleanup_error:
+                    original.add_note(
+                        f"exact rollback refused; bytes quarantined: {cleanup_error!r}"
+                    )
+                    try:
+                        abandon_owned(owner)
+                    except BaseException:
+                        quarantine(owner, original)
+                    owner_live = False
         raise
+
+
+def _seal_query_entrypoint(implementation, import_guard):
+    assert_implementation = freeze_callable_guard(
+        implementation,
+        error_type=DiffuseBaseArtifactError,
+        label="query publication implementation",
+    )
+    assert_import_guard = freeze_callable_guard(
+        import_guard,
+        error_type=DiffuseBaseArtifactError,
+        label="query publication guard",
+    )
+
+    def publish_query_entry(
+        queries_root: Path,
+        *,
+        store_artifact_path: Path,
+        store_manifest: DiffuseBaseStoreManifest,
+        treatment_identity: DiffuseBaseTreatmentIdentity,
+        sample: GoldBlindLongMemEvalSample,
+        config: EvalConfig,
+        embedder: object,
+        embedding_identity: DiffuseBaseEmbeddingIdentity,
+    ) -> tuple[
+        Path,
+        DiffuseQueryInputManifest,
+        tuple["FrozenLegacyQueryInputs", ...],
+    ]:
+        assert_implementation(implementation)
+        assert_import_guard(import_guard)
+        import_guard()
+        return implementation(
+            queries_root,
+            store_artifact_path=store_artifact_path,
+            store_manifest=store_manifest,
+            treatment_identity=treatment_identity,
+            sample=sample,
+            config=config,
+            embedder=embedder,
+            embedding_identity=embedding_identity,
+            _sealed_import_guard=import_guard,
+        )
+
+    return publish_query_entry
+
+
+_QUERY_GUARD_EXCLUDES = (
+    "_seal_query_entrypoint",
+    "query_publication_import_guard",
+    "publish_query_entry",
+    "_QUERY_GUARD_EXCLUDES",
+    "_sealed_query_guard",
+)
+_sealed_query_guard = freeze_namespace_guard(
+    globals(),
+    error_type=DiffuseBaseArtifactError,
+    label="query publication module",
+    exclude=_QUERY_GUARD_EXCLUDES,
+)
+query_publication_import_guard = freeze_namespace_guard(
+    globals(),
+    error_type=DiffuseBaseArtifactError,
+    label="query publication module",
+    exclude=_QUERY_GUARD_EXCLUDES,
+)
+publish_query_entry = _seal_query_entrypoint(
+    _publish_query_entry, _sealed_query_guard
+)
+del _seal_query_entrypoint, _sealed_query_guard

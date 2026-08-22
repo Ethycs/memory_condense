@@ -211,6 +211,9 @@ def test_build_qa_prompt_includes_context_and_question():
     messages = build_qa_prompt("Where?", ["chunk one", "chunk two"])
     assert messages[0]["role"] == "system"
     assert "newest relevant user update" in messages[0]["content"]
+    assert "do not abstain merely because the value is approximate" in (
+        messages[0]["content"]
+    )
     assert "difference, duration, or amount remaining" in messages[0]["content"]
     assert "explicit start or end boundary" in messages[0]["content"]
     assert "chunk one" in messages[1]["content"]

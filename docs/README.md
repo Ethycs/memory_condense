@@ -1,13 +1,15 @@
 # memory_condense — documentation tree
 
 **Status**: Living Document
-**Date**: 2026-08-20 (adds the design-frozen resident latent-fusion contract)
+**Date**: 2026-08-21 (adds the checkpointed LiteLLM Terra synthesis result)
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
 
 > **Built and locally measured; external competitiveness remains open.** Campaign artifacts report 10/10 judge verdicts on a selected ten-question LongMemEval-S development slice; a structural audit verifies their internal bindings, not provider/judge execution or factual correctness. The exact frozen v3 treatment has now also run provider-free retrieval over all 100 validation questions: mean labeled evidence-source recall was 87.6%, every labeled source was recovered for 82%, and literal gold text appeared in 48% of final contexts. Those are retrieval diagnostics, not answer accuracy; no validation responder or judge call was made. The earlier artifact result did not generalize at the evidence-admission layer. This validation population is now analysis-used, Mem0 production remains NO-GO, and a tuned v4 system needs a new untouched confirmation population. `git log --oneline` and the machine-readable artifacts remain the authority over prose.
+
+> **Current 1M synthesis result.** On the original ten-question development concatenation, a strict, checkpointed Terra arm held retrieval fixed and reached 5/10 exact match and 0.718433 mean F1 at S1. S2/S3 did not improve it, no independent judge ran, and no held-out claim follows; see Research Log 24.
 
 > **Code/evidence boundary.** The organized source tree is implementation epoch
 > v4. Frozen validation-v3 evidence still certifies commit
@@ -26,6 +28,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `02 - Implementation/01 - Running the Eval Harness.md` | ✅ | Rewritten for four CLI modes; benchmark data sources + cost warning; sweep is 54 configs, not 48 |
 | `02 - Implementation/03 - Qwen3 Prefix Attention Lab.md` | **experimental / integrated** | Seven-layer Qwen3-8B BF16 prefix, compact persistent CAV/QK/OV artifacts, bounded dual QK/heat reads, source-aware packing, safe admission, and physical pruning; public benchmarking remains open |
 | `02 - Implementation/04 - Episode-Primary Latent Evidence Fusion.md` | **experimental / resident A+B implemented** | Exact query-preserving Qwen atom rows and same-GPU atomic K-latent matched fusion now pass provider-free, CUDA, and pinned-checkpoint smoke gates; extractive rendering, router training, route-bearing v2 evaluation, and any quality claim remain open |
+| `02 - Implementation/05 - As-Built Mathematical Reference.md` | **implemented / test-covered** | Exact working formulas and edge cases for BM25/TF-ISF/RRF, co-access serving, heat diffusion, causal transitions, episodic surprise/refinement, coverage energies, forced choice, and evaluation metrics |
 | `03 - Architecture/00 - System Overview.md` | ✅ | Diagram and every subsystem rewritten; "there is no condensation yet" was false |
 | `03 - Architecture/01 - Native Hypergraph Memory Plane.md` | **new / proposed** | Event-centric hypergraph for live QK/OV/CAV observations, with the measured pairwise graph retained as a bounded serving projection; no durable request-derived transformer token state (static model/tokenizer assets excluded) |
 | `03 - Architecture/02 - Query-Conditioned Bayesian Coverage Loop.md` | **implemented / prefix measurement pending** | Primary full-width Qwen3-8B layers 0–5 with layer-5 QK/OV transport-affinity grouping; secondary compact-INI classifier; recall-safe coverage ordering and zero durable transformer state |
@@ -53,7 +56,11 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `10 - Research Log/16 - 2026-08-18 - V3 retrieval freeze and validation campaign.md` | **frozen development treatment** | Final no-provider replay reached 100% source and scored answer-value coverage at a mean 1,986 returned tokens; exact cache receipts, prompt-proxy identity, a 100-question campaign plan, and the corrected Mem0 protocol are frozen, but no held-out provider calls have run |
 | `10 - Research Log/17 - 2026-08-18 - Locked treatment handoff and discourse closure frontier.md` | **operational handoff / incomplete goal** | Consolidates the treatment, ten prepared cache shards, hard invariants, controlled Mem0 tooling, current test evidence, explicit NO-GO boundaries, and the proposed general-purpose Grounded Discourse Closure RAG design |
 | `10 - Research Log/18 - 2026-08-18 - Validation v3 provider-free retrieval audit.md` | **100-question provider-free audit / retrieval gate failed** | Exact frozen-v3 replay across all ten validation shards: 87.6% mean evidence-source recall, 82% all-source recovery, zero post-coverage closures, zero provider calls, unchanged cache hashes, and an explicit development-to-validation generalization gap; answer accuracy remains unmeasured |
-| `07 - Status Reports/…` | ✅ | Three dated handoffs; **2026-08-15 is the current one** and supersedes the earlier test counts (48 → 366 → 523) |
+| `10 - Research Log/21 - 2026-08-21 - Retrieval nesting and fresh 1M episode-primary test.md` | **1M functional ablation / retrieval regression** | A fresh validation-offset-0 `episode_primary` route completed end to end but replaced the v3 authority and fell to 3/10 literal reachability; this is not the original concatenated-memory control |
+| `10 - Research Log/22 - 2026-08-21 - Recall-guarded cumulative retrieval.md` | **measured 1M development ladder** | The original 1,039,203-token development concatenation ran through four strictly nested provider-free stages: S0 recovered every labeled source and 5/10 literal answers; S1 improved mean evidence F1 by 4.62%, while S2 and S3 added no further scored gain under the cap |
+| `10 - Research Log/23 - 2026-08-21 - Episodic evidence scoring and synthesis.md` | **measured local synthesis / negative answer result** | A pinned Qwen3-0.6B inspected all 176 episodic additions and made 12 unique S1-S3 answer calls; its historical raw-p(A) answerability proxies found no useful S2 addition, while every stage scored 0/10 exact match and 0.010227 mean F1, with no independent judge or calibrated-density claim |
+| `10 - Research Log/24 - 2026-08-21 - LiteLLM Terra episodic synthesis and rescoring.md` | **measured provider synthesis / improved development answer result** | A strict, 12-call checkpointed Terra arm held retrieval fixed, labeled all 176 additions, and raised S1 to 5/10 exact match and 0.718433 F1; S2/S3 reached 4/10 and 0.706806, all five S2-only additions were labeled irrelevant/none, and no independent judge or held-out claim is made |
+| `07 - Status Reports/…` | ✅ | Six dated handoffs through 2026-08-19; the 2026-08-15 report remains the retrieval-measurement handoff, while the 2026-08-19 reports cover the later simplification audit and implementation |
 
 ## The tree
 
@@ -61,7 +68,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 docs/
 ├── 00 - Theory/           Retrieval, proof-carrying coverage, associative memory, and episodic closure
 ├── 01 - Design/           The original architecture plan + eval design rationale
-├── 02 - Implementation/   Setup, eval modes, Qwen labs, and frozen implementation contracts
+├── 02 - Implementation/   Setup, eval modes, Qwen labs, frozen contracts, and as-built mathematics
 ├── 03 - Architecture/     The as-built system map, package layout, and proposed hypergraph memory plane
 ├── 04 - Reference/        External landscape (SimpleMem, Mem0, MemDelta…) + vocabulary
 ├── 05 - Standards/        Normative data contracts (SQLite v2, embedding, memory provenance, formats)
@@ -100,6 +107,7 @@ docs/
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
 - "How do I run the Qwen attention-prefix experiment?" → `02 - Implementation/03 - Qwen3 Prefix Attention Lab.md`.
 - "How will episode retrieval feed the K-latent attention fusion stage?" → `02 - Implementation/04 - Episode-Primary Latent Evidence Fusion.md` — a design-frozen, query-conditioned GPU feature-to-router contract with no trained or measured fusion claim yet.
+- "What exact math does the working implementation execute?" → `02 - Implementation/05 - As-Built Mathematical Reference.md` — the code-aligned equations, defaults, edge cases, tie-breaks, and focused test map for working retrieval paths that were previously implicit.
 - "How do I actually *use* it day to day?" → `02 - Implementation/02 - MCP Integration.md` — the memory system is exposed to Claude Code as an MCP server.
 - "Is this competitive?" → **not established**. `10 - Research Log/18` records the exact 100-question provider-free v3 validation audit: mean evidence-source recall fell to 87.6%, all-source recovery to 82%, and answer accuracy remains unmeasured. The same-budget Mem0 arm is also still open.
 - "What is the large-model attention-head memory idea?" → `00 - Theory/01 - Extracted Attention Heads as Recursive Associative Memory.md` — a **DRAFT** whose first CAV/live-head prototype is implemented, including the full-teacher J-Space implication.
@@ -115,6 +123,8 @@ docs/
 - "What is the frozen v3 treatment and validation plan?" → `10 - Research Log/16 - 2026-08-18 - V3 retrieval freeze and validation campaign.md` — the final no-provider replay, exact artifact/cache identities, ten-shard held-out plan, prompt-proxy semantics, and corrected Mem0 comparison boundary.
 - "What is operational now, what is still unmeasured, and what comes next?" → `10 - Research Log/17 - 2026-08-18 - Locked treatment handoff and discourse closure frontier.md` — the current readiness matrix, exact invariants and hashes, Mem0 production NO-GO, authorization gates, and the general-purpose diffuse-retrieval design.
 - "Did the frozen v3 treatment generalize to all 100 validation questions?" → `10 - Research Log/18 - 2026-08-18 - Validation v3 provider-free retrieval audit.md` — not at the retrieval-admission level; it records the exact metrics, identities, post-run cache audit, and why no provider accuracy claim follows.
+- "How are new retrieval methods added without replacing the strongest prior packet, and what happened at 1M?" → `10 - Research Log/22 - 2026-08-21 - Recall-guarded cumulative retrieval.md` — four provider-ready stages preserve a frozen-v3-compatible protected root, then add direct episodes, representative episodes, and artifact-global closure. On the exact original 1,039,203-token development concatenation, only direct episodes improved a scored retrieval metric; later stages preserved evidence but added no further gain under the cap.
+- "Did a larger synthesizer answer the cumulative 1M contexts and score the episodic additions?" → `10 - Research Log/24 - 2026-08-21 - LiteLLM Terra episodic synthesis and rescoring.md` — yes on the ten-question development concatenation: strict Terra synthesis reached 5/10 exact match and 0.718433 F1 at S1 with exact-quote citations, while both semantic and local numeric scoring found no strong S2-only evidence. This is not a held-out or independently judged result.
 
 ## The one distinction this tree tries hardest to keep
 

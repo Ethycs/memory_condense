@@ -6,6 +6,7 @@ import re
 import shutil
 import sqlite3
 import zlib
+from datetime import datetime, timezone
 
 import numpy as np
 import pytest
@@ -24,6 +25,7 @@ from memory_condense.eval.causal_benchmark import (
     _held_out_query_batch,
     causal_consolidation_ingest_fn,
 )
+from memory_condense.eval.compiled_cache import compiled_store_ingest_fn
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
 from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 from memory_condense.domain.schemas import Chunk
@@ -130,6 +132,11 @@ def test_source_reader_accepts_pre_source_id_historical_store(tmp_path):
     assert rows[0][:4] == (1, "user", "old prompt", None)
     assert rows[0][4][0].chunk_id == "c1"
 
+    target = tmp_path / "uncertifiable-replay"
+    with pytest.raises(ValueError, match="invalid created_at: t1"):
+        stage_causal_store(database, target, ReplayEmbedder())
+    assert not target.exists()
+
 
 def test_causal_staging_never_retrieves_the_current_or_future_turn(tmp_path):
     source = tmp_path / "source"
@@ -228,6 +235,58 @@ def test_causal_staging_closes_episode_before_next_source_timestamp(tmp_path):
     assert any("amber" in text for text in selected_text)
     assert all("session-b" not in text for text in selected_text)
     assert all("violet" not in text for text in selected_text)
+
+
+def test_causal_staging_preserves_turn_chunk_and_timestamp_identity(tmp_path):
+    source = tmp_path / "identity-source"
+    live = ReplayEmbedder()
+    first_at = datetime(2026, 8, 20, 9, 30, tzinfo=timezone.utc)
+    second_at = datetime(2026, 8, 20, 9, 31, tzinfo=timezone.utc)
+    with MemoryCondenser(
+        data_dir=source,
+        embedder=live,
+        auto_extract=False,
+        chunker_min_tokens=1,
+        chunker_max_tokens=40,
+    ) as condenser:
+        _first_turn, first_chunks = condenser.ingest(
+            "assistant",
+            "The preserved identity marker is amber.",
+            source_id="identity-source",
+            created_at=first_at,
+            turn_id="stable-turn-1",
+        )
+        condenser.ingest(
+            "user",
+            "What is the preserved identity marker?",
+            source_id="identity-source",
+            created_at=second_at,
+            turn_id="stable-turn-2",
+        )
+
+    query = "What is the preserved identity marker?"
+    stage_causal_store(
+        source / "memory.db",
+        tmp_path / "identity-staged",
+        FrozenQueryEmbedder({query: live.embed_query(query)}),
+        retrieval_k=1,
+        max_event_nodes=3,
+        new_event_nodes=1,
+        max_prompt_tokens=128,
+    )
+
+    with sqlite3.connect(tmp_path / "identity-staged" / "memory.db") as connection:
+        turns = connection.execute(
+            "SELECT turn_id, created_at, source_id FROM turns ORDER BY ordinal"
+        ).fetchall()
+        chunk_ids = {
+            row[0] for row in connection.execute("SELECT chunk_id FROM chunks")
+        }
+    assert [row[0] for row in turns] == ["stable-turn-1", "stable-turn-2"]
+    assert datetime.fromisoformat(turns[0][1]) == first_at
+    assert datetime.fromisoformat(turns[1][1]) == second_at
+    assert [row[2] for row in turns] == ["identity-source", "identity-source"]
+    assert {item.chunk_id for item in first_chunks} <= chunk_ids
 
 
 def test_comparison_reports_gains_and_losses_without_question_text():
@@ -535,7 +594,7 @@ def test_normal_and_blind_cold_builds_share_the_exact_training_batch(tmp_path):
         normal.close()
 
 
-def test_blind_causal_hit_still_materializes_and_attests_compiled_cache(
+def test_rebuilt_compiled_artifact_builds_identity_matched_causal_cache(
     tmp_path,
 ):
     class CapturingEmbedder(ReplayEmbedder):
@@ -582,6 +641,12 @@ def test_blind_causal_hit_still_materializes_and_attests_compiled_cache(
         prepare_only=True,
     )
     seed_ingest(sample, config, tmp_path / "seed").close()
+    first_causal_manifest = next(
+        causal_cache.glob(f"*/{CAUSAL_MANIFEST_NAME}")
+    )
+    first_compiled_manifest_sha256 = json.loads(
+        first_causal_manifest.read_text(encoding="utf-8")
+    )["compiled_manifest_sha256"]
     shutil.rmtree(compiled_cache)
 
     hit_embedder = CapturingEmbedder()
@@ -597,6 +662,32 @@ def test_blind_causal_hit_still_materializes_and_attests_compiled_cache(
         assert len(receipts["compiled"]) == 1
         assert len(receipts["causal"]) == 1
         assert list(compiled_cache.glob("*/compiled-store.json"))
+        assert len(list(causal_cache.glob(f"*/{CAUSAL_MANIFEST_NAME}"))) == 2
+        assert receipts["causal"][0]["compiled_manifest_sha256"] == (
+            receipts["compiled"][0]["manifest_sha256"]
+        )
+        assert receipts["causal"][0]["compiled_manifest_sha256"] != (
+            first_compiled_manifest_sha256
+        )
+        compiled_database = next(compiled_cache.glob("*/memory.db"))
+        with (
+            sqlite3.connect(compiled_database) as compiled_connection,
+            sqlite3.connect(store.database_path) as causal_connection,
+        ):
+            compiled_turn_ids = compiled_connection.execute(
+                "SELECT turn_id FROM turns ORDER BY ordinal"
+            ).fetchall()
+            causal_turn_ids = causal_connection.execute(
+                "SELECT turn_id FROM turns ORDER BY ordinal"
+            ).fetchall()
+            compiled_chunk_ids = compiled_connection.execute(
+                "SELECT chunk_id FROM chunks ORDER BY rowid"
+            ).fetchall()
+            causal_chunk_ids = causal_connection.execute(
+                "SELECT chunk_id FROM chunks ORDER BY rowid"
+            ).fetchall()
+        assert causal_turn_ids == compiled_turn_ids
+        assert causal_chunk_ids == compiled_chunk_ids
         assert held_out not in {
             text for batch in hit_embedder.query_batches for text in batch
         }
@@ -664,6 +755,9 @@ def test_required_causal_cache_hit_is_read_only_and_reports_exact_pair(tmp_path)
         assert receipts["causal"][0]["compiled_cache_key"] == receipts["compiled"][0][
             "cache_key"
         ]
+        assert receipts["causal"][0]["compiled_manifest_sha256"] == (
+            receipts["compiled"][0]["manifest_sha256"]
+        )
         assert scored.query_batches == [[sample.questions[0].dated_question]]
     finally:
         store.close()
@@ -690,17 +784,6 @@ def test_required_causal_cache_miss_fails_before_query_or_write(tmp_path):
             self.query_batches.append(list(texts))
             return super().embed_queries(texts)
 
-    compiled_root = tmp_path / "compiled"
-    causal_root = tmp_path / "causal"
-    compiled_root.mkdir()
-    causal_root.mkdir()
-    embedder = CapturingEmbedder()
-    ingest = causal_consolidation_ingest_fn(
-        compiled_root,
-        causal_cache_root=causal_root,
-        embedder=embedder,
-        require_cache_hit=True,
-    )
     sample = BenchmarkSample(
         sample_id="strict-causal-miss",
         turns=[("user", "Historical text")],
@@ -713,11 +796,39 @@ def test_required_causal_cache_miss_fails_before_query_or_write(tmp_path):
         ],
     )
     config = EvalConfig(retrieval=RetrievalConfig(mode="causal_graph"))
+    compiled_root = tmp_path / "compiled"
+    causal_root = tmp_path / "causal"
+    causal_root.mkdir()
+    embedder = CapturingEmbedder()
+    compiled_store_ingest_fn(compiled_root, embedder=embedder)(
+        sample,
+        config,
+        tmp_path / "compiled-build",
+    ).close()
+    compiled_before = {
+        path.relative_to(compiled_root).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in compiled_root.rglob("*")
+        if path.is_file()
+    }
+    ingest = causal_consolidation_ingest_fn(
+        compiled_root,
+        causal_cache_root=causal_root,
+        embedder=embedder,
+        require_cache_hit=True,
+    )
 
     with pytest.raises(RuntimeError, match="required causal-store cache entry"):
         ingest(sample, config, tmp_path / "unused")
     assert embedder.query_batches == []
-    assert list(compiled_root.iterdir()) == []
+    assert {
+        path.relative_to(compiled_root).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in compiled_root.rglob("*")
+        if path.is_file()
+    } == compiled_before
     assert list(causal_root.iterdir()) == []
     assert not (tmp_path / "unused").exists()
 
@@ -761,7 +872,14 @@ def test_causal_manifest_attests_training_only_build_protocol(tmp_path):
         ingest(sample, config, tmp_path / "must-not-open")
 
 
-def test_blind_prepare_rejects_causal_to_compiled_identity_mismatch(tmp_path):
+@pytest.mark.parametrize(
+    "tampered_field",
+    ("compiled_cache_key", "compiled_manifest_sha256"),
+)
+def test_blind_prepare_rejects_causal_to_compiled_identity_mismatch(
+    tmp_path,
+    tampered_field,
+):
     sample = BenchmarkSample(
         sample_id="compiled-link",
         turns=[
@@ -789,10 +907,10 @@ def test_blind_prepare_rejects_causal_to_compiled_identity_mismatch(tmp_path):
     ingest(sample, config, tmp_path / "build").close()
     manifest_path = next(causal_cache.glob(f"*/{CAUSAL_MANIFEST_NAME}"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["compiled_cache_key"] = "f" * 64
+    manifest[tampered_field] = "f" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="compiled cache identity mismatch"):
+    with pytest.raises(RuntimeError, match=r"compiled .*identity mismatch"):
         ingest(sample, config, tmp_path / "must-not-open")
 
 

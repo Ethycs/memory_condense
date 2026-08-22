@@ -43,6 +43,19 @@ class ReplayEvent:
     causal_chunk_ids: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceReplayRow:
+    """Exact source-store turn identity plus its already embedded chunks."""
+
+    ordinal: int
+    turn_id: str
+    role: str
+    text: str
+    source_id: str | None
+    created_at: str | None
+    chunks: tuple[Chunk, ...]
+
+
 class FrozenQueryEmbedder:
     """Read-only lookup for query vectors batched before Qwen is loaded."""
 
@@ -77,9 +90,9 @@ class FrozenQueryEmbedder:
         return []
 
 
-def _source_rows(
-    source_db: Path,
-) -> list[tuple[int, str, str, str | None, list[Chunk]]]:
+def _source_replay_rows(source_db: Path) -> list[_SourceReplayRow]:
+    """Read exact turn IDs/timestamps without changing historical row order."""
+
     connection = sqlite3.connect(source_db)
     try:
         turn_columns = {
@@ -88,9 +101,13 @@ def _source_rows(
         }
         ordinal_expression = "ordinal" if "ordinal" in turn_columns else "rowid"
         source_expression = "source_id" if "source_id" in turn_columns else "NULL"
+        created_expression = (
+            "created_at" if "created_at" in turn_columns else "NULL"
+        )
         turns = connection.execute(
             f"SELECT {ordinal_expression}, turn_id, role, text, "
-            f"{source_expression} FROM turns ORDER BY {ordinal_expression}"
+            f"{source_expression}, {created_expression} FROM turns "
+            f"ORDER BY {ordinal_expression}"
         ).fetchall()
         chunk_rows = connection.execute(
             "SELECT chunk_id, turn_id, text, start_char, end_char, token_count, "
@@ -115,9 +132,59 @@ def _source_rows(
         )
         chunks_by_turn.setdefault(row[1], []).append(chunk)
     return [
-        (int(ordinal), role, text, source_id, chunks_by_turn.get(turn_id, []))
-        for ordinal, turn_id, role, text, source_id in turns
+        _SourceReplayRow(
+            ordinal=int(ordinal),
+            turn_id=str(turn_id),
+            role=str(role),
+            text=str(text),
+            source_id=None if source_id is None else str(source_id),
+            created_at=None if created_at is None else str(created_at),
+            chunks=tuple(chunks_by_turn.get(turn_id, ())),
+        )
+        for ordinal, turn_id, role, text, source_id, created_at in turns
     ]
+
+
+def _source_rows(
+    source_db: Path,
+) -> list[tuple[int, str, str, str | None, list[Chunk]]]:
+    """Historical public projection retained for replay scripts and tests."""
+
+    return [
+        (
+            row.ordinal,
+            row.role,
+            row.text,
+            row.source_id,
+            list(row.chunks),
+        )
+        for row in _source_replay_rows(source_db)
+    ]
+
+
+def _validated_replay_timestamps(
+    rows: Sequence[_SourceReplayRow],
+) -> tuple[datetime | None, ...]:
+    """Parse all source timestamps before a replay target can be created.
+
+    The tolerant historical ``_source_rows`` projection remains available for
+    inspecting old databases.  A revision-4 causal replay, however, cannot
+    certify chronology after silently replacing an invalid source timestamp.
+    """
+
+    parsed: list[datetime | None] = []
+    for row in rows:
+        if row.created_at is None:
+            parsed.append(None)
+            continue
+        try:
+            parsed.append(datetime.fromisoformat(row.created_at))
+        except ValueError as exc:
+            raise ValueError(
+                "causal replay source turn has an invalid created_at: "
+                f"{row.turn_id}"
+            ) from exc
+    return tuple(parsed)
 
 
 def _source_user_queries(source_db: str | Path) -> list[str]:
@@ -172,8 +239,9 @@ def stage_causal_store(
     target = Path(target_dir)
     if target.exists():
         raise FileExistsError(f"refusing to replace replay store: {target}")
-    rows = _source_rows(source)
-    source_chunk_count = sum(len(row[4]) for row in rows)
+    rows = _source_replay_rows(source)
+    replay_timestamps = _validated_replay_timestamps(rows)
+    source_chunk_count = sum(len(row.chunks) for row in rows)
     budget = ContextBudget(
         recent_window_tokens=0,
         memory_header_tokens=0,
@@ -239,7 +307,12 @@ def stage_causal_store(
         budget=budget,
         retriever_max_elements=max(1, source_chunk_count),
     ) as condenser:
-        for ordinal, role, text, source_id, source_chunks in rows:
+        for row, created_at in zip(rows, replay_timestamps, strict=True):
+            ordinal = row.ordinal
+            role = row.role
+            text = row.text
+            source_id = row.source_id
+            source_chunks = row.chunks
             # LongMemEval inserts a dated system turn at the start of each
             # source session. Close the previous episode before that turn is
             # visible; otherwise its timestamp is incorrectly treated as an
@@ -275,11 +348,18 @@ def stage_causal_store(
                         "outcome_ids": [],
                     }
 
-            turn = condenser.transcript.append(role, text, source_id=source_id)
-            copied = [
-                chunk.model_copy(update={"turn_id": turn.turn_id})
-                for chunk in source_chunks
-            ]
+            turn = condenser.transcript.append(
+                role,
+                text,
+                source_id=source_id,
+                created_at=created_at,
+                turn_id=row.turn_id,
+            )
+            copied = list(source_chunks)
+            if any(chunk.turn_id != turn.turn_id for chunk in copied):
+                raise RuntimeError(
+                    "causal replay source chunk changed its original turn ID"
+                )
             condenser.retriever.add_chunks(copied)
             chunks_seen += len(copied)
             if pending is not None:

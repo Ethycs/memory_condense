@@ -60,11 +60,12 @@ def _cache_receipts(
     turn_count: int = 1,
 ) -> dict[str, list[dict[str, object]]]:
     compiled_key = _digest(f"compiled-key-{shard}")
+    compiled_manifest = _digest(f"compiled-manifest-{shard}")
     execution_digest = _digest("embedding-execution")
     return {
         "compiled": [
             {
-                "manifest_sha256": _digest(f"compiled-manifest-{shard}"),
+                "manifest_sha256": compiled_manifest,
                 "cache_key": compiled_key,
                 "sample_sha256": sample_digest,
                 "database_sha256": _digest(f"compiled-database-{shard}"),
@@ -82,6 +83,7 @@ def _cache_receipts(
                 "cache_key": _digest(f"causal-key-{shard}"),
                 "sample_sha256": sample_digest,
                 "compiled_cache_key": compiled_key,
+                "compiled_manifest_sha256": compiled_manifest,
                 "database_sha256": _digest(f"causal-database-{shard}"),
                 "index_sha256": _digest(f"causal-index-{shard}"),
                 "build_protocol_sha256": _digest("causal-build-protocol"),

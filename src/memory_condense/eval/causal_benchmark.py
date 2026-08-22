@@ -46,7 +46,7 @@ from memory_condense.ingest.loader import BenchmarkSample
 
 
 CAUSAL_CACHE_FORMAT = "memory-condense-causal-benchmark-store-v1"
-CAUSAL_CACHE_REVISION = 3
+CAUSAL_CACHE_REVISION = 4
 CAUSAL_MANIFEST_NAME = "causal-store.json"
 CAUSAL_BUILD_PROTOCOL = "causal-training-query-only-v1"
 
@@ -79,6 +79,7 @@ def _causal_cache_key(
     embedding_execution: dict[str, str | int | bool],
     implementation_digest: str,
     environment_digest: str,
+    compiled_manifest_sha256: str | None,
 ) -> str:
     retrieval = config.retrieval
     payload = {
@@ -92,6 +93,10 @@ def _causal_cache_key(
         "embedding_execution": embedding_execution,
         "implementation_sha256": implementation_digest,
         "environment_lock_sha256": environment_digest,
+        # A compiled cache key identifies write-time inputs, not the concrete
+        # SQLite/HNSW artifact.  Its verified manifest digest commits to those
+        # exact bytes and therefore to the turn/chunk identities replayed.
+        "compiled_manifest_sha256": compiled_manifest_sha256,
         "schema_version": CURRENT_SCHEMA_VERSION,
         "write_policy": {
             "expansion_tokens": (
@@ -126,6 +131,7 @@ def _verified_causal_manifest(
     expected_embedding_execution: dict[str, str | int | bool],
     expected_implementation_sha256: str,
     expected_environment_lock_sha256: str,
+    expected_compiled_manifest_sha256: str | None,
 ) -> dict[str, Any]:
     manifest_path = store_dir / CAUSAL_MANIFEST_NAME
     try:
@@ -150,6 +156,13 @@ def _verified_causal_manifest(
         raise RuntimeError(f"causal-store implementation mismatch: {manifest_path}")
     if payload.get("environment_lock_sha256") != expected_environment_lock_sha256:
         raise RuntimeError(f"causal-store environment mismatch: {manifest_path}")
+    if (
+        payload.get("compiled_manifest_sha256")
+        != expected_compiled_manifest_sha256
+    ):
+        raise RuntimeError(
+            f"causal-store compiled manifest identity mismatch: {manifest_path}"
+        )
     database_path = store_dir / "memory.db"
     index_path = store_dir / "hnsw_index.bin"
     if _file_sha256(database_path) != payload.get("database_sha256"):
@@ -170,6 +183,9 @@ def _causal_manifest_receipt(
         "cache_key": str(manifest["cache_key"]),
         "sample_sha256": str(manifest["sample_sha256"]),
         "compiled_cache_key": str(manifest["compiled_cache_key"]),
+        "compiled_manifest_sha256": str(
+            manifest["compiled_manifest_sha256"]
+        ),
         "database_sha256": str(manifest["database_sha256"]),
         "index_sha256": str(manifest["index_sha256"]),
         "build_protocol_sha256": hashlib.sha256(
@@ -296,38 +312,6 @@ def causal_consolidation_ingest_fn(
             raise ValueError(
                 "causal consolidation ingest requires a causal retrieval mode"
             )
-        sample_digest = sample_sha256(sample)
-        cache_key = _causal_cache_key(
-            sample,
-            config,
-            embedding_model=embedding_model,
-            embedding_dim=embedding_dim,
-            embedding_execution=embedding_execution,
-            implementation_digest=active_implementation_digest,
-            environment_digest=active_environment_digest,
-        )
-        cached_target = (
-            _causal_store_dir(learned_root, sample, cache_key)
-            if learned_root is not None
-            else None
-        )
-        cached_manifest = (
-            _verified_causal_manifest(
-                cached_target,
-                expected_key=cache_key,
-                expected_sample_sha256=sample_digest,
-                expected_embedding_execution=embedding_execution,
-                expected_implementation_sha256=active_implementation_digest,
-                expected_environment_lock_sha256=active_environment_digest,
-            )
-            if cached_target is not None and cached_target.exists()
-            else None
-        )
-        if require_cache_hit and cached_target is not None and not cached_target.exists():
-            raise RuntimeError(
-                f"required causal-store cache entry is missing: {cached_target}"
-            )
-        final_queries = [] if prepare_only else _held_out_query_batch(sample, config)
 
         def open_source_store() -> tuple[Path, dict[str, str | int] | None]:
             """Ensure the compiled source exists and close its read handle."""
@@ -357,6 +341,63 @@ def causal_consolidation_ingest_fn(
                 source_store.close()
             return source_db, compiled_receipt
 
+        # An exact compiled artifact must be known before the causal cache key
+        # is chosen.  Two independently built compiled roots can share the
+        # same logical key while carrying different generated turn/chunk IDs.
+        source_db: Path | None = None
+        compiled_receipt: dict[str, str | int] | None = None
+        if compiled_ingest is not None:
+            source_db, compiled_receipt = open_source_store()
+            if compiled_receipt is None:
+                raise RuntimeError(
+                    "compiled source did not expose an exact cache receipt"
+                )
+        compiled_manifest_digest = None
+        if compiled_receipt is not None:
+            raw_manifest_digest = compiled_receipt.get("manifest_sha256")
+            if not isinstance(raw_manifest_digest, str) or re.fullmatch(
+                r"[0-9a-f]{64}", raw_manifest_digest.casefold()
+            ) is None:
+                raise RuntimeError(
+                    "compiled source exposed an invalid manifest identity"
+                )
+            compiled_manifest_digest = raw_manifest_digest.casefold()
+
+        sample_digest = sample_sha256(sample)
+        cache_key = _causal_cache_key(
+            sample,
+            config,
+            embedding_model=embedding_model,
+            embedding_dim=embedding_dim,
+            embedding_execution=embedding_execution,
+            implementation_digest=active_implementation_digest,
+            environment_digest=active_environment_digest,
+            compiled_manifest_sha256=compiled_manifest_digest,
+        )
+        cached_target = (
+            _causal_store_dir(learned_root, sample, cache_key)
+            if learned_root is not None
+            else None
+        )
+        cached_manifest = (
+            _verified_causal_manifest(
+                cached_target,
+                expected_key=cache_key,
+                expected_sample_sha256=sample_digest,
+                expected_embedding_execution=embedding_execution,
+                expected_implementation_sha256=active_implementation_digest,
+                expected_environment_lock_sha256=active_environment_digest,
+                expected_compiled_manifest_sha256=compiled_manifest_digest,
+            )
+            if cached_target is not None and cached_target.exists()
+            else None
+        )
+        if require_cache_hit and cached_target is not None and not cached_target.exists():
+            raise RuntimeError(
+                f"required causal-store cache entry is missing: {cached_target}"
+            )
+        final_queries = [] if prepare_only else _held_out_query_batch(sample, config)
+
         def runtime_embedder():
             """Embed held-out probes only after the durable build is closed."""
 
@@ -373,18 +414,19 @@ def causal_consolidation_ingest_fn(
         ) -> None:
             if receipt is None:
                 return
-            if manifest.get("compiled_cache_key") != receipt.get("cache_key"):
+            if (
+                manifest.get("compiled_cache_key") != receipt.get("cache_key")
+                or manifest.get("compiled_manifest_sha256")
+                != receipt.get("manifest_sha256")
+            ):
                 raise RuntimeError(
                     "causal-store compiled cache identity mismatch"
                 )
 
         if cached_manifest is not None:
-            # A blind preparation receipt promises both cache layers. A causal
-            # hit must not short-circuit past a missing compiled artifact.
-            compiled_receipt = None
-            if (prepare_only or require_cache_hit) and compiled_ingest is not None:
-                _source_db, compiled_receipt = open_source_store()
-                verify_compiled_link(cached_manifest, compiled_receipt)
+            # A configured compiled artifact was verified before the causal
+            # key lookup, so every hit is bound to the exact active source.
+            verify_compiled_link(cached_manifest, compiled_receipt)
             if require_cache_hit and compiled_receipt is None:
                 raise RuntimeError(
                     "required causal-store hit has no compiled-cache receipt"
@@ -410,7 +452,8 @@ def causal_consolidation_ingest_fn(
             )
             return store
 
-        source_db, compiled_receipt = open_source_store()
+        if source_db is None:
+            source_db, compiled_receipt = open_source_store()
 
         retrieval = config.retrieval
         prompt_limit = retrieval.consolidation_max_training_prompt_tokens
@@ -475,6 +518,11 @@ def causal_consolidation_ingest_fn(
                         if compiled_receipt is not None
                         else None
                     ),
+                    "compiled_manifest_sha256": (
+                        compiled_receipt.get("manifest_sha256")
+                        if compiled_receipt is not None
+                        else None
+                    ),
                     "database_sha256": _file_sha256(build_target / "memory.db"),
                     "index_sha256": _file_sha256(build_target / "hnsw_index.bin"),
                     "stats": stats,
@@ -493,6 +541,7 @@ def causal_consolidation_ingest_fn(
                         expected_embedding_execution=embedding_execution,
                         expected_implementation_sha256=active_implementation_digest,
                         expected_environment_lock_sha256=active_environment_digest,
+                        expected_compiled_manifest_sha256=compiled_manifest_digest,
                     )
                     shutil.rmtree(build_target)
                 build_target = cached_target
@@ -507,6 +556,7 @@ def causal_consolidation_ingest_fn(
                     expected_embedding_execution=embedding_execution,
                     expected_implementation_sha256=active_implementation_digest,
                     expected_environment_lock_sha256=active_environment_digest,
+                    expected_compiled_manifest_sha256=compiled_manifest_digest,
                 )
                 verify_compiled_link(active_manifest, compiled_receipt)
         except BaseException:

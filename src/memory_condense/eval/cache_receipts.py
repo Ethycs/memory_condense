@@ -27,6 +27,7 @@ CAUSAL_RECEIPT_FIELDS = (
     "cache_key",
     "sample_sha256",
     "compiled_cache_key",
+    "compiled_manifest_sha256",
     "database_sha256",
     "index_sha256",
     "build_protocol_sha256",
@@ -103,6 +104,10 @@ def validated_cache_receipts(
     causal = result["causal"][0]
     if causal["compiled_cache_key"] != compiled["cache_key"]:
         raise ValueError("causal cache receipt does not bind the compiled cache key")
+    if causal["compiled_manifest_sha256"] != compiled["manifest_sha256"]:
+        raise ValueError(
+            "causal cache receipt does not bind the compiled manifest identity"
+        )
     for field in (
         "sample_sha256",
         "embedding_execution_sha256",

@@ -102,13 +102,14 @@ def make_config(k: int = 3) -> EvalConfig:
 def _blind_cache_receipts(sample: BenchmarkSample):
     digest = sample_sha256(sample)
     compiled_key = hashlib.sha256(b"compiled-cache").hexdigest()
+    compiled_manifest = hashlib.sha256(b"compiled-manifest").hexdigest()
     execution = hashlib.sha256(b"embedding-execution").hexdigest()
     implementation = hashlib.sha256(b"implementation").hexdigest()
     environment = hashlib.sha256(b"environment").hexdigest()
     return {
         "compiled": [
             {
-                "manifest_sha256": hashlib.sha256(b"compiled-manifest").hexdigest(),
+                "manifest_sha256": compiled_manifest,
                 "cache_key": compiled_key,
                 "sample_sha256": digest,
                 "database_sha256": hashlib.sha256(b"compiled-db").hexdigest(),
@@ -126,6 +127,7 @@ def _blind_cache_receipts(sample: BenchmarkSample):
                 "cache_key": hashlib.sha256(b"causal-cache").hexdigest(),
                 "sample_sha256": digest,
                 "compiled_cache_key": compiled_key,
+                "compiled_manifest_sha256": compiled_manifest,
                 "database_sha256": hashlib.sha256(b"causal-db").hexdigest(),
                 "index_sha256": hashlib.sha256(b"causal-index").hexdigest(),
                 "build_protocol_sha256": hashlib.sha256(b"protocol").hexdigest(),
@@ -363,6 +365,27 @@ def test_run_benchmark_rejects_unlinked_receipts_before_answering_and_closes():
 
     assert answer_calls == []
     assert created and all(store.closed for store in created)
+
+
+def test_run_benchmark_rejects_compiled_manifest_identity_mismatch():
+    receipts = _blind_cache_receipts(SAMPLE)
+    receipts["causal"][0]["compiled_manifest_sha256"] = "f" * 64
+    answer_calls: list[object] = []
+
+    def receipt_ingest(sample, config, data_dir):
+        store = fake_ingest_fn(sample, config, data_dir)
+        store.blind_cache_receipts = receipts
+        return store
+
+    with pytest.raises(ValueError, match="compiled manifest identity"):
+        run_benchmark(
+            samples=[SAMPLE],
+            config=make_config(),
+            answer_fn=lambda messages: answer_calls.append(messages) or "Boston",
+            ingest_fn=receipt_ingest,
+        )
+
+    assert answer_calls == []
 
 
 def test_run_benchmark_category_breakdown():

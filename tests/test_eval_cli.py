@@ -2007,6 +2007,7 @@ def test_prepare_cache_is_blind_and_emits_only_hashes_counts_and_timings(
                         "cache_key": "6" * 64,
                         "sample_sha256": sample_sha256(sample),
                         "compiled_cache_key": "2" * 64,
+                        "compiled_manifest_sha256": "1" * 64,
                         "database_sha256": file_sha256(self.database_path),
                         "index_sha256": file_sha256(index_path),
                         "build_protocol_sha256": "7" * 64,

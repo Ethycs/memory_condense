@@ -1875,7 +1875,10 @@ def test_owned_runtime_guard_rejects_nested_index_method_rebinding(
 
 
 def test_owned_finalizer_guard_rejects_discourse_snapshot_rebinding() -> None:
-    original = derived_final_module.DiscourseStore.snapshot
+    had_own_snapshot = (
+        "snapshot" in derived_final_module.DiscourseStore.__dict__
+    )
+    original = derived_final_module.DiscourseStore.__dict__.get("snapshot")
     derived_final_module.DiscourseStore.snapshot = lambda _self: None
     try:
         with pytest.raises(DiffuseBaseArtifactError):
@@ -1887,7 +1890,10 @@ def test_owned_finalizer_guard_rejects_discourse_snapshot_rebinding() -> None:
                 assert_outer_intact=lambda: None,
             )
     finally:
-        derived_final_module.DiscourseStore.snapshot = original
+        if had_own_snapshot:
+            derived_final_module.DiscourseStore.snapshot = original
+        else:
+            del derived_final_module.DiscourseStore.snapshot
 
 
 def test_short_text_equal_to_route_labels_is_not_mistaken_for_payload(

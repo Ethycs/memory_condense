@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -555,6 +556,77 @@ def test_shard_validator_crossbinds_policy_population_store_and_parts(
     ).hexdigest()
     with pytest.raises(ValueError, match="another shard/campaign"):
         validate_validation_shard_retrieval(changed, preflight=contexts[0])
+
+
+def test_fresh_shard_question_path_passes_the_locked_budget_constants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    implementation, environment = "d" * 64, "e" * 64
+    _samples_value, _shards, _population_value, _policy, contexts, artifacts = (
+        _contexts_and_artifacts(
+            tmp_path,
+            implementation=implementation,
+            environment=environment,
+        )
+    )
+    context, expected = contexts[0], artifacts[0]
+    source = expected["source_store_receipt"]
+    combined = CombinedCumulativeStoreReceipt(
+        **dict(expected["combined_store_receipt"])
+    )
+
+    class _Condenser:
+        def set_context_candidate_selector(self, selector: object) -> None:
+            self.selector = selector
+
+    prepared = SimpleNamespace(
+        condenser=_Condenser(),
+        receipt=combined,
+        compilation=SimpleNamespace(
+            artifact=SimpleNamespace(artifact_id=combined.artifact_id),
+            receipt_sha256=combined.compilation_receipt_sha256,
+        ),
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(merge_impl, "implementation_sha256", lambda: implementation)
+    monkeypatch.setattr(merge_impl, "environment_lock_sha256", lambda: environment)
+    monkeypatch.setattr(
+        merge_impl,
+        "retrieve_recall_guarded_cumulative_packet",
+        lambda *_args, **kwargs: calls.append(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        merge_impl,
+        "_question_part",
+        lambda _result, *, local_ordinal, **_kwargs: copy.deepcopy(
+            expected["questions"][local_ordinal]
+        ),
+    )
+
+    retrieval, _digest_value = merge_impl.run_locked_validation_shard_retrieval(
+        prepared=prepared,
+        preflight=context,
+        selector=object(),
+        representative_linker=object(),
+        source_store_receipt=source,
+        source_store_mode="verified_cache_hit",
+        combined_store_mode="verified_cache_hit",
+    )
+
+    assert len(calls) == 10
+    assert calls[0]["max_context_tokens"] == shard_impl.MAX_CONTEXT_TOKENS
+    assert calls[0]["max_prompt_tokens"] == shard_impl.MAX_PROMPT_TOKENS
+    assert calls[0]["responder_output_token_reserve"] == (
+        shard_impl.RESPONDER_OUTPUT_TOKEN_RESERVE
+    )
+    assert calls[0]["source_router_max_sources"] == (
+        shard_impl.SOURCE_ROUTER_MAX_SOURCES
+    )
+    assert calls[0]["source_router_rrf_constant"] == (
+        shard_impl.SOURCE_ROUTER_RRF_CONSTANT
+    )
+    assert retrieval["question_count"] == 10
 
 
 def test_strict_ten_shard_merge_publishes_self_contained_100q_artifact(

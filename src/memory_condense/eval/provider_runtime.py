@@ -3,34 +3,19 @@
 from __future__ import annotations
 
 import os
-import re
 import time
 
+from memory_condense.eval._binary_judge_protocol import (
+    JUDGE_MAX_TOKENS,
+    _BINARY_JUDGE_VERDICT,
+    parse_binary_judge_verdict as _parse_binary_judge_verdict,
+)
 from memory_condense.eval._completion import _content, build_completion_request
 from memory_condense.eval.benchmark import (
     BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
     build_judge_prompt,
 )
-from memory_condense.eval.judge import JUDGE_MAX_TOKENS
 from memory_condense.eval.schemas import UsageStats
-
-
-_BINARY_JUDGE_VERDICT = re.compile(
-    r"^\s*(CORRECT|INCORRECT)\b(?P<remainder>.*)$",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _parse_binary_judge_verdict(text: str) -> bool:
-    """Parse one unambiguous judge label and reject provider/protocol noise."""
-
-    match = _BINARY_JUDGE_VERDICT.match(text or "")
-    if match is None:
-        raise RuntimeError("judge returned an empty or malformed verdict")
-    remainder = match.group("remainder").lstrip(" \t\r\n,.:;-—")
-    if remainder.casefold().startswith("or ") or remainder.startswith("/"):
-        raise RuntimeError("judge returned an ambiguous verdict")
-    return match.group(1).casefold() == "correct"
 
 
 def _make_central_dev_client(model: str):

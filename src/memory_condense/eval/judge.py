@@ -18,6 +18,7 @@ import time
 
 import litellm
 
+from memory_condense.eval._binary_judge_protocol import JUDGE_MAX_TOKENS
 from memory_condense.eval._completion import _content, build_completion_request
 from memory_condense.eval.schemas import DEFAULT_JUDGE_MODEL, UsageStats
 
@@ -40,9 +41,6 @@ IMPORTANT: Judge based on substance, not style. Different wording is fine as lon
 
 Respond with valid JSON only:
 {"score": <1-5>, "reasoning": "<1-2 sentences>"}"""
-
-JUDGE_MAX_TOKENS = 1024
-
 
 def build_judge_prompt(
     user_text: str,

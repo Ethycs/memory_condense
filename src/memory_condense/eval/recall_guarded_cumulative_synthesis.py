@@ -7,6 +7,7 @@ artifact validation/publication lives in the artifacts module.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -19,6 +20,8 @@ from memory_condense.eval._recall_guarded_cumulative_synthesis_artifacts import 
     normalize_fallback_abstentions,
 )
 from memory_condense.eval._recall_guarded_cumulative_synthesis_contracts import (
+    ANSWER_REUSE_FORMAT,
+    ANSWER_REUSE_RULE,
     ANSWERABILITY_BAND_THRESHOLDS,
     EVIDENCE_DENSITY_PER_100_TOKEN_THRESHOLDS,
     EvidenceDensity,
@@ -276,6 +279,7 @@ def synthesize_question(
 
     cached: dict[str, dict[str, Any]] = {}
     stage_outputs: list[dict[str, Any]] = []
+    previous_evidence_ids = {row["evidence_id"] for row in root_rows}
     for stage in stage_maps[1:]:
         stage_id = str(stage["stage_id"])
         projection = _projection_sha(stage)
@@ -303,6 +307,9 @@ def synthesize_question(
             reused["reused_from_stage_id"] = cached[key]["stage_id"]
             reused["source_stage_receipt_sha256"] = _stage_receipt_sha256(stage)
             stage_outputs.append(reused)
+            previous_evidence_ids = {
+                row["evidence_id"] for row in _evidence_rows(stage)
+            }
             continue
         if progress:
             progress(
@@ -380,6 +387,79 @@ def synthesize_question(
                     "short_answer_with_forced_choice_attribution"
                 )
                 effective_prompt_sha256 = source_prompt_sha
+        current_evidence_ids = [
+            row["evidence_id"] for row in _evidence_rows(stage)
+        ]
+        newly_added_ids = [
+            evidence_id
+            for evidence_id in current_evidence_ids
+            if evidence_id not in root_ids
+            and evidence_id not in previous_evidence_ids
+        ]
+        current_labels = list(normalized["evidence_labels"])
+        labels_by_id = {
+            str(label["evidence_id"]): label for label in current_labels
+        }
+        answer_reuse: dict[str, Any] | None = None
+        if (
+            stage_outputs
+            and all(
+                labels_by_id[evidence_id]["density"] == "none"
+                and labels_by_id[evidence_id]["role"] == "irrelevant"
+                and labels_by_id[evidence_id]["supports_claim_ids"] == []
+                for evidence_id in newly_added_ids
+            )
+        ):
+            previous = stage_outputs[-1]
+            generated_answer = copy.deepcopy(normalized["answer"])
+            generated_claims = copy.deepcopy(normalized["claims"])
+            generated_labels = copy.deepcopy(current_labels)
+            previous_labels_by_id = {
+                str(label["evidence_id"]): label
+                for label in previous["evidence_labels"]
+            }
+            effective_labels = [
+                copy.deepcopy(
+                    previous_labels_by_id.get(
+                        str(label["evidence_id"]),
+                        label,
+                    )
+                )
+                for label in generated_labels
+            ]
+            new_labels = [
+                labels_by_id[evidence_id] for evidence_id in newly_added_ids
+            ]
+            reuse_body = {
+                "format": ANSWER_REUSE_FORMAT,
+                "rule": ANSWER_REUSE_RULE,
+                "from_stage_id": previous["stage_id"],
+                "new_evidence_ids": newly_added_ids,
+                "new_evidence_labels_sha256": identity_sha256(new_labels),
+                "generated_answer": generated_answer,
+                "generated_claims": generated_claims,
+                "generated_evidence_labels": generated_labels,
+                "generated_answer_sha256": identity_sha256(generated_answer),
+                "generated_claims_sha256": identity_sha256(generated_claims),
+                "generated_evidence_labels_sha256": identity_sha256(
+                    generated_labels
+                ),
+                "source_answer_sha256": identity_sha256(previous["answer"]),
+                "source_claims_sha256": identity_sha256(previous["claims"]),
+                "source_evidence_labels_sha256": identity_sha256(
+                    previous["evidence_labels"]
+                ),
+                "effective_evidence_labels_sha256": identity_sha256(
+                    effective_labels
+                ),
+            }
+            answer_reuse = {
+                **reuse_body,
+                "receipt_sha256": identity_sha256(reuse_body),
+            }
+            normalized["answer"] = copy.deepcopy(previous["answer"])
+            normalized["claims"] = copy.deepcopy(previous["claims"])
+            normalized["evidence_labels"] = effective_labels
         claim_scores, claim_reports = _rescore_claims(
             runtime=runtime,
             question=query,
@@ -405,6 +485,7 @@ def synthesize_question(
             "synthesis_mode": synthesis_mode,
             "structured_attempt": structured_attempt,
             "attribution_score_report": attribution_report,
+            "monotonic_answer_reuse": answer_reuse,
             "episodic_evidence_count": len(novel_aliases),
             **normalized,
             "claim_scores": claim_scores,
@@ -412,6 +493,7 @@ def synthesize_question(
         }
         cached[key] = row
         stage_outputs.append(dict(row))
+        previous_evidence_ids = set(current_evidence_ids)
     if implementation_sha256() != synthesis_implementation:
         raise RuntimeError("synthesis implementation changed during the question")
     usage_after = _dump(runtime.usage)

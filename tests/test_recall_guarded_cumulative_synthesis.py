@@ -9,6 +9,9 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 from memory_condense.domain.discourse import identity_sha256
+from memory_condense.eval._recall_guarded_cumulative_synthesis_contracts import (
+    SYNTHESIS_PROMPT_POLICY_V2,
+)
 from memory_condense.eval.recall_guarded_cumulative_1m import (
     QUESTION_FORMAT,
     RETRIEVAL_FORMAT,
@@ -18,6 +21,7 @@ from memory_condense.eval.recall_guarded_cumulative_1m import (
 )
 from memory_condense.eval.recall_guarded_cumulative_synthesis import (
     SYNTHESIS_FORMAT,
+    SYNTHESIS_PROMPT_POLICY,
     SYNTHESIS_SCORE_FORMAT,
     SYNTHESIS_STAGE_IDS,
     assemble_synthesis_artifact,
@@ -292,6 +296,236 @@ def test_s1_s3_label_population_does_not_memoize_different_prompts() -> None:
     assert s1["synthesis_key_sha256"] != s2["synthesis_key_sha256"]
 
 
+def test_v3_prompt_locks_answer_selection_and_canonical_rendering() -> None:
+    messages, _aliases, _required = build_synthesis_messages(
+        _question()["stages"][1],
+        root_evidence_ids={"root"},
+    )
+    prompt = messages[1]["content"]
+
+    assert SYNTHESIS_PROMPT_POLICY["format"] == (
+        "memory-condense-recall-guarded-synthesis-policy-v3"
+    )
+    assert "latest supported value" in prompt
+    assert '"close to N now" supports answering N' in prompt
+    assert "equally current evidence supports a conflicting value" in prompt
+    assert "numeric scalar, return only the value" in prompt
+    assert "comma-space separators; never render a list with arrows" in prompt
+    assert 'Answer exactly "I don\'t know" only when' in prompt
+
+
+def test_none_irrelevant_additions_reuse_prior_answer_and_keep_current_audit() -> None:
+    def response(
+        *,
+        answer: str,
+        claim_id: str,
+        labels: Sequence[tuple[str, str, str, Sequence[str]]],
+    ) -> str:
+        return json.dumps(
+            {
+                "answer": {"text": answer, "claim_ids": [claim_id]},
+                "claims": [
+                    {
+                        "claim_id": claim_id,
+                        "text": f"Generated claim for {answer}",
+                        "citations": [
+                            {
+                                "evidence_alias": "E002",
+                                "quote": "I chose Miss Bee Providore",
+                            }
+                        ],
+                    }
+                ],
+                "evidence_labels": [
+                    {
+                        "evidence_alias": alias,
+                        "role": role,
+                        "density": density,
+                        "supports_claim_ids": list(supports),
+                    }
+                    for alias, role, density, supports in labels
+                ],
+            }
+        )
+
+    s1_raw = response(
+        answer=_GOLD,
+        claim_id="C1",
+        labels=(
+            ("E002", "decisive", "critical", ("C1",)),
+            ("E003", "supporting", "high", ("C1",)),
+        ),
+    )
+    s2_raw = response(
+        answer="A regressed answer",
+        claim_id="C2",
+        labels=(
+            ("E002", "decisive", "critical", ("C2",)),
+            ("E003", "supporting", "high", ("C2",)),
+            ("E004", "irrelevant", "none", ()),
+        ),
+    )
+    s3_raw = response(
+        answer="Another regressed answer",
+        claim_id="C3",
+        labels=(
+            ("E002", "decisive", "critical", ("C3",)),
+            ("E003", "supporting", "high", ("C3",)),
+            ("E004", "irrelevant", "none", ()),
+        ),
+    )
+    part = synthesize_question(
+        _question(),
+        retrieval_sha256="d" * 64,
+        runtime=_Runtime([s1_raw, s2_raw, s3_raw]),
+    )
+    s1, s2, s3 = part["stages"]
+
+    assert _canonical_json_bytes(s2["answer"]) == _canonical_json_bytes(
+        s1["answer"]
+    )
+    assert _canonical_json_bytes(s2["claims"]) == _canonical_json_bytes(
+        s1["claims"]
+    )
+    assert _canonical_json_bytes(s3["answer"]) == _canonical_json_bytes(
+        s2["answer"]
+    )
+    assert _canonical_json_bytes(s3["claims"]) == _canonical_json_bytes(
+        s2["claims"]
+    )
+    assert s2["raw_completion"] == s2_raw
+    assert s2["completion_report"]["call"] == 2
+    assert s2["evidence_labels"][-1]["density"] == "none"
+    assert s2["evidence_labels"][-1]["role"] == "irrelevant"
+    assert s2["evidence_labels"][0]["supports_claim_ids"] == ["C1"]
+    assert s2["monotonic_answer_reuse"]["from_stage_id"] == STAGE_IDS[1]
+    assert s2["monotonic_answer_reuse"]["new_evidence_ids"] == ["novel-3"]
+    assert s2["monotonic_answer_reuse"]["generated_answer"]["text"] == (
+        "A regressed answer"
+    )
+    assert s2["monotonic_answer_reuse"]["generated_evidence_labels"][0][
+        "supports_claim_ids"
+    ] == ["C2"]
+    assert s3["raw_completion"] == s3_raw
+    assert s3["completion_report"]["call"] == 3
+    assert s3["monotonic_answer_reuse"]["from_stage_id"] == STAGE_IDS[2]
+    assert s3["monotonic_answer_reuse"]["new_evidence_ids"] == []
+    assert s3["monotonic_answer_reuse"]["generated_claims"][0][
+        "claim_id"
+    ] == "C3"
+    assert s3["evidence_labels"][0]["supports_claim_ids"] == ["C1"]
+
+    artifact = assemble_synthesis_artifact(
+        _retrieval(),
+        retrieval_sha256="d" * 64,
+        question_parts=[part],
+    )
+    assert artifact["unique_synthesis_calls"] == 3
+
+    tampered = copy.deepcopy(part)
+    tampered["stages"][1]["monotonic_answer_reuse"][
+        "source_claims_sha256"
+    ] = "f" * 64
+    with pytest.raises(ValueError, match="reuse receipt changed"):
+        assemble_synthesis_artifact(
+            _retrieval(),
+            retrieval_sha256="d" * 64,
+            question_parts=[tampered],
+        )
+
+    rollback = copy.deepcopy(part)
+    rollback["stages"][2]["monotonic_answer_reuse"][
+        "from_stage_id"
+    ] = STAGE_IDS[1]
+    with pytest.raises(ValueError, match="immediate predecessor"):
+        assemble_synthesis_artifact(
+            _retrieval(),
+            retrieval_sha256="d" * 64,
+            question_parts=[rollback],
+        )
+
+
+def test_v2_question_parts_remain_assemblable_after_v3_policy_upgrade() -> None:
+    part, _runtime = _successful_part()
+    legacy = copy.deepcopy(part)
+    legacy_policy_sha = identity_sha256(SYNTHESIS_PROMPT_POLICY_V2)
+    legacy["synthesis_prompt_policy"] = copy.deepcopy(
+        SYNTHESIS_PROMPT_POLICY_V2
+    )
+    legacy["synthesis_prompt_policy_sha256"] = legacy_policy_sha
+    for score in legacy["episodic_evidence_scores"]:
+        score["evidence_density_policy_sha256"] = legacy_policy_sha
+    root_ids = {"root"}
+    for source_stage, stage in zip(
+        _question()["stages"][1:], legacy["stages"], strict=True
+    ):
+        messages, _aliases, _required = build_synthesis_messages(
+            source_stage,
+            root_evidence_ids=root_ids,
+            prompt_policy=SYNTHESIS_PROMPT_POLICY_V2,
+        )
+        structured_prompt_sha = identity_sha256(messages)
+        stage["synthesis_prompt_policy_sha256"] = legacy_policy_sha
+        stage["structured_prompt_messages_sha256"] = structured_prompt_sha
+        stage["prompt_messages_sha256"] = structured_prompt_sha
+        stage.pop("monotonic_answer_reuse", None)
+        for claim_score in stage["claim_scores"]:
+            claim_score["answer_value"][
+                "evidence_density_policy_sha256"
+            ] = legacy_policy_sha
+            claim_score["citation_support_proxy"][
+                "evidence_density_policy_sha256"
+            ] = legacy_policy_sha
+        stage["synthesis_key_sha256"] = identity_sha256(
+            {
+                "question_sha256": legacy["question_sha256"],
+                "evidence_projection_sha256": stage[
+                    "evidence_projection_sha256"
+                ],
+                "source_prompt_messages_sha256": stage[
+                    "source_prompt_messages_sha256"
+                ],
+                "structured_prompt_messages_sha256": structured_prompt_sha,
+                "runtime_identity_sha256": legacy["runtime_identity_sha256"],
+                "synthesis_prompt_policy_sha256": legacy_policy_sha,
+                "request_policy_sha256": legacy["request_policy_sha256"],
+            }
+        )
+
+    artifact = assemble_synthesis_artifact(
+        _retrieval(),
+        retrieval_sha256="d" * 64,
+        question_parts=[legacy],
+    )
+
+    assert artifact["synthesis_prompt_policy"] == SYNTHESIS_PROMPT_POLICY_V2
+    assert artifact["synthesis_prompt_policy_sha256"] == legacy_policy_sha
+
+
+def test_assembled_question_policy_object_must_match_campaign_policy() -> None:
+    part, _runtime = _successful_part()
+    artifact = assemble_synthesis_artifact(
+        _retrieval(),
+        retrieval_sha256="d" * 64,
+        question_parts=[part],
+    )
+    artifact["questions"][0]["synthesis_prompt_policy"] = copy.deepcopy(
+        SYNTHESIS_PROMPT_POLICY_V2
+    )
+    artifact["question_identity_sha256s"] = [
+        identity_sha256(question) for question in artifact["questions"]
+    ]
+
+    with pytest.raises(ValueError, match="question identity changed"):
+        score_recall_guarded_synthesis(
+            artifact,
+            sample=_sample(),
+            synthesis_sha256=hashlib.sha256(
+                _canonical_json_bytes(artifact)
+            ).hexdigest(),
+        )
+
+
 def test_exact_prompt_and_projection_are_memoized() -> None:
     question = _question()
     question["stages"][3]["provider_messages"] = copy.deepcopy(
@@ -500,11 +734,12 @@ def test_normalize_fallback_abstentions_is_auditable_gold_blind_and_scoreable() 
     assert artifact["questions"][0]["stages"][0] == abstention_before
     assert normalized["gold_fields_present"] is False
     assert normalized["normalization"] == {
-        "kind": "squad_normalized_fallback_abstention_v1",
+        "kind": "squad_normalized_abstention_v2",
         "source_synthesis_sha256": source_synthesis_sha256,
         "raw_completions_changed": False,
         "gold_fields_read": False,
         "normalized_stage_rows": 1,
+        "normalized_generated_reuse_rows": 0,
     }
 
     sample = _sample()
@@ -519,6 +754,101 @@ def test_normalize_fallback_abstentions_is_auditable_gold_blind_and_scoreable() 
     assert scores["format"] == SYNTHESIS_SCORE_FORMAT
     assert len(scores["questions"][0]["stages"]) == len(SYNTHESIS_STAGE_IDS)
     assert scores["questions"][0]["stages"][0]["exact_match"] is False
+
+
+def test_abstention_normalization_refreshes_monotonic_reuse_receipts() -> None:
+    def response(
+        aliases: Sequence[str],
+        *,
+        claim_id: str,
+    ) -> str:
+        return json.dumps(
+            {
+                "answer": {
+                    "text": "I don't know.",
+                    "claim_ids": [claim_id],
+                },
+                "claims": [
+                    {
+                        "claim_id": claim_id,
+                        "text": "The evidence names a possible choice.",
+                        "citations": [
+                            {
+                                "evidence_alias": "E002",
+                                "quote": "I chose Miss Bee Providore",
+                            }
+                        ],
+                    }
+                ],
+                "evidence_labels": [
+                    {
+                        "evidence_alias": alias,
+                        "role": (
+                            "irrelevant" if alias == "E004" else "decisive"
+                        ),
+                        "density": "none" if alias == "E004" else "critical",
+                        "supports_claim_ids": (
+                            [] if alias == "E004" else [claim_id]
+                        ),
+                    }
+                    for alias in aliases
+                ],
+            }
+        )
+
+    part = synthesize_question(
+        _question(),
+        retrieval_sha256="d" * 64,
+        runtime=_Runtime(
+            [
+                response(("E002", "E003"), claim_id="C1"),
+                response(("E002", "E003", "E004"), claim_id="C2"),
+                response(("E002", "E003", "E004"), claim_id="C3"),
+            ]
+        ),
+    )
+    artifact = assemble_synthesis_artifact(
+        _retrieval(),
+        retrieval_sha256="d" * 64,
+        question_parts=[part],
+    )
+
+    normalized = normalize_fallback_abstentions(
+        artifact,
+        source_synthesis_sha256="f" * 64,
+    )
+
+    assert normalized["normalization"]["normalized_stage_rows"] == 3
+    assert normalized["normalization"][
+        "normalized_generated_reuse_rows"
+    ] == 2
+    for stage in normalized["questions"][0]["stages"]:
+        assert stage["answer"]["claim_ids"] == []
+        assert stage["claims"] == []
+        assert stage["claim_scores"] == []
+        assert all(
+            label["supports_claim_ids"] == []
+            for label in stage["evidence_labels"]
+        )
+        receipt = stage.get("monotonic_answer_reuse")
+        if receipt is not None:
+            assert receipt["generated_answer"]["claim_ids"] == []
+            assert receipt["generated_claims"] == []
+            assert all(
+                label["supports_claim_ids"] == []
+                for label in receipt["generated_evidence_labels"]
+            )
+            body = dict(receipt)
+            declared = body.pop("receipt_sha256")
+            assert declared == identity_sha256(body)
+
+    score_recall_guarded_synthesis(
+        normalized,
+        sample=_sample(),
+        synthesis_sha256=hashlib.sha256(
+            _canonical_json_bytes(normalized)
+        ).hexdigest(),
+    )
 
 
 @pytest.mark.parametrize(

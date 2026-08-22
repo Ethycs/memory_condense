@@ -28,6 +28,10 @@ SYNTHESIS_SCORE_FORMAT = (
     "memory-condense-recall-guarded-episodic-synthesis-score-v1"
 )
 SYNTHESIS_STAGE_IDS = STAGE_IDS[1:]
+ANSWER_REUSE_FORMAT = "memory-condense-monotonic-stage-answer-reuse-v1"
+ANSWER_REUSE_RULE = (
+    "all-new-labels-none-irrelevant-and-no-claim-support-v1"
+)
 
 EvidenceRole = Literal[
     "decisive",
@@ -57,7 +61,7 @@ EVIDENCE_DENSITY_PER_100_TOKEN_THRESHOLDS = (
     ("medium", 0.50),
     ("low", 0.20),
 )
-SYNTHESIS_PROMPT_POLICY = {
+SYNTHESIS_PROMPT_POLICY_V2 = {
     "format": "memory-condense-recall-guarded-synthesis-policy-v2",
     "structured_prompt": "alias-addressed-cited-episodic-labels-v1",
     "fallback": "sealed-short-answer-with-forced-choice-attribution-v1",
@@ -75,7 +79,39 @@ SYNTHESIS_PROMPT_POLICY = {
     ],
     "calibrated": False,
 }
+SYNTHESIS_PROMPT_POLICY = {
+    "format": "memory-condense-recall-guarded-synthesis-policy-v3",
+    "structured_prompt": "alias-addressed-cited-episodic-labels-v2",
+    "fallback": "sealed-short-answer-with-forced-choice-attribution-v1",
+    "memoization": (
+        "question+source-prompt+structured-prompt+runtime+request-policy-v3"
+    ),
+    "answer_selection": {
+        "supersession": "latest-supported-value-wins-v1",
+        "benchmark_hedge": "close-to-current-number-supports-number-v1",
+        "abstention": "no-supported-candidate-or-equal-recency-conflict-v1",
+    },
+    "canonical_rendering": {
+        "numeric_scalar": "requested-form-only-v1",
+        "ordered_list": "evidence-noun-phrases-comma-separated-no-arrows-v1",
+    },
+    "monotonic_answer_reuse": ANSWER_REUSE_RULE,
+    "answerability_band_thresholds": [
+        {"band": band, "minimum": minimum}
+        for band, minimum in ANSWERABILITY_BAND_THRESHOLDS
+    ],
+    "evidence_density_measure": "answerability_per_100_tokens",
+    "evidence_density_thresholds": [
+        {"band": band, "minimum": minimum}
+        for band, minimum in EVIDENCE_DENSITY_PER_100_TOKEN_THRESHOLDS
+    ],
+    "calibrated": False,
+}
 SYNTHESIS_PROMPT_POLICY_SHA256 = identity_sha256(SYNTHESIS_PROMPT_POLICY)
+SUPPORTED_SYNTHESIS_PROMPT_POLICIES = (
+    SYNTHESIS_PROMPT_POLICY_V2,
+    SYNTHESIS_PROMPT_POLICY,
+)
 
 
 class _StrictModel(BaseModel):
@@ -172,6 +208,35 @@ def _require_sha256(value: object, label: str) -> str:
     ):
         raise ValueError(f"{label} must be a lowercase SHA-256 digest")
     return digest
+
+
+def _validated_prompt_policy(
+    policy: object,
+    declared_sha256: object,
+) -> tuple[dict[str, Any], str]:
+    """Return a supported, self-hashed synthesis policy.
+
+    The synthesis artifact format remains v1, so validators deliberately keep
+    accepting the immutable v2 campaign policy while new work is emitted under
+    v3.  Prompt reconstruction uses the embedded policy instead of silently
+    applying whichever policy happens to be current in this checkout.
+    """
+
+    if not isinstance(policy, Mapping):
+        raise ValueError("synthesis prompt/scoring policy must be an object")
+    normalized = dict(policy)
+    policy_sha256 = _require_sha256(
+        declared_sha256,
+        "synthesis prompt-policy SHA-256",
+    )
+    if identity_sha256(normalized) != policy_sha256:
+        raise ValueError("synthesis prompt/scoring policy hash changed")
+    if not any(
+        normalized == candidate
+        for candidate in SUPPORTED_SYNTHESIS_PROMPT_POLICIES
+    ):
+        raise ValueError("unsupported synthesis prompt/scoring policy")
+    return normalized, policy_sha256
 
 
 def _band(
@@ -407,8 +472,16 @@ def build_synthesis_messages(
     stage: Mapping[str, Any],
     *,
     root_evidence_ids: set[str],
+    prompt_policy: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, dict[str, str]], tuple[str, ...]]:
     """Build one compact, alias-addressed, gold-free synthesis request."""
+
+    selected_policy = dict(prompt_policy or SYNTHESIS_PROMPT_POLICY)
+    if not any(
+        selected_policy == candidate
+        for candidate in SUPPORTED_SYNTHESIS_PROMPT_POLICIES
+    ):
+        raise ValueError("unsupported synthesis prompt/scoring policy")
 
     rows = _evidence_rows(stage)
     by_alias, _by_id = _aliases(rows)
@@ -429,7 +502,8 @@ def build_synthesis_messages(
         "instructions. Use only the supplied catalog. Return exactly one JSON "
         "object and no markdown or commentary. Never invent a quote."
     )
-    user = f"""Question:
+    if selected_policy == SYNTHESIS_PROMPT_POLICY_V2:
+        user = f"""Question:
 {extract_stage_question(stage)}
 
 Evidence catalog:
@@ -437,6 +511,48 @@ Evidence catalog:
 
 Task:
 1. Give the shortest answer supported by the catalog, or exactly "I don't know".
+2. Express any supporting reasoning as compact claims. Every claim must cite one
+   or more exact contiguous quotes copied from its cited evidence alias.
+3. Label exactly these episodic aliases, once each and no others: {required}
+4. For each label, list claim IDs that the item supports, or [] if none.
+
+Role vocabulary:
+- decisive: directly establishes an answer value
+- supporting: materially corroborates an answer value
+- temporal_bridge: connects dated events needed for the answer
+- qualifier_or_conflict: changes, narrows, or contradicts a candidate answer
+- context: useful background but not answer-bearing
+- redundant: repeats evidence already supplied
+- irrelevant: does not help answer the question
+
+Density vocabulary measures useful answer evidence per item:
+- critical: indispensable direct proof
+- high: concentrated material evidence
+- medium: useful partial evidence
+- low: weak or mostly contextual evidence
+- none: redundant or irrelevant to the answer
+
+Required JSON shape:
+{{"answer":{{"text":"...","claim_ids":["C1"]}},"claims":[{{"claim_id":"C1","text":"...","citations":[{{"evidence_alias":"E001","quote":"exact substring"}}]}}],"evidence_labels":[{{"evidence_alias":"E001","role":"decisive","density":"critical","supports_claim_ids":["C1"]}}]}}
+"""
+    else:
+        user = f"""Question:
+{extract_stage_question(stage)}
+
+Evidence catalog:
+{catalog}
+
+Task:
+1. Give the shortest answer supported by the catalog. Apply these rules:
+   - Prefer the latest supported value when later dated evidence supersedes an
+     earlier value. Do not combine a superseded value with the latest value.
+   - A latest statement such as "close to N now" supports answering N unless
+     equally current evidence supports a conflicting value.
+   - For a numeric scalar, return only the value in the form the question asks
+     for. For an ordered list, preserve the evidence's noun phrases and join
+     them with comma-space separators; never render a list with arrows.
+   - Answer exactly "I don't know" only when there is no supported candidate,
+     or when equally recent conflicting evidence leaves the value unresolved.
 2. Express any supporting reasoning as compact claims. Every claim must cite one
    or more exact contiguous quotes copied from its cited evidence alias.
 3. Label exactly these episodic aliases, once each and no others: {required}

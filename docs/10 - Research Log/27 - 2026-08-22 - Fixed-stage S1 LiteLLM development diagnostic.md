@@ -1,12 +1,15 @@
 # Fixed-stage S1 LiteLLM development diagnostic
 
-**Status:** a live ten-question development diagnostic completed through the
-new fixed-stage answer and judge paths. The answer run made exactly 10
-physical Terra calls and the independent judge made exactly 10 physical Sol
-calls, all with zero retries. Sol scored 9/10 and correctly classified the
-formal gate as `insufficient_population`. Byte-identical replay passed. This
-does **not** establish a 100-question result, >=95% accuracy, provider
-persistence, or a fair Mem0 comparison.
+**Status:** operationally informative but protocol-ineligible. The completed
+root contains exactly 10 physical Terra calls and 10 physical Sol calls, with
+zero SDK retries, and its offline replay is byte-identical. However, the
+earlier sandbox-blocked root contains the same Terra call key and identical
+request bytes as the first request in the completed root. Across the retained
+campaign evidence there are therefore 11 request reservations for 10 unique
+answer calls, violating the strict terminal-uncertainty/no-retry rule. Sol's
+sealed score is 9/10 with status `insufficient_population`. This does **not**
+establish a certified development campaign, a 100-question result, >=95%
+accuracy, provider persistence, or a fair Mem0 comparison.
 
 This is the first live exercise of the launch surface frozen in
 [Research Log 26](26%20-%202026-08-22%20-%20Fixed-stage%20S1%20and%20locked%20100Q%20campaign.md).
@@ -23,17 +26,20 @@ campaign, not a substitute for that campaign.
 | Population | original ten-question development concatenation; 1,039,203 transcript-token proxies and 5,400 turns |
 | Retrieval | immutable provider-free cumulative retrieval artifact |
 | Answered stage | S1 `direct_episode_additions` only |
-| Terra execution | 10 logical prompts, 10 unique prompts, 10 noncached physical calls, 0 retries |
+| Completed-root Terra execution | 10 logical prompts, 10 unique prompts, 10 noncached physical calls, 0 SDK retries |
 | Sol execution | 10 logical judgments, 10 unique prompts, 10 noncached physical calls, 0 retries |
+| Combined retained Terra reservations | 11 request journals for 10 unique call keys; one call key/request is duplicated across roots |
 | Independent semantic result | 9 correct, 1 incorrect, 0.900000 binary accuracy |
 | Formal target | >=0.95 accuracy on at least 100 questions at one fixed stage |
 | Gate result | `insufficient_population`; `gate_passed=false` |
+| Strict journal-protocol eligibility | false; terminal request uncertainty was repeated in another checkpoint root |
 | Replay | byte-identical answer and judge artifacts; no new provider calls |
 | Mem0 | not run or scored |
 
-The 9/10 score is useful development evidence that the new 8,000-input /
-256-output fixed-stage plumbing works end to end. It is neither a passing
-score nor an estimate on the locked validation population.
+The 9/10 score is useful operational evidence that the new 8,000-input /
+256-output fixed-stage plumbing can run end to end. The duplicated reservation
+makes the diagnostic ineligible under its own strict journal protocol. It is
+neither a passing score nor an estimate on the locked validation population.
 
 ## Execution boundary and artifact roots
 
@@ -57,18 +63,26 @@ It contains exactly one request journal and no response journal or
 
 The request bytes are identical to the corresponding first request in the
 successful campaign. The fixed-stage runtime treats a request without a
-response as terminal uncertainty, so that root was not retried or silently
-completed. The network-authorized run used a separately named root:
+response as terminal uncertainty. The network-authorized run nevertheless
+repeated that reservation in a separately named root:
 
 ```text
 eval_results/longmemeval-1m-recall-guarded-cumulative-fixed-stage-final-answer-v1-development-network-authorized-20260822/
 ```
 
-Keeping both roots makes the failed boundary visible and prevents the later
-success from being misrepresented as a retry of an uncertain journal entry.
+Keeping both roots makes the failed boundary visible, but a different
+filesystem root does not create a different logical call. The campaign
+binding, call key, request-journal identity, and physical request bytes are
+the same. Combined evidence therefore contains 11 Terra request reservations
+for 10 unique answer calls. The completed artifact is internally consistent
+with 10 physical calls and zero SDK retries, but the broader execution lineage
+is not protocol-clean: it repeated a terminally uncertain request.
+
 The failed root proves only that a request reservation was published and no
 response was retained; it does not independently certify what an external
-provider may or may not have observed.
+provider may or may not have observed. This uncertainty is precisely why the
+strict rule forbids repeating the reservation, even when the first observed
+failure was a sandbox-local connection denial.
 
 ## Locked live routes and budgets
 
@@ -85,11 +99,13 @@ Both live stages used the same LiteLLM-compatible gateway,
 | Provider retries | 0 | 0 |
 
 The Terra preflight reconstructed every selected provider message before the
-first call. Its maximum prompt was 7,283/8,000 proxy tokens. The ten live
-completion reports all carry `physical_call=true`, `cache_hit=false`, and
-`retries=0`; the final cumulative counters are 10 logical, 10 unique, 10
-physical, and 0 checkpoint hits. Gold fields are absent from the answer
-artifact.
+first call. Its maximum prompt was 7,283/8,000 proxy tokens. Within the
+completed root, the ten live completion reports all carry
+`physical_call=true`, `cache_hit=false`, and `retries=0`; the final cumulative
+counters are 10 logical, 10 unique, 10 physical, and 0 checkpoint hits. Gold
+fields are absent from the answer artifact. Those `retries=0` fields describe
+SDK behavior inside that root; they do not erase the duplicate request
+reservation retained in the blocked root.
 
 The answer stage reports 68,284 input-token proxies and 88 output-token
 proxies across the population, with 48.9597 seconds of accumulated call
@@ -136,10 +152,13 @@ verdict was the development knowledge-update question `a2f3aa27`:
 | Sol verdict | `INCORRECT` |
 | Sol reason | the prediction was approximate while the gold answer specified exactly 1,300 followers |
 
-This is an approximate-answer rendering miss, not a new retrieval-admission
-measurement. The historical packet contained the newest update in
-approximate form, and Terra preserved that form. The binary judge applied a
-strict distinction between `Close to 1300` and `1300`.
+The historical source stated the current value in approximate form, and Terra
+faithfully preserved that meaning. The negative verdict is therefore likely
+an adjudication false negative rather than a retrieval or responder failure:
+the judge imposed an exact-versus-approximate distinction that the source
+itself did not support. That assessment is post hoc, however. There was no
+preregistered appeal or second-judge policy, so the sealed binary score remains
+9/10 and the negative row cannot be changed after inspection.
 
 ## Historical prompt bytes versus the validation correction
 
@@ -185,7 +204,9 @@ score bytes.
 The files and their `.sha256` sidecars agree. The retained completion reports
 inside a replayed artifact still describe the original physical calls; their
 `physical_call=true` fields are immutable provenance, not evidence that replay
-called the provider again.
+called the provider again. Exact offline replay validates the completed
+root's bytes but cannot cure the earlier duplicate reservation or make the
+combined campaign lineage protocol-eligible.
 
 ## Artifact identities
 
@@ -225,11 +246,18 @@ Canonical artifacts:
 
 ## What this does and does not establish
 
-This run establishes that the fixed-S1 answer pipeline can validate the old
-1M development retrieval, stay under the registered prompt cap, make exactly
-the authorized unique Terra calls without retries, publish a gold-blind
-answer artifact, hand it to an independently routed Sol judge, and replay both
-artifacts without provider access.
+The completed root shows operationally that the fixed-S1 answer pipeline can
+validate the old 1M development retrieval, stay under the registered prompt
+cap, publish a gold-blind answer artifact, hand it to an independently routed
+Sol judge, and replay both artifacts without provider access. Its internal
+artifact accounting consistently records exactly 10 unique physical Terra
+calls with zero SDK retries.
+
+The combined retained execution does **not** establish a protocol-clean
+campaign. Repeating the sandbox-blocked call reservation under a new
+checkpoint root violated the terminal-uncertainty/no-retry contract, even
+though the later root was internally consistent and replayed exactly. The
+development diagnostic is therefore protocol-ineligible and noncertified.
 
 It does not meet the formal gate for two independent reasons: the measured
 accuracy is 0.90 rather than >=0.95, and the population is 10 rather than at
@@ -238,7 +266,15 @@ not pass. The 100-question validation retrieval, 100 Terra answers, and 100
 Sol verdicts remain separate work and must produce their own identities and
 score.
 
+The formal validation run must begin with network escalation/authorization
+before its first run-mode request reservation. If any request-only journal is
+created without a matching response, that reservation is terminal: do not
+repeat its call key in the same root, a new checkpoint root, or another copy
+of the campaign. The campaign must stop rather than convert uncertainty into
+an unrecorded manual retry.
+
 No Mem0 production arm was run, so there is no paired Mem0 metric or fairness
 claim. No external-provider persistence guarantee was obtained. The result
-should be cited as a live, replayable development diagnostic of the fixed
-answer-and-judge path—and nothing broader.
+should be cited as an operationally informative, replayable, but
+protocol-ineligible development diagnostic of the fixed answer-and-judge
+path—and nothing broader.

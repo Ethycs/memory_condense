@@ -890,6 +890,7 @@ def _validate_sealed_question_payload(part: Mapping[str, Any]) -> None:
         raise ValueError("retrieval question changed its cumulative stages")
     typed_stages: list[CumulativeRetrievalStageReceipt] = []
     parent_ids: tuple[str, ...] = ()
+    prompt_question: str | None = None
     for index, (expected_stage, stage) in enumerate(
         zip(STAGE_IDS, stages, strict=True)
     ):
@@ -941,11 +942,16 @@ def _validate_sealed_question_payload(part: Mapping[str, Any]) -> None:
             or typed.max_context_token_proxy != MAX_CONTEXT_TOKENS
         ):
             raise ValueError("retrieval stage prompt/budget seal changed")
-        if quote_sha256(_extract_stage_question(stage)) != part[
-            "dated_question_sha256"
-        ]:
+        stage_question = _extract_stage_question(stage)
+        if prompt_question is None:
+            prompt_question = stage_question
+        if (
+            stage_question != prompt_question
+            or quote_sha256(stage_question) != part["dated_question_sha256"]
+        ):
             raise ValueError("retrieval stage changed its dated question")
         parent_ids = tuple(ids)
+    assert prompt_question is not None
     ladder = CumulativeRetrievalLadder(stages=tuple(typed_stages))
     final = RecallGuardedCumulativeReceipt(
         **dict(part.get("retrieval_receipt", {}))
@@ -953,20 +959,37 @@ def _validate_sealed_question_payload(part: Mapping[str, Any]) -> None:
     predecessor = CausalCoveragePredecessorReceipt(
         **dict(part.get("predecessor_receipt", {}))
     )
-    if (
-        predecessor.retrieval_query_sha256 != part["question_sha256"]
-        or predecessor.prompt_question_sha256
-        != part["dated_question_sha256"]
-        or predecessor.retrieval_policy_sha256
-        != part["retrieval_policy_sha256"]
-        or predecessor.prompt_messages_sha256
-        != typed_stages[0].prompt_messages_sha256
-        or final.ladder_receipt_sha256 != ladder.receipt_sha256
-        or final.predecessor_receipt_sha256 != predecessor.receipt_sha256
-        or final.prompt_messages_sha256
-        != typed_stages[-1].prompt_messages_sha256
-    ):
-        raise ValueError("retrieval question receipts no longer cross-bind")
+    # The population probes above are raw-byte quote hashes.  Runtime receipts
+    # deliberately use domain-separated canonical identities instead, and the
+    # causal predecessor uses the dated prompt as both retrieval and prompt
+    # input.  Reconstruct those identities from the sealed provider question;
+    # comparing either receipt directly with a quote hash mixes hash domains.
+    receipt_bindings = {
+        "predecessor retrieval query identity": (
+            predecessor.retrieval_query_sha256
+            == identity_sha256({"query": prompt_question})
+        ),
+        "prompt question identity": predecessor.prompt_question_sha256
+        == identity_sha256({"prompt_question": prompt_question}),
+        "retrieval policy": predecessor.retrieval_policy_sha256
+        == part["retrieval_policy_sha256"],
+        "predecessor prompt": predecessor.prompt_messages_sha256
+        == typed_stages[0].prompt_messages_sha256,
+        "cumulative ladder": final.ladder_receipt_sha256
+        == ladder.receipt_sha256,
+        "predecessor receipt": final.predecessor_receipt_sha256
+        == predecessor.receipt_sha256,
+        "final prompt": final.prompt_messages_sha256
+        == typed_stages[-1].prompt_messages_sha256,
+    }
+    failed_bindings = [
+        label for label, matched in receipt_bindings.items() if not matched
+    ]
+    if failed_bindings:
+        raise ValueError(
+            "retrieval question receipts no longer cross-bind: "
+            + ", ".join(failed_bindings)
+        )
     _assert_gold_blind_schema(part, label="retrieval question")
 
 
@@ -1041,6 +1064,27 @@ def _validate_question_part(
         )
     if any(part.get(name) != value for name, value in expected.items()):
         raise ValueError("retrieval question belongs to another shard/campaign")
+    predecessor = CausalCoveragePredecessorReceipt(
+        **dict(part.get("predecessor_receipt", {}))
+    )
+    runtime_question_bindings = {
+        "retrieval query identity": predecessor.retrieval_query_sha256
+        == identity_sha256({"query": str(question.dated_question).strip()}),
+        "prompt question identity": predecessor.prompt_question_sha256
+        == identity_sha256(
+            {"prompt_question": str(question.dated_question).strip()}
+        ),
+    }
+    failed_runtime_bindings = [
+        label
+        for label, matched in runtime_question_bindings.items()
+        if not matched
+    ]
+    if failed_runtime_bindings:
+        raise ValueError(
+            "retrieval runtime question binding changed: "
+            + ", ".join(failed_runtime_bindings)
+        )
     _validate_sealed_question_payload(part)
 
 

@@ -21,6 +21,7 @@ from memory_condense.domain.discourse import (
     DiscourseArtifact,
     EvidenceBundle,
     ObligationResult,
+    identity_sha256,
 )
 from memory_condense.domain.schemas import Chunk, RetrievalResult
 from memory_condense.eval.recall_guarded_cumulative import (
@@ -1045,6 +1046,12 @@ def test_combined_build_reopens_and_matches_frozen_v3_prompt(
         assert [item.text for item in result.predecessor.excerpts] == frozen_context
         assert result.predecessor.receipt.protected_chunk_ids[0] == (
             protected_chunk_id
+        )
+        assert result.predecessor.receipt.retrieval_query_sha256 == (
+            identity_sha256({"query": question.dated_question})
+        )
+        assert result.predecessor.receipt.prompt_question_sha256 == (
+            identity_sha256({"prompt_question": question.dated_question})
         )
         assert result.context.startswith(result.predecessor.protected_context)
         assert cobalt_chunk_id in result.receipt.added_chunk_ids

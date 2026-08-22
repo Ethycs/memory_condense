@@ -80,6 +80,7 @@ def _samples() -> tuple[BenchmarkSample, ...]:
                 question=f"Which code belongs to item {offset + local:03d}?",
                 answer=f"secret-{offset + local:03d}",
                 evidence_sources=[f"gold-{offset + local:03d}"],
+                question_date="2026/08/22 (Sat) 00:00",
             )
             for local in range(10)
         ]
@@ -306,8 +307,12 @@ def _sealed_question(
     ladder = CumulativeRetrievalLadder(stages=tuple(typed_stages))
     predecessor = CausalCoveragePredecessorReceipt(
         matched_controls_sha256=_H,
-        retrieval_query_sha256=quote_sha256(question.question),
-        prompt_question_sha256=quote_sha256(question.dated_question),
+        retrieval_query_sha256=identity_sha256(
+            {"query": question.dated_question.strip()}
+        ),
+        prompt_question_sha256=identity_sha256(
+            {"prompt_question": question.dated_question.strip()}
+        ),
         retrieval_policy_sha256=context.policy.retrieval_policy_sha256,
         context_budget_sha256=_H,
         raw_graph_anchor_sequence_sha256=_H,
@@ -549,6 +554,59 @@ def test_shard_validator_crossbinds_policy_population_store_and_parts(
     assert "secret-000" not in encoded
     assert "gold-000" not in encoded
 
+    sealed = artifacts[0]["questions"][0]
+    source_question = contexts[0].sample.questions[0]
+    predecessor = sealed["predecessor_receipt"]
+    assert source_question.question != source_question.dated_question
+    assert predecessor["retrieval_query_sha256"] == identity_sha256(
+        {"query": source_question.dated_question.strip()}
+    )
+    assert predecessor["prompt_question_sha256"] == identity_sha256(
+        {"prompt_question": source_question.dated_question.strip()}
+    )
+    assert predecessor["retrieval_query_sha256"] != sealed["question_sha256"]
+    assert predecessor["prompt_question_sha256"] != sealed[
+        "dated_question_sha256"
+    ]
+
+    for receipt_field, quote_field, error_label in (
+        (
+            "retrieval_query_sha256",
+            "dated_question_sha256",
+            "retrieval query identity",
+        ),
+        (
+            "prompt_question_sha256",
+            "dated_question_sha256",
+            "prompt question identity",
+        ),
+    ):
+        changed_runtime = copy.deepcopy(artifacts[0])
+        changed_question = changed_runtime["questions"][0]
+        changed_predecessor = changed_question["predecessor_receipt"]
+        changed_predecessor[receipt_field] = changed_question[quote_field]
+        changed_predecessor["receipt_sha256"] = ""
+        typed_predecessor = CausalCoveragePredecessorReceipt(
+            **dict(changed_predecessor)
+        )
+        changed_question["predecessor_receipt"] = asdict(typed_predecessor)
+        changed_final = changed_question["retrieval_receipt"]
+        changed_final["predecessor_receipt_sha256"] = (
+            typed_predecessor.receipt_sha256
+        )
+        changed_final["receipt_sha256"] = ""
+        changed_question["retrieval_receipt"] = asdict(
+            RecallGuardedCumulativeReceipt(**dict(changed_final))
+        )
+        changed_runtime["question_part_sha256s"][0] = hashlib.sha256(
+            shard_impl._canonical_json_bytes(changed_question)
+        ).hexdigest()
+        with pytest.raises(ValueError, match=error_label):
+            validate_validation_shard_retrieval(
+                changed_runtime,
+                preflight=contexts[0],
+            )
+
     changed = copy.deepcopy(artifacts[0])
     changed["questions"][0]["combined_store_receipt_sha256"] = "f" * 64
     changed["question_part_sha256s"][0] = hashlib.sha256(
@@ -679,6 +737,42 @@ def test_strict_ten_shard_merge_publishes_self_contained_100q_artifact(
         encoding="ascii"
     ).startswith(digest)
     validate_merged_validation_retrieval(merged)
+
+    changed_runtime = copy.deepcopy(merged)
+    changed_question = changed_runtime["questions"][0]
+    changed_predecessor = changed_question["predecessor_receipt"]
+    changed_predecessor["retrieval_query_sha256"] = changed_question[
+        "dated_question_sha256"
+    ]
+    changed_predecessor["receipt_sha256"] = ""
+    typed_predecessor = CausalCoveragePredecessorReceipt(
+        **dict(changed_predecessor)
+    )
+    changed_question["predecessor_receipt"] = asdict(typed_predecessor)
+    changed_final = changed_question["retrieval_receipt"]
+    changed_final["predecessor_receipt_sha256"] = (
+        typed_predecessor.receipt_sha256
+    )
+    changed_final["receipt_sha256"] = ""
+    changed_question["retrieval_receipt"] = asdict(
+        RecallGuardedCumulativeReceipt(**dict(changed_final))
+    )
+    source_projection = copy.deepcopy(changed_question)
+    source_projection["format"] = VALIDATION_SHARD_QUESTION_FORMAT
+    source_projection.pop("source_shard_retrieval_sha256")
+    source_projection.pop("source_question_part_sha256")
+    source_part_sha = hashlib.sha256(
+        shard_impl._canonical_json_bytes(source_projection)
+    ).hexdigest()
+    changed_question["source_question_part_sha256"] = source_part_sha
+    changed_runtime["shards"][0]["source_question_part_sha256s"][0] = (
+        source_part_sha
+    )
+    changed_runtime["question_part_sha256s"][0] = hashlib.sha256(
+        shard_impl._canonical_json_bytes(changed_question)
+    ).hexdigest()
+    with pytest.raises(ValueError, match="predecessor retrieval query identity"):
+        validate_merged_validation_retrieval(changed_runtime)
 
     changed = copy.deepcopy(merged)
     changed["questions"][0]["source_shard_retrieval_sha256"] = "f" * 64

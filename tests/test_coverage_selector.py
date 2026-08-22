@@ -583,6 +583,42 @@ def test_qwen_prefix_singleton_query_is_a_non_degraded_bypass():
     assert selector.last_report.active_partition_exhaustive is None
 
 
+def test_qwen_prefix_singleton_bypass_reports_bound_choice_identity():
+    candidates = [_result(0, "The receipt is in the desk drawer.")]
+    linker = _FakePrefixLinker({}, fail=True)
+
+    class UninvokedChoiceProvider:
+        model_id = "Qwen/Qwen3-0.6B"
+        model_revision = "choice-revision"
+        checkpoint_sha256 = "b" * 64
+        device = "cuda"
+        dtype_name = "float16"
+
+        def score_candidates(self, *_args, **_kwargs):
+            raise AssertionError("singleton bypass must not invoke choice scoring")
+
+    selector = QwenPrefixCoverageSelector(
+        linker,
+        score_provider=UninvokedChoiceProvider(),
+    )
+
+    assert selector.select("Where is the receipt?", candidates) == candidates
+    assert linker.calls == []
+    assert selector.last_report is not None
+    assert selector.last_report.selection_status == "bypassed"
+    assert selector.last_report.score_provider_report == {
+        "model_id": "Qwen/Qwen3-0.6B",
+        "model_revision": "choice-revision",
+        "checkpoint_sha256": "b" * 64,
+        "device": "cuda",
+        "dtype": "float16",
+        "runtime": (
+            f"{UninvokedChoiceProvider.__module__}.UninvokedChoiceProvider"
+        ),
+        "retained_transformer_state_bytes": 0,
+    }
+
+
 def test_qwen_prefix_derived_scalar_queries_bypass_set_coverage():
     queries = (
         "How many days before Rack Fest did I participate in Turbocharged Tuesdays?",

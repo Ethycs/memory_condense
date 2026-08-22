@@ -130,6 +130,35 @@ class QwenPrefixCoverageSelector:
             ),
         }
 
+    def _score_provider_identity_fields(
+        self,
+    ) -> dict[str, str | int] | None:
+        """Read checkpoint identity even when a scalar query bypasses scoring.
+
+        A non-set query intentionally never invokes the optional score provider,
+        so it has no per-call ``last_report``.  Certified runtimes still need to
+        attest which already-loaded provider was bound to the selector.  These
+        fields are immutable construction-time identity, not fabricated scoring
+        counters.
+        """
+
+        provider = self.score_provider
+        if provider is None:
+            return None
+        return {
+            "model_id": str(getattr(provider, "model_id", "")),
+            "model_revision": str(getattr(provider, "model_revision", "")),
+            "checkpoint_sha256": str(
+                getattr(provider, "checkpoint_sha256", "")
+            ),
+            "device": str(getattr(provider, "device", "")),
+            "dtype": str(getattr(provider, "dtype_name", "")),
+            "runtime": (
+                f"{type(provider).__module__}.{type(provider).__name__}"
+            ),
+            "retained_transformer_state_bytes": 0,
+        }
+
     def select_source_companions(
         self,
         query: str,
@@ -388,6 +417,7 @@ class QwenPrefixCoverageSelector:
             allow_selected_scope_fixed_k_closure=(
                 self.allow_selected_scope_fixed_k_closure
             ),
+            score_provider_report=self._score_provider_identity_fields(),
             **self._prefix_report_fields(),
             required_evidence_role=program.required_evidence_role,
             required_evidence_role_basis=program.required_evidence_role_basis,

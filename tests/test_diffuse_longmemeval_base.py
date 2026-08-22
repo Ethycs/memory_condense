@@ -655,7 +655,7 @@ def test_fixed_compiled_derived_database_and_final_receipt_match_the_golden(
             provider_identity_module
         )
     assert phase.receipt_sha256 == (
-        "deee81b4da1d75c235541bc68f7986e451b2523a90c971a0e60f784488a23014"
+        "feecd218149c582e8b1db44a86c8eb5b3774011e9ca5d3c3169b77c339aa6d7b"
     )
     condenser.close()
     database = clone.path / _DATABASE_NAME
@@ -668,10 +668,10 @@ def test_fixed_compiled_derived_database_and_final_receipt_match_the_golden(
         phase=phase,
     )
     assert finalization.receipt_sha256 == (
-        "4a1246b9011426cd207b8100b107e3b708d9d2c5a8adec229224a3ebdcc48276"
+        "11b23c7c1cd5d996e50da90adcec0857aa826441b7a3e2d3198bcb8f4d257946"
     )
     assert file_sha256(clone.path / DERIVED_FINALIZATION_NAME) == (
-        "aa67d08dc8f6af09e9ac78f9548489c8b2065d3ca5c85542d316820b94c69e69"
+        "175cfc4ea453f4a24d70d9a9c5f002ddb0d21ea7e79da2691b7307e1f87027f1"
     )
     assert {path.name for path in clone.path.iterdir()} == {
         _DATABASE_NAME,

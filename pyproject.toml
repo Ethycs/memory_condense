@@ -13,6 +13,9 @@ dependencies = [
     "hnswlib>=0.8",
     "pysbd>=0.3",
     "litellm>=1.40",
+    "httpx>=0.28,<1",
+    "openai>=2.20,<3",
+    "truststore>=0.10.4,<0.11",
     "tiktoken>=0.7",
     "python-dotenv>=1.0",
 ]

@@ -305,10 +305,18 @@ $retrievalRoot = "eval_results/longmemeval-1m-recall-guarded-cumulative-validati
   --policy-manifest $policy --output-root $retrievalRoot `
   --sample-offset 0 --qwen-prefix-model-dir .cache/models/Qwen3-8B `
   --qwen-choice-model-dir .cache/models/Qwen3-0.6B --device cuda
+
+if ($LASTEXITCODE -ne 0) {
+  throw "Validation shard preflight failed for offset 0."
+}
 ```
 
 After separately checking all ten preflights, the future GPU retrieval and
-provider-free merge are:
+provider-free merge are shown below. Run only one shard process at a time and
+wait for any existing process for an offset to exit before invoking that
+offset again. PowerShell does not reliably stop a `foreach` loop merely
+because a native executable returns nonzero, so every invocation has an
+explicit exit-code check and the merge cannot follow a failed shard:
 
 ```powershell
 foreach ($offset in 0,10,20,30,40,50,60,70,80,90) {
@@ -317,11 +325,19 @@ foreach ($offset in 0,10,20,30,40,50,60,70,80,90) {
     --policy-manifest $policy --output-root $retrievalRoot `
     --sample-offset $offset --qwen-prefix-model-dir .cache/models/Qwen3-8B `
     --qwen-choice-model-dir .cache/models/Qwen3-0.6B --device cuda
+
+  if ($LASTEXITCODE -ne 0) {
+    throw "Validation retrieval failed for offset $offset."
+  }
 }
 
 & $python -u tools/run_recall_guarded_cumulative_validation_retrieval.py `
   --phase merge --dataset $dataset --split-manifest $split `
   --policy-manifest $policy --output-root $retrievalRoot --device cuda
+
+if ($LASTEXITCODE -ne 0) {
+  throw "Locked ten-shard validation merge failed."
+}
 ```
 
 The fixed-stage provider-free preflight and future Terra run are:

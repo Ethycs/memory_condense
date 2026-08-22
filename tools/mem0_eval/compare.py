@@ -1,11 +1,12 @@
 """Strict paired comparison of frozen treatment and Mem0 campaign reports.
 
-This module intentionally accepts only the public dictionaries emitted by
-``merge_benchmark_reports`` and ``merge_mem0_shard_reports``.  It does not
-load unvalidated shard reports and it does not provide a permissive file CLI.
-Both campaign objects are nevertheless treated as hostile input here: their
-public schemas, identities, primitive question rows, aggregates, and hashes
-are checked again before a paired result is emitted.
+Schema v2 accepts the public dictionaries emitted by
+``merge_benchmark_reports`` and ``merge_mem0_shard_reports``.  Schema v3 also
+accepts the sealed fixed-stage semantic-judge score as the treatment input.
+This module does not load unvalidated shard reports or provide a permissive
+file CLI.  Both inputs are treated as hostile: their public schemas,
+identities, primitive question rows, aggregates, and hashes are checked again
+before a paired result is emitted.
 
 The Mem0 arm has no exact evidence-provenance primitive.  Its request-window
 attribution is therefore preserved as not-applicable for provenance metric
@@ -51,6 +52,33 @@ from .prompt_pack import (
 COMPARISON_SCHEMA_VERSION = 2
 COMPARISON_REPORT_TYPE = "treatment_mem0_paired_campaign"
 TREATMENT_REPORT_TYPE = "benchmark_campaign"
+FIXED_STAGE_COMPARISON_SCHEMA_VERSION = 3
+FIXED_STAGE_TREATMENT_FORMAT = (
+    "memory-condense-fixed-stage-final-answer-semantic-judge-score-v1"
+)
+FIXED_STAGE_ID = "direct_episode_additions"
+FIXED_STAGE_TERRA_MODEL = "openai/codex_sdk/gpt-5.6-terra"
+FIXED_STAGE_TERRA_GATEWAY_MODEL = "codex_sdk/gpt-5.6-terra"
+FIXED_STAGE_SOL_MODEL = "openai/codex_sdk/gpt-5.6-sol"
+FIXED_STAGE_SOL_GATEWAY_MODEL = "codex_sdk/gpt-5.6-sol"
+FIXED_STAGE_RESPONDER_MAX_OUTPUT_TOKENS = 256
+FIXED_STAGE_JUDGE_MAX_OUTPUT_TOKENS = 1_024
+FIXED_STAGE_PROMPT_CAP = 8_000
+FIXED_STAGE_RESPONDER_RUNTIME_FORMAT = (
+    "memory-condense-recall-guarded-fixed-stage-final-answer-runtime-v1"
+)
+FIXED_STAGE_JUDGE_RUNTIME_FORMAT = (
+    "memory-condense-recall-guarded-semantic-judge-runtime-v1"
+)
+FIXED_STAGE_JUDGE_REQUEST_FORMAT = (
+    "memory-condense-semantic-judge-call-request-v1"
+)
+FIXED_STAGE_JUDGE_RESPONSE_FORMAT = (
+    "memory-condense-semantic-judge-call-response-v1"
+)
+FIXED_STAGE_JUDGE_CAMPAIGN_FORMAT = (
+    "memory-condense-fixed-stage-final-answer-semantic-judge-campaign-v1"
+)
 MEM0_REPORT_TYPE = "mem0_longmemeval_campaign"
 MEM0_ARM_ID = "mem0_oss_2_0_18_direct_1m_v1"
 COMMON_QUESTION_SCHEMA = "memory-condense-common-qa-result-v1"
@@ -94,6 +122,118 @@ FROZEN_SOURCE_POLICY_SHA256 = (
 )
 FROZEN_RETRIEVAL_IDENTITY_SHA256 = (
     "08ffd89a8b30803a0d8121445c1d54171120b1f1e51c866d4015f2d36b87cbaf"
+)
+
+_FIXED_STAGE_TREATMENT_TOP_FIELDS = frozenset(
+    {
+        "format",
+        "final_answer_artifact_sha256",
+        "responder_runtime_identity_sha256",
+        "responder_prompt_policy",
+        "responder_prompt_policy_sha256",
+        "retrieval_sha256",
+        "population_identity_sha256",
+        "gold_scoring_population_sha256",
+        "question_count",
+        "gold_loaded_posthoc",
+        "independent_llm_judge",
+        "fixed_stage_id",
+        "responder_model",
+        "judge_model",
+        "judge_runtime_identity",
+        "judge_runtime_identity_sha256",
+        "semantic_judge_policy",
+        "semantic_judge_policy_sha256",
+        "semantic_judge_implementation_sha256",
+        "campaign_binding",
+        "campaign_binding_sha256",
+        "logical_judgment_count",
+        "unique_judge_prompt_count",
+        "deduplicated_logical_judgment_count",
+        "judge_prompt_preflight",
+        "judge_usage",
+        "questions",
+        "category_counts",
+        "category_aggregates",
+        "aggregate",
+        "target_gate",
+    }
+)
+
+_FIXED_STAGE_QUESTION_FIELDS = frozenset(
+    {
+        "ordinal",
+        "question_id",
+        "category",
+        "question_sha256",
+        "dated_question_sha256",
+        "gold_answer_sha256",
+        "prediction_sha256",
+        "fixed_stage_id",
+        "answer_call_key_sha256",
+        "answer_response_journal_sha256",
+        "judge_messages_sha256",
+        "judge_prompt_token_proxy",
+        "correct",
+        "judge_output",
+        "judge_output_sha256",
+        "call_key_sha256",
+        "request_journal_sha256",
+        "response_journal_sha256",
+        "completion_report",
+    }
+)
+
+_FIXED_STAGE_JUDGE_RUNTIME_FIELDS = frozenset(
+    {
+        "format",
+        "gateway_url",
+        "caller_model",
+        "gateway_model",
+        "default_max_new_tokens",
+        "retries",
+        "temperature",
+        "authorized_unique_calls",
+        "campaign_binding",
+        "campaign_binding_sha256",
+        "request_journal_format",
+        "response_journal_format",
+    }
+)
+
+_FIXED_STAGE_COMPLETION_FIELDS = frozenset(
+    {
+        "gateway_url",
+        "caller_model",
+        "gateway_model",
+        "call_key_sha256",
+        "runtime_identity_sha256",
+        "campaign_binding_sha256",
+        "request_journal_sha256",
+        "messages_sha256",
+        "completion_sha256",
+        "response_id",
+        "response_model",
+        "finish_reason",
+        "max_new_tokens",
+        "reported_usage_available",
+        "reported_input_tokens",
+        "reported_output_tokens",
+        "reported_total_tokens",
+        "reported_input_tokens_available",
+        "reported_output_tokens_available",
+        "reported_total_tokens_available",
+        "input_token_proxy",
+        "output_token_proxy",
+        "elapsed_s",
+        "retries",
+        "cache_hit",
+        "physical_call",
+        "cumulative_logical_calls",
+        "cumulative_unique_calls",
+        "cumulative_physical_calls",
+        "cumulative_checkpoint_hits",
+    }
 )
 FROZEN_RETRIEVAL_FIELDS = (
     "mode", "k", "ef_search", "alpha", "candidates", "neighbor_radius",
@@ -1902,6 +2042,9 @@ def _validate_paired_population_identity(
 def compare_campaign_reports(
     treatment_campaign: Mapping[str, Any],
     mem0_campaign: Mapping[str, Any],
+    *,
+    fixed_stage_final_answer_artifact: Mapping[str, Any] | None = None,
+    fixed_stage_retrieval: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Revalidate and compare two strict merged campaign dictionaries.
 
@@ -1910,6 +2053,28 @@ def compare_campaign_reports(
     schema drift, duplicate/missing questions, non-finite values, secret
     material, forged primitive metrics, aggregate drift, and identity drift.
     """
+
+    if (
+        isinstance(treatment_campaign, Mapping)
+        and treatment_campaign.get("format") == FIXED_STAGE_TREATMENT_FORMAT
+    ):
+        from .compare_fixed_stage import compare_fixed_stage_score
+
+        mem0 = _validate_mem0(mem0_campaign)
+        return compare_fixed_stage_score(
+            treatment_campaign,
+            mem0,
+            final_answer_artifact=fixed_stage_final_answer_artifact,
+            retrieval=fixed_stage_retrieval,
+        )
+
+    if (
+        fixed_stage_final_answer_artifact is not None
+        or fixed_stage_retrieval is not None
+    ):
+        raise PairedComparisonError(
+            "fixed-stage derivation inputs cannot be used with schema-v2"
+        )
 
     treatment = _validate_treatment(treatment_campaign)
     mem0 = _validate_mem0(mem0_campaign)
@@ -2122,6 +2287,14 @@ def compare_campaign_reports(
 __all__ = [
     "COMPARISON_REPORT_TYPE",
     "COMPARISON_SCHEMA_VERSION",
+    "FIXED_STAGE_COMPARISON_SCHEMA_VERSION",
+    "FIXED_STAGE_ID",
+    "FIXED_STAGE_JUDGE_MAX_OUTPUT_TOKENS",
+    "FIXED_STAGE_PROMPT_CAP",
+    "FIXED_STAGE_RESPONDER_MAX_OUTPUT_TOKENS",
+    "FIXED_STAGE_SOL_MODEL",
+    "FIXED_STAGE_TERRA_MODEL",
+    "FIXED_STAGE_TREATMENT_FORMAT",
     "PairedComparisonError",
     "canonical_sha256",
     "compare_campaign_reports",

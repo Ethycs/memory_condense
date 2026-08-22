@@ -1319,6 +1319,58 @@ def test_scoring_stage_verifies_artifact_and_closes_exact_twenty_calls(
     assert not list(tmp_path.glob("*.staging"))
 
 
+def test_scoring_treats_zero_provider_input_usage_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    shard, retrieval, _adapter = _run_stage_a(tmp_path)
+    observed_messages: list[Sequence[Mapping[str, str]]] = []
+
+    def provider(
+        messages: Sequence[Mapping[str, str]],
+        *,
+        model: str,
+        max_output_tokens: int,
+    ) -> ProviderCallResult:
+        del max_output_tokens
+        observed_messages.append(messages)
+        is_judge = model == MEM0_SOURCE_JUDGE_MODEL
+        return ProviderCallResult(
+            text="CORRECT same answer" if is_judge else "answer",
+            # Some compatible gateways complete requests but report zero
+            # provider input usage.  Zero means unknown, not an empty request.
+            usage=UsageStats(input_tokens=0, output_tokens=2, calls=1),
+        )
+
+    _declare_stateless(provider)
+    result = run_scoring_stage(
+        shard=shard,
+        authorization=_scoring_authorization(shard, retrieval.artifact_sha256),
+        root_environment_lock_path=LOCK_PATH,
+        retrieval_artifact_path=retrieval.artifact_path,
+        retrieval_trace_path=retrieval.trace_path,
+        report_path=tmp_path / "zero-usage-report.json",
+        scoring_trace_path=tmp_path / "zero-usage-scoring.trace.json",
+        responder=provider,
+        judge=provider,
+        process_guard=ShardProcessGuard("test-scoring-zero-provider-usage"),
+    )
+
+    assert len(observed_messages) == 20
+    assert all(messages for messages in observed_messages)
+    assert all(
+        row["prompt_token_proxy"] > 0
+        and row["prompt_token_proxy"] <= row["max_prompt_tokens"] == 8_000
+        and row["provider_prompt_budget_compliant"] is None
+        for row in result.report["question_results"]
+    )
+    receipt = result.report["scoring_receipt"]
+    assert receipt["responder_input_usage_status"] == "unavailable"
+    assert receipt["judge_input_usage_status"] == "unavailable"
+    assert receipt["responder_usage"]["input_tokens"] == 0
+    assert receipt["judge_usage"]["input_tokens"] == 0
+    assert not list(tmp_path.glob("*.staging"))
+
+
 def test_scoring_pair_publication_rolls_back_first_complete_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

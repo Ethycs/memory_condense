@@ -23,9 +23,12 @@ from memory_condense.eval.mem0_adapter import (
     MEM0AI_PIN,
 )
 from tools.mem0_eval.prompt_pack import (
+    MEM0_CONFIGURED_RECENT_WINDOW,
+    MEM0_EFFECTIVE_RECENT_WINDOW,
     MEM0_MAX_PROMPT_TOKEN_PROXY,
     MEM0_PROMPT_CAP_SEMANTICS,
     MEM0_RETRIEVAL_ROW_FORMAT,
+    MEM0_RECENT_WINDOW_SEMANTICS,
     MEM0_SOURCE_JUDGE_MODEL,
     MEM0_SOURCE_RESPONDER_MODEL,
     Mem0PromptProtocolError,
@@ -211,6 +214,13 @@ def test_rank_admission_renders_created_at_chronology_and_exact_qa_messages():
     assert [message["role"] for message in packed.messages] == ["system", "user"]
     assert packed.prompt_token_proxy == count_chat_prompt_token_proxy(expected)
     assert packed.prompt_token_proxy <= MEM0_MAX_PROMPT_TOKEN_PROXY
+    assert packed.configured_recent_window == MEM0_CONFIGURED_RECENT_WINDOW
+    assert packed.effective_recent_window == MEM0_EFFECTIVE_RECENT_WINDOW == 0
+    assert packed.recent_window_semantics == MEM0_RECENT_WINDOW_SEMANTICS
+    # The configured replay default is metadata only for completed-haystack
+    # LongMemEval QA; the exact provider input contains retrieved memory text
+    # and no independently appended raw conversation tail.
+    assert "recent turn" not in json.dumps(packed.provider_messages()).casefold()
 
 
 def test_full_recount_admits_exact_cap_and_rejects_next_rank():
@@ -454,6 +464,10 @@ def test_json_pools_and_all_hashes_bind_exact_provider_artifact():
     assert row["source_evaluation_identity_sha256"] == _sha256_json(
         row["source_evaluation_identity"]
     )
+    assert row["prompt_pack_protocol"] == packed.protocol
+    assert row["configured_recent_window"] == MEM0_CONFIGURED_RECENT_WINDOW
+    assert row["effective_recent_window"] == MEM0_EFFECTIVE_RECENT_WINDOW
+    assert row["recent_window_semantics"] == MEM0_RECENT_WINDOW_SEMANTICS
     assert row["provenance"] == {
         "kind": MEM0_ATTRIBUTION_KIND,
         "supports_exact_source_provenance": False,

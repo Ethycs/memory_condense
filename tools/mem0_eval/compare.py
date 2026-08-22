@@ -40,9 +40,15 @@ from .policy import (
     MEM0_EMBEDDER_PROVIDER,
     MEM0_EMBEDDER_REVISION,
 )
+from .prompt_pack import (
+    MEM0_CONFIGURED_RECENT_WINDOW,
+    MEM0_EFFECTIVE_RECENT_WINDOW,
+    MEM0_PROMPT_PACK_PROTOCOL,
+    MEM0_RECENT_WINDOW_SEMANTICS,
+)
 
 
-COMPARISON_SCHEMA_VERSION = 1
+COMPARISON_SCHEMA_VERSION = 2
 COMPARISON_REPORT_TYPE = "treatment_mem0_paired_campaign"
 TREATMENT_REPORT_TYPE = "benchmark_campaign"
 MEM0_REPORT_TYPE = "mem0_longmemeval_campaign"
@@ -387,6 +393,7 @@ _MEM0_QUESTION_FIELDS = frozenset(
         "category",
         "retrieval_row_sha256",
         "query_sha256",
+        "prompt_pack_protocol",
         "context",
         "context_sha256",
         "context_tokens",
@@ -409,6 +416,10 @@ _MEM0_QUESTION_FIELDS = frozenset(
         "f1",
         "judge_correct",
         "judge_reasoning",
+        "provider_prompt_budget_compliant",
+        "configured_recent_window",
+        "effective_recent_window",
+        "recent_window_semantics",
         "responder_usage",
         "judge_usage",
     }
@@ -1043,8 +1054,28 @@ def _validate_mem0_question(
     if prompt > prompt_cap:
         raise PairedComparisonError(f"{label}.prompt_token_proxy exceeds the cap")
     _must_equal(row["max_prompt_tokens"], prompt_cap, f"{label}.max_prompt_tokens")
+    _must_equal(
+        row["prompt_pack_protocol"],
+        MEM0_PROMPT_PACK_PROTOCOL,
+        f"{label}.prompt_pack_protocol",
+    )
     _must_equal(row["residual_prompt_tokens"], prompt_cap - prompt, f"{label}.residual_prompt_tokens")
     _must_equal(row["prompt_token_proxy_identity"], proxy_identity, f"{label}.prompt_token_proxy_identity")
+    _must_equal(
+        row["configured_recent_window"],
+        MEM0_CONFIGURED_RECENT_WINDOW,
+        f"{label}.configured_recent_window",
+    )
+    _must_equal(
+        row["effective_recent_window"],
+        MEM0_EFFECTIVE_RECENT_WINDOW,
+        f"{label}.effective_recent_window",
+    )
+    _must_equal(
+        row["recent_window_semantics"],
+        MEM0_RECENT_WINDOW_SEMANTICS,
+        f"{label}.recent_window_semantics",
+    )
     raw_count = _integer(row["raw_pool_count"], f"{label}.raw_pool_count")
     packed_count = _integer(row["packed_count"], f"{label}.packed_count")
     if packed_count > raw_count:
@@ -1065,10 +1096,17 @@ def _validate_mem0_question(
     judge = _usage(row["judge_usage"], f"{label}.judge_usage")
     if responder["calls"] != 1 or judge["calls"] != 1:
         raise PairedComparisonError(f"{label} must bind one responder and one judge call")
-    if int(responder["input_tokens"]) <= 0 or int(responder["input_tokens"]) > prompt_cap:
-        raise PairedComparisonError(f"{label} has invalid responder input usage")
-    if int(judge["input_tokens"]) <= 0:
-        raise PairedComparisonError(f"{label} has no exact judge input usage")
+    provider_input = int(responder["input_tokens"])
+    expected_provider_compliance: bool | None = (
+        None if provider_input == 0 else provider_input <= prompt_cap
+    )
+    _must_equal(
+        row["provider_prompt_budget_compliant"],
+        expected_provider_compliance,
+        f"{label}.provider_prompt_budget_compliant",
+    )
+    if expected_provider_compliance is False:
+        raise PairedComparisonError(f"{label} responder input exceeds the prompt cap")
     return {
         **row,
         "question_id": question_id,
@@ -1461,7 +1499,7 @@ def _validate_mem0(value: Any) -> _ValidatedArm:
     report = _mapping(value, "mem0 campaign")
     _walk_json(report, "mem0 campaign")
     _exact_keys(report, _MEM0_TOP_FIELDS, "mem0 campaign")
-    _must_equal(report["schema_version"], 1, "mem0.schema_version")
+    _must_equal(report["schema_version"], 2, "mem0.schema_version")
     _must_equal(report["report_type"], MEM0_REPORT_TYPE, "mem0.report_type")
     _must_equal(report["arm_id"], MEM0_ARM_ID, "mem0.arm_id")
     _must_equal(report["run_status"], "complete", "mem0.run_status")
@@ -1497,12 +1535,29 @@ def _validate_mem0(value: Any) -> _ValidatedArm:
         "mem0 frozen composed-sample population",
     )
     prompt_identity = _mapping(report["prompt_identity"], "mem0.prompt_identity")
-    _exact_keys(prompt_identity, {"max_prompt_tokens", "prompt_cap_semantics", "prompt_token_proxy_identity", "responder_output_token_reserve"}, "mem0.prompt_identity")
+    _exact_keys(
+        prompt_identity,
+        {
+            "prompt_pack_protocol",
+            "max_prompt_tokens",
+            "prompt_cap_semantics",
+            "prompt_token_proxy_identity",
+            "responder_output_token_reserve",
+            "configured_recent_window",
+            "effective_recent_window",
+            "recent_window_semantics",
+        },
+        "mem0.prompt_identity",
+    )
     expected_prompt_identity = {
+        "prompt_pack_protocol": MEM0_PROMPT_PACK_PROTOCOL,
         "max_prompt_tokens": report["max_prompt_tokens"],
         "prompt_cap_semantics": protocol["prompt_cap_semantics"],
         "prompt_token_proxy_identity": proxy,
         "responder_output_token_reserve": report["responder_output_token_reserve"],
+        "configured_recent_window": protocol["recent_window"],
+        "effective_recent_window": MEM0_EFFECTIVE_RECENT_WINDOW,
+        "recent_window_semantics": MEM0_RECENT_WINDOW_SEMANTICS,
     }
     _must_equal(prompt_identity, expected_prompt_identity, "mem0.prompt_identity")
     raw_rows = _list(report["question_results"], "mem0.question_results")
@@ -1523,9 +1578,33 @@ def _validate_mem0(value: Any) -> _ValidatedArm:
     judges = [row["judge_usage"] for row in rows]
     _validate_usage_total(report["responder_usage"], _sum_usage(responders), "mem0.responder_usage")
     _validate_usage_total(report["judge_usage"], _sum_usage(judges), "mem0.judge_usage")
-    provider_inputs = [int(row["responder_usage"]["input_tokens"]) for row in rows]
-    _must_equal(report["provider_prompt_budget_compliance"], True, "mem0.provider_prompt_budget_compliance")
-    _must_equal(report["provider_input_usage_status"], "local_injected_receipts_complete", "mem0.provider_input_usage_status")
+    provider_inputs = [
+        int(row["responder_usage"]["input_tokens"])
+        for row in rows
+        if int(row["responder_usage"]["input_tokens"]) > 0
+    ]
+    provider_compliance = (
+        all(value <= int(report["max_prompt_tokens"]) for value in provider_inputs)
+        if provider_inputs
+        else None
+    )
+    provider_status = (
+        "unavailable"
+        if not provider_inputs
+        else "complete"
+        if len(provider_inputs) == len(rows)
+        else "partial"
+    )
+    _must_equal(
+        report["provider_prompt_budget_compliance"],
+        provider_compliance,
+        "mem0.provider_prompt_budget_compliance",
+    )
+    _must_equal(
+        report["provider_input_usage_status"],
+        "local_injected_receipts_" + provider_status,
+        "mem0.provider_input_usage_status",
+    )
     _must_equal(report["external_provider_usage_certified"], False, "mem0.external_provider_usage_certified")
     sources = _mapping(report["question_sources"], "mem0.question_sources")
     if set(sources) != set(ids):
@@ -1679,12 +1758,20 @@ def _validate_shared_identity(treatment: _ValidatedArm, mem0: _ValidatedArm) -> 
         _must_equal(right[field], left[field], f"paired identity {field}")
     for field in _SHARED_PROTOCOL_FIELDS:
         _must_equal(mem0.protocol[field], treatment.protocol[field], f"paired protocol {field}")
+    # ``recent_window=4`` is the shared replay configuration default.  This
+    # comparator separately binds the frozen LongMemEval implementation hash
+    # and reconstructs treatment prompts solely from ``retrieved_chunks``;
+    # completed-haystack QA therefore has no live recent-turn tail in either
+    # arm.  Keep configured and effective values distinct in the public pair.
     prompt_contract = {
         "max_prompt_tokens": left["max_prompt_tokens"],
         "prompt_cap_semantics": treatment.protocol["prompt_cap_semantics"],
         "prompt_token_proxy_identity": left["prompt_token_proxy_identity"],
         "responder_output_token_reserve": left["responder_output_token_reserve"],
         "qa_prompt_builder": "memory_condense.eval.benchmark.build_qa_prompt",
+        "configured_recent_window": left["recent_window"],
+        "effective_recent_window": MEM0_EFFECTIVE_RECENT_WINDOW,
+        "recent_window_semantics": MEM0_RECENT_WINDOW_SEMANTICS,
     }
     return {
         **{field: left[field] for field in common_hashes},
@@ -1692,6 +1779,9 @@ def _validate_shared_identity(treatment: _ValidatedArm, mem0: _ValidatedArm) -> 
         "responder_model": left["responder_model"],
         "judge_model": left["judge_model"],
         "recent_window": left["recent_window"],
+        "configured_recent_window": left["recent_window"],
+        "effective_recent_window": MEM0_EFFECTIVE_RECENT_WINDOW,
+        "recent_window_semantics": MEM0_RECENT_WINDOW_SEMANTICS,
         "prompt_contract": prompt_contract,
         "prompt_contract_sha256": canonical_sha256(prompt_contract),
     }

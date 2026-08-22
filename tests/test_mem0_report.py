@@ -231,7 +231,14 @@ def _declare_stateless(callback):
     return callback
 
 
-def _run_shard(tmp_path: Path, shard, *, effective_sha256: str) -> Path:
+def _run_shard(
+    tmp_path: Path,
+    shard,
+    *,
+    effective_sha256: str,
+    responder_input_tokens: int = 100,
+    judge_input_tokens: int = 50,
+) -> Path:
     directory = tmp_path / f"shard-{shard.sample_offset:03d}"
     directory.mkdir()
     mem0_directory = directory / "mem0"
@@ -288,7 +295,7 @@ def _run_shard(tmp_path: Path, shard, *, effective_sha256: str) -> Path:
         result = ProviderCallResult(
             text=f"answer {answer_index}",
             usage=UsageStats(
-                input_tokens=100,
+                input_tokens=responder_input_tokens,
                 output_tokens=2,
                 elapsed_s=0.01,
                 calls=1,
@@ -308,7 +315,7 @@ def _run_shard(tmp_path: Path, shard, *, effective_sha256: str) -> Path:
         return ProviderCallResult(
             text="CORRECT same answer",
             usage=UsageStats(
-                input_tokens=50,
+                input_tokens=judge_input_tokens,
                 output_tokens=3,
                 elapsed_s=0.01,
                 calls=1,
@@ -508,6 +515,40 @@ def test_native_run_shard_report_validates_and_rebuilds_prompt(tmp_path: Path) -
         )
 
 
+def test_native_report_validates_unavailable_provider_input_usage(
+    tmp_path: Path,
+) -> None:
+    shard = _shard(0)
+    population = _population((shard,))
+    path = _run_shard(
+        tmp_path,
+        shard,
+        effective_sha256=_digest("effective-zero-usage"),
+        responder_input_tokens=0,
+        judge_input_tokens=0,
+    )
+    document = json.loads(path.read_text(encoding="utf-8"))
+
+    validated = validate_mem0_shard_report(
+        document,
+        report_path=path,
+        expected=population.shards[0],
+        population=population,
+    )
+
+    assert all(
+        row["provider_prompt_budget_compliant"] is None
+        and row["prompt_token_proxy"] > 0
+        for row in validated.questions
+    )
+    assert document["scoring_receipt"]["responder_input_usage_status"] == (
+        "unavailable"
+    )
+    assert document["scoring_receipt"]["judge_input_usage_status"] == (
+        "unavailable"
+    )
+
+
 def test_ten_native_shards_merge_against_synthetic_population(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -548,6 +589,8 @@ def test_ten_native_shards_merge_against_synthetic_population(
     assert merged["operation_totals"]["mem0_local_logical_wrapper_calls"] == 20
     assert merged["operation_totals"]["answer_judge_logical_wrapper_calls"] == 200
     assert merged["prompt_token_proxy_budget_compliance"] is True
+    assert merged["prompt_identity"]["configured_recent_window"] == 4
+    assert merged["prompt_identity"]["effective_recent_window"] == 0
     assert merged["production_binding_certified"] is False
     assert merged["runtime_model_identity_probe"]["kind"] == (
         "unavailable_injected_nonproduction"

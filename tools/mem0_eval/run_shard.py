@@ -64,9 +64,11 @@ from .protocol import (
 )
 
 
-RETRIEVAL_ARTIFACT_FORMAT = "memory-condense-mem0-retrieval-artifact-v1"
-RETRIEVAL_TRACE_FORMAT = "memory-condense-mem0-retrieval-trace-v1"
-SCORING_TRACE_FORMAT = "memory-condense-mem0-scoring-trace-v1"
+SHARD_SCHEMA_VERSION = 2
+RETRIEVAL_ARTIFACT_FORMAT = "memory-condense-mem0-retrieval-artifact-v2"
+RETRIEVAL_TRACE_FORMAT = "memory-condense-mem0-retrieval-trace-v2"
+SCORING_TRACE_FORMAT = "memory-condense-mem0-scoring-trace-v2"
+SCORING_RECEIPT_FORMAT = "memory-condense-mem0-scoring-receipt-v2"
 SHARD_REPORT_TYPE = "mem0_longmemeval_stress_shard"
 SHARD_ARM_ID = "mem0_oss_2_0_18_direct_1m_v1"
 MEM0_RUNTIME_PROTOCOL = "mem0-oss-2.0.18-certified-local-v1"
@@ -1608,6 +1610,31 @@ def _pack_payload(
     )
     if prompt_tokens > max_tokens or residual != max_tokens - prompt_tokens:
         raise ValueError("prompt packer returned inconsistent token accounting")
+    from .prompt_pack import (
+        MEM0_EFFECTIVE_RECENT_WINDOW,
+        MEM0_PROMPT_PACK_PROTOCOL,
+        MEM0_RECENT_WINDOW_SEMANTICS,
+    )
+
+    source_identity = row.get("source_evaluation_identity")
+    if not isinstance(source_identity, Mapping):
+        raise TypeError("prompt packer omitted source_evaluation_identity")
+    configured_recent_window = _require_count(
+        row.get("configured_recent_window"),
+        "configured_recent_window",
+    )
+    if configured_recent_window != source_identity.get("recent_window"):
+        raise ValueError(
+            "prompt packer configured recent window differs from source policy"
+        )
+    if row.get("effective_recent_window") != MEM0_EFFECTIVE_RECENT_WINDOW:
+        raise ValueError(
+            "LongMemEval prompt packer must use no live recent-turn tail"
+        )
+    if row.get("recent_window_semantics") != MEM0_RECENT_WINDOW_SEMANTICS:
+        raise ValueError("prompt packer recent-window semantics mismatch")
+    if row.get("prompt_pack_protocol") != MEM0_PROMPT_PACK_PROTOCOL:
+        raise ValueError("prompt packer protocol mismatch")
     row_digest = row.pop("retrieval_row_sha256", None)
     _require_sha256(row_digest, "retrieval_row_sha256")
     if canonical_json_sha256(row) != row_digest:
@@ -2625,6 +2652,22 @@ def _sum_usage(rows: Sequence[UsageStats]) -> UsageStats:
     return sum(rows, UsageStats())
 
 
+def _provider_input_usage_status(rows: Sequence[UsageStats]) -> str:
+    """Describe provider input-count availability without inventing usage.
+
+    A completed call whose provider reports zero input tokens has unknown
+    input usage.  It remains a completed call, but zero must not be presented
+    as an actually empty request.
+    """
+
+    available = sum(1 for row in rows if row.input_tokens > 0)
+    if available == 0:
+        return "unavailable"
+    if available == len(rows):
+        return "complete"
+    return "partial"
+
+
 def _parse_judge(text: str) -> tuple[bool, str]:
     match = _JUDGE_RE.match(text)
     if match is None:
@@ -2754,6 +2797,8 @@ def run_scoring_stage(
         question_results: list[dict[str, Any]] = []
         answer_usages: list[UsageStats] = []
         judge_usages: list[UsageStats] = []
+        from .prompt_pack import verify_provider_input_tokens
+
         for index, ((retrieval_row, pack), question) in enumerate(
             zip(verified_rows, shard.parsed_sample.questions, strict=True), start=1
         ):
@@ -2764,10 +2809,9 @@ def run_scoring_stage(
                 model=authorization.responder_model,
                 max_output_tokens=authorization.responder_max_output_tokens,
             )
-            if answer.usage.input_tokens <= 0:
-                raise ValueError("responder omitted exact provider input-token usage")
-            if answer.usage.input_tokens > authorization.max_prompt_tokens:
-                raise ValueError("responder provider input exceeded the 8k cap")
+            provider_prompt_budget_compliant = verify_provider_input_tokens(
+                pack, answer.usage.input_tokens
+            )
             prediction = answer.text.strip()
             if not prediction:
                 raise ValueError("responder returned an empty answer")
@@ -2780,8 +2824,8 @@ def run_scoring_stage(
                 model=authorization.judge_model,
                 max_output_tokens=authorization.judge_max_output_tokens,
             )
-            if judge_result.usage.input_tokens <= 0:
-                raise ValueError("judge omitted exact provider input-token usage")
+            if judge_result.usage.input_tokens < 0:
+                raise ValueError("judge provider input-token usage cannot be negative")
             judged_correct, judge_reasoning = _parse_judge(judge_result.text)
             answer_usages.append(answer.usage)
             judge_usages.append(judge_result.usage)
@@ -2797,6 +2841,9 @@ def run_scoring_stage(
                 "query_sha256": hashlib.sha256(
                     retrieval_row["query"].encode("utf-8")
                 ).hexdigest(),
+                "prompt_pack_protocol": retrieval_row[
+                    "prompt_pack_protocol"
+                ],
                 "context": retrieval_row["context"],
                 "context_sha256": retrieval_row["context_sha256"],
                 "context_tokens": retrieval_row["context_tokens"],
@@ -2823,6 +2870,18 @@ def run_scoring_stage(
                 "f1": f1_score(prediction, question.answer),
                 "judge_correct": judged_correct,
                 "judge_reasoning": judge_reasoning,
+                "provider_prompt_budget_compliant": (
+                    provider_prompt_budget_compliant
+                ),
+                "configured_recent_window": retrieval_row[
+                    "configured_recent_window"
+                ],
+                "effective_recent_window": retrieval_row[
+                    "effective_recent_window"
+                ],
+                "recent_window_semantics": retrieval_row[
+                    "recent_window_semantics"
+                ],
                 "responder_usage": _usage_payload(answer.usage),
                 "judge_usage": _usage_payload(judge_result.usage),
             }
@@ -2875,7 +2934,7 @@ def run_scoring_stage(
             "rendering_mode": MEM0_CERTIFIED_RENDERING,
         }
         report = {
-            "schema_version": 1,
+            "schema_version": SHARD_SCHEMA_VERSION,
             "report_type": SHARD_REPORT_TYPE,
             "arm_id": SHARD_ARM_ID,
             "run_status": "complete",
@@ -2941,6 +3000,7 @@ def run_scoring_stage(
                 "retrieval_trace": artifact["retrieval_trace"],
             },
             "scoring_receipt": {
+                "format": SCORING_RECEIPT_FORMAT,
                 "retrieval_artifact_sha256": authorization.retrieval_artifact_sha256,
                 "source_environment_lock_sha256": environment_lock_before,
                 "responder_logical_wrapper_calls": answer_budget.receipt(),
@@ -2958,6 +3018,12 @@ def run_scoring_stage(
                 ),
                 "external_provider_persistence_certified": False,
                 "stateless_provider_contracts": stateless_provider_contracts,
+                "responder_input_usage_status": (
+                    _provider_input_usage_status(answer_usages)
+                ),
+                "judge_input_usage_status": (
+                    _provider_input_usage_status(judge_usages)
+                ),
                 "responder_usage": _usage_payload(responder_usage),
                 "judge_usage": _usage_payload(judge_usage),
             },

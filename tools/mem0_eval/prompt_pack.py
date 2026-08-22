@@ -43,8 +43,8 @@ from memory_condense.eval.mem0_adapter import (
 from .protocol import Mem0ComparisonProtocolError
 
 
-MEM0_PROMPT_PACK_PROTOCOL = "memory-condense-mem0-prompt-pack-v1"
-MEM0_RETRIEVAL_ROW_FORMAT = "memory-condense-mem0-retrieval-row-v1"
+MEM0_PROMPT_PACK_PROTOCOL = "memory-condense-mem0-prompt-pack-v2"
+MEM0_RETRIEVAL_ROW_FORMAT = "memory-condense-mem0-retrieval-row-v2"
 MEM0_MAX_PROMPT_TOKEN_PROXY = 8_000
 MEM0_RUNTIME_PROTOCOL = "mem0-oss-2.0.18-certified-local-v1"
 MEM0_PROMPT_CAP_SEMANTICS = (
@@ -52,6 +52,16 @@ MEM0_PROMPT_CAP_SEMANTICS = (
 )
 MEM0_SOURCE_RESPONDER_MODEL = "openai/codex_sdk/gpt-5.6-terra"
 MEM0_SOURCE_JUDGE_MODEL = "openai/codex_sdk/gpt-5.6-sol"
+# ``recent_window`` is a shared EvalConfig default, but LongMemEval is a
+# completed-haystack QA protocol rather than live turn-by-turn replay.  The
+# treatment therefore passes ``recent_turns=0`` when assembling its context.
+# Keep both values explicit so a report cannot mistake the configured replay
+# default for content that actually entered the provider request.
+MEM0_CONFIGURED_RECENT_WINDOW = 4
+MEM0_EFFECTIVE_RECENT_WINDOW = 0
+MEM0_RECENT_WINDOW_SEMANTICS = (
+    "longmemeval_completed_haystack_has_no_live_recent_tail_v1"
+)
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -141,6 +151,9 @@ class PackedMem0Prompt:
     prompt_token_proxy_identity: Mapping[str, str | int]
     source_evaluation_identity: Mapping[str, Any]
     source_evaluation_identity_sha256: str
+    configured_recent_window: int
+    effective_recent_window: int
+    recent_window_semantics: str
     attribution_kind: str
     supports_exact_source_provenance: bool
 
@@ -197,6 +210,7 @@ class PackedMem0Prompt:
         packed_pool = [candidate.as_dict() for candidate in self.packed_pool]
         row: dict[str, Any] = {
             "format": MEM0_RETRIEVAL_ROW_FORMAT,
+            "prompt_pack_protocol": self.protocol,
             "question_id": question_id,
             "query": self.query,
             "context": self.context,
@@ -233,6 +247,9 @@ class PackedMem0Prompt:
             "source_evaluation_identity_sha256": (
                 self.source_evaluation_identity_sha256
             ),
+            "configured_recent_window": self.configured_recent_window,
+            "effective_recent_window": self.effective_recent_window,
+            "recent_window_semantics": self.recent_window_semantics,
             "provenance": {
                 "kind": self.attribution_kind,
                 "supports_exact_source_provenance": (
@@ -396,7 +413,7 @@ def validate_source_evaluation_identity(
         "responder_output_token_reserve": (
             BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE
         ),
-        "recent_window": 4,
+        "recent_window": MEM0_CONFIGURED_RECENT_WINDOW,
         "accuracy_target": 0.95,
         "min_target_questions": 100,
         "stress_context_tokens": 1_000_000,
@@ -751,6 +768,9 @@ def pack_mem0_prompt(
         prompt_token_proxy_identity=identity,
         source_evaluation_identity=source_identity,
         source_evaluation_identity_sha256=_canonical_sha256(source_identity),
+        configured_recent_window=int(source_identity["recent_window"]),
+        effective_recent_window=MEM0_EFFECTIVE_RECENT_WINDOW,
+        recent_window_semantics=MEM0_RECENT_WINDOW_SEMANTICS,
         attribution_kind=MEM0_ATTRIBUTION_KIND,
         supports_exact_source_provenance=False,
     )
@@ -787,8 +807,11 @@ def verify_provider_input_tokens(
 
 __all__ = [
     "MEM0_MAX_PROMPT_TOKEN_PROXY",
+    "MEM0_CONFIGURED_RECENT_WINDOW",
+    "MEM0_EFFECTIVE_RECENT_WINDOW",
     "MEM0_PROMPT_CAP_SEMANTICS",
     "MEM0_PROMPT_PACK_PROTOCOL",
+    "MEM0_RECENT_WINDOW_SEMANTICS",
     "MEM0_RETRIEVAL_ROW_FORMAT",
     "MEM0_SOURCE_JUDGE_MODEL",
     "MEM0_SOURCE_RESPONDER_MODEL",

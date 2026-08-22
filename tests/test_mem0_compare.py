@@ -19,6 +19,7 @@ from memory_condense.domain._tokenizer import (
 from memory_condense.eval.benchmark import build_qa_prompt, exact_match, f1_score
 from memory_condense.eval.validation_profile import LONGMEMEVAL_1M_95_PROFILE
 from tools.mem0_eval.compare import (
+    COMPARISON_SCHEMA_VERSION,
     COMPARISON_REPORT_TYPE,
     FROZEN_DATASET_SHA256,
     FROZEN_SAMPLE_SHA256_BY_OFFSET,
@@ -37,6 +38,11 @@ from tools.mem0_eval.policy import (
     MEM0_EMBEDDER_MODEL,
     MEM0_EMBEDDER_PROVIDER,
     MEM0_EMBEDDER_REVISION,
+)
+from tools.mem0_eval.prompt_pack import (
+    MEM0_EFFECTIVE_RECENT_WINDOW,
+    MEM0_PROMPT_PACK_PROTOCOL,
+    MEM0_RECENT_WINDOW_SEMANTICS,
 )
 
 
@@ -392,6 +398,11 @@ def _mem0_campaign(treatment: dict) -> dict:
                 "judge_reasoning": (
                     "CORRECT: same answer" if correct else "INCORRECT: wrong answer"
                 ),
+                "prompt_pack_protocol": MEM0_PROMPT_PACK_PROTOCOL,
+                "provider_prompt_budget_compliant": True,
+                "configured_recent_window": 4,
+                "effective_recent_window": MEM0_EFFECTIVE_RECENT_WINDOW,
+                "recent_window_semantics": MEM0_RECENT_WINDOW_SEMANTICS,
                 "responder_usage": _usage(prompt, elapsed=0.12),
                 "judge_usage": _usage(90, elapsed=0.22),
             }
@@ -483,7 +494,7 @@ def _mem0_campaign(treatment: dict) -> dict:
         "source_evaluation_identity_sha256": canonical_sha256(protocol),
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "report_type": "mem0_longmemeval_campaign",
         "arm_id": "mem0_oss_2_0_18_direct_1m_v1",
         "run_status": "complete",
@@ -546,10 +557,14 @@ def _mem0_campaign(treatment: dict) -> dict:
             },
         },
         "prompt_identity": {
+            "prompt_pack_protocol": MEM0_PROMPT_PACK_PROTOCOL,
             "max_prompt_tokens": 8000,
             "prompt_cap_semantics": protocol["prompt_cap_semantics"],
             "prompt_token_proxy_identity": proxy,
             "responder_output_token_reserve": 256,
+            "configured_recent_window": 4,
+            "effective_recent_window": MEM0_EFFECTIVE_RECENT_WINDOW,
+            "recent_window_semantics": MEM0_RECENT_WINDOW_SEMANTICS,
         },
         "sample_offsets": list(range(0, 100, 10)),
         "num_samples": 10,
@@ -640,6 +655,8 @@ def test_recomputes_strict_paired_metrics_and_preserves_noncertified_status(
 
     result = compare_campaign_reports(treatment, mem0)
 
+    assert COMPARISON_SCHEMA_VERSION == 2
+    assert result["schema_version"] == COMPARISON_SCHEMA_VERSION
     assert result["report_type"] == COMPARISON_REPORT_TYPE
     assert result["metric_comparison"] == {
         "valid": True,
@@ -683,6 +700,56 @@ def test_recomputes_strict_paired_metrics_and_preserves_noncertified_status(
     assert result["paired_population_identity"]["sample_set_sha256"] == (
         canonical_sha256(dict(FROZEN_SAMPLE_SHA256_BY_OFFSET))
     )
+    assert result["shared_identity"]["configured_recent_window"] == 4
+    assert result["shared_identity"]["effective_recent_window"] == 0
+    assert result["shared_identity"]["recent_window_semantics"] == (
+        MEM0_RECENT_WINDOW_SEMANTICS
+    )
+
+
+def test_mem0_zero_provider_input_usage_is_unavailable_not_an_empty_prompt(
+    campaign_pair,
+):
+    treatment, mem0 = copy.deepcopy(campaign_pair)
+    for row, common in zip(
+        mem0["question_results"],
+        mem0["common_question_results"],
+        strict=True,
+    ):
+        row["responder_usage"]["input_tokens"] = 0
+        row["judge_usage"]["input_tokens"] = 0
+        row["provider_prompt_budget_compliant"] = None
+        common["responder_usage"] = row["responder_usage"]
+        common["judge_usage"] = row["judge_usage"]
+        assert row["messages"]
+        assert row["prompt_token_proxy"] > 0
+    mem0["responder_usage"] = _sum_usage(
+        [row["responder_usage"] for row in mem0["question_results"]]
+    )
+    mem0["judge_usage"] = _sum_usage(
+        [row["judge_usage"] for row in mem0["question_results"]]
+    )
+    mem0["provider_prompt_budget_compliance"] = None
+    mem0["provider_input_usage_status"] = (
+        "local_injected_receipts_unavailable"
+    )
+
+    result = compare_campaign_reports(treatment, mem0)
+
+    assert result["metric_comparison"]["valid"] is True
+    assert mem0["responder_usage"]["input_tokens"] == 0
+    assert all(
+        row["mem0"]["prompt_token_proxy"] > 0
+        for row in result["question_results"]
+    )
+
+
+def test_rejects_mem0_effective_recent_window_drift(campaign_pair):
+    treatment, mem0 = copy.deepcopy(campaign_pair)
+    mem0["question_results"][0]["effective_recent_window"] = 4
+
+    with pytest.raises(PairedComparisonError, match="effective_recent_window"):
+        compare_campaign_reports(treatment, mem0)
 
 
 @pytest.mark.parametrize(

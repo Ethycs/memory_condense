@@ -56,11 +56,18 @@ from memory_condense.eval.reproducibility import (
 
 from .policy import Mem0ComparisonPolicy, load_mem0_comparison_policy
 from .preflight import load_source_validation_plan, tool_implementation_sha256
-from .prompt_pack import pack_mem0_prompt, validate_source_evaluation_identity
+from .prompt_pack import (
+    MEM0_EFFECTIVE_RECENT_WINDOW,
+    MEM0_PROMPT_PACK_PROTOCOL,
+    MEM0_RECENT_WINDOW_SEMANTICS,
+    MEM0_RETRIEVAL_ROW_FORMAT,
+    pack_mem0_prompt,
+    validate_source_evaluation_identity,
+)
 from .protocol import RawStressShard, build_raw_stress_shards
 
 
-SHARD_SCHEMA_VERSION = 1
+SHARD_SCHEMA_VERSION = 2
 SHARD_REPORT_TYPE = "mem0_longmemeval_stress_shard"
 RETRIEVAL_ARTIFACT_TYPE = "mem0_longmemeval_retrieval_artifact"
 CAMPAIGN_REPORT_TYPE = "mem0_longmemeval_campaign"
@@ -77,10 +84,10 @@ INGESTION_PROTOCOL = "mem0-official-longmemeval-consecutive-slices-v1"
 # These are JSON-object receipts written by ``run_shard``.  An earlier draft
 # of this merger described them as JSONL and consequently could not consume a
 # report produced by the runner it was meant to validate.
-RETRIEVAL_TRACE_FORMAT = "memory-condense-mem0-retrieval-trace-v1"
-SCORING_TRACE_FORMAT = "memory-condense-mem0-scoring-trace-v1"
-RETRIEVAL_ARTIFACT_FORMAT = "memory-condense-mem0-retrieval-artifact-v1"
-SCORING_RECEIPT_FORMAT = "memory-condense-mem0-scoring-receipt-v1"
+RETRIEVAL_TRACE_FORMAT = "memory-condense-mem0-retrieval-trace-v2"
+SCORING_TRACE_FORMAT = "memory-condense-mem0-scoring-trace-v2"
+RETRIEVAL_ARTIFACT_FORMAT = "memory-condense-mem0-retrieval-artifact-v2"
+SCORING_RECEIPT_FORMAT = "memory-condense-mem0-scoring-receipt-v2"
 
 SOURCE_COVERAGE_STATUS = "unavailable_exact_source_provenance"
 SOURCE_COVERAGE_REASON = (
@@ -901,8 +908,13 @@ def _validate_retrieval_row(
     row = _mapping(value, label)
     _must_equal(
         row.get("format"),
-        "memory-condense-mem0-retrieval-row-v1",
+        MEM0_RETRIEVAL_ROW_FORMAT,
         f"{label}.format",
+    )
+    _must_equal(
+        row.get("prompt_pack_protocol"),
+        MEM0_PROMPT_PACK_PROTOCOL,
+        f"{label}.prompt_pack_protocol",
     )
     question_id = _string(row.get("question_id"), f"{label}.question_id")
     _must_equal(question_id, expected_question["question_id"], f"{label}.question_id")
@@ -1015,6 +1027,21 @@ def _validate_retrieval_row(
         row.get("prompt_token_proxy_identity"),
         source_identity["prompt_token_proxy_identity"],
         f"{label}.prompt_token_proxy_identity",
+    )
+    _must_equal(
+        row.get("configured_recent_window"),
+        source_identity["recent_window"],
+        f"{label}.configured_recent_window",
+    )
+    _must_equal(
+        row.get("effective_recent_window"),
+        MEM0_EFFECTIVE_RECENT_WINDOW,
+        f"{label}.effective_recent_window",
+    )
+    _must_equal(
+        row.get("recent_window_semantics"),
+        MEM0_RECENT_WINDOW_SEMANTICS,
+        f"{label}.recent_window_semantics",
     )
     _validate_row_provenance(row.get("provenance"), f"{label}.provenance")
     if "source_coverage" in row and row["source_coverage"] is not None:
@@ -2166,6 +2193,7 @@ def _validate_native_retrieval_artifact(
 
 
 _NATIVE_RETRIEVAL_FIELD_MAP = {
+    "prompt_pack_protocol": "prompt_pack_protocol",
     "context": "context",
     "context_sha256": "context_sha256",
     "context_tokens": "context_tokens",
@@ -2182,6 +2210,9 @@ _NATIVE_RETRIEVAL_FIELD_MAP = {
     "packed_memory_tokens": "packed_memory_tokens",
     "packed_pool_sha256": "packed_pool_sha256",
     "search_latency_s": "search_latency_s",
+    "configured_recent_window": "configured_recent_window",
+    "effective_recent_window": "effective_recent_window",
+    "recent_window_semantics": "recent_window_semantics",
 }
 
 _NATIVE_SCORED_QUESTION_FIELDS = (
@@ -2194,6 +2225,7 @@ _NATIVE_SCORED_QUESTION_FIELDS = (
     "category",
     "retrieval_row_sha256",
     "query_sha256",
+    "prompt_pack_protocol",
     "context",
     "context_sha256",
     "context_tokens",
@@ -2216,6 +2248,10 @@ _NATIVE_SCORED_QUESTION_FIELDS = (
     "f1",
     "judge_correct",
     "judge_reasoning",
+    "provider_prompt_budget_compliant",
+    "configured_recent_window",
+    "effective_recent_window",
+    "recent_window_semantics",
     "responder_usage",
     "judge_usage",
 )
@@ -2275,12 +2311,19 @@ def _validate_native_scored_question(
         raise Mem0ReportError(
             f"{label} must bind one responder and one judge call"
         )
-    if int(responder["input_tokens"]) <= 0:
-        raise Mem0ReportError(f"{label} has no exact responder input-token usage")
-    if int(responder["input_tokens"]) > prompt_cap:
-        raise Mem0ReportError(f"{label} responder input usage exceeds the prompt cap")
-    if int(judge["input_tokens"]) <= 0:
-        raise Mem0ReportError(f"{label} has no exact judge input-token usage")
+    provider_input = int(responder["input_tokens"])
+    expected_provider_compliance: bool | None = (
+        None if provider_input == 0 else provider_input <= prompt_cap
+    )
+    _must_equal(
+        row.get("provider_prompt_budget_compliant"),
+        expected_provider_compliance,
+        f"{label}.provider_prompt_budget_compliant",
+    )
+    if expected_provider_compliance is False:
+        raise Mem0ReportError(
+            f"{label} responder input usage exceeds the prompt cap"
+        )
     projected = {field: row[field] for field in _NATIVE_SCORED_QUESTION_FIELDS}
     projected["f1"] = recomputed_f1
     projected["exact_match"] = exact_match(prediction, gold)
@@ -2318,6 +2361,19 @@ def _validate_usage_total(
     return total
 
 
+def _provider_input_usage_status(
+    rows: Sequence[Mapping[str, int | float]],
+) -> str:
+    """Return availability, treating zero as unknown rather than empty."""
+
+    available = sum(1 for row in rows if int(row["input_tokens"]) > 0)
+    if available == 0:
+        return "unavailable"
+    if available == len(rows):
+        return "complete"
+    return "partial"
+
+
 def _validate_native_scoring_receipt(
     value: Any,
     *,
@@ -2336,6 +2392,7 @@ def _validate_native_scoring_receipt(
     receipt = _mapping(value, label)
     question_count = len(expected.questions)
     for field, wanted in {
+        "format": SCORING_RECEIPT_FORMAT,
         "retrieval_artifact_sha256": artifact_sha256,
         "source_environment_lock_sha256": population.plan.environment_lock_sha256,
         "answer_judge_logical_wrapper_calls": 2 * question_count,
@@ -2369,6 +2426,16 @@ def _validate_native_scoring_receipt(
     )
     _validate_usage_total(
         receipt.get("judge_usage"), judge_rows, f"{label}.judge_usage"
+    )
+    _must_equal(
+        receipt.get("responder_input_usage_status"),
+        _provider_input_usage_status(responder_rows),
+        f"{label}.responder_input_usage_status",
+    )
+    _must_equal(
+        receipt.get("judge_input_usage_status"),
+        _provider_input_usage_status(judge_rows),
+        f"{label}.judge_input_usage_status",
     )
 
     _descriptor, trace, trace_digest = _validate_json_trace_descriptor(
@@ -2953,6 +3020,7 @@ def merge_mem0_shard_reports(
             },
         },
         "prompt_identity": {
+            "prompt_pack_protocol": MEM0_PROMPT_PACK_PROTOCOL,
             "max_prompt_tokens": prompt_cap,
             "prompt_cap_semantics": population.source_evaluation_identity[
                 "prompt_cap_semantics"
@@ -2961,6 +3029,11 @@ def merge_mem0_shard_reports(
                 "prompt_token_proxy_identity"
             ],
             "responder_output_token_reserve": output_reserve,
+            "configured_recent_window": population.source_evaluation_identity[
+                "recent_window"
+            ],
+            "effective_recent_window": MEM0_EFFECTIVE_RECENT_WINDOW,
+            "recent_window_semantics": MEM0_RECENT_WINDOW_SEMANTICS,
         },
         "sample_offsets": list(FROZEN_OFFSETS),
         "num_samples": len(validated),

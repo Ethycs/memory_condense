@@ -13,6 +13,19 @@ Current provider-free status:
   100 searches.
 - The score phase requires exactly 100 Terra responder calls and 100 Sol judge
   calls, with zero retries.
+- The shared evaluation configuration records `recent_window=4`, but the
+  completed-haystack LongMemEval QA path has no live conversation tail. Both
+  arms therefore use an effective recent window of zero. Retrieval rows and
+  merged prompt identities record configured `4` and effective `0`
+  separately; no four-turn tail is appended to the Mem0 provider prompt.
+- The local prompt-token proxy is recounted before every responder call and
+  remains the hard 8,000-token authorization gate. A completed provider call
+  that reports zero input tokens is recorded as usage **unavailable**, not as
+  a zero-token request and not as provider-side proof of cap compliance.
+- Retrieval artifacts, traces, scoring receipts, shard reports, and campaign
+  reports are versioned as v2/schema 2 for these fields. The serialized
+  retrieval row also binds the v2 prompt-pack protocol, so a legacy v1 result
+  fails explicitly instead of being interpreted under the revised schema.
 - The pinned Mem0 2.0.18 V3 path is metered at
   `Memory.llm.generate_response`: exactly one logical extraction call must
   complete for every `infer=True` add, so the campaign authorizes exactly
@@ -96,7 +109,7 @@ try {
     --source-root "$sourceRepo\src\memory_condense" `
     --tool-root "$toolRepo\tools\mem0_eval" `
     --expected-source-sha256 452be3bfa7524bb81676c7abcb032529a32a480311d24d1e17f8513c783ecd83 `
-    --expected-tool-sha256 e35c9e13c15b619e04a33b34559617166a4e922797f7d8e6d642a01820d03ed2 `
+    --expected-tool-sha256 0f4ad27abf13d97d62ea876acc462b11cb4df9c254c483e2bd34563251467a40 `
     --module tools.mem0_eval.preflight -- `
     --benchmark-file $dataset `
     --split-manifest "$sourceRepo\docs\10 - Research Log\data\longmemeval-95-target-split-v2.json" `

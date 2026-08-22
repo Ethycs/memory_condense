@@ -1,7 +1,7 @@
 # memory_condense — documentation tree
 
 **Status**: Living Document
-**Date**: 2026-08-21 (adds the checkpointed LiteLLM Terra synthesis result)
+**Date**: 2026-08-22 (adds the independent Sol judge and v3 synthesis repair)
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
@@ -9,7 +9,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 
 > **Built and locally measured; external competitiveness remains open.** Campaign artifacts report 10/10 judge verdicts on a selected ten-question LongMemEval-S development slice; a structural audit verifies their internal bindings, not provider/judge execution or factual correctness. The exact frozen v3 treatment has now also run provider-free retrieval over all 100 validation questions: mean labeled evidence-source recall was 87.6%, every labeled source was recovered for 82%, and literal gold text appeared in 48% of final contexts. Those are retrieval diagnostics, not answer accuracy; no validation responder or judge call was made. The earlier artifact result did not generalize at the evidence-admission layer. This validation population is now analysis-used, Mem0 production remains NO-GO, and a tuned v4 system needs a new untouched confirmation population. `git log --oneline` and the machine-readable artifacts remain the authority over prose.
 
-> **Current 1M synthesis result.** On the original ten-question development concatenation, a strict, checkpointed Terra arm held retrieval fixed and reached 5/10 exact match and 0.718433 mean F1 at S1. S2/S3 did not improve it, no independent judge ran, and no held-out claim follows; see Research Log 24.
+> **Current 1M synthesis result.** On the original ten-question development concatenation, the repaired v3 Terra policy held retrieval fixed and reached 6/10 exact match, 0.901019 mean F1, and 10/10 independent Sol semantic accuracy at S1, S2, and S3. The exact replay made zero provider calls and reproduced identical artifact bytes. This is diagnostic development evidence, not a target-gate result: the population is only ten and the structured synthesis call allowed 4,096 output tokens rather than the frozen answer-stage allowance of 256. The >=95% gate remains unpassed; see Research Log 25.
 
 > **Code/evidence boundary.** The organized source tree is implementation epoch
 > v4. Frozen validation-v3 evidence still certifies commit
@@ -60,6 +60,7 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | `10 - Research Log/22 - 2026-08-21 - Recall-guarded cumulative retrieval.md` | **measured 1M development ladder** | The original 1,039,203-token development concatenation ran through four strictly nested provider-free stages: S0 recovered every labeled source and 5/10 literal answers; S1 improved mean evidence F1 by 4.62%, while S2 and S3 added no further scored gain under the cap |
 | `10 - Research Log/23 - 2026-08-21 - Episodic evidence scoring and synthesis.md` | **measured local synthesis / negative answer result** | A pinned Qwen3-0.6B inspected all 176 episodic additions and made 12 unique S1-S3 answer calls; its historical raw-p(A) answerability proxies found no useful S2 addition, while every stage scored 0/10 exact match and 0.010227 mean F1, with no independent judge or calibrated-density claim |
 | `10 - Research Log/24 - 2026-08-21 - LiteLLM Terra episodic synthesis and rescoring.md` | **measured provider synthesis / improved development answer result** | A strict, 12-call checkpointed Terra arm held retrieval fixed, labeled all 176 additions, and raised S1 to 5/10 exact match and 0.718433 F1; S2/S3 reached 4/10 and 0.706806, all five S2-only additions were labeled irrelevant/none, and no independent judge or held-out claim is made |
+| `10 - Research Log/25 - 2026-08-22 - Independent Sol judge and v3 synthesis repair.md` | **independently judged development diagnostic / formal gate still open** | A separate Sol path reconstructed and recounted every sealed Terra prompt, judged v2 at 9/10, and judged the runtime-gold-blind v3 synthesis repair at 10/10 for S1-S3; byte-identical zero-call replay passed, but the ten-question population and 4,096-token synthesis output allowance make this ineligible for the locked answer-stage gate, and Mem0 remains unrun |
 | `07 - Status Reports/…` | ✅ | Six dated handoffs through 2026-08-19; the 2026-08-15 report remains the retrieval-measurement handoff, while the 2026-08-19 reports cover the later simplification audit and implementation |
 
 ## The tree
@@ -125,6 +126,7 @@ docs/
 - "Did the frozen v3 treatment generalize to all 100 validation questions?" → `10 - Research Log/18 - 2026-08-18 - Validation v3 provider-free retrieval audit.md` — not at the retrieval-admission level; it records the exact metrics, identities, post-run cache audit, and why no provider accuracy claim follows.
 - "How are new retrieval methods added without replacing the strongest prior packet, and what happened at 1M?" → `10 - Research Log/22 - 2026-08-21 - Recall-guarded cumulative retrieval.md` — four provider-ready stages preserve a frozen-v3-compatible protected root, then add direct episodes, representative episodes, and artifact-global closure. On the exact original 1,039,203-token development concatenation, only direct episodes improved a scored retrieval metric; later stages preserved evidence but added no further gain under the cap.
 - "Did a larger synthesizer answer the cumulative 1M contexts and score the episodic additions?" → `10 - Research Log/24 - 2026-08-21 - LiteLLM Terra episodic synthesis and rescoring.md` — yes on the ten-question development concatenation: strict Terra synthesis reached 5/10 exact match and 0.718433 F1 at S1 with exact-quote citations, while both semantic and local numeric scoring found no strong S2-only evidence. This is not a held-out or independently judged result.
+- "Did an independent judge verify the 1M answers, and did the synthesis repair work?" → `10 - Research Log/25 - 2026-08-22 - Independent Sol judge and v3 synthesis repair.md` — yes as a diagnostic on the same ten development questions: Sol scored v2 at 9/10 and the fixed-retrieval v3 policy at 10/10 for every stage, with exact zero-call replay. The formal >=95% result is still open because the locked gate requires at least 100 questions at one fixed stage and a 256-token final responder, while this structured synthesis call allowed 4,096 output tokens.
 
 ## The one distinction this tree tries hardest to keep
 

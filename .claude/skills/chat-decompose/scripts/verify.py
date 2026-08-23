@@ -104,7 +104,7 @@ def main() -> int:
             errors += 1
         bad = 0
         for raw_file in raw_files:
-            m = re.match(r"turn-(\d{3})-", raw_file.name)
+            m = re.match(r"turn-(\d{3,})-", raw_file.name)
             if not m:
                 fail(f"unparseable raw file name: {raw_file}")
                 errors += 1

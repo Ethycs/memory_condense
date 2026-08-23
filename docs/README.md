@@ -92,7 +92,8 @@ docs/
 ├── 07 - Status Reports/   Dated snapshots (session handoffs)
 ├── 08 - Analysis/         Measured results — the ablation numbers, and one retraction
 ├── 09 - Archived/         Superseded material (append-only)
-└── 10 - Research Log/     Dated experiment entries with data/ artifacts; baselines of record
+├── 10 - Research Log/     Dated experiment entries with data/ artifacts; baselines of record
+└── 11 - Codex Workstream/ The Codex transcript decomposed: 9-chapter dev guide + 40 ADRs
 ```
 
 ## Governance

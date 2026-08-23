@@ -64,13 +64,31 @@ and the bounded implementation contract is
 [Episode-Primary Latent Evidence Fusion](../02%20-%20Implementation/04%20-%20Episode-Primary%20Latent%20Evidence%20Fusion.md).
 
 The repository already implements the generic and same-GPU extraction /
-reinjection pair, exact route-matrix receipts, and an extractive renderer. The
-current router remains untrained and has only synthetic smoke evidence. More
-importantly, it has not been joined to this recall-guarded S0--S3 artifact or
-run as a one-million-token answer arm. Persisted CAV coordinates currently
-support routing/gating; the fixed-S1 Terra run below does not inject them into
-the responder's residual stream. Therefore it would be incorrect to call that
-run the ultimate CAV treatment.
+reinjection equations, exact route-matrix receipts, and an extractive renderer.
+The intended CAVs here are the per-query updated latent concepts $C_1$: the
+learned $C_0$ tokens read the selected evidence and the resulting $C_1$ values
+are written back into the evidence-node residuals. This is not the separate
+fixed-bank operation of projecting evidence onto previously persisted CAV
+directions.
+
+The current executable path nevertheless stops short of the treatment in the
+theory note. `LatentEvidenceRouter` computes $X_1$, but the generic planner only
+records its hash, and the resident executor validates and then releases the
+full steered-node tensor. Both paths derive extractive groups from the $[K,N]$
+and $[N,K]$ attention matrices instead. Thus the surviving behavior is an
+attention-routing proxy: it uses the extraction/reinjection weights to reorder
+exact text, but downstream inference never consumes the reinjected node states
+$X_1$ themselves. The router is also untrained and has only synthetic smoke
+evidence.
+
+Consequently, the missing fourth-layer experiment is not "compute another CAV
+score" and is not, by definition, residual injection into the final answer
+LLM. It is a matched post-S0--S3 arm that preserves $X_1$ and makes those
+reinjected evidence-node representations affect the evidence selection or
+synthesis path. Direct answer-model activation injection is a possible later
+variant, but it requires an open-weight responder; the graph-transformer design
+itself specifies reinjection into the evidence nodes. The fixed-S1 Terra run
+below exercises neither variant and must remain the text-only control.
 
 The synthesis role labels are `decisive`, `supporting`, `temporal_bridge`,
 `qualifier_or_conflict`, `context`, `redundant`, and `irrelevant`. Its density
@@ -138,10 +156,13 @@ the controlled LiteLLM Terra route with an 8,000-token prompt cap, 256-token
 output reserve, zero retries, and a fresh output root.
 
 This answers “does the already-retrieved 1M memory packet support the task?”
-It does not answer “does latent CAV reinjection improve that packet?” The
-latter needs a distinct matched arm using an open-weight responder with an
-owned residual-stream injection point; the remote Terra endpoint exposes no
-activation hook.
+It does not answer “does latent CAV reinjection improve that packet?” That
+question needs a distinct matched arm in which the computed $X_1$ node states
+survive and change the downstream evidence/synthesis input. Terra can still be
+the text synthesizer if the steered node states are converted into a bounded
+selection or ordering policy first. Only the stronger answer-model activation
+injection variant requires an open-weight responder; the remote Terra endpoint
+exposes no activation hook.
 
 | Result | Value |
 | --- | ---: |

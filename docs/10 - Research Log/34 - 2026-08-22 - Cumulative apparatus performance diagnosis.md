@@ -1,11 +1,12 @@
 # Cumulative apparatus performance diagnosis
 
-**Status:** this is a docs-only diagnosis and post-campaign design note. The
-locked provider-free campaign has six sealed shards through offset 50, and
-offset 60 is running. No optimization described here has been applied. The
-retrieval implementation, policy, receipt semantics, and artifacts remain
-frozen until all ten retrieval shards are complete. This note therefore does
-not revise, reinterpret, or supersede any sealed result.
+**Status:** this is a docs-only diagnosis. The locked provider-free campaign
+sealed six shards through offset 50. Its offset-60 build was later intentionally
+stopped when the active objective changed from exact 100-question certification
+to the fast original 1M retrieval-and-synthesis benchmark documented in
+[Research Log 35](35%20-%202026-08-22%20-%20Fast%201M%20retrieval%20and%20synthesis%20path.md).
+No optimization described here was applied to the six sealed shards, and this
+note does not revise or reinterpret any sealed result.
 
 The apparatus is doing materially more work than a production fixed-S1 query
 would require. Some of that work is the price of a strict experimental audit;
@@ -290,13 +291,13 @@ No optimization is accepted on a wall-clock improvement alone.
 
 ## Campaign boundary and next decision
 
-Offset 60 is running. No optimization in this note has been applied to it or
-to any prior shard. The no-change rule remains in force through offsets 70,
-80, and 90, the deterministic merge, and the independent validation of the
-sealed retrieval root. The fixed-S1 Terra responder, independent Sol judge,
-`>=95%` gate, and production-bound Mem0 comparison are still incomplete.
+No optimization in this note was applied to offset 60 or any prior shard. The
+offset-60 process was stopped before sealing, and offsets 70--90 were not
+started. The deterministic 100-question merge, `>=95%` gate, and
+production-bound Mem0 comparison therefore remain incomplete by design.
 
-After the retrieval campaign is sealed, step 1 should land first on a new
-benchmark branch. The exact v1-compatible work in step 2 can then establish a
-trusted baseline. Steps 3--6 proceed only with their declared v2 identities
-and independent reconstruction gates.
+The active fast path reuses the original sealed retrieval artifact and does
+not need these campaign optimizations. If exact certification resumes, step 1
+should land first on a new benchmark branch. The exact v1-compatible work in
+step 2 can then establish a trusted baseline. Steps 3--6 proceed only with
+their declared v2 identities and independent reconstruction gates.

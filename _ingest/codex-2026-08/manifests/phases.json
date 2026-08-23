@@ -1,0 +1,94 @@
+{
+  "phases": [
+    {
+      "phase_id": "01",
+      "slug": "cav-attention-head-ideation",
+      "name": "CAV attention-head architecture ideation",
+      "merged_turn_range": ["001", "032"],
+      "summary": "After brief project setup, the user pivots into designing a live memory system built from a large model's attention heads (CAV pullback, QK/OV circuits), committing to heads-only usage and downloading Qwen 8B head-layer safetensors as the real substrate.",
+      "decision_ids": ["DR-0001", "DR-0002", "DR-0003"],
+      "source_proposals": ["A.phase-1"],
+      "notes": "Adopted as proposed. Turns 001-006 (setup/pixi scolding) folded in per Agent A's note; the CAV pivot at 007 is the first real design thread. Ends at the user's explicit drift-halt at 033."
+    },
+    {
+      "phase_id": "02",
+      "slug": "retrieval-grounding-and-heat-diffusion",
+      "name": "Retrieval grounding, benchmarks, and heat diffusion",
+      "merged_turn_range": ["033", "072"],
+      "summary": "Refocus on measured retrieval: real corpora, role boundaries for the LLM slice (linker/inspector only), storage backends, a parallel benchmark rig, and the heat-diffusion read stage over attention links.",
+      "decision_ids": ["DR-0004", "DR-0005", "DR-0006", "DR-0007"],
+      "source_proposals": ["A.phase-2"],
+      "notes": "Adopted as proposed. Agent A flagged 049 (perf-rig pivot) as a possible split, but the rig work stays interleaved with recall improvements, so the phase is kept whole."
+    },
+    {
+      "phase_id": "03",
+      "slug": "95-percent-associative-memory-campaign",
+      "name": "95% accuracy campaign: Hebbian overlay and consolidation layer",
+      "merged_turn_range": ["073", "114"],
+      "summary": "Under the user's 95%-accuracy-on-long-chats target, turn-transition learning and a Hebbian graph overlay are built and reprimanded into retrenchment; an architecture review then identifies consolidation as the missing layer, which is designed as live per-turn association/strengthening, implemented, ablated, and committed.",
+      "decision_ids": ["DR-0008", "DR-0009", "DR-0010", "DR-0011"],
+      "source_proposals": ["A.phase-3", "A.phase-4"],
+      "notes": "Merged A.phase-3 + A.phase-4: both narrow toward one design conclusion (the committed associative/consolidation layer) under the same 95% goal. Internal sub-boundary at 093 (architecture-review request) preserved as a section break, not a phase break."
+    },
+    {
+      "phase_id": "04",
+      "slug": "longmemeval-debugging-and-1m-baseline",
+      "name": "LongMemEval debugging and the 1M-token baseline",
+      "merged_turn_range": ["115", "172"],
+      "summary": "Benchmark-driven debugging of the retrieval chain against locked LongMemEval (partition-local search fix, two-hop retrieval, recurrent CAV), culminating in the reframe that success means beating 1M-token full-context retrieval with the system as context provider; a 1M-token merged stress transcript is then built and characterized.",
+      "decision_ids": ["DR-0012", "DR-0013", "DR-0014", "DR-0015", "DR-0016"],
+      "source_proposals": ["A.phase-5", "B.phase-1"],
+      "notes": "A/B seam at 157/158 dissolved: source turns 157-160 continue the LongMemEval token-count thread mid-discussion (confirmed against source), and the 153-156 reframe governs the 1M baseline work at 161-172. The real pivot inside the phase is 161 ('I want to see retrieval with a 1M transcript'), captured as part of DR-0016."
+    },
+    {
+      "phase_id": "05",
+      "slug": "packet-compression-and-operational-replacement",
+      "name": "Packet compression and operational replacement",
+      "merged_turn_range": ["173", "232"],
+      "summary": "Shrinking the returned context packet (NLTK/TF-ISF/HSC/SOM, channel pruning, information-bottleneck packer), then testing whether the system can fully replace context: operational transcript-replacement runs via the codex_sdk gateway plus 'keep pushing' cycles on facet retrieval and partition routing, ending with the routing arm rejected.",
+      "decision_ids": ["DR-0017", "DR-0018", "DR-0019", "DR-0020", "DR-0021", "DR-0022"],
+      "source_proposals": ["B.phase-2", "B.phase-3"],
+      "notes": "Merged B.phase-2 + B.phase-3: one compress-then-operationalize arc — 207 ('ready to completely replace context?') is the natural payoff of the compression work, kept as an internal sub-boundary. Turn 221 is an off-topic aside (book recommendation) inside this phase."
+    },
+    {
+      "phase_id": "06",
+      "slug": "set-completion-selector",
+      "name": "Set completion: diagnosis, mechanism, and selector build",
+      "merged_turn_range": ["233", "322"],
+      "summary": "From the user's zoom-out, the #1 failure is diagnosed as complete-set reachability; mechanism exploration (BGE dedupe, cross-encoders, QK/OV operators, late binding) settles on query-conditioned marginal set selection, implemented as a small-model selector with INI protocol and six-layer Qwen prefix, then validated via layer ablation and accuracy wrap-up.",
+      "decision_ids": ["DR-0023", "DR-0024", "DR-0025", "DR-0026", "DR-0027", "DR-0028"],
+      "source_proposals": ["B.phase-4", "B.phase-5", "C.phase-1"],
+      "notes": "Merged B.phase-4 + B.phase-5 (diagnosis and solution of one problem — set completion) and dissolved the B/C seam: C's 315-322 ('did we do the layer ablation?') is validation of this same selector work (confirmed against source). Soft internal boundaries at 261 and 267 noted by Agent B are treated as section breaks."
+    },
+    {
+      "phase_id": "07",
+      "slug": "diffuse-retrieval-buildout",
+      "name": "Diffuse retrieval design and buildout",
+      "merged_turn_range": ["323", "392"],
+      "summary": "The user opens the diffuse-information frontier: closure-aware RAG chosen over vanilla RAG and EM-LLM-as-dependency, the codebase reorganized into objects/transformations/workflows, then tranche-by-tranche GPU replay implementation with recurring cleanup-vs-progress debates.",
+      "decision_ids": ["DR-0029", "DR-0030", "DR-0031", "DR-0032", "DR-0033"],
+      "source_proposals": ["C.phase-2"],
+      "notes": "Adopted as proposed. Agent C's alternative split at 377 ('keep going' after a day gap) rejected: it resumes the same buildout. The recurring 'should we refactor' thread (341, 365, 373, 379-384) stays cross-cutting, not a phase."
+    },
+    {
+      "phase_id": "08",
+      "slug": "1m-test-execution-and-regression",
+      "name": "1M test execution and regression accountability",
+      "merged_turn_range": ["393", "430"],
+      "summary": "Actually running the 1M-token memory test (waiving checkpoint/corpus blockers), discovering a performance regression from a silently changed retrieval stack, and re-locking the cumulative linearly-nested 'ultimate' design.",
+      "decision_ids": ["DR-0034", "DR-0035"],
+      "source_proposals": ["C.phase-3"],
+      "notes": "Adopted as proposed. Confirmed 430/431 boundary: 430 closes the cumulative-harness correction; 431 ('What's going on') opens the slow-run diagnosis after a gap."
+    },
+    {
+      "phase_id": "09",
+      "slug": "acceleration-scoring-and-ladder-restoration",
+      "name": "Run acceleration, LLM scoring, and design-ladder restoration",
+      "merged_turn_range": ["431", "471"],
+      "summary": "Diagnosing slow 1M runs and adding LLM synthesis/rescoring of S1-S3 episodic evidence, publishing to GitHub, then streamlining the heavy apparatus into fast benchmark runs while recovering the forgotten CAV-reinjection fusion layer and restoring the dropped Hebbian arm to the cumulative ladder.",
+      "decision_ids": ["DR-0036", "DR-0037", "DR-0038", "DR-0039", "DR-0040"],
+      "source_proposals": ["C.phase-4", "C.phase-5"],
+      "notes": "Merged C.phase-4 + C.phase-5: both are driven by the same make-it-fast-and-complete-the-ladder motivation (slow runs at 431, heavy apparatus at 447), with the 443-444 publish and the 445 status question as an internal sub-boundary. Slice ends on 471, an unanswered housekeeping request."
+    }
+  ]
+}

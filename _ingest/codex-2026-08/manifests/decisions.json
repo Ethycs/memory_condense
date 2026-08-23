@@ -1,0 +1,364 @@
+{
+  "decisions": [
+    {
+      "decision_id": "DR-0001",
+      "slug": "pivot-to-cav-attention-heads",
+      "title": "Pivot architecture toward CAV pullback over attention heads",
+      "merged_turn_refs": ["007", "009"],
+      "phase_id": "01",
+      "tag": "PIVOT",
+      "one_line": "Redirect the project toward a live memory system using a larger model's attention heads (CAV pullback, QK/OV circuits) as relational operators."
+    },
+    {
+      "decision_id": "DR-0002",
+      "slug": "attention-heads-only-substrate",
+      "title": "Use attention heads only, discard the rest of the model",
+      "merged_turn_refs": ["011", "013"],
+      "phase_id": "01",
+      "tag": "LOCK-IN",
+      "one_line": "Commit to using only the attention heads as substrate, discarding the rest of the model, captured as a docs/theory note."
+    },
+    {
+      "decision_id": "DR-0003",
+      "slug": "qwen-8b-head-safetensors",
+      "title": "Download only Qwen 8B head-layer safetensors as substrate",
+      "merged_turn_refs": ["019", "021"],
+      "phase_id": "01",
+      "tag": "LOCK-IN",
+      "one_line": "Adopt Qwen 8B head-layer safetensors (downloaded in isolation) as the real, non-mock substrate."
+    },
+    {
+      "decision_id": "DR-0004",
+      "slug": "halt-infrastructure-drift",
+      "title": "Halt infrastructure drift, refocus on measured retrieval",
+      "merged_turn_refs": ["033"],
+      "phase_id": "02",
+      "tag": "SCOPE-CUT",
+      "one_line": "User halts infrastructure expansion; work refocuses on improving the existing measured retrieval results."
+    },
+    {
+      "decision_id": "DR-0005",
+      "slug": "llm-slice-linker-only",
+      "title": "Restrict the LLM slice to linker/inspector role",
+      "merged_turn_refs": ["041", "043"],
+      "phase_id": "02",
+      "tag": "LOCK-IN",
+      "one_line": "The LLM slice is a linker/inspector only; no token-level activation state is stored."
+    },
+    {
+      "decision_id": "DR-0006",
+      "slug": "pivot-to-performance-rig",
+      "title": "Pivot to performance optimization with a parallel-run rig",
+      "merged_turn_refs": ["049"],
+      "phase_id": "02",
+      "tag": "PIVOT",
+      "one_line": "With benchmarks saturated, shift effort to performance optimization backed by a parallel-run rig."
+    },
+    {
+      "decision_id": "DR-0007",
+      "slug": "heat-diffusion-framing",
+      "title": "Adopt heat-diffusion framing for the read stage",
+      "merged_turn_refs": ["065", "069"],
+      "phase_id": "02",
+      "tag": "LOCK-IN",
+      "one_line": "Adopt attention as a local transition operator (heat diffusion) for the read stage over attention links, and implement it."
+    },
+    {
+      "decision_id": "DR-0008",
+      "slug": "set-95-percent-target",
+      "title": "Set 95% accuracy on long chats as the target",
+      "merged_turn_refs": ["073"],
+      "phase_id": "03",
+      "tag": "PIVOT",
+      "one_line": "User sets 95% accuracy on long chats as the explicit optimization target for the campaign."
+    },
+    {
+      "decision_id": "DR-0009",
+      "slug": "hebbian-retrench",
+      "title": "Retrench after Hebbian work shows zero evidence gain",
+      "merged_turn_refs": ["081", "082"],
+      "phase_id": "03",
+      "tag": "SCOPE-CUT",
+      "one_line": "Following a user reprimand, the assistant concedes the Hebbian work produced zero evidence gain and retrenches."
+    },
+    {
+      "decision_id": "DR-0010",
+      "slug": "operational-e2e-test-primary",
+      "title": "Make the operational end-to-end test primary",
+      "merged_turn_refs": ["085", "086"],
+      "phase_id": "03",
+      "tag": "LOCK-IN",
+      "one_line": "The operational end-to-end test (ingest a full conversation, answer from memory) becomes the primary test."
+    },
+    {
+      "decision_id": "DR-0011",
+      "slug": "live-per-turn-consolidation",
+      "title": "Define consolidation as live per-turn association/strengthening",
+      "merged_turn_refs": ["097", "100"],
+      "phase_id": "03",
+      "tag": "LOCK-IN",
+      "one_line": "Consolidation is redefined as live per-turn association/strengthening via subsequent prompts, mirroring decay, using Qwen activations."
+    },
+    {
+      "decision_id": "DR-0012",
+      "slug": "target-longmemeval",
+      "title": "Shift the target to the locked LongMemEval benchmark",
+      "merged_turn_refs": ["115"],
+      "phase_id": "04",
+      "tag": "PIVOT",
+      "one_line": "The optimization target shifts from local 39-probe wins to the locked LongMemEval benchmark."
+    },
+    {
+      "decision_id": "DR-0013",
+      "slug": "partition-local-search-fix",
+      "title": "Fix step 4 with partition-local search",
+      "merged_turn_refs": ["123", "127"],
+      "phase_id": "04",
+      "tag": "LOCK-IN",
+      "one_line": "Step 4 (global-pool filtering) is identified as the weak spot; a partition-local search fix is ordered."
+    },
+    {
+      "decision_id": "DR-0014",
+      "slug": "two-hop-retrieval",
+      "title": "Adopt two-hop attention-guided retrieval",
+      "merged_turn_refs": ["139", "141"],
+      "phase_id": "04",
+      "tag": "LOCK-IN",
+      "one_line": "Two-hop retrieval (attention against recalled evidence, then re-retrieval) is adopted over recursive reranking."
+    },
+    {
+      "decision_id": "DR-0015",
+      "slug": "recurrent-cav-refinement",
+      "title": "Refine two-hop into recurrent CAV activation",
+      "merged_turn_refs": ["145", "146"],
+      "phase_id": "04",
+      "tag": "LOCK-IN",
+      "one_line": "Two-hop retrieval is refined into recurrent CAV: initial search activations augmented with retrieved evidence."
+    },
+    {
+      "decision_id": "DR-0016",
+      "slug": "beat-1m-full-context-baseline",
+      "title": "Reframe success as beating 1M-token full-context retrieval",
+      "merged_turn_refs": ["153", "156", "161"],
+      "phase_id": "04",
+      "tag": "LOCK-IN",
+      "one_line": "Success is reframed as beating 1M-token full-context retrieval, with the system as context provider (never answerer); the user then locks 1M single-transcript retrieval as the concrete benchmark."
+    },
+    {
+      "decision_id": "DR-0017",
+      "slug": "tf-isf-hsc-adoption",
+      "title": "Adopt TF-ISF activation with minimal HSC layer",
+      "merged_turn_refs": ["186"],
+      "phase_id": "05",
+      "tag": "LOCK-IN",
+      "one_line": "Adopt TF-ISF activation plus a minimal provenance-preserving HSC layer for packet compression."
+    },
+    {
+      "decision_id": "DR-0018",
+      "slug": "defer-som-ablation",
+      "title": "Defer SOM to a later ablation",
+      "merged_turn_refs": ["186"],
+      "phase_id": "05",
+      "tag": "SCOPE-CUT",
+      "one_line": "The SOM compression arm is deferred to a later ablation rather than built now."
+    },
+    {
+      "decision_id": "DR-0019",
+      "slug": "four-slot-hsc-reversible-pruning",
+      "title": "Choose four-slot HSC channel and reversible pruning",
+      "merged_turn_refs": ["196", "198"],
+      "phase_id": "05",
+      "tag": "LOCK-IN",
+      "one_line": "Four-slot HSC channel chosen over eight-slot after displacement evidence; query-conditioned reversible pruning chosen over aggressive deletion."
+    },
+    {
+      "decision_id": "DR-0020",
+      "slug": "ib-greedy-channel-packer",
+      "title": "Adopt the information-bottleneck greedy channel packer",
+      "merged_turn_refs": ["206"],
+      "phase_id": "05",
+      "tag": "LOCK-IN",
+      "one_line": "An information-bottleneck greedy channel packer is adopted as an opt-in post-retrieval stage."
+    },
+    {
+      "decision_id": "DR-0021",
+      "slug": "operational-replacement-via-gateway",
+      "title": "Run the operational transcript-replacement test via the central-dev gateway",
+      "merged_turn_refs": ["209", "211", "214"],
+      "phase_id": "05",
+      "tag": "LOCK-IN",
+      "one_line": "Commit the tree and run the operational transcript-replacement test via the central-dev codex_sdk LiteLLM gateway instead of an Anthropic key."
+    },
+    {
+      "decision_id": "DR-0022",
+      "slug": "reject-two-partition-routing",
+      "title": "Reject the two-partition routing arm",
+      "merged_turn_refs": ["232"],
+      "phase_id": "05",
+      "tag": "SCOPE-CUT",
+      "one_line": "The two-partition routing arm is rejected: 86.3% coverage falls below the simpler role-aware baseline's 93%."
+    },
+    {
+      "decision_id": "DR-0023",
+      "slug": "freeze-generation-reachability-objective",
+      "title": "Freeze answer generation; make reachability the objective",
+      "merged_turn_refs": ["237", "238"],
+      "phase_id": "06",
+      "tag": "LOCK-IN",
+      "one_line": "Answer generation is frozen; complete-set reachability inside the correct history is declared the objective and the weakest link."
+    },
+    {
+      "decision_id": "DR-0024",
+      "slug": "cav-reachability-layer",
+      "title": "Build a minimal CAV event/concept-link reachability layer",
+      "merged_turn_refs": ["251", "252"],
+      "phase_id": "06",
+      "tag": "LOCK-IN",
+      "one_line": "Build a minimal CAV event/concept-link reachability layer, with deterministic extraction as the control arm."
+    },
+    {
+      "decision_id": "DR-0025",
+      "slug": "marginal-set-selection-over-qkov",
+      "title": "Abandon QK/OV operator construction for marginal set selection",
+      "merged_turn_refs": ["285", "286"],
+      "phase_id": "06",
+      "tag": "PIVOT",
+      "one_line": "QK/OV activation-operator construction is abandoned in favor of simpler query-conditioned marginal set selection."
+    },
+    {
+      "decision_id": "DR-0026",
+      "slug": "ini-selector-protocol",
+      "title": "Replace JSON with INI for the selector protocol",
+      "merged_turn_refs": ["299", "300"],
+      "phase_id": "06",
+      "tag": "LOCK-IN",
+      "one_line": "The INI exchange format replaces JSON for the small-model selector protocol (after 'ini' was initially misread as INT8)."
+    },
+    {
+      "decision_id": "DR-0027",
+      "slug": "restore-six-layer-qwen-prefix",
+      "title": "Restore the six-layer Qwen3-8B prefix QK/OV architecture",
+      "merged_turn_refs": ["304"],
+      "phase_id": "06",
+      "tag": "LOCK-IN",
+      "one_line": "Drift correction: stop the full 0.6B generator ablation and restore the intended six-layer Qwen3-8B prefix QK/OV architecture."
+    },
+    {
+      "decision_id": "DR-0028",
+      "slug": "staged-gpu-residency",
+      "title": "Adopt staged GPU residency",
+      "merged_turn_refs": ["306"],
+      "phase_id": "06",
+      "tag": "LOCK-IN",
+      "one_line": "Remove the BGE-on-CPU defensive rule and adopt staged GPU residency (BGE then Qwen prefix)."
+    },
+    {
+      "decision_id": "DR-0029",
+      "slug": "closure-aware-rag",
+      "title": "Use closure-aware RAG for diffuse retrieval",
+      "merged_turn_refs": ["327", "328"],
+      "phase_id": "07",
+      "tag": "LOCK-IN",
+      "one_line": "Diffuse retrieval will use closure-aware RAG (discourse graph plus evidence obligations), not vanilla top-k RAG."
+    },
+    {
+      "decision_id": "DR-0030",
+      "slug": "objects-transformations-workflows-reorg",
+      "title": "Reorganize the codebase into objects, transformations, workflows",
+      "merged_turn_refs": ["341", "342"],
+      "phase_id": "07",
+      "tag": "LOCK-IN",
+      "one_line": "The codebase is reorganized as immutable objects -> pure transformations -> stateful workflows/adapters."
+    },
+    {
+      "decision_id": "DR-0031",
+      "slug": "reject-em-llm-dependency",
+      "title": "Reject EM-LLM as a dependency",
+      "merged_turn_refs": ["345", "346"],
+      "phase_id": "07",
+      "tag": "SCOPE-CUT",
+      "one_line": "EM-LLM is rejected as a dependency; only surprise-based segmentation and boundary techniques are borrowed."
+    },
+    {
+      "decision_id": "DR-0032",
+      "slug": "reuse-surprise-attention-machinery",
+      "title": "Reuse existing surprise/attention-head machinery",
+      "merged_turn_refs": ["353", "355"],
+      "phase_id": "07",
+      "tag": "LOCK-IN",
+      "one_line": "Reuse the existing surprise/attention-head machinery instead of reimplementing EM-LLM algorithms."
+    },
+    {
+      "decision_id": "DR-0033",
+      "slug": "targeted-refactor-only",
+      "title": "Refuse a whole-codebase rewrite; refactor only replay/eval plumbing",
+      "merged_turn_refs": ["383", "384"],
+      "phase_id": "07",
+      "tag": "SCOPE-CUT",
+      "one_line": "No whole-codebase rewrite; only a targeted refactor of the concentrated replay/eval plumbing."
+    },
+    {
+      "decision_id": "DR-0034",
+      "slug": "waive-corpus-checkpoint-blockers",
+      "title": "Waive corpus and checkpoint blockers to run the 1M test",
+      "merged_turn_refs": ["405", "409"],
+      "phase_id": "08",
+      "tag": "SCOPE-CUT",
+      "one_line": "User waives corpus-blocked and checkpoint concerns ('controlled environment') to force the 1M test to run."
+    },
+    {
+      "decision_id": "DR-0035",
+      "slug": "relock-linear-cumulative-design",
+      "title": "Re-lock the linear-cumulative 'ultimate' design",
+      "merged_turn_refs": ["425", "427"],
+      "phase_id": "08",
+      "tag": "LOCK-IN",
+      "one_line": "User halts drift and re-locks the linear-cumulative design: each retrieval method must nest on the previous; build and document the ultimate version."
+    },
+    {
+      "decision_id": "DR-0036",
+      "slug": "llm-rescoring-s1-s3",
+      "title": "Add LLM synthesis/rescoring of S1-S3 episodic evidence",
+      "merged_turn_refs": ["435", "441"],
+      "phase_id": "09",
+      "tag": "LOCK-IN",
+      "one_line": "Add LLM-based synthesis and rescoring of S1-S3 episodic evidence, using the litellm endpoint."
+    },
+    {
+      "decision_id": "DR-0037",
+      "slug": "streamline-fast-benchmark-runs",
+      "title": "Drop exact validation rebuilds; streamline for speed",
+      "merged_turn_refs": ["449"],
+      "phase_id": "09",
+      "tag": "SCOPE-CUT",
+      "one_line": "Exact validation rebuilds are dropped; keep only memory retrieval plus summarization against benchmarks, streamlined for fast runs."
+    },
+    {
+      "decision_id": "DR-0038",
+      "slug": "cav-reinjection",
+      "title": "Reinject CAV instead of recomputing it",
+      "merged_turn_refs": ["455", "457"],
+      "phase_id": "09",
+      "tag": "LOCK-IN",
+      "one_line": "The forgotten fourth layer is recovered from memory: reinject CAV instead of recomputing it."
+    },
+    {
+      "decision_id": "DR-0039",
+      "slug": "restore-hebbian-arm",
+      "title": "Restore the Hebbian arm to the evaluation ladder",
+      "merged_turn_refs": ["463", "464"],
+      "phase_id": "09",
+      "tag": "LOCK-IN",
+      "one_line": "The Hebbian arm is discovered to have fallen out of the executable evaluation ladder; its restoration begins."
+    },
+    {
+      "decision_id": "DR-0040",
+      "slug": "cav-as-linking-fusion-layer",
+      "title": "Clarify CAV as the linking/fusion layer over S0-S3",
+      "merged_turn_refs": ["467", "470"],
+      "phase_id": "09",
+      "tag": "LOCK-IN",
+      "one_line": "The design is clarified as layers of increasing complexity, with CAV as the linking/fusion layer over S0-S3 evidence, not a retrieval method."
+    }
+  ]
+}

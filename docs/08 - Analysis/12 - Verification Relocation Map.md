@@ -4,8 +4,14 @@
 **Date**: 2026-08-24
 **Charter**: `docs/06 - Roadmaps/03 - Verification Relocation Charter.md`
 **Machine-readable companion**: `12 - Verification Relocation Map.csv`
-(one row per check: family, file, line, class, destination, message,
+(one row per check: family, file, line, class, *why*, destination, message,
 guarding condition, block span, deferred flag)
+
+> **Revised 2026-08-25.** The first cut of this map classified checks by
+> pattern-matching their raise *messages* and overcounted the Delete class by
+> 93%. It has been rebuilt to classify on the **AST of each guarding
+> condition**. See "Why the first classification was wrong" below. All counts
+> in this document are the revised ones.
 
 ---
 
@@ -40,28 +46,32 @@ the size of the whole retrieval system.
 
 | Class | Checks | Block LOC | Destination |
 | --- | ---: | ---: | --- |
-| **Delete / identity** | 503 | 2,654 | Remove — interior hash cross-check |
-| **Delete / receipt** | 84 | 252 | Remove — receipt & certification bookkeeping |
-| **Test** | 163 | 485 | Move to pytest over the pure transformation |
-| **Behavioral invariant** | 33 | 149 | **Keep in-path** — the recall guard |
-| Input validation | 274 | 683 | Keep in place — ordinary type/format checks |
-| Operational | 165 | 386 | Keep in place — OS errors, TOCTOU, preconditions |
+| **Delete / identity** | 286 | 1,725 | Remove — interior recomputation cross-check |
+| **Delete / receipt** | 18 | 56 | Remove — receipt & certification bookkeeping |
+| **Test** | 313 | 1,108 | Move to pytest over the pure transformation |
+| **Behavioral invariant** | 33 | 160 | **Keep in-path** — the recall guard |
+| Input validation | 464 | 1,334 | Keep in place — ordinary type/format checks |
+| Operational | 108 | 226 | Keep in place — OS errors, TOCTOU, preconditions |
 | **Total** | **1,222** | **4,609** | |
+
+90.8% of rows are decided by AST shape; 9.2% fall back to the message where
+the condition carries no structural signal. The CSV's `why` column records
+which rule fired for every row.
 
 Split by family:
 
 | Class | Cumulative | Diffuse-replay |
 | --- | ---: | ---: |
-| Delete / identity | 262 | 241 |
-| Delete / receipt | 46 | 38 |
-| Test | 107 | 56 |
-| Behavioral | 29 | 4 |
-| Input validation | 102 | 172 |
-| Operational | 25 | 140 |
+| Delete / identity | 118 | 168 |
+| Delete / receipt | 9 | 9 |
+| Test | 163 | 150 |
+| Behavioral | 21 | 12 |
+| Input validation | 237 | 227 |
+| Operational | 23 | 85 |
 | **Total** | **571** | **651** |
 
 **Boundary rows: zero.** No check in either family currently seals a whole
-run's input or output. Every one of the 587 Delete-class checks seals an
+run's input or output. Every one of the 304 Delete-class checks seals an
 *interior* step against an *interior* recomputation. The two boundary seals
 the charter wants do not exist yet — V4 creates them, it does not preserve
 them.
@@ -69,11 +79,12 @@ them.
 ### Deviation from the charter's expected split
 
 The charter guessed "a handful of Boundary rows, ~30–50 Test rows, 1–2
-behavioral invariants, everything else Delete". The map found **163 Test rows
-and 33 behavioral rows — 4× and 20× the estimate**. The Delete share is as
-predicted in proportion (48% of all checks) but ~12× the absolute count. V2
-is therefore a substantially larger sitting than the charter budgeted; V3
-stays mechanical.
+behavioral invariants, everything else Delete". The map found **313 Test rows
+and 33 behavioral rows — 7× and 20× the estimate**, and Delete is *not* the
+residue the charter assumed: at 304 of 1,222 it is only 25% of all checks,
+behind both Test and ordinary input validation. Most of what looks like
+verification apparatus is ordinary defensive typing that was never in scope.
+V2 is a substantially larger sitting than budgeted; V3 is smaller.
 
 ---
 
@@ -96,7 +107,7 @@ if self.receipt.matched_controls_sha256 != self.predecessor.receipt.matched_cont
 ```
 
 `_recall_guarded_cumulative_result.py` is the extreme case: its
-`__post_init__` is 48 consecutive Delete-class comparisons, a dataclass whose
+`__post_init__` is 35 consecutive Delete-class comparisons, a dataclass whose
 entire construction cost is re-verifying that Python assigned the fields it
 was just handed. These checks cannot fail unless the interpreter is broken —
 and they are exactly the checks that passed while the retrieval stack was
@@ -106,23 +117,24 @@ Per-file Delete counts, heaviest first:
 
 | Checks | File |
 | ---: | --- |
-| 63 | `_diffuse_replay_contracts.py` |
-| 57 | `_recall_guarded_cumulative_synthesis_artifacts.py` |
-| 48 | `_recall_guarded_cumulative_result.py` |
-| 45 | `recall_guarded_cumulative_final_answer.py` |
-| 41 | `diffuse_longmemeval_route_v2.py` |
-| 37 | `diffuse_longmemeval_analysis.py` |
-| 27 | `_diffuse_latent_training_corpus_route.py` |
-| 25 | `recall_guarded_cumulative_final_answer_semantic_judge.py` |
-| 24 | `_recall_guarded_cumulative_validation_campaign.py` |
-| 24 | `_diffuse_replay_validation.py` |
+| 49 | `_diffuse_replay_contracts.py` |
+| 35 | `_recall_guarded_cumulative_result.py` |
+| 30 | `diffuse_longmemeval_analysis.py` |
+| 28 | `diffuse_longmemeval_route_v2.py` |
+| 21 | `_diffuse_latent_training_corpus_io.py` |
+| 16 | `recall_guarded_cumulative_runtime.py` |
+| 13 | `_recall_guarded_cumulative_validation_campaign.py` |
+| 12 | `recall_guarded_cumulative_final_answer.py` |
+| 11 | `_diffuse_replay_reconstruction.py` |
+| 11 | `_diffuse_replay_validation.py` |
 
-Deleting the 587 Delete-class blocks removes **2,906 LOC** directly. The
+Deleting the 304 Delete-class blocks removes **1,781 LOC** directly. The
 receipt *fields* and `identity_sha256(...)` call sites that exist only to feed
 them are additional; the upper bound on removable apparatus across both
-families is **~7,100 LOC**, against the charter's "at least halve the 4,208
-verification-touching lines" target. The target is reachable with room to
-spare.
+families is **~5,900 LOC**, against the charter's "at least halve the 4,208
+verification-touching lines" target. Still reachable, but with far less slack
+than the first map implied — and only if the receipt fields go too, not just
+the comparisons.
 
 ---
 
@@ -223,9 +235,9 @@ Tranche C.
 
 | Tranche | Scope | Files | Delete | Block LOC | Test rows | Behavioral |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| **A** | Cumulative interior: `_ops.py`, `_contracts.py`, `_result.py` | 3 | 81 | 258 | 29 | 8 |
-| **B** | Diffuse-replay interior: `_diffuse_replay_{contracts,validation,reconstruction}.py` | 3 | 107 | 785 | 9 | 2 |
-| **C** | Runners, synthesis, final answer, corpus | 16 | 399 | 1,863 | 125 | 23 |
+| **A** | Cumulative interior: `_ops.py`, `_contracts.py`, `_result.py` | 3 | 49 | 160 | 45 | 12 |
+| **B** | Diffuse-replay interior: `_diffuse_replay_{contracts,validation,reconstruction}.py` | 3 | 71 | 611 | 39 | 2 |
+| **C** | Runners, synthesis, final answer, corpus | 16 | 184 | 1,010 | 229 | 19 |
 
 Tranche C is larger than A and B combined and must be split at execution
 time — one commit per module, gated each time. Its per-module Delete counts,
@@ -379,15 +391,23 @@ Covered, by map row:
 | `contracts.py:606,608` | cumulative context and prompt caps | Test |
 | `contracts.py:614` | cumulative retrieval retains zero request-token state | Test |
 | `ops.py:186` | `causal_graph_context_budget` is a total deterministic projection | Test |
-| `contracts.py:612` | workspace = prompt + reserve | **Delete/identity — see below** |
-| `contracts.py:556,561,570` | three additive methods, valid statuses, exact `bool` | **Delete/receipt — see below** |
-| `contracts.py:343` | a root names no parent evidence | **Delete/identity — see below** |
+| `contracts.py:612` | workspace = prompt + reserve | Test |
+| `contracts.py:556,561` | three additive methods, valid statuses | Test |
+| `contracts.py:570` | `representative_runtime_certified` is exactly `bool` | InputValidation |
+
+The last three rows are why this map was rebuilt. The message-based
+classifier filed `:612` and `:343` as Delete/identity and `:556`, `:561`,
+`:570` as Delete/receipt; writing tests against them showed all five assert
+real properties. The AST-based classifier now files them correctly, and the
+tests here are the standing evidence for that. See "Why the first
+classification was wrong".
 
 Behavioral rows are covered **in addition to**, not instead of, the runtime
 checks — per the correction above they stay in-path:
 
 | Row | Property |
 | --- | --- |
+| `contracts.py:343` | a root stage names no parent evidence |
 | `contracts.py:348` | a child keeps its parent as an ordered prefix (no drop, no reorder) |
 | `contracts.py:356` | a root admits its complete evidence set |
 | `contracts.py:586` | final chunks are the ordered cumulative union |
@@ -404,37 +424,76 @@ protected-prefix recall guard (`:588`) — and the suite went red on precisely
 the six tests that assert them, with the expected messages. Source restored
 and re-verified clean before commit.
 
-### The classifier has an 8.7% false-Delete rate
+### Why the first classification was wrong
 
-Writing the tests surfaced a defect in this map. Five rows the tests cover
-are classified **Delete**, but they assert real properties:
+The first cut of this map matched regexes against each check's raise
+*message*. Writing the V2 tests exposed the failure: rows asserting real
+properties were filed **Delete**, because their message happened to contain
+`changed`, `receipt` or `parent`.
 
-| Row | Check | Classified | Actually |
-| --- | --- | --- | --- |
-| `contracts.py:612` | `workspace == prompt + reserve` | Delete/identity | cap arithmetic — Test |
-| `contracts.py:556` | exactly three additive methods | Delete/receipt | arity — Test |
-| `contracts.py:561` | admission status is one of three literals | Delete/receipt | enum — Test |
-| `contracts.py:570` | `representative_runtime_certified` is exactly `bool` | Delete/receipt | type — InputValidation |
-| `contracts.py:343` | a root stage names no parent evidence | Delete/identity | structural — Behavioral |
+The initial diagnosis — a rule-ordering bug, ~8.7% affected — was itself
+wrong, in both the cause and the size. The cause is not precedence; it is
+that **text about code cannot classify code**. `type(x) is not bool` is a
+type check whatever the operand is named, and
+`workspace != prompt + reserve` is addition however the message describes it.
+Reordering regexes cannot fix that, and the first "fix" — a
+`review_before_delete` flag keyed on message text — was the same wrong
+instrument applied twice.
 
-The cause is keyword collision: the pattern rules test for `changed`,
-`receipt` and `parent` before they test for arithmetic or structural
-language, so a check whose *message* happens to contain one of those words is
-swept into Delete regardless of what it asserts. "cumulative prompt workspace
-accounting **changed**" is addition, not a hash comparison.
+The classifier now parses the **AST of each guarding condition** and decides
+on operation shape:
 
-Sweeping the whole map for Delete rows that carry substantive
-Test/Behavioral language finds **51 of 587 — 8.7%**. The CSV now carries a
-`review_before_delete` column flagging each one, and
-`scripts/classify_verification_checks.py` (the classifier, with its
-`OVERRIDES` table) is committed so the sweep is reproducible.
+| Condition shape | Class |
+| --- | --- |
+| `recompute(...) != stored_field` | Delete/identity |
+| `stored_digest_a != stored_digest_b` | Delete/identity |
+| `type(x) is not T`, `isinstance(...)` | InputValidation |
+| `len(x) != N` | Test (arity) |
+| `x not in {literals}` | Test (enum) |
+| `a != b + c` | Test (arithmetic) |
+| `a[:n] != b` | Behavioral (prefix nesting) |
+| `set(a) & set(b)` | Behavioral (re-admission) |
+| `x is not False` | Test (policy flag) |
+| `x != MODULE_CONSTANT` | InputValidation (format) |
 
-**This is a V3 blocking condition.** Deleting the Delete class wholesale
-would silently drop ~51 real invariants — the same failure mode the charter
-was written to fix, one level up. Every flagged row must be read individually
-and reclassified before its tranche lands. The 8.7% is a floor, not a
-ceiling: it counts only rows whose message betrays the miss, and a check
-whose message is uninformative could be misfiled with no signal at all.
+The message is consulted only where the AST carries no structural signal —
+9.2% of rows — and never overrides a structural verdict.
+
+**Effect on the Delete class:**
+
+| | Message-based | AST-based | Δ |
+| --- | ---: | ---: | ---: |
+| Delete / identity | 503 | 286 | −217 |
+| Delete / receipt | 84 | 18 | −66 |
+| **Delete total** | **587** | **304** | **−283** |
+| Test | 163 | 313 | +150 |
+| InputValidation | 274 | 464 | +190 |
+
+**The first map overcounted Delete by 93%.** Executing V3 against it would
+have deleted roughly 283 checks that are type assertions, arity checks, enum
+guards, cap arithmetic and structural invariants — the charter's own failure
+mode reproduced one level up, in the instrument built to prevent it.
+
+### The classifier is scored, not assumed
+
+Thirty-one rows in `_recall_guarded_cumulative_contracts.py` were read
+individually while writing `tests/test_cumulative_contract_invariants.py`.
+They form a validation set with known answers:
+
+- **AST-based: 29/31 correct (94%).**
+- Message-based: 20/25 on the subset with recorded values (80%), and every
+  one of its five errors put a real property into Delete.
+
+Both residual misses are `Test` vs `InputValidation` boundary calls
+(`contracts.py:45` "must be non-empty", `:249` "non-negative integer rows",
+which is a combined type-and-range check). **Both destinations are "keep in
+place", so neither can cause a wrong deletion.** No row in the validation set
+is wrongly classified Delete.
+
+That asymmetry is the property to preserve: the classifier may still be
+imprecise at the Test/InputValidation boundary, where the cost is a test that
+does not get written, and is accurate at the Delete boundary, where the cost
+is a lost invariant.
 
 ### Deferred to the existing integration fixture
 
@@ -477,142 +536,3 @@ criterion — reclassify as Behavioral, document, continue.
 3. The corpus filesystem and IO TOCTOU guards (140 Operational checks across
    `_diffuse_latent_training_corpus_{filesystem,io}.py`) are genuine race
    protection on Windows, not verification apparatus. Out of scope; they stay.
-
----
-
-## Appendix — the 51 Delete rows that need individual review
-
-Generated by `scripts/classify_verification_checks.py`; the CSV's
-`review_before_delete` column is the machine-readable form. Read each
-before its tranche lands and reclassify. Grouped by file, in line order.
-
-**`_diffuse_latent_training_corpus_models.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 54 | Delete/identity | {}  must be a lowercase SHA-256 |
-
-**`_diffuse_latent_training_corpus_route.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 977 | Delete/identity | packet prompt accounting changed |
-
-**`_diffuse_replay_contracts.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 1178 | Delete/identity | derived origin belongs to another base/query pair |
-
-**`_diffuse_replay_reconstruction.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 605 | Delete/receipt | arm and query packet budgets disagree |
-| 718 | Delete/identity | replay manifest belongs to another runtime binding |
-| 725 | Delete/identity | replay manifest belongs to another verified base |
-
-**`_recall_guarded_cumulative_contracts.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 209 | Delete/receipt | coverage_runtime_certified must be boolean |
-| 275 | Delete/receipt | predecessor excerpt and anchor coordinates disagree |
-| 343 | Delete/identity | a root cumulative stage cannot name parent evidence |
-| 431 | Delete/identity | cumulative ladder stages changed hard budgets |
-| 434 | Delete/identity | the first cumulative stage must be a root |
-| 556 | Delete/receipt | cumulative receipt requires three additive methods |
-| 561 | Delete/receipt | cumulative receipt has an invalid admission status |
-| 570 | Delete/receipt | representative_runtime_certified must be boolean |
-| 612 | Delete/identity | cumulative prompt workspace accounting changed |
-
-**`_recall_guarded_cumulative_ops.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 92 | Delete/receipt | require_certified_coverage_runtime must be boolean |
-| 636 | Delete/identity | representative expansion belongs to another query |
-
-**`_recall_guarded_cumulative_result.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 295 | Delete/identity | novel projection belongs to another closure plan |
-| 337 | Delete/identity | cumulative receipt changed the ladder hard budgets |
-| 401 | Delete/identity | addition packet belongs to another projected plan |
-| 478 | Delete/identity | cumulative stage context accounting changed |
-| 480 | Delete/identity | cumulative stage prompt accounting changed |
-| 517 | Delete/identity | cumulative result context accounting changed |
-| 519 | Delete/identity | cumulative result prompt accounting changed |
-
-**`_recall_guarded_cumulative_synthesis_artifacts.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 87 | Delete/identity | episodic token-density accounting changed |
-| 478 | Delete/identity | synthesis question part belongs to another retrieval |
-| 668 | Delete/identity | synthesis completion-call accounting changed |
-| 677 | Delete/identity | synthesis score-call accounting changed |
-
-**`_recall_guarded_cumulative_synthesis_contracts.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 209 | Delete/identity | {}  must be a lowercase SHA-256 digest |
-
-**`_recall_guarded_cumulative_validation_shard.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 251 | Delete/identity | {}  must be a lowercase SHA-256 digest |
-| 944 | Delete/identity | retrieval stage prompt/budget seal changed |
-
-**`diffuse_longmemeval_analysis.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 426 | Delete/identity | query receipt belongs to another question |
-| 456 | Delete/receipt | query receipt belongs to another artifact |
-| 458 | Delete/identity | query receipt belongs to another snapshot |
-| 534 | Delete/receipt | compilation receipt belongs to another boundary arm |
-| 554 | Delete/identity | query receipt belongs to another corpus |
-| 556 | Delete/identity | query receipt belongs to another arm |
-| 568 | Delete/identity | query receipt belongs to another compilation |
-| 570 | Delete/receipt | query receipt belongs to another artifact |
-| 574 | Delete/identity | query receipt belongs to another snapshot |
-| 940 | Delete/identity | benchmark gold belongs to another retrieved corpus |
-
-**`diffuse_longmemeval_route_v2.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 734 | Delete/identity | packet prompt identity or accounting changed |
-| 752 | Delete/identity | packet prompt identity or accounting changed |
-
-**`recall_guarded_cumulative_1m.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 690 | Delete/identity | retrieval question part belongs to another campaign |
-| 959 | Delete/identity | retrieval artifact belongs to another population or route |
-
-**`recall_guarded_cumulative_final_answer.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 129 | Delete/identity | {}  must be a lowercase SHA-256 digest |
-| 840 | Delete/identity | final-answer artifact belongs to another protocol |
-| 1023 | Delete/identity | final-answer immutable usage accounting changed |
-
-**`recall_guarded_cumulative_final_answer_semantic_judge.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 144 | Delete/identity | {}  must be a lowercase SHA-256 digest |
-| 663 | Delete/identity | Sol runtime belongs to another fixed-stage campaign |
-
-**`recall_guarded_cumulative_runtime.py`**
-
-| Line | Class | Check |
-| ---: | --- | --- |
-| 654 | Delete/identity | combined store was built for another context budget |

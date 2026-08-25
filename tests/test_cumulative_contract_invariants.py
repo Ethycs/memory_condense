@@ -21,13 +21,14 @@ keeps the protected prefix. Per the map these stay in-path; the tests here
 are additional cover, not a replacement, so a V3 tranche that removes one by
 accident fails loudly.
 
-**Rows the map misfiled as Delete** — writing these tests surfaced an 8.7%
-false-Delete rate in the classifier, where a check whose message contains
-"changed", "receipt" or "parent" was swept into Delete regardless of what it
-asserts. `workspace == prompt + reserve` is addition, not a hash comparison.
-Five such rows are covered here (contracts.py:343, 556, 561, 570, 612) and
-the map's `review_before_delete` column flags the other 46. These tests are
-what stands between V3 and silently deleting a real invariant.
+**Rows the first map misfiled as Delete** — writing these tests is what
+exposed it. Five rows here (contracts.py:343, 556, 561, 570, 612) were filed
+for deletion because their raise messages contain "changed", "receipt" or
+"parent", though they assert arity, an enum, a type, addition and a
+structural invariant respectively. That finding forced the map's classifier
+to be rebuilt on the AST of each guarding condition rather than on message
+text, which cut the Delete class from 587 rows to 304. These tests are the
+standing evidence for that reclassification.
 """
 
 from __future__ import annotations

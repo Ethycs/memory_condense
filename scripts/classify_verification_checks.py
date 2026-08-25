@@ -1,8 +1,36 @@
 """Classify every runtime check in the cumulative and diffuse-replay families.
 
-Charter: docs/06 - Roadmaps/03 - Verification Relocation Charter.md
-Emits docs/08 - Analysis/12 - Verification Relocation Map.csv
+Charter: ``docs/06 - Roadmaps/03 - Verification Relocation Charter.md``
+Emits ``docs/08 - Analysis/12 - Verification Relocation Map.csv``.
+
+**Classification is structural, not textual.**  An earlier revision matched
+regexes against the raise message and produced a large false-Delete
+population: any check whose message happened to contain "changed", "receipt"
+or "parent" was swept into Delete regardless of what it asserted.
+``self.prompt_workspace_token_proxy != self.prompt_token_proxy +
+self.responder_output_token_reserve`` is addition; ``type(x) is not bool`` is
+a type check.  Neither is a hash comparison, and no amount of rule reordering
+fixes that — text about code is not code.
+
+So each check is classified by the **shape of its guarding condition's AST**:
+
+  recompute(...) != stored_digest      -> Delete/identity  (recomputation)
+  stored_digest_a != stored_digest_b   -> Delete/identity  (cross-check)
+  type(x) is not T                     -> InputValidation
+  len(x) != N                          -> Test             (arity)
+  x not in {literal, ...}              -> Test             (enum)
+  a != b + c                           -> Test             (arithmetic)
+  a[:n] != b                           -> Behavioral       (prefix nesting)
+  set(a) & set(b)                      -> Behavioral       (re-admission)
+  a <= b  on id collections            -> Test             (ownership)
+
+The raise message is used only to break ties the AST leaves ambiguous, and
+never to override a structural verdict.
+
+    python scripts/classify_verification_checks.py
 """
+
+from __future__ import annotations
 
 import ast
 import collections
@@ -26,10 +54,7 @@ _diffuse_latent_training_corpus_route.py""".split()
 
 FILES = CUM + DIF
 ROOT = pathlib.Path("src/memory_condense/eval")
-CORPUS_IO = {
-    "_diffuse_latent_training_corpus_filesystem.py",
-    "_diffuse_latent_training_corpus_io.py",
-}
+
 FENCED = {
     "recall_guarded_cumulative_fast_artifact.py",
     "fast_cav_feature_session.py",
@@ -37,59 +62,358 @@ FENCED = {
     "consolidation_replay.py",
 }
 
-BEHAVIORAL = (
+# Functions that derive a digest from live data.  A comparison with one of
+# these on either side is a recomputation cross-check.
+HASH_CALLS = re.compile(
+    r"^(identity_sha256|quote_sha256|sha256_digest|.*_sha256|.*_digest"
+    r"|canonical_json_bytes|_canonical_json_bytes)$"
+)
+
+# Attributes/names that hold an already-stored digest.
+DIGEST_NAME = re.compile(r"(sha256|sha_256|_digest|digest_|fingerprint)$", re.I)
+
+
+# --------------------------------------------------------------------------
+# AST feature extraction over one guarding condition
+# --------------------------------------------------------------------------
+
+
+def calls_hash(node) -> bool:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        name = (
+            func.id
+            if isinstance(func, ast.Name)
+            else func.attr
+            if isinstance(func, ast.Attribute)
+            else ""
+        )
+        if name and HASH_CALLS.match(name):
+            return True
+    return False
+
+
+def names_digest(node) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Attribute) and DIGEST_NAME.search(child.attr):
+            return True
+        if isinstance(child, ast.Name) and DIGEST_NAME.search(child.id):
+            return True
+    return False
+
+
+def is_type_check(node) -> bool:
+    """``type(x) is not T`` / ``not isinstance(x, T)``."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Compare):
+            left = child.left
+            if (
+                isinstance(left, ast.Call)
+                and isinstance(left.func, ast.Name)
+                and left.func.id == "type"
+                and any(isinstance(op, (ast.Is, ast.IsNot)) for op in child.ops)
+            ):
+                return True
+        if (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "isinstance"
+        ):
+            return True
+    return False
+
+
+def has_len_call(node) -> bool:
+    return any(
+        isinstance(c, ast.Call)
+        and isinstance(c.func, ast.Name)
+        and c.func.id == "len"
+        for c in ast.walk(node)
+    )
+
+
+def has_membership_literal(node) -> bool:
+    """``x not in {'a', 'b'}`` — an enum check."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Compare) and any(
+            isinstance(op, (ast.In, ast.NotIn)) for op in child.ops
+        ):
+            for comparator in child.comparators:
+                if isinstance(comparator, (ast.Set, ast.Tuple, ast.List)):
+                    if all(
+                        isinstance(e, ast.Constant) for e in comparator.elts
+                    ):
+                        return True
+    return False
+
+
+def has_arithmetic(node) -> bool:
+    return any(
+        isinstance(c, ast.BinOp) and isinstance(c.op, (ast.Add, ast.Sub, ast.Mult))
+        for c in ast.walk(node)
+    )
+
+
+def has_slice(node) -> bool:
+    """``a[: len(b)] != b`` — the prefix/nesting shape."""
+    return any(
+        isinstance(c, ast.Subscript) and isinstance(c.slice, ast.Slice)
+        for c in ast.walk(node)
+    )
+
+
+def has_set_op(node) -> bool:
+    """set intersection or subset — re-admission / ownership."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.BinOp) and isinstance(child.op, ast.BitAnd):
+            return True
+        if isinstance(child, ast.Compare) and any(
+            isinstance(op, (ast.LtE, ast.GtE, ast.Lt, ast.Gt)) for op in child.ops
+        ):
+            if any(
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Name)
+                and c.func.id == "set"
+                for c in ast.walk(child)
+            ):
+                return True
+    return False
+
+
+def has_ordering_compare(node) -> bool:
+    """``a > b`` on scalars — a cap or budget comparison."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Compare) and any(
+            isinstance(op, (ast.Lt, ast.Gt, ast.LtE, ast.GtE)) for op in child.ops
+        ):
+            return True
+    return False
+
+
+STORED_ROOT = re.compile(r"^(receipt|compilation|artifact|manifest|snapshot)$", re.I)
+
+
+def reaches_stored_field(operand) -> bool:
+    """``self.receipt.x`` / ``obj.compilation.y`` — a persisted payload field."""
+    while isinstance(operand, ast.Attribute):
+        if STORED_ROOT.match(operand.attr):
+            return True
+        operand = operand.value
+        if isinstance(operand, ast.Attribute) and STORED_ROOT.match(operand.attr):
+            return True
+    return False
+
+
+def recomputes_against_stored(node) -> bool:
+    """One side is a call over live data, the other reads a stored field."""
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Compare):
+            continue
+        operands = (child.left, *child.comparators)
+        has_call = any(isinstance(o, ast.Call) for o in operands)
+        has_stored = any(reaches_stored_field(o) for o in operands)
+        if has_call and has_stored:
+            return True
+    return False
+
+
+def is_bare_truthiness(node) -> bool:
+    """``not x`` / ``x`` / ``path.exists()`` — a presence test, no comparison."""
+    return not any(isinstance(c, ast.Compare) for c in ast.walk(node))
+
+
+def compares_module_constant(node) -> bool:
+    """``x != SOME_CONSTANT`` — a format/schema check against a frozen literal."""
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Compare):
+            continue
+        for operand in (child.left, *child.comparators):
+            if isinstance(operand, ast.Name) and operand.id.isupper():
+                return True
+            if isinstance(operand, ast.Attribute) and operand.attr.isupper():
+                return True
+    return False
+
+
+def compares_two_stored_chains(node) -> bool:
+    """Both sides reach through a stored object (``.receipt.``/``.compilation.``).
+
+    This is a cross-check between two persisted payloads, not a property of a
+    live computation.
+    """
+    def chain_depth(operand):
+        depth = 0
+        while isinstance(operand, ast.Attribute):
+            depth += 1
+            operand = operand.value
+        return depth
+
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Compare):
+            continue
+        operands = (child.left, *child.comparators)
+        if len(operands) < 2:
+            continue
+        if all(chain_depth(o) >= 2 for o in operands):
+            return True
+    return False
+
+
+def is_identity_flag_check(node) -> bool:
+    """``x is not False`` / ``x is not True`` — a policy flag, not an identity."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Compare) and any(
+            isinstance(op, (ast.Is, ast.IsNot)) for op in child.ops
+        ):
+            if any(
+                isinstance(c, ast.Constant) and isinstance(c.value, bool)
+                for c in child.comparators
+            ):
+                return True
+    return False
+
+
+def is_none_check(node) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Compare) and any(
+            isinstance(op, (ast.Is, ast.IsNot)) for op in child.ops
+        ):
+            if any(
+                isinstance(c, ast.Constant) and c.value is None
+                for c in child.comparators
+            ):
+                return True
+    return False
+
+
+# Message patterns, used ONLY where the AST is genuinely ambiguous.
+BEHAVIORAL_MSG = re.compile(
     r"prefix|cumulative union|duplicate|monoton|not an earlier stage"
-    r"|immediate predecessor|no longer cumulative|complete evidence set"
+    r"|immediate predecessor|no longer cumulative|complete evidence set",
+    re.I,
 )
-IDENTITY = (
-    r"sha-?256|_digest|identity_payload|fingerprint|lineage|parent_hash|attest"
-    r"|\bseal|\bchanged\b|frozen original|bytes differ|mutated package files"
-    r"|worktree is not clean|differs from|differ from the|does not match its"
-    r"|cannot be reconstructed|not reproducible"
+OWNERSHIP_MSG = re.compile(r"belongs to another|owned|ownership", re.I)
+RECEIPT_MSG = re.compile(
+    r"receipt|certif|reservation|provenance|eligib|attest|lineage", re.I
 )
-RECEIPT = (
-    r"receipt|certified|certification|reservation|provenance|eligib"
-    r"|is missing the|identity is missing|lacks a declared identity"
-    r"|no mapping identity|omitted its identity|has no runtime identity"
-    r"|no valid implementation digest|omitted its completion report"
-)
-TEST = (
-    r"exceed|_cap\b| cap\b|budget|unique|sorted|one-to-one|zero .*state"
-    r"|transformer state|token state|non-negative|disagree|accounting"
-    r"|belongs to another|owned_|ownership|truncat"
-    r"|population is incomplete|omitted its population|populations differ"
-    r"|repeats a|repeated |is out of order|do(es)? not cover|cover the frozen"
-    r"|exactly 100 questions|is incomplete|has no |no citations|unknown claim"
-    r"|unknown evidence|exact evidence substring|must not cite"
-    r"|cannot admit|cannot claim|admitted direct chunks|artifact-global"
-    r"|gold firewall|gold-bearing|must own its|cannot mint|forbidden|firewall"
-    r"|not part of the locked|locked 100q|omitted retrieval/evaluation"
-    r"|not normalized|abstention retained|used different runtimes"
-    r"|not authoritative|conflict"
-)
-INPUT_VALIDATION = (
+VALIDATION_MSG = re.compile(
     r"must be |must contain|must equal|must map|must return|must use|require"
-    r"|cannot be empty|must not be empty|unsupported|invalid|non-empty"
-    r"|non-finite|non-string|non-json|non-numeric|schema|wrong exact|non-exact"
-    r"|malformed|noncanonical|not canonical|is not closed|not a canonical"
-    r"|has no user|no user message|provider messages are missing|missing:"
+    r"|cannot be empty|unsupported|invalid|non-empty|non-finite|non-string"
+    r"|non-json|non-numeric|schema|malformed|noncanonical|not canonical",
+    re.I,
 )
-OPERATIONAL = (
-    r"does not exist|refusing to replace|no historical|undated turn"
-    r"|unembedded chunk|lost its|not bound before|not produced"
-    r"|could not be rehydrated|is unavailable|returned an empty|is empty"
-    r"|absent from"
-)
-CORPUS_OPS = (
-    r"corpus|staging|handle|clobber|collision|replaced|snapshot is closed"
-    r"|short .* write"
-    r"|cannot (read|write|seek|flush|open|close|create|inspect|enumerate"
-    r"|resolve|atomically)"
+OPERATIONAL_MSG = re.compile(
+    r"does not exist|refusing to replace|cannot (read|write|seek|flush|open"
+    r"|close|create|inspect|enumerate|resolve|atomically)|no historical"
+    r"|undated turn|unembedded chunk|lost its|not bound before|not produced"
+    r"|could not be rehydrated|is unavailable|corpus|staging|handle|clobber"
+    r"|snapshot is closed|short .* write",
+    re.I,
 )
 
 
-def message_of(node):
-    parts = []
+def classify(test_node, message: str, in_except: bool) -> tuple[str, str]:
+    """Return ``(class, why)``.  Structure decides; message only breaks ties."""
+    if in_except:
+        return "Operational", "raised from an except handler"
+
+    if test_node is None:
+        if OPERATIONAL_MSG.search(message):
+            return "Operational", "no condition; operational message"
+        if RECEIPT_MSG.search(message):
+            return "Delete/receipt", "no condition; receipt message"
+        return "InputValidation", "no condition; presence check"
+
+    # --- structural shapes, most specific first -------------------------
+    if is_type_check(test_node):
+        return "InputValidation", "type()/isinstance() check"
+
+    if has_slice(test_node):
+        return "Behavioral", "slice comparison (ordered-prefix nesting)"
+
+    if has_set_op(test_node):
+        if BEHAVIORAL_MSG.search(message):
+            return "Behavioral", "set operation (re-admission)"
+        return "Test", "set operation (ownership/subset)"
+
+    if has_membership_literal(test_node):
+        return "Test", "membership in a literal set (enum)"
+
+    # A call on one side compared against a stored field on the other is a
+    # recomputation cross-check, whether or not the callee is a hash. e.g.
+    # count_chat_prompt_token_proxy(self.messages) != self.receipt.prompt_token_proxy
+    if recomputes_against_stored(test_node):
+        return "Delete/identity", "recomputes a value and compares to a stored field"
+
+    recompute = calls_hash(test_node)
+    digest = names_digest(test_node)
+
+    if recompute and digest:
+        return "Delete/identity", "recomputes a digest and compares to a stored one"
+    if recompute:
+        return "Delete/identity", "derives a digest for comparison"
+
+    if has_arithmetic(test_node):
+        return "Test", "arithmetic comparison"
+
+    if has_len_call(test_node):
+        return "Test", "len() arity comparison"
+
+    if digest:
+        # A stored digest is named, but nothing is recomputed. If the shape is
+        # a presence or ordering test, it is structural, not an identity
+        # cross-check — this is precisely where the textual rules failed.
+        if is_none_check(test_node):
+            return "Behavioral", "presence of a parent link (structural)"
+        if has_ordering_compare(test_node):
+            return "Test", "ordering/cap comparison"
+        return "Delete/identity", "compares stored digest fields"
+
+    if has_ordering_compare(test_node):
+        return "Test", "ordering/cap comparison"
+
+    if is_identity_flag_check(test_node):
+        return "Test", "boolean policy-flag check"
+
+    if is_bare_truthiness(test_node):
+        if OPERATIONAL_MSG.search(message):
+            return "Operational", "presence test; operational message"
+        return "InputValidation", "presence test (no comparison)"
+
+    if compares_module_constant(test_node):
+        return "InputValidation", "compares against a frozen module constant"
+
+    if compares_two_stored_chains(test_node):
+        return "Delete/identity", "cross-check between two stored payloads"
+
+    # --- no structural signal: fall back to the message -----------------
+    if BEHAVIORAL_MSG.search(message):
+        return "Behavioral", "message: nesting/monotonicity"
+    if OPERATIONAL_MSG.search(message):
+        return "Operational", "message: operational"
+    if OWNERSHIP_MSG.search(message):
+        return "Test", "message: ownership"
+    if RECEIPT_MSG.search(message):
+        return "Delete/receipt", "message: receipt/certification bookkeeping"
+    if VALIDATION_MSG.search(message):
+        return "InputValidation", "message: type/format validation"
+    return "Test", "equality of two derived values"
+
+
+DESTINATION = {
+    "Delete/identity": "delete (interior identity cross-check)",
+    "Delete/receipt": "delete (receipt/certification bookkeeping)",
+    "Test": "move to pytest over the pure transformation",
+    "Behavioral": "KEEP in-path (recall guard: monotonic nesting)",
+    "InputValidation": "keep in place (ordinary type/format validation)",
+    "Operational": "keep in place (OS / TOCTOU / precondition)",
+}
+
+
+def message_of(node) -> str:
+    parts: list[str] = []
 
     def walk(n):
         if isinstance(n, ast.Constant) and isinstance(n.value, str):
@@ -108,129 +432,13 @@ def message_of(node):
     return " ".join(parts).strip()
 
 
-# Hand-assigned classes for checks the pattern rules cannot decide.
-# Keyed "<file>:<line>"; reviewed one by one against the source.
-OVERRIDES = {
-    # --- cumulative ---------------------------------------------------
-    "_recall_guarded_cumulative_ops.py:197": "InputValidation",
-    "_recall_guarded_cumulative_ops.py:216": "Test",
-    "_recall_guarded_cumulative_ops.py:232": "Operational",
-    "_recall_guarded_cumulative_contracts.py:220": "Test",
-    "_recall_guarded_cumulative_contracts.py:353": "Test",
-    "_recall_guarded_cumulative_result.py:511": "Delete/identity",
-    "_recall_guarded_cumulative_validation_campaign.py:654": "Test",
-    "_recall_guarded_cumulative_synthesis_artifacts.py:172": "Test",
-    "_recall_guarded_cumulative_synthesis_artifacts.py:202": "InputValidation",
-    "_recall_guarded_cumulative_synthesis_artifacts.py:217": "InputValidation",
-    "_recall_guarded_cumulative_synthesis_artifacts.py:591": "Delete/receipt",
-    "_recall_guarded_cumulative_synthesis_artifacts.py:963": "InputValidation",
-    "_recall_guarded_cumulative_synthesis_artifacts.py:1041": "Test",
-    "_recall_guarded_cumulative_synthesis_artifacts.py:1156": "Delete/receipt",
-    "_recall_guarded_cumulative_synthesis_contracts.py:197": "InputValidation",
-    "_recall_guarded_cumulative_synthesis_contracts.py:338": "InputValidation",
-    "_recall_guarded_cumulative_synthesis_contracts.py:340": "Test",
-    "_recall_guarded_cumulative_synthesis_contracts.py:594": "InputValidation",
-    "recall_guarded_cumulative_final_answer.py:77": "Test",
-    "recall_guarded_cumulative_final_answer.py:218": "Delete/identity",
-    "recall_guarded_cumulative_final_answer.py:267": "Test",
-    "recall_guarded_cumulative_final_answer.py:306": "Test",
-    "recall_guarded_cumulative_final_answer_semantic_judge.py:232": "Delete/receipt",
-    "recall_guarded_cumulative_final_answer_semantic_judge.py:298": "Test",
-    "recall_guarded_cumulative_1m.py:996": "Test",
-    "recall_guarded_cumulative_runtime.py:631": "Operational",
-    # --- diffuse-replay -----------------------------------------------
-    "_diffuse_replay_contracts.py:213": "InputValidation",
-    "_diffuse_replay_contracts.py:1045": "Test",
-    "_diffuse_replay_validation.py:96": "Delete/identity",
-    "_diffuse_replay_validation.py:145": "Delete/identity",
-    "_diffuse_replay_reconstruction.py:524": "Test",
-    "diffuse_longmemeval_route_v2.py:348": "Test",
-    "diffuse_longmemeval_replay.py:231": "Delete/receipt",
-    "diffuse_longmemeval_replay.py:241": "Delete/receipt",
-    "diffuse_longmemeval_replay.py:314": "Test",
-    "diffuse_longmemeval_replay.py:392": "Test",
-    "diffuse_longmemeval_replay.py:396": "Operational",
-    "diffuse_longmemeval_replay.py:456": "Test",
-    "diffuse_longmemeval_analysis.py:578": "Test",
-    "diffuse_longmemeval_analysis.py:638": "Test",
-    "diffuse_longmemeval_analysis.py:995": "Operational",
-    "_diffuse_latent_training_corpus_filesystem.py:341": "Operational",
-    "_diffuse_latent_training_corpus_filesystem.py:439": "Operational",
-    "_diffuse_latent_training_corpus_filesystem.py:843": "Operational",
-    "_diffuse_latent_training_corpus_filesystem.py:1171": "Operational",
-    "_diffuse_latent_training_corpus_io.py:631": "Test",
-    "_diffuse_latent_training_corpus_io.py:722": "Test",
-    "_diffuse_latent_training_corpus_io.py:748": "Delete/identity",
-    "_diffuse_latent_training_corpus_io.py:915": "Operational",
-    "_diffuse_latent_training_corpus_io.py:1046": "Delete/identity",
-    "_diffuse_latent_training_corpus_io.py:1097": "Operational",
-    "_diffuse_latent_training_corpus_models.py:213": "InputValidation",
-    "_diffuse_latent_training_corpus_models.py:743": "InputValidation",
-    "_diffuse_latent_training_corpus_models.py:837": "Delete/identity",
-    "_diffuse_latent_training_corpus_route.py:729": "Test",
-    "_diffuse_latent_training_corpus_route.py:828": "Test",
-}
-
-
-def classify(filename, line, condition, message, in_except):
-    override = OVERRIDES.get(f"{filename}:{line}")
-    if override:
-        return override
-    text = (condition + " " + message).lower()
-    if in_except:
-        return "Operational"
-    if filename in CORPUS_IO and re.search(CORPUS_OPS, text):
-        return "Operational"
-    if re.search(BEHAVIORAL, text):
-        return "Behavioral"
-    if re.search(IDENTITY, text):
-        return "Delete/identity"
-    if re.search(RECEIPT, text):
-        return "Delete/receipt"
-    if re.search(TEST, text):
-        return "Test"
-    if re.search(INPUT_VALIDATION, text):
-        return "InputValidation"
-    if re.search(OPERATIONAL, text):
-        return "Operational"
-    return "Other"
-
-
-# A Delete-class row is "suspect" when its message also carries substantive
-# Test/Behavioral language — arity, type, cap arithmetic, ownership,
-# coordinate agreement.  The pattern rules key on words like "changed",
-# "receipt" and "parent", which appear in checks that are really asserting a
-# property.  Such rows must be read individually before V3 deletes them:
-# they are the ones where a blind delete would lose a real invariant.
-SUSPECT_DELETE = re.compile(
-    r"must be boolean|must be a |requires (three|exactly)|invalid .* status"
-    r"|accounting|cannot name parent|non-negative|must be sorted"
-    r"|values must be unique|exceeds|cap|budget|one-to-one|zero .*state"
-    r"|prefix|union|duplicate|belongs to another|coordinates disagree"
-    r"|must be non-empty",
-    re.IGNORECASE,
-)
-
-
-DESTINATION = {
-    "Delete/identity": "delete (interior identity cross-check)",
-    "Delete/receipt": "delete (receipt/certification bookkeeping)",
-    "Test": "move to pytest over the pure transformation",
-    "Behavioral": "KEEP in-path (recall guard: monotonic nesting)",
-    "InputValidation": "keep in place (ordinary type/format validation)",
-    "Operational": "keep in place (OS / TOCTOU / precondition)",
-    "Other": "MANUAL REVIEW",
-}
-
-
 def collect():
     rows = []
     for name in FILES:
         path = ROOT / name
         if not path.exists():
             continue
-        source = path.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source)
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
         parent = {}
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
@@ -238,30 +446,31 @@ def collect():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Raise):
                 continue
-            cursor, condition, span, in_except = node, None, 1, False
+            cursor, test_node, span, in_except = node, None, 1, False
             while cursor in parent:
                 up = parent[cursor]
                 if isinstance(up, ast.ExceptHandler):
                     in_except = True
                     break
                 if isinstance(up, ast.If) and any(cursor is s for s in up.body):
-                    condition = ast.unparse(up.test)
+                    test_node = up.test
                     span = (up.end_lineno or up.lineno) - up.lineno + 1
                     break
                 cursor = up
             message = message_of(node)
-            cls = classify(name, node.lineno, condition or "", message, in_except)
-            suspect = cls.startswith("Delete") and bool(SUSPECT_DELETE.search(message))
+            cls, why = classify(test_node, message, in_except)
             rows.append(
                 {
-                    "review_before_delete": "yes" if suspect else "",
                     "family": "cumulative" if name in CUM else "diffuse-replay",
                     "file": name,
                     "line": node.lineno,
                     "cls": cls,
+                    "why": why,
                     "destination": DESTINATION[cls],
                     "check": message,
-                    "condition": (condition or "")[:160],
+                    "condition": (
+                        ast.unparse(test_node) if test_node is not None else ""
+                    )[:160],
                     "span": span,
                     "deferred": "yes" if name in FENCED else "",
                 }
@@ -276,15 +485,14 @@ ORDER = [
     "Behavioral",
     "InputValidation",
     "Operational",
-    "Other",
 ]
 
 
-def main():
+def main() -> None:
     rows = collect()
     out = pathlib.Path("docs/08 - Analysis/12 - Verification Relocation Map.csv")
     fields = [
-        "family", "file", "line", "cls", "review_before_delete", "destination",
+        "family", "file", "line", "cls", "why", "destination",
         "check", "condition", "span", "deferred",
     ]
     with out.open("w", newline="", encoding="utf-8") as fh:
@@ -309,34 +517,22 @@ def main():
     lcb = sum(loc[("diffuse-replay", k)] for k in ORDER)
     print(f"{'TOTAL':<18}{ca:>6}{lca:>8}{cb:>6}{lcb:>8}{ca + cb:>7}{lca + lcb:>8}")
 
-    print("\n=== per-file Delete counts ===")
-    per_file = collections.Counter(
-        r["file"] for r in rows if r["cls"].startswith("Delete")
-    )
-    for name, n in per_file.most_common():
-        print(f"{n:>5}  {name}")
+    print("\n=== decided by AST shape vs by message fallback ===")
+    fallback = sum(1 for r in rows if r["why"].startswith("message:"))
+    print(f"  structural : {len(rows) - fallback:>5}  ({100 * (len(rows) - fallback) / len(rows):.1f}%)")
+    print(f"  message    : {fallback:>5}  ({100 * fallback / len(rows):.1f}%)")
 
-    suspects = [r for r in rows if r["review_before_delete"]]
-    deletes = [r for r in rows if r["cls"].startswith("Delete")]
-    print(
-        "\n=== Delete rows needing individual review before V3: "
-        f"{len(suspects)} of {len(deletes)} "
-        f"({100 * len(suspects) / len(deletes):.1f}%) ==="
-    )
-    for row in suspects:
-        print(f"  {row['file']}:{row['line']}  {row['check'][:66]}")
-
-    leftover = [r for r in rows if r["cls"] == "Other"]
-    print(f"\n=== remaining Other: {len(leftover)} ===")
-    for row in leftover:
-        print(f"  {row['file']}:{row['line']}  {row['check'][:68]}")
+    print("\n=== why, by frequency ===")
+    for why, n in collections.Counter(r["why"] for r in rows).most_common():
+        print(f"{n:>5}  {why}")
 
     scratch = pathlib.Path(
         r"C:/Users/Keytone/AppData/Local/Temp/claude"
         r"/f--Keytone-Documents-GitHub-memory-condense"
         r"/df76f76e-e421-442b-8bc3-cfe361373236/scratchpad/checks.json"
     )
-    scratch.write_text(json.dumps(rows, indent=0), encoding="utf-8")
+    if scratch.parent.exists():
+        scratch.write_text(json.dumps(rows, indent=0), encoding="utf-8")
 
 
 if __name__ == "__main__":

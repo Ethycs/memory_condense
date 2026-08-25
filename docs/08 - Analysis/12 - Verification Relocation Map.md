@@ -189,25 +189,51 @@ The charter named five test targets. Against the map:
 | --- | --- |
 | monotonic nesting | **Reclassified — Behavioral, stays in-path.** Add a pytest *as well*, but do not delete the runtime check. |
 | no-duplicate evidence | **Reclassified — Behavioral, stays in-path** (`ops.py:783`). Same treatment. |
-| zero transformer state | Test — 6 sites (`ops.py:237,647`, `contracts.py:239,614`, `runtime.py:346`, +1) |
-| policy / artifact / query ownership | Test — 31 sites, "belongs to another {artifact,query,plan,closure}" |
-| packing-cap arithmetic | Test — 24 sites, context/prompt/workspace caps and reserves |
+| zero transformer state | Test — 8 sites |
+| policy / artifact / query ownership | Test — 23 sites, "belongs to another {artifact,query,plan,closure}" |
+| packing-cap arithmetic | Test — 40 sites, context/prompt/workspace caps and reserves |
 
-The remaining ~100 Test rows the charter did not anticipate cluster as:
+The 313 Test rows, grouped by the rule that classified them:
 
-- **Population completeness** (~34): shard/campaign/judge populations are
-  complete, unrepeated, ordered, and cover the frozen question set.
-- **Gold firewall** (~12): no gold-bearing field crosses into a synthesis or
-  retrieval input.
-- **Route policy consistency** (~21): `episode_primary` cannot admit
-  artifact-global routes; `seeded_graph` cannot claim exhaustive closure.
-- **Citation integrity** (~14): claims cite known evidence aliases, quotes are
-  exact substrings, abstentions carry no claims.
-- **Coordinate agreement** (~19): excerpt/anchor/atom coordinate arrays agree
-  in length and order.
+| Rows | Classifying rule |
+| ---: | --- |
+| 157 | equality of two derived values *(the default — see below)* |
+| 70 | `len()` arity comparison |
+| 28 | ordering / cap comparison |
+| 22 | boolean policy-flag check |
+| 14 | membership in a literal set (enum) |
+| 11 | ownership, by message |
+| 6 | arithmetic comparison |
+| 5 | set operation (ownership / subset) |
 
-All five clusters are properties of pure transformations over data the test
-can construct directly. None needs a run.
+### Known limitation: the 157-row default bucket
+
+`equality of two derived values` is what the classifier returns when a
+condition is a plain `a != b` with no other structural signal — no call, no
+digest name, no `len`, no slice, no set op, no arithmetic. It is a **default,
+not a positive finding**, and it is genuinely heterogeneous. Sampling it
+shows three populations:
+
+- correctly Test — `retained_request_token_state_bytes != 0`,
+  coordinate-agreement comparisons, added-evidence projection;
+- arguably Behavioral — `stage.parent_evidence_ids !=
+  parent.selected_evidence_ids` is structural nesting by another name;
+- **actually Delete** — `ops.py:136` and `:156`
+  (`str(report.get(name, "")) != str(value)`) compare a live runtime report
+  against frozen config. That is runtime certification, which the charter
+  classes as Delete/receipt.
+
+So the AST classifier now errs in the *opposite* direction from the message
+one: it leaves some Delete rows sitting in Test. That is the safe direction —
+a check that wrongly stays costs a little hot-path work, where a check that
+wrongly goes costs an invariant — but it means **the 304 Delete figure is a
+lower bound**, and V3 tranches should expect to find a few more deletions
+inside this bucket rather than treating Test as closed.
+
+Distinguishing them needs data-flow, not shape: whether one operand
+ultimately derives from a persisted payload and the other from live
+computation. That is a larger instrument than this map warrants; reading the
+157 rows during their tranche is cheaper.
 
 ---
 

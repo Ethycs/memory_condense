@@ -24,6 +24,9 @@ dependencies = [
 packages = ["src/memory_condense"]
 
 [tool.pytest.ini_options]
+# Without this, a bare `pytest` walks eval_results/ and dies with ~129
+# PermissionError collection errors on sealed artifact directories.
+testpaths = ["tests"]
 markers = [
     "slow: marks tests that require model download (deselect with '-m \"not slow\"')",
 ]

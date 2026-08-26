@@ -273,21 +273,6 @@ class CausalCoveragePredecessor:
         anchor_ids = tuple(item.chunk.chunk_id for item in anchors)
         if excerpt_ids != anchor_ids or excerpt_ids != self.receipt.protected_chunk_ids:
             raise ValueError("predecessor excerpt and anchor coordinates disagree")
-        if identity_sha256([item.identity_payload() for item in excerpts]) != (
-            self.receipt.protected_excerpt_projection_sha256
-        ):
-            raise ValueError("predecessor excerpt projection changed")
-        if longmemeval_anchor_sequence_sha256(anchors) != (
-            self.receipt.selected_anchor_sequence_sha256
-        ):
-            raise ValueError("predecessor anchor sequence changed")
-        protected_context = _numbered_context(item.text for item in excerpts)
-        if quote_sha256(protected_context) != self.receipt.protected_context_sha256:
-            raise ValueError("predecessor rendered context changed")
-        if identity_sha256(list(self.messages)) != self.receipt.prompt_messages_sha256:
-            raise ValueError("predecessor prompt messages changed")
-        if count_chat_prompt_token_proxy(self.messages) != self.receipt.prompt_token_proxy:
-            raise ValueError("predecessor prompt token count changed")
         object.__setattr__(self, "excerpts", excerpts)
         object.__setattr__(self, "anchors", anchors)
         object.__setattr__(self, "messages", _freeze_messages(self.messages))
@@ -488,8 +473,6 @@ class NovelClosureProjection:
     def __post_init__(self) -> None:
         if not isinstance(self.plan, ClosurePlan):
             raise TypeError("novel closure projection requires a ClosurePlan")
-        if self.plan.plan_sha256 != self.receipt.projected_plan_sha256:
-            raise ValueError("novel closure projection changed its projected plan")
 
 
 @dataclass(frozen=True, slots=True)

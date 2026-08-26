@@ -472,8 +472,6 @@ def _close_cumulative_method_plan(
         expansion_exhaustive=expansion_exhaustive,
         routing_scope=routing_scope,
     )
-    if plan.expansion_receipt_sha256 != expansion_identity_sha256:
-        raise RuntimeError("closure plan changed its cumulative method expansion")
     return plan
 
 
@@ -796,10 +794,6 @@ def retrieve_recall_guarded_cumulative_packet(
                     },
                 )
             )
-            if identity_sha256(list(next_messages)) != (
-                packet.receipt.prompt_messages_sha256
-            ):
-                raise RuntimeError("addition packet does not bind its stage prompt")
             current_evidence_context = (
                 f"{current_evidence_context}\n"
                 f"[{current_entry_count + 1}] {packet.context}"

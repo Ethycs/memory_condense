@@ -259,18 +259,6 @@ class RecallGuardedCumulativeRetrieval:
             self.predecessor.receipt.matched_controls_sha256
         ):
             raise ValueError("cumulative result changed matched controls")
-        if self.receipt.predecessor_receipt_sha256 != (
-            self.predecessor.receipt.receipt_sha256
-        ):
-            raise ValueError("cumulative result changed its predecessor")
-        if self.receipt.direct_expansion_receipt_sha256 != (
-            self.episode_expansion.receipt_sha256
-        ):
-            raise ValueError("cumulative result changed direct episode expansion")
-        if self.receipt.representative_expansion_receipt_sha256 != (
-            self.representative_expansion.receipt_sha256
-        ):
-            raise ValueError("cumulative result changed representative expansion")
         if self.receipt.representative_runtime_certified != (
             self.representative_expansion.runtime_binding_certified
         ):
@@ -316,15 +304,11 @@ class RecallGuardedCumulativeRetrieval:
                 self.receipt.responder_output_token_reserve
             ):
                 raise ValueError("addition packet changed the responder reserve")
-        if self.ladder.receipt_sha256 != self.receipt.ladder_receipt_sha256:
-            raise ValueError("cumulative result changed its retrieval ladder")
         if len(self.ladder.stages) != 4 or tuple(
             item.stage_id for item in self.ladder.stages
         ) != _CUMULATIVE_STAGE_IDS:
             raise ValueError("cumulative result changed the four-stage ladder")
         root_stage = self.ladder.stages[0]
-        if root_stage.matched_controls_sha256 != self.receipt.matched_controls_sha256:
-            raise ValueError("cumulative ladder changed matched controls")
         if (
             root_stage.max_context_token_proxy,
             root_stage.max_prompt_token_proxy,
@@ -360,10 +344,6 @@ class RecallGuardedCumulativeRetrieval:
             self.predecessor.receipt.protected_chunk_ids
         ):
             raise ValueError("cumulative receipt changed protected chunk IDs")
-        if self.receipt.protected_excerpt_projection_sha256 != (
-            self.predecessor.receipt.protected_excerpt_projection_sha256
-        ):
-            raise ValueError("cumulative receipt changed protected excerpts")
         if protected_ids != self.receipt.protected_evidence_ids:
             raise ValueError("cumulative result changed protected coordinates")
         current_context = self.predecessor.protected_context
@@ -454,10 +434,6 @@ class RecallGuardedCumulativeRetrieval:
         stages = self.ladder.stages
         if stages[0].selected_evidence_ids != protected_ids:
             raise ValueError("root stage changed protected evidence")
-        if stages[0].method_evidence_sha256 != (
-            self.predecessor.receipt.receipt_sha256
-        ):
-            raise ValueError("root stage does not bind the predecessor")
         for index, projection in enumerate(projections, 1):
             stage = stages[index]
             if stage.method_evidence_sha256 != projection.receipt.receipt_sha256:

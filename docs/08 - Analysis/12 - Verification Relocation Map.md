@@ -549,6 +549,90 @@ criterion — reclassify as Behavioral, document, continue.
 
 ---
 
+## V3 status — Tranche A1 landed, A2 blocked on a decision
+
+Tranche A was scoped at 49 Delete rows. **15 landed. 34 are deferred**, and
+the reason is a finding, not caution.
+
+### What landed (A1)
+
+47 lines, pure deletion, no other edit:
+
+| File | Removed | What |
+| --- | ---: | --- |
+| `_contracts.py` | 6 | the five `CausalCoveragePredecessor` projection recomputes (excerpt projection, anchor sequence, rendered context, prompt messages, token count) and the `NovelClosureProjection` plan/receipt binding |
+| `_ops.py` | 2 | the closure-plan expansion tautology (constructed three lines above with that exact value) and the addition-packet prompt-hash recompute |
+| `_result.py` | 7 | pure digest-to-digest bindings whose structural equivalents are retained |
+
+Every one is a recomputation of a value against a digest derived from the
+same data in the same call. In each case the *invariant binding* is retained
+— the coordinate-agreement check above the predecessor block, the evidence
+prefix checks in the ladder, the structural assembly checks at the end of
+`__post_init__`.
+
+Verified: 80 tests green (65 new + the cumulative integration suite), input
+seal and behavior seal unchanged, gate passes.
+
+### Why 34 rows did not land
+
+**Reading the rows before deleting them changed the answer for 6 of the
+first 14 I examined.** The classifier is structurally sound but it cannot see
+intent:
+
+| Row | Classified | Actually | Why |
+| --- | --- | --- | --- |
+| `ops.py:97` | Delete/receipt | **Keep permanently** | a fail-closed gate: `local_ini` has no checkpoint receipt, so certification must refuse. Deleting it lets an uncertifiable backend certify. |
+| `ops.py:636` | Delete/identity | Test | query ownership — the charter's own V2 list calls this Test |
+| `ops.py:640` | Delete/identity | Test | policy ownership, same |
+| `ops.py:728` | Delete/identity | Behavioral | all three closure plans must read one discourse snapshot; catches a mid-run store change |
+| `contracts.py:425` | Delete/identity | Test | ladder-wide matched-controls uniformity; no test exists yet |
+| `result.py:337,341,345` | Delete | Test | cap and reserve propagation; no tests yet |
+
+### The blocking finding: two checks are load-bearing *and* tested
+
+Two deletions made an existing integration test fail:
+
+- `contracts.py:438` — parent-hash lineage. `test_stage_and_ladder_reject_predecessor_loss`
+  builds a stage with correct parent evidence but a forged
+  `parent_stage_receipt_sha256` and requires rejection. After deletion the
+  ladder binds by *evidence* only, so two different parents with identical
+  evidence become interchangeable.
+- `result.py:261` — matched controls. `test_result_rejects_resealed_receipt_lies`
+  forges `matched_controls_sha256` on the receipt and requires rejection.
+
+The charter names both classes for deletion — "parent-hash lineage" and
+"per-call identity cross-checks" are listed explicitly. But the existing
+tests encode the receipt regime as *intended, asserted behavior*. Deleting
+these is behavior-visible, and the charter requires that anything
+behavior-visible "gets its own commit and a docs note" and is "never silent".
+
+Both checks were therefore **restored**, and the tranche stopped short rather
+than rewriting a passing test to accommodate a deletion. That rewrite is the
+highest-risk edit in this whole exercise: it is how coverage is lost while
+the suite stays green.
+
+**This is a decision, not a task.** The existing integration tests assert the
+verification regime the charter wants removed. Either:
+
+1. the tests are rewritten alongside each deletion, in its own commit with a
+   docs note — the charter's stated process, or
+2. lineage and receipt-forgery detection are reclassified as Behavioral and
+   kept, narrowing V3 substantially.
+
+Until that is settled, A2 (the remaining 34 rows), B and C cannot proceed
+past the same wall — every family has checks of exactly this shape.
+
+### Revised expectation for V3
+
+Of 14 Tranche A rows read closely, 8 were safe to delete, 4 were
+misclassified keeps, and 2 need a decision. If that ratio holds, the 304
+Delete rows contain roughly **170 genuinely deletable checks**, not 304 — and
+the charter's "halve the verification-touching lines" target is not
+reachable by deleting comparisons alone. It needs the receipt *fields* to go
+too, which is V4's receipt collapse, not V3's deletions.
+
+---
+
 ## Open questions for V2
 
 1. `_recall_guarded_cumulative_result.py`'s `__post_init__` is 47 Delete

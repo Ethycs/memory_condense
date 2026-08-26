@@ -265,9 +265,9 @@ $$
 h^{(t+1)}_v=\frac{\widetilde h^{(t+1)}_v}{Z},\qquad v\in K.
 $$
 
-The same $1/Z$ factor updates the diagnostic best-path contribution. Removed
-pre-normalization mass is added to `discarded_heat`; because every retained
-frontier is renormalized, that diagnostic is not itself a final probability.
+The same $1/Z$ factor updates the diagnostic best-path contribution. Mass on
+trimmed nodes is simply dropped; because every retained frontier is
+renormalized, the surviving distribution still sums to one.
 
 Function defaults are two hops, three neighbors per node, eight retained
 nodes, $\rho=0.35$, and both temperatures `1.0`. The measured development
@@ -339,26 +339,15 @@ u^{velocity}_j=
 \frac{\sum_h a_{jh}\cos(\delta_{jh},v)}{\sum_h a_{jh}}.
 $$
 
-Let
+The final proposal score is
 
 $$
-M_{all}=1+\sum_e M_{eff,e},
+S_j=S^{base}_j+w_tu^{learned}_j+w_vu^{velocity}_j.
 $$
 
-where the sum includes edge statistics whose last turn is not in the future.
-The exploration bonus and final proposal score are
-
-$$
-E_j=w_x\sqrt{\frac{\ln(1+M_{all})}{1+M_{eff,j}}},
-$$
-
-$$
-S_j=S^{base}_j+w_tu^{learned}_j+w_vu^{velocity}_j+E_j.
-$$
-
-Defaults are $h=128$, $m_0=1$, $w_t=0.25$, $w_v=0$, $\tau=1$, and
-$w_x=0$. Equal scores break toward descending destination ID because the
-implementation sorts `(score, destination_id)` in reverse order.
+Defaults are $h=128$, $m_0=1$, $w_t=0.25$, $w_v=0$, and $\tau=1$. Equal
+scores break toward descending destination ID because the implementation
+sorts `(score, destination_id)` in reverse order.
 
 Feedback is delayed until a later turn. With observed CAV change
 $\Delta c=c_{t+1}-c_t$, head alignment is

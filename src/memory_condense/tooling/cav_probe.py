@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from memory_condense.associations.cav_memory import cav_layer_key
 from memory_condense.modeling.qwen_prefix import (
     add_prefix_encoder_arguments,
     prefix_encoder_from_args,
@@ -296,7 +297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if passed:
                 passing_layers.add(layer)
-            vector_tensors[f"{dataset.name}.layer_{layer}"] = cav.vector.contiguous()
+            vector_tensors[cav_layer_key(dataset.name, layer)] = cav.vector.contiguous()
             layer_reports.append(
                 {
                     "layer": layer,

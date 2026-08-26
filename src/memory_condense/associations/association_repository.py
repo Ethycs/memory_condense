@@ -8,7 +8,10 @@ from typing import Any, Sequence
 from memory_condense.associations.association_artifacts import (
     AssociationArtifactStoreMixin,
 )
-from memory_condense.associations.association_edges import AssociationEdgeStoreMixin
+from memory_condense.associations.association_edges import (
+    AssociationEdgeStoreMixin,
+    head_edge_columns,
+)
 from memory_condense.associations.association_models import (
     AssociationArtifact,
     StoredCAVNeighbor,
@@ -16,6 +19,9 @@ from memory_condense.associations.association_models import (
 )
 from memory_condense.associations.hebbian_store import HebbianAssociationStoreMixin
 from memory_condense.persistence.db import Database
+
+#: Bound on each opt-in neighbor cache. No caller has ever varied it.
+_NEIGHBOR_CACHE_LIMIT = 512
 
 
 class AssociationStore(
@@ -30,7 +36,6 @@ class AssociationStore(
         db: Database,
         *,
         cache_neighbors: bool = False,
-        cache_limit: int = 512,
     ) -> None:
         self._db = db
         self._artifact_cache: dict[str, AssociationArtifact] = {}
@@ -40,7 +45,7 @@ class AssociationStore(
         self._edge_neighbor_cache: OrderedDict[
             tuple, dict[str, tuple[StoredHeadEdge, ...]]
         ] = OrderedDict()
-        self._cache_limit = max(0, int(cache_limit)) if cache_neighbors else 0
+        self._cache_limit = _NEIGHBOR_CACHE_LIMIT if cache_neighbors else 0
 
     def _cache_put(self, cache: OrderedDict, key: tuple, value: Any) -> None:
         if self._cache_limit == 0:
@@ -57,19 +62,13 @@ class AssociationStore(
         *,
         source_chunk_ids: Sequence[str] | None = None,
         now_turn: int | None = None,
-        usage_half_life: float = 100.0,
-        usage_weight: float = 0.05,
     ) -> int:
         """Enforce a hard per-source degree cap using live edge utility."""
         if max_neighbors < 0:
             raise ValueError("max_neighbors must be non-negative")
         self._require_artifact(artifact_id)
         turn = self._db.current_turn() if now_turn is None else int(now_turn)
-        select_columns = (
-            "SELECT source_chunk_id, destination_chunk_id, head_weights, qk_score, "
-            "ov_transport, evidence_count, traversal_count, last_access_turn, "
-            "temporal_forward FROM chunk_head_edges "
-        )
+        select_columns = f"SELECT {head_edge_columns()} FROM chunk_head_edges "
         rows: list = []
         if source_chunk_ids is None:
             rows = self._db.execute(
@@ -100,27 +99,9 @@ class AssociationStore(
         for source_id, source_rows in rows_by_source.items():
             ranked: list[tuple[float, str]] = []
             for row in source_rows:
-                edge = StoredHeadEdge(
-                    source_chunk_id=source_id,
-                    destination_chunk_id=row[1],
-                    artifact_id=artifact_id,
-                    head_weights=self._unpack_f32(row[2]),
-                    qk_score=float(row[3]),
-                    ov_transport=float(row[4]),
-                    evidence_count=int(row[5]),
-                    traversal_count=int(row[6]),
-                    last_access_turn=int(row[7]),
-                    temporal_forward=None if row[8] is None else bool(row[8]),
-                )
+                edge = self._stored_edge(row, artifact_id)
                 ranked.append(
-                    (
-                        edge.utility(
-                            now_turn=turn,
-                            usage_half_life=usage_half_life,
-                            usage_weight=usage_weight,
-                        ),
-                        edge.destination_chunk_id,
-                    )
+                    (edge.utility(now_turn=turn), edge.destination_chunk_id)
                 )
             ranked.sort(reverse=True)
             for _, destination_id in ranked[max_neighbors:]:

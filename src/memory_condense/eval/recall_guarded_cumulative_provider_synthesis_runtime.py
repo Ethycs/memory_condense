@@ -29,6 +29,9 @@ from memory_condense.domain._tokenizer import (
 )
 from memory_condense.domain.discourse import identity_sha256, quote_sha256
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.eval._artifact_json import (
+    canonical_json_bytes as _canonical_json_bytes,
+)
 from memory_condense.eval.recall_guarded_cumulative_synthesis_runtime import (
     RecallGuardedCumulativeSynthesisRuntime,
 )
@@ -136,19 +139,6 @@ def _campaign_binding(
     )
     assert isinstance(copied, dict)
     return copied
-
-
-def _canonical_json_bytes(value: object) -> bytes:
-    return (
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    ).encode("utf-8")
 
 
 def _sealed_journal(body: Mapping[str, Any]) -> dict[str, Any]:

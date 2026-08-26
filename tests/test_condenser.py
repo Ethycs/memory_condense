@@ -2077,20 +2077,21 @@ class TestRetrieval:
         assert [result.route for result in expanded] == ["hybrid", "qk"]
         assert expanded[1].chunk.chunk_id == linked.chunk.chunk_id
         assert expanded[1].anchor_chunk_id == first.chunk.chunk_id
-        stored_edge = populated.associations.neighbors(
-            first.chunk.chunk_id, artifact.artifact_id, top_k=1
-        )[0]
+        stored_edge = populated.associations.neighbors_many(
+            [first.chunk.chunk_id], artifact.artifact_id, top_k_per_source=1
+        )[first.chunk.chunk_id][0]
         assert stored_edge.traversal_count == 1
 
     def test_associative_search_can_fill_a_reserved_slot_from_cavs(self, populated):
         baseline = populated.search_hybrid("SQLite storage", k=3)
         first, _, linked = baseline
         artifact = populated.associations.register_artifact(association_artifact())
-        populated.associations.put_signature(
-            first.chunk.chunk_id, artifact.artifact_id, [1.0, -0.5]
-        )
-        populated.associations.put_signature(
-            linked.chunk.chunk_id, artifact.artifact_id, [0.8, -0.2]
+        populated.associations.put_signatures(
+            artifact.artifact_id,
+            [
+                (first.chunk.chunk_id, [1.0, -0.5]),
+                (linked.chunk.chunk_id, [0.8, -0.2]),
+            ],
         )
 
         expanded = populated.search_associative(
@@ -2102,7 +2103,7 @@ class TestRetrieval:
         assert len(expanded) == 2
         assert expanded[1].route == "cav"
         assert expanded[1].chunk.chunk_id == linked.chunk.chunk_id
-        signature = populated.associations.get_signature(
+        signature = populated.associations._get_signature(
             linked.chunk.chunk_id, artifact.artifact_id
         )
         assert signature is not None
@@ -2215,11 +2216,11 @@ class TestRetrieval:
         )
 
         assert expanded == [cheap_source]
-        edge = populated.associations.neighbors(
-            source.chunk.chunk_id,
+        edge = populated.associations.neighbors_many(
+            [source.chunk.chunk_id],
             artifact.artifact_id,
-            top_k=1,
-        )[0]
+            top_k_per_source=1,
+        )[source.chunk.chunk_id][0]
         assert edge.traversal_count == 0
 
     def test_live_hebbian_access_learns_and_recalls_co_retrieved_chunk(
@@ -2253,8 +2254,8 @@ class TestRetrieval:
         baseline = populated.search_hybrid("SQLite storage", k=3)
         first, _, linked = baseline
         artifact = populated.associations.register_artifact(association_artifact())
-        populated.associations.put_signature(
-            linked.chunk.chunk_id, artifact.artifact_id, [1.0, 0.0]
+        populated.associations.put_signatures(
+            artifact.artifact_id, [(linked.chunk.chunk_id, [1.0, 0.0])]
         )
         populated.associations.upsert_edge(
             first.chunk.chunk_id,

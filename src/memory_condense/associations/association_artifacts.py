@@ -1,4 +1,17 @@
-"""Artifact identity and compact CAV-signature persistence."""
+"""Artifact identity and compact CAV-signature persistence.
+
+``AssociationArtifactStoreMixin`` is one of three mixins composed into
+``AssociationStore``. It is not standalone: the composer must supply
+
+* ``self._db`` -- an open :class:`~memory_condense.persistence.db.Database`;
+* ``self._artifact_cache`` -- ``dict[str, AssociationArtifact]``;
+* ``self._cav_neighbor_cache`` -- an ``OrderedDict`` bounded by ``_cache_put``;
+* ``self._cache_limit`` -- ``0`` to disable neighbor caching entirely;
+* ``self._cache_put(cache, key, value)`` -- bounded cache insertion.
+
+In return it provides ``_require_artifact``, ``_resolved_turn``, ``_pack_f32``,
+and ``_unpack_f32`` to its sibling mixins.
+"""
 
 from __future__ import annotations
 
@@ -101,34 +114,20 @@ class AssociationArtifactStoreMixin:
     def _unpack_f32(blob: bytes) -> tuple[float, ...]:
         return tuple(float(value) for value in np.frombuffer(blob, dtype="<f4"))
 
-    def put_signature(
-        self,
-        chunk_id: str,
-        artifact_id: str,
-        values: Sequence[float],
-        *,
-        created_turn: int | None = None,
-    ) -> None:
-        artifact = self._require_artifact(artifact_id)
-        if artifact.cav_layer is None or not artifact.concept_names:
-            raise ValueError("artifact does not define a CAV coordinate system")
-        blob = self._pack_f32(
-            values,
-            width=len(artifact.concept_names),
-            field_name="CAV signature",
-        )
-        turn = self._db.current_turn() if created_turn is None else int(created_turn)
-        if turn < 0:
-            raise ValueError("created_turn must be non-negative")
-        self._db.execute(
-            "INSERT INTO chunk_cav_signatures "
-            "(chunk_id, artifact_id, signature, created_turn) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(chunk_id, artifact_id) DO UPDATE SET "
-            "signature = excluded.signature, created_turn = excluded.created_turn",
-            (chunk_id, artifact_id, blob, turn),
-        )
-        self._db.commit()
-        self._cav_neighbor_cache.clear()
+    def _resolved_turn(self, turn: int | None, *, field_name: str) -> int:
+        """Default an unset turn to the live clock and reject negative turns."""
+        resolved = self._db.current_turn() if turn is None else int(turn)
+        if resolved < 0:
+            raise ValueError(f"{field_name} must be non-negative")
+        return resolved
+
+    @staticmethod
+    def _checked_signature_width(
+        values: tuple[float, ...], artifact: AssociationArtifact
+    ) -> tuple[float, ...]:
+        if len(values) != len(artifact.concept_names):
+            raise ValueError("stored CAV signature width does not match its artifact")
+        return values
 
     def put_signatures(
         self,
@@ -142,9 +141,7 @@ class AssociationArtifactStoreMixin:
         artifact = self._require_artifact(artifact_id)
         if artifact.cav_layer is None or not artifact.concept_names:
             raise ValueError("artifact does not define a CAV coordinate system")
-        turn = self._db.current_turn() if created_turn is None else int(created_turn)
-        if turn < 0:
-            raise ValueError("created_turn must be non-negative")
+        turn = self._resolved_turn(created_turn, field_name="created_turn")
         rows = [
             (
                 str(chunk_id),
@@ -183,7 +180,7 @@ class AssociationArtifactStoreMixin:
             is not None
         )
 
-    def get_signature(
+    def _get_signature(
         self, chunk_id: str, artifact_id: str
     ) -> StoredCAVSignature | None:
         artifact = self._require_artifact(artifact_id)
@@ -194,13 +191,12 @@ class AssociationArtifactStoreMixin:
         ).fetchone()
         if row is None:
             return None
-        values = self._unpack_f32(row[0])
-        if len(values) != len(artifact.concept_names):
-            raise ValueError("stored CAV signature width does not match its artifact")
         return StoredCAVSignature(
             chunk_id=chunk_id,
             artifact_id=artifact_id,
-            values=values,
+            values=self._checked_signature_width(
+                self._unpack_f32(row[0]), artifact
+            ),
             created_turn=int(row[1]),
             access_count=int(row[2]),
             last_access_turn=int(row[3]),
@@ -241,11 +237,9 @@ class AssociationArtifactStoreMixin:
             chunk_id = row[0]
             if chunk_id in excluded:
                 continue
-            values = self._unpack_f32(row[1])
-            if len(values) != len(artifact.concept_names):
-                raise ValueError(
-                    "stored CAV signature width does not match its artifact"
-                )
+            values = self._checked_signature_width(
+                self._unpack_f32(row[1]), artifact
+            )
             source_id = row[2] if with_sources else None
             scanned.append(
                 (chunk_id, values, None if source_id is None else str(source_id))
@@ -285,7 +279,7 @@ class AssociationArtifactStoreMixin:
             return ()
         seeds: list[tuple[float, ...]] = []
         for chunk_id in unique_seeds:
-            signature = self.get_signature(chunk_id, artifact_id)
+            signature = self._get_signature(chunk_id, artifact_id)
             if signature is not None:
                 seeds.append(signature.values)
         if not seeds:

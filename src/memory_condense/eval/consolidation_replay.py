@@ -11,18 +11,22 @@ consolidation.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
+import secrets
 import shutil
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, MutableSequence, Sequence
 
 import numpy as np
 
 from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.domain._discourse_identity import identity_sha256
 from memory_condense.domain.integrity import file_sha256 as _sha256
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.search.packing.context_packer import ContextBudget
@@ -30,6 +34,9 @@ from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.eval.answer_value_coverage import contains_answer
 from memory_condense.tooling.qwen_consolidation import load_qwen_linker
 from memory_condense.domain.schemas import Chunk, PackedContext
+
+
+RETRIEVAL_ACCESS_EVENT_FORMAT = "memory-condense.retrieval-access-event.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +48,361 @@ class ReplayEvent:
     user_text: str
     chunk_ids: tuple[str, ...]
     causal_chunk_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalAccessEvent:
+    """Immutable, text-free receipt for one historical direct retrieval."""
+
+    event_id: str
+    now_turn: int
+    chunk_ids: tuple[str, ...]
+    event_sha256: str = field(init=False)
+
+    def identity_payload(self) -> dict[str, object]:
+        """Return the canonical ordered-ID projection bound by the event seal."""
+
+        return {
+            "format": RETRIEVAL_ACCESS_EVENT_FORMAT,
+            "event_id": self.event_id,
+            "now_turn": self.now_turn,
+            "chunk_ids": self.chunk_ids,
+        }
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.event_id) is not str
+            or not self.event_id
+            or self.event_id != self.event_id.strip()
+        ):
+            raise ValueError("event_id must be an exact non-empty string")
+        if type(self.now_turn) is not int or self.now_turn < 0:
+            raise ValueError("now_turn must be an exact non-negative integer")
+        if type(self.chunk_ids) is not tuple:
+            raise TypeError("chunk_ids must be an exact tuple")
+        if any(
+            type(chunk_id) is not str
+            or not chunk_id
+            or chunk_id != chunk_id.strip()
+            for chunk_id in self.chunk_ids
+        ):
+            raise ValueError("chunk_ids must contain only exact non-empty IDs")
+        event_id = self.event_id
+        now_turn = self.now_turn
+        chunk_ids = self.chunk_ids
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "now_turn", now_turn)
+        object.__setattr__(self, "chunk_ids", chunk_ids)
+        object.__setattr__(
+            self,
+            "event_sha256",
+            identity_sha256(self.identity_payload()),
+        )
+
+
+RETRIEVAL_ACCESS_CAPTURE_FORMAT = (
+    "memory-condense.retrieval-access-capture.v1"
+)
+_RETRIEVAL_ACCESS_CAPTURE_AUTHORITY = secrets.token_bytes(32)
+
+
+class RetrievalAccessCaptureValidationError(ValueError):
+    """Raised when a staging-issued direct-retrieval capture is invalid."""
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalAccessCapture:
+    """Text-free, transiently authorized projection of direct retrievals.
+
+    ``capture_sha256`` is deterministic and safe to persist. The private
+    authorization tag is process-local and exists only to prevent a caller
+    from feeding an independently re-sealed event list to the history sealer.
+    It is intentionally excluded from equality, repr, and ``payload``.
+    """
+
+    format: str
+    source_database_sha256: str
+    capture_policy_sha256: str
+    retrieval_k: int
+    expansion_tokens: int
+    max_prompt_tokens: int
+    events: tuple[RetrievalAccessEvent, ...]
+    retained_request_token_state_bytes: int
+    capture_sha256: str
+    _authorization_tag: str = field(repr=False, compare=False)
+
+    def payload(self) -> dict[str, object]:
+        """Return the deterministic, text-free projection (never its tag)."""
+
+        return _retrieval_access_capture_payload(
+            source_database_sha256=self.source_database_sha256,
+            capture_policy_sha256=self.capture_policy_sha256,
+            retrieval_k=self.retrieval_k,
+            expansion_tokens=self.expansion_tokens,
+            max_prompt_tokens=self.max_prompt_tokens,
+            events=self.events,
+        )
+
+
+@dataclass(slots=True)
+class RetrievalAccessCaptureSink:
+    """Single-use output slot populated only by ``stage_causal_store``."""
+
+    _capture: RetrievalAccessCapture | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def capture(self) -> RetrievalAccessCapture:
+        """Return the completed capture or fail if staging did not finish."""
+
+        if self._capture is None:
+            raise RetrievalAccessCaptureValidationError(
+                "retrieval access capture is unavailable before staging completes"
+            )
+        return verify_retrieval_access_capture(self._capture)
+
+
+def _require_capture_digest(value: object, label: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RetrievalAccessCaptureValidationError(
+            f"{label} must be an exact lowercase SHA-256 digest"
+        )
+    return value
+
+
+def _retrieval_access_capture_payload(
+    *,
+    source_database_sha256: str,
+    capture_policy_sha256: str,
+    retrieval_k: int,
+    expansion_tokens: int,
+    max_prompt_tokens: int,
+    events: Sequence[RetrievalAccessEvent],
+) -> dict[str, object]:
+    return {
+        "format": RETRIEVAL_ACCESS_CAPTURE_FORMAT,
+        "source_database_sha256": source_database_sha256,
+        "capture_policy_sha256": capture_policy_sha256,
+        "retrieval_k": retrieval_k,
+        "expansion_tokens": expansion_tokens,
+        "max_prompt_tokens": max_prompt_tokens,
+        "direct_expansion_only": True,
+        "event_id_scheme": "causal-user:{ordinal}",
+        "capture_point": (
+            "after_direct_context_pack_before_current_user_append"
+        ),
+        "exclude_current_and_future_turns": True,
+        "ordered_events": [
+            {
+                "event_id": event.event_id,
+                "now_turn": event.now_turn,
+                "event_sha256": event.event_sha256,
+            }
+            for event in events
+        ],
+        "event_count": len(events),
+        "retained_request_token_state_bytes": 0,
+    }
+
+
+def _validated_capture_events(
+    events: object,
+) -> tuple[RetrievalAccessEvent, ...]:
+    if type(events) is not tuple:
+        raise RetrievalAccessCaptureValidationError(
+            "capture events must be an exact tuple"
+        )
+    for index, event in enumerate(events):
+        label = f"capture events[{index}]"
+        if type(event) is not RetrievalAccessEvent:
+            raise RetrievalAccessCaptureValidationError(
+                f"{label} must be an exact RetrievalAccessEvent"
+            )
+        if (
+            type(event.event_id) is not str
+            or not event.event_id
+            or event.event_id != event.event_id.strip()
+        ):
+            raise RetrievalAccessCaptureValidationError(
+                f"{label}.event_id must be an exact non-empty string"
+            )
+        if type(event.now_turn) is not int or event.now_turn < 0:
+            raise RetrievalAccessCaptureValidationError(
+                f"{label}.now_turn must be an exact non-negative integer"
+            )
+        if type(event.chunk_ids) is not tuple or any(
+            type(chunk_id) is not str
+            or not chunk_id
+            or chunk_id != chunk_id.strip()
+            for chunk_id in event.chunk_ids
+        ):
+            raise RetrievalAccessCaptureValidationError(
+                f"{label}.chunk_ids must be an exact tuple of non-empty IDs"
+            )
+        event_sha256 = _require_capture_digest(
+            event.event_sha256,
+            f"{label}.event_sha256",
+        )
+        if event_sha256 != identity_sha256(event.identity_payload()):
+            raise RetrievalAccessCaptureValidationError(
+                f"{label}.event_sha256 does not match its ordered ID payload"
+            )
+    return events
+
+
+def retrieval_access_capture_sha256(
+    *,
+    source_database_sha256: str,
+    capture_policy_sha256: str,
+    retrieval_k: int,
+    expansion_tokens: int,
+    max_prompt_tokens: int,
+    events: Sequence[RetrievalAccessEvent],
+) -> str:
+    """Return the deterministic persisted seal for one capture projection."""
+
+    return identity_sha256(
+        _retrieval_access_capture_payload(
+            source_database_sha256=source_database_sha256,
+            capture_policy_sha256=capture_policy_sha256,
+            retrieval_k=retrieval_k,
+            expansion_tokens=expansion_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            events=events,
+        )
+    )
+
+
+def _mint_retrieval_access_capture(
+    *,
+    source_database_sha256: str,
+    capture_policy_sha256: str,
+    retrieval_k: int,
+    expansion_tokens: int,
+    max_prompt_tokens: int,
+    events: Sequence[RetrievalAccessEvent],
+) -> RetrievalAccessCapture:
+    """Mint the process-local capability; called only at the staging boundary."""
+
+    source_digest = _require_capture_digest(
+        source_database_sha256,
+        "capture source_database_sha256",
+    )
+    policy_digest = _require_capture_digest(
+        capture_policy_sha256,
+        "capture capture_policy_sha256",
+    )
+    for value, label in (
+        (retrieval_k, "retrieval_k"),
+        (expansion_tokens, "expansion_tokens"),
+        (max_prompt_tokens, "max_prompt_tokens"),
+    ):
+        if type(value) is not int or value < 1:
+            raise RetrievalAccessCaptureValidationError(
+                f"capture {label} must be an exact positive integer"
+            )
+    normalized_events = _validated_capture_events(tuple(events))
+    capture_sha256 = retrieval_access_capture_sha256(
+        source_database_sha256=source_digest,
+        capture_policy_sha256=policy_digest,
+        retrieval_k=retrieval_k,
+        expansion_tokens=expansion_tokens,
+        max_prompt_tokens=max_prompt_tokens,
+        events=normalized_events,
+    )
+    authorization_tag = hmac.new(
+        _RETRIEVAL_ACCESS_CAPTURE_AUTHORITY,
+        capture_sha256.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return RetrievalAccessCapture(
+        format=RETRIEVAL_ACCESS_CAPTURE_FORMAT,
+        source_database_sha256=source_digest,
+        capture_policy_sha256=policy_digest,
+        retrieval_k=retrieval_k,
+        expansion_tokens=expansion_tokens,
+        max_prompt_tokens=max_prompt_tokens,
+        events=normalized_events,
+        retained_request_token_state_bytes=0,
+        capture_sha256=capture_sha256,
+        _authorization_tag=authorization_tag,
+    )
+
+
+def verify_retrieval_access_capture(
+    capture: object,
+) -> RetrievalAccessCapture:
+    """Verify deterministic content and transient staging authorization."""
+
+    if type(capture) is not RetrievalAccessCapture:
+        raise RetrievalAccessCaptureValidationError(
+            "history sealing requires a staging-issued RetrievalAccessCapture"
+        )
+    if capture.format != RETRIEVAL_ACCESS_CAPTURE_FORMAT:
+        raise RetrievalAccessCaptureValidationError(
+            "unsupported retrieval access capture"
+        )
+    source_digest = _require_capture_digest(
+        capture.source_database_sha256,
+        "capture source_database_sha256",
+    )
+    policy_digest = _require_capture_digest(
+        capture.capture_policy_sha256,
+        "capture capture_policy_sha256",
+    )
+    for value, label in (
+        (capture.retrieval_k, "retrieval_k"),
+        (capture.expansion_tokens, "expansion_tokens"),
+        (capture.max_prompt_tokens, "max_prompt_tokens"),
+    ):
+        if type(value) is not int or value < 1:
+            raise RetrievalAccessCaptureValidationError(
+                f"capture {label} must be an exact positive integer"
+            )
+    events = _validated_capture_events(capture.events)
+    if (
+        type(capture.retained_request_token_state_bytes) is not int
+        or capture.retained_request_token_state_bytes != 0
+    ):
+        raise RetrievalAccessCaptureValidationError(
+            "retrieval access capture may not retain request token state"
+        )
+    expected_sha256 = retrieval_access_capture_sha256(
+        source_database_sha256=source_digest,
+        capture_policy_sha256=policy_digest,
+        retrieval_k=capture.retrieval_k,
+        expansion_tokens=capture.expansion_tokens,
+        max_prompt_tokens=capture.max_prompt_tokens,
+        events=events,
+    )
+    capture_sha256 = _require_capture_digest(
+        capture.capture_sha256,
+        "capture capture_sha256",
+    )
+    if capture_sha256 != expected_sha256:
+        raise RetrievalAccessCaptureValidationError(
+            "retrieval access capture seal mismatch"
+        )
+    expected_tag = hmac.new(
+        _RETRIEVAL_ACCESS_CAPTURE_AUTHORITY,
+        expected_sha256.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    if (
+        type(capture._authorization_tag) is not str
+        or not hmac.compare_digest(capture._authorization_tag, expected_tag)
+    ):
+        raise RetrievalAccessCaptureValidationError(
+            "retrieval access capture was not issued by this staging process"
+        )
+    return capture
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,10 +452,27 @@ class FrozenQueryEmbedder:
         return []
 
 
+def _open_source_database(source_db: str | Path) -> sqlite3.Connection:
+    """Open a historical store without creating SQLite WAL/SHM sidecars."""
+
+    try:
+        path = Path(source_db).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise FileNotFoundError(f"source database not found: {source_db}") from exc
+    if not path.is_file():
+        raise FileNotFoundError(f"source database not found: {path}")
+    connection = sqlite3.connect(
+        f"{path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
 def _source_replay_rows(source_db: Path) -> list[_SourceReplayRow]:
     """Read exact turn IDs/timestamps without changing historical row order."""
 
-    connection = sqlite3.connect(source_db)
+    connection = _open_source_database(source_db)
     try:
         turn_columns = {
             str(row[1])
@@ -190,7 +569,7 @@ def _validated_replay_timestamps(
 def _source_user_queries(source_db: str | Path) -> list[str]:
     """Read only user text, avoiding a second materialization of embeddings."""
 
-    connection = sqlite3.connect(Path(source_db))
+    connection = _open_source_database(source_db)
     try:
         turn_columns = {
             str(row[1])
@@ -219,6 +598,9 @@ def stage_causal_store(
     max_event_nodes: int = 9,
     new_event_nodes: int = 5,
     max_prompt_tokens: int = 128,
+    retrieval_access_events: MutableSequence[RetrievalAccessEvent] | None = None,
+    retrieval_access_capture_sink: RetrievalAccessCaptureSink | None = None,
+    retrieval_access_capture_policy_sha256: str | None = None,
 ) -> tuple[list[ReplayEvent], dict[str, int]]:
     """Reveal a corpus and bind each response episode to its retrieved context.
 
@@ -227,8 +609,13 @@ def stage_causal_store(
     event joins the stored prompt and prior anchors with every newly experienced
     response/tool chunk through as many fixed-size slices as necessary. This is
     the fast episodic-binding half of consolidation; later prompts provide
-    repeated support. Nothing from a future episode can enter an earlier event,
-    and slice count changes compute rather than transformer workspace memory.
+    repeated support. When ``retrieval_access_events`` is supplied, the exact
+    ordered direct-result IDs are captured before the current prompt is
+    appended. Those receipts contain no query text or token state. Nothing from
+    a future episode can enter an earlier event, and slice count changes compute
+    rather than transformer workspace memory. A capture sink additionally
+    receives a transiently authorized, deterministic projection of those exact
+    direct packs. Only that projection is accepted by the history sealer.
     """
 
     if max_event_nodes < 2:
@@ -239,6 +626,30 @@ def stage_causal_store(
     target = Path(target_dir)
     if target.exists():
         raise FileExistsError(f"refusing to replace replay store: {target}")
+    if retrieval_access_capture_sink is not None:
+        if type(retrieval_access_capture_sink) is not RetrievalAccessCaptureSink:
+            raise TypeError(
+                "retrieval_access_capture_sink must be an exact "
+                "RetrievalAccessCaptureSink"
+            )
+        if retrieval_access_capture_sink._capture is not None:
+            raise ValueError("retrieval access capture sink is single-use")
+        if retrieval_access_capture_policy_sha256 is None:
+            raise ValueError(
+                "capture policy digest is required with a retrieval access sink"
+            )
+        capture_policy_sha256 = _require_capture_digest(
+            retrieval_access_capture_policy_sha256,
+            "retrieval_access_capture_policy_sha256",
+        )
+        source_database_sha256_before = _sha256(source)
+    else:
+        if retrieval_access_capture_policy_sha256 is not None:
+            raise ValueError(
+                "capture policy digest requires a retrieval access capture sink"
+            )
+        capture_policy_sha256 = None
+        source_database_sha256_before = None
     rows = _source_replay_rows(source)
     replay_timestamps = _validated_replay_timestamps(rows)
     source_chunk_count = sum(len(row.chunks) for row in rows)
@@ -255,6 +666,7 @@ def stage_causal_store(
     pending: dict[str, object] | None = None
     completed_episodes = 0
     outcome_chunks_bound = 0
+    captured_access_events: list[RetrievalAccessEvent] = []
 
     def interleave(old_ids: Sequence[str], new_ids: Sequence[str]) -> tuple[str, ...]:
         members: list[str] = []
@@ -328,6 +740,8 @@ def stage_causal_store(
                 if count_tokens(text) > max_prompt_tokens:
                     skipped_large += 1
                 else:
+                    access_event_id = f"causal-user:{ordinal}"
+                    access_turn = condenser.transcript.current_turn()
                     packed = condenser.build_context(
                         text,
                         recent_turns=0,
@@ -337,10 +751,19 @@ def stage_causal_store(
                         reheat_memories=False,
                         use_consolidation=False,
                         learn_consolidation=False,
-                        access_event_id=f"causal-user:{ordinal}",
+                        access_event_id=access_event_id,
                     )
+                    access_event = RetrievalAccessEvent(
+                        event_id=access_event_id,
+                        now_turn=access_turn,
+                        chunk_ids=tuple(packed.direct_expansion_chunk_ids),
+                    )
+                    if retrieval_access_events is not None:
+                        retrieval_access_events.append(access_event)
+                    if retrieval_access_capture_sink is not None:
+                        captured_access_events.append(access_event)
                     pending = {
-                        "event_id": f"causal-user:{ordinal}",
+                        "event_id": access_event_id,
                         "user_text": text,
                         "source_id": source_id,
                         "anchor_ids": tuple(packed.direct_expansion_chunk_ids),
@@ -370,6 +793,23 @@ def stage_causal_store(
                 pending_ids.extend(chunk.chunk_id for chunk in copied)
 
         finalize_pending(condenser.transcript.current_turn())
+    if retrieval_access_capture_sink is not None:
+        source_database_sha256_after = _sha256(source)
+        if source_database_sha256_before != source_database_sha256_after:
+            raise RuntimeError(
+                "source database changed while retrieval access was staged"
+            )
+        if capture_policy_sha256 is None:
+            raise AssertionError("validated capture policy digest was lost")
+        retrieval_access_capture_sink._capture = _mint_retrieval_access_capture(
+            source_database_sha256=source_database_sha256_after,
+            capture_policy_sha256=capture_policy_sha256,
+            retrieval_k=retrieval_k,
+            expansion_tokens=expansion_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            events=captured_access_events,
+        )
+
     return events, {
         "source_turns": len(rows),
         "events": len(events),

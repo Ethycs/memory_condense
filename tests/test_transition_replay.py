@@ -99,8 +99,13 @@ def test_compiled_loader_never_uses_future_chunks_as_current_candidates(tmp_path
         )
         associations = AssociationStore(database)
         associations.register_artifact(artifact)
-        for index, chunk in enumerate(chunks):
-            associations.put_signature(chunk.chunk_id, artifact.artifact_id, (float(index),))
+        associations.put_signatures(
+            artifact.artifact_id,
+            [
+                (chunk.chunk_id, (float(index),))
+                for index, chunk in enumerate(chunks)
+            ],
+        )
         # Turn 2 ranks old chunk 0 over old chunk 1. Turn 3 later reveals that
         # its own strongest history target was chunk 1.
         associations.upsert_edge(

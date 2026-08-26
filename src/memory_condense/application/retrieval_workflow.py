@@ -13,7 +13,9 @@ from memory_condense.application.query_routing import (
 from memory_condense.associations.association_store import HebbianUpdate
 from memory_condense.associations.associative_retrieval import expand_associative_results
 from memory_condense.associations.hebbian_retrieval import (
+    HebbianExpansionReceipt,
     expand_hebbian_results,
+    expand_hebbian_results_with_receipt,
     retrieval_concept_activations,
 )
 from memory_condense.domain.schemas import RetrievalResult
@@ -209,6 +211,7 @@ class RetrievalWorkflowMixin:
         *,
         k: int | None = None,
         hebbian_slots: int = 1,
+        max_seed_concepts: int = 12,
         max_candidates: int = 32,
         half_life_turns: float = 200.0,
         min_score: float = 0.05,
@@ -228,6 +231,42 @@ class RetrievalWorkflowMixin:
             now_turn=self._db.current_turn(),
             k=k,
             hebbian_slots=hebbian_slots,
+            max_seed_concepts=max_seed_concepts,
+            max_candidates=max_candidates,
+            half_life_turns=half_life_turns,
+            min_score=min_score,
+            lexical_protection_threshold=lexical_protection_threshold,
+            max_prompt_token_increase=max_prompt_token_increase,
+        )
+
+    def expand_hebbian_with_receipt(
+        self,
+        anchors: Sequence[RetrievalResult],
+        artifact_id: str,
+        *,
+        k: int | None = None,
+        hebbian_slots: int = 1,
+        max_seed_concepts: int = 12,
+        max_candidates: int = 32,
+        half_life_turns: float = 200.0,
+        min_score: float = 0.05,
+        lexical_protection_threshold: float | None = (
+            SAFE_ASSOCIATION_LEXICAL_THRESHOLD
+        ),
+        max_prompt_token_increase: int | None = (
+            SAFE_ASSOCIATION_MAX_TOKEN_INCREASE
+        ),
+    ) -> tuple[list[RetrievalResult], HebbianExpansionReceipt]:
+        """Expand cached anchors and return its sealed membership receipt."""
+        return expand_hebbian_results_with_receipt(
+            anchors,
+            artifact_id,
+            store=self._associations,
+            hydrate=self._retriever.hydrate_chunk,
+            now_turn=self._db.current_turn(),
+            k=k,
+            hebbian_slots=hebbian_slots,
+            max_seed_concepts=max_seed_concepts,
             max_candidates=max_candidates,
             half_life_turns=half_life_turns,
             min_score=min_score,

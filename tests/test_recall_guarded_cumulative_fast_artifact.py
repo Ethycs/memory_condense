@@ -194,6 +194,12 @@ def _fixture_artifact(
             "responder_output_token_reserve"
         ],
         "protected_context_sha256": s0_receipt["context_sha256"],
+        "packed_chunk_ids": [
+            f"chunk-{item['evidence_id']}" for item in stage_evidence[0]
+        ],
+        "protected_chunk_ids": [
+            f"chunk-{item['evidence_id']}" for item in stage_evidence[0]
+        ],
         "retrieval_policy_sha256": retrieval_policy_sha,
         "retained_request_token_state_bytes": question_retained_state_bytes,
     }
@@ -203,6 +209,9 @@ def _fixture_artifact(
     retrieval_receipt: dict[str, object] = {
         "format": "memory-condense-recall-guarded-cumulative-retrieval-v1",
         "predecessor_receipt_sha256": predecessor_receipt["receipt_sha256"],
+        "protected_chunk_ids": [
+            f"chunk-{item['evidence_id']}" for item in stage_evidence[0]
+        ],
         "protected_evidence_ids": [
             item["evidence_id"] for item in stage_evidence[0]
         ],
@@ -292,6 +301,7 @@ def test_loads_exact_immutable_rows_and_deduplicates_feature_work(tmp_path: Path
     assert artifact.unique_feature_row_count == 2
     question = artifact.questions[0]
     assert question.question_id == "fixture-q"
+    assert question.protected_chunk_ids == ("chunk-e-alpha",)
     assert question.question == "Which two codes were selected?"
     assert question.dated_question == (
         "[Question asked at 2026/08/22 (Sat) 12:00]\n"
@@ -335,6 +345,32 @@ def test_loads_exact_immutable_rows_and_deduplicates_feature_work(tmp_path: Path
         "evidence_text",
         "row_sha256",
     }
+
+
+def test_rejects_mismatched_protected_chunk_coordinate_receipts(tmp_path: Path):
+    value = _fixture_artifact()
+    question = value["questions"][0]  # type: ignore[index]
+    assert isinstance(question, dict)
+    predecessor = question["predecessor_receipt"]
+    retrieval = question["retrieval_receipt"]
+    assert isinstance(predecessor, dict)
+    assert isinstance(retrieval, dict)
+    predecessor["protected_chunk_ids"] = ["chunk-different"]
+    predecessor.pop("receipt_sha256")
+    predecessor["receipt_sha256"] = _identity(predecessor)
+    retrieval["predecessor_receipt_sha256"] = predecessor["receipt_sha256"]
+    retrieval.pop("receipt_sha256")
+    retrieval["receipt_sha256"] = _identity(retrieval)
+    question_parts = value["question_part_sha256s"]
+    assert isinstance(question_parts, list)
+    question_parts[0] = hashlib.sha256(_canonical_bytes(question)).hexdigest()
+    path, digest = _publish(tmp_path, value)
+
+    with pytest.raises(
+        FastArtifactValidationError,
+        match="protected chunk IDs must exactly match the packed S0 coordinates",
+    ):
+        load_fast_retrieval_artifact(path, expected_sha256=digest)
 
 
 def test_requires_a_digest_anchor_and_checks_raw_bytes(tmp_path: Path):

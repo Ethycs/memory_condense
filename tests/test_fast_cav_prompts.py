@@ -105,6 +105,7 @@ def _artifact(*, max_prompt_tokens: int = 8_000) -> FastRetrievalArtifact:
         dated_question_sha256=dated_sha,
         predecessor_receipt_sha256="2" * 64,
         retrieval_receipt_sha256="3" * 64,
+        protected_chunk_ids=("chunk-alpha", "chunk-beta", "chunk-gamma"),
         retained_request_token_state_bytes=0,
         question=_RAW_QUESTION,
         dated_question=_DATED_QUESTION,

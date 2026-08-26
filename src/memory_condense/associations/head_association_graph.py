@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from memory_condense.associations.association_models import (
-    evidence_weighted_mean,
-    qk_transport_utility,
-)
+from memory_condense.associations.association_models import evidence_weighted_mean
 from memory_condense.associations.head_memory_models import HeadAssociationEdge
+from memory_condense.modeling.qwen_prefix import head_vote_mean
+
+#: Heads that carry an association before calibration selects a subset.
+_DEFAULT_HEAD_VOTE_K = 4
 
 
 class HeadAssociationGraph:
@@ -24,8 +25,7 @@ class HeadAssociationGraph:
 
         if self.selected_heads:
             return float(weights[list(self.selected_heads)].mean())
-        strongest = torch.topk(weights, k=min(4, len(weights))).values
-        return float(strongest.mean())
+        return float(head_vote_mean(torch, weights, k=_DEFAULT_HEAD_VOTE_K))
 
     def add(
         self,
@@ -34,26 +34,13 @@ class HeadAssociationGraph:
         head_weights: Any,
         *,
         reverse: bool = True,
-        ov_transport: float = 0.0,
     ) -> None:
         if source_id == destination_id:
             return
         weights = head_weights.detach().float().cpu()
-        self._merge(
-            source_id,
-            destination_id,
-            weights,
-            temporal_forward=False,
-            ov_transport=ov_transport,
-        )
+        self._merge(source_id, destination_id, weights, temporal_forward=False)
         if reverse:
-            self._merge(
-                destination_id,
-                source_id,
-                weights,
-                temporal_forward=True,
-                ov_transport=ov_transport,
-            )
+            self._merge(destination_id, source_id, weights, temporal_forward=True)
 
     def _merge(
         self,
@@ -62,7 +49,6 @@ class HeadAssociationGraph:
         weights: Any,
         *,
         temporal_forward: bool,
-        ov_transport: float,
     ) -> None:
         edges = self._adjacency.setdefault(source_id, {})
         current = edges.get(destination_id)
@@ -72,7 +58,6 @@ class HeadAssociationGraph:
                 destination_id=destination_id,
                 head_weights=weights,
                 score=self._score(weights),
-                ov_transport=max(0.0, float(ov_transport)),
                 temporal_forward=temporal_forward,
             )
             return
@@ -81,9 +66,6 @@ class HeadAssociationGraph:
             current.head_weights, weights, count, 1
         )
         current.score = self._score(current.head_weights)
-        current.ov_transport = evidence_weighted_mean(
-            current.ov_transport, max(0.0, float(ov_transport)), count, 1
-        )
         current.evidence_count += 1
         if current.temporal_forward != temporal_forward:
             current.temporal_forward = None
@@ -173,14 +155,6 @@ class HeadAssociationGraph:
             ]
         return tuple(sorted(edges, key=lambda edge: edge.score, reverse=True))
 
-    def edges(self) -> tuple[HeadAssociationEdge, ...]:
-        """Export compact directed edges for an external persistence backend."""
-        return tuple(
-            edge
-            for source_id in sorted(self._adjacency)
-            for edge in self.neighbors(source_id)
-        )
-
     def remove_episode_ids(self, episode_ids: Sequence[str]) -> int:
         """Remove pruned episodes as both graph sources and destinations."""
         removed_ids = set(episode_ids)
@@ -199,27 +173,6 @@ class HeadAssociationGraph:
             if not edges:
                 del self._adjacency[source_id]
         return removed_edges
-
-    def prune_neighbors(self, max_neighbors: int) -> int:
-        """Bound persistent graph degree using QK score plus transported value."""
-        if max_neighbors < 0:
-            raise ValueError("max_neighbors must be non-negative")
-        removed = 0
-        for source_id in list(self._adjacency):
-            edges = self._adjacency[source_id]
-            ranked = sorted(
-                edges.values(),
-                key=lambda edge: qk_transport_utility(edge.score, edge.ov_transport),
-                reverse=True,
-            )
-            keep = {edge.destination_id for edge in ranked[:max_neighbors]}
-            for destination_id in list(edges):
-                if destination_id not in keep:
-                    del edges[destination_id]
-                    removed += 1
-            if not edges:
-                del self._adjacency[source_id]
-        return removed
 
     @property
     def edge_count(self) -> int:

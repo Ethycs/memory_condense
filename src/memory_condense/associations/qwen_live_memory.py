@@ -16,7 +16,14 @@ from memory_condense.associations.head_memory_models import (
     LiveMemoryHit,
     LiveMemoryResult,
 )
-from memory_condense.modeling.qwen_prefix import Qwen3PrefixEncoder
+from memory_condense.associations.qwen_memory_linker import (
+    numbered_memory_block,
+    token_span_for_characters,
+)
+from memory_condense.modeling.qwen_prefix import (
+    Qwen3PrefixEncoder,
+    gqa_key_group_index,
+)
 
 
 class QwenLiveHeadMemory:
@@ -134,30 +141,18 @@ class QwenLiveHeadMemory:
             candidate_indices = torch.topk(scores, k=count).indices.tolist()
 
         candidates = [self.store.items[int(index)] for index in candidate_indices]
-        parts: list[str] = []
-        character_spans: list[tuple[int, int]] = []
-        cursor = 0
-        for position, candidate in enumerate([*candidates, item]):
-            part = f"[Memory {position}] {candidate.text}\n"
-            parts.append(part)
-            character_spans.append((cursor, cursor + len(part)))
-            cursor += len(part)
-        joint_text = "".join(parts)
+        joint_text, character_spans, _cursor = numbered_memory_block(
+            [candidate.text for candidate in [*candidates, item]]
+        )
         tokenized = self.encoder.tokenizer(
             joint_text,
             return_offsets_mapping=True,
             return_tensors="pt",
         )
         offsets = tokenized["offset_mapping"][0].tolist()
-        token_spans: list[list[int]] = []
-        for start, stop in character_spans:
-            token_spans.append(
-                [
-                    token_index
-                    for token_index, (token_start, token_stop) in enumerate(offsets)
-                    if token_stop > start and token_start < stop
-                ]
-            )
+        token_spans = [
+            token_span_for_characters(offsets, span) for span in character_spans
+        ]
 
         capture = self.encoder.capture(joint_text, layer=self.association_layer)
         attention = capture.attention[0].float()
@@ -212,10 +207,11 @@ class QwenLiveHeadMemory:
         """Measure each selected episode's actual contribution through W_O."""
         torch = self.encoder._torch
         attention = self.decoder.self_attn
-        groups_per_key = self.store.query_heads // self.store.key_value_heads
-        key_groups = (
-            torch.arange(self.store.query_heads, device=self.store.device)
-            // groups_per_key
+        key_groups = gqa_key_group_index(
+            torch,
+            query_heads=self.store.query_heads,
+            key_value_heads=self.store.key_value_heads,
+            device=self.store.device,
         )
         transports: list[Any] = []
         with torch.inference_mode():
@@ -430,9 +426,3 @@ class QwenLiveHeadMemory:
             hop_episode_ids=hop_ids,
             query_cav_signature=seeds.query_cav_signature,
         )
-
-    def prune(self, max_items: int, *, age_half_life: float = 100.0) -> list[str]:
-        """Prune low-utility K/V entries and their association-graph edges."""
-        removed = self.store.prune(max_items, age_half_life=age_half_life)
-        self.graph.remove_episode_ids(removed)
-        return removed

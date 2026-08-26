@@ -41,3 +41,5 @@ eval_results/
 
 # MCP server per-project memory store
 .memory_condense/
+
+_ingest/

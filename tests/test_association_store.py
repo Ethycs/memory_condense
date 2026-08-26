@@ -84,10 +84,10 @@ class TestCompactSignatures:
         store = AssociationStore(db)
         artifact = store.register_artifact(_artifact())
         with pytest.raises(ValueError, match="exactly 2"):
-            store.put_signature(chunks[0], artifact.artifact_id, [0.5])
+            store.put_signatures(artifact.artifact_id, [(chunks[0], [0.5])])
 
-        store.put_signature(chunks[0], artifact.artifact_id, [1.0, -0.5])
-        stored = store.get_signature(chunks[0], artifact.artifact_id)
+        store.put_signatures(artifact.artifact_id, [(chunks[0], [1.0, -0.5])])
+        stored = store._get_signature(chunks[0], artifact.artifact_id)
         assert stored is not None
         assert stored.values == pytest.approx((1.0, -0.5))
         assert store.stats(artifact.artifact_id) == {
@@ -104,8 +104,9 @@ class TestCompactSignatures:
         store = AssociationStore(db)
         artifact = store.register_artifact(_artifact())
         signatures = ([1.0, -1.0], [0.9, -0.2], [-1.0, 1.0], [0.7, 0.7])
-        for chunk_id, values in zip(chunks, signatures, strict=True):
-            store.put_signature(chunk_id, artifact.artifact_id, values)
+        store.put_signatures(
+            artifact.artifact_id, list(zip(chunks, signatures, strict=True))
+        )
 
         hits = store.cav_neighbors(
             [chunks[0]], artifact.artifact_id, top_k=3
@@ -167,9 +168,9 @@ class TestSparseEdges:
 
         with Database(path) as reopened:
             store = AssociationStore(reopened)
-            edge = store.neighbors(
-                chunks[0], artifact.artifact_id, top_k=1
-            )[0]
+            edge = store.neighbors_many(
+                [chunks[0]], artifact.artifact_id, top_k_per_source=1
+            )[chunks[0]][0]
             assert edge.evidence_count == 4
             assert edge.qk_score == pytest.approx(0.5)
             assert edge.ov_transport == pytest.approx(2.5)
@@ -201,13 +202,12 @@ class TestSparseEdges:
             artifact.artifact_id,
             2,
             now_turn=4,
-            usage_weight=0.1,
         ) == 1
         kept = {
             edge.destination_chunk_id
-            for edge in store.neighbors(
-                chunks[0], artifact.artifact_id, top_k=10, now_turn=4
-            )
+            for edge in store.neighbors_many(
+                [chunks[0]], artifact.artifact_id, top_k_per_source=10, now_turn=4
+            )[chunks[0]]
         }
         assert kept == {chunks[0 + 1], chunks[3]}
 
@@ -224,38 +224,46 @@ class TestSparseEdges:
         many = store.neighbors_many(
             chunks[:2], artifact.artifact_id, top_k_per_source=2
         )
-        assert many[chunks[0]] == store.neighbors(
-            chunks[0], artifact.artifact_id, top_k=2
-        )
-        assert many[chunks[1]] == store.neighbors(
-            chunks[1], artifact.artifact_id, top_k=2
-        )
+        assert many[chunks[0]] == store.neighbors_many(
+            [chunks[0]], artifact.artifact_id, top_k_per_source=2
+        )[chunks[0]]
+        assert many[chunks[1]] == store.neighbors_many(
+            [chunks[1]], artifact.artifact_id, top_k_per_source=2
+        )[chunks[1]]
 
     def test_opt_in_neighbor_cache_is_invalidated_by_live_writes(self, db):
         chunks = _insert_chunks(db, 4)
         store = AssociationStore(db, cache_neighbors=True)
         artifact = store.register_artifact(_artifact())
-        store.put_signature(chunks[0], artifact.artifact_id, [1.0, 0.0])
-        store.put_signature(chunks[1], artifact.artifact_id, [0.9, 0.0])
+        store.put_signatures(
+            artifact.artifact_id,
+            [(chunks[0], [1.0, 0.0]), (chunks[1], [0.9, 0.0])],
+        )
         assert len(
             store.cav_neighbors([chunks[0]], artifact.artifact_id, top_k=5)
         ) == 1
-        store.put_signature(chunks[2], artifact.artifact_id, [0.8, 0.0])
+        store.put_signatures(artifact.artifact_id, [(chunks[2], [0.8, 0.0])])
         assert len(
             store.cav_neighbors([chunks[0]], artifact.artifact_id, top_k=5)
         ) == 2
 
-        assert store.neighbors(chunks[0], artifact.artifact_id, top_k=5) == ()
+        assert store.neighbors_many(
+            [chunks[0]], artifact.artifact_id, top_k_per_source=5
+        )[chunks[0]] == ()
         store.upsert_edge(
             chunks[0], chunks[3], artifact.artifact_id, [0.6] * 32, qk_score=0.6
         )
-        assert len(store.neighbors(chunks[0], artifact.artifact_id, top_k=5)) == 1
+        assert len(
+            store.neighbors_many(
+                [chunks[0]], artifact.artifact_id, top_k_per_source=5
+            )[chunks[0]]
+        ) == 1
 
     def test_remove_chunk_clears_both_edge_directions_and_signature(self, db):
         chunks = _insert_chunks(db, 3)
         store = AssociationStore(db)
         artifact = store.register_artifact(_artifact())
-        store.put_signature(chunks[1], artifact.artifact_id, [1.0, 0.0])
+        store.put_signatures(artifact.artifact_id, [(chunks[1], [1.0, 0.0])])
         store.upsert_edge(
             chunks[0],
             chunks[1],
@@ -280,7 +288,7 @@ class TestSparseEdges:
         store = AssociationStore(db)
         artifact = store.register_artifact(_artifact())
         with pytest.raises(sqlite3.IntegrityError):
-            store.put_signature("missing", artifact.artifact_id, [1.0, 0.0])
+            store.put_signatures(artifact.artifact_id, [("missing", [1.0, 0.0])])
 
 
 def test_schema_has_no_token_state_columns(db):

@@ -865,16 +865,11 @@ class Qwen3PrefixEncoder:
                     queries, keys = self._apply_rotary_pos_emb(
                         queries, keys, cos, sin
                     )
-                    groups_per_key = (
-                        self.config.num_attention_heads
-                        // self.config.num_key_value_heads
-                    )
-                    key_groups = (
-                        self._torch.arange(
-                            self.config.num_attention_heads,
-                            device=self.device,
-                        )
-                        // groups_per_key
+                    key_groups = gqa_key_group_index(
+                        self._torch,
+                        query_heads=self.config.num_attention_heads,
+                        key_value_heads=self.config.num_key_value_heads,
+                        device=self.device,
                     )
                     expanded_keys = keys[:, key_groups]
                     logits = self._torch.einsum(
@@ -919,6 +914,31 @@ class Qwen3PrefixEncoder:
         """Capture residual, Q/K/V, attention, and OV signals for one layer."""
         layer = self.layers - 1 if layer is None else int(layer)
         return self.capture_layers(text, layers=(layer,))[layer]
+
+
+def gqa_key_group_index(
+    torch: Any,
+    *,
+    query_heads: int,
+    key_value_heads: int,
+    device: Any,
+) -> Any:
+    """Index every query head onto the key/value group it shares under GQA.
+
+    Grouped-query attention stores one K/V head per group, so any tensor of
+    shape ``[..., kv_heads, ...]`` becomes query-head aligned by indexing its
+    head axis with this vector.
+    """
+    return torch.arange(query_heads, device=device) // (query_heads // key_value_heads)
+
+
+def head_vote_mean(torch: Any, values: Any, *, k: int, dim: int = 0) -> Any:
+    """Average the strongest ``k`` per-head scores along ``dim``.
+
+    A top-k vote keeps a few decisive heads from being washed out by the
+    majority that ignore a span, without letting a single head decide alone.
+    """
+    return torch.topk(values, k=min(k, values.shape[dim]), dim=dim).values.mean(dim=dim)
 
 
 def mean_pool_residual(residual: Any, attention_mask: Any | None = None) -> Any:

@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-
 RETRIEVAL_FORMAT = "memory-condense-recall-guarded-cumulative-1m-retrieval-v1"
 CAMPAIGN_FORMAT = "memory-condense-recall-guarded-cumulative-1m-campaign-v1"
 QUESTION_FORMAT = "memory-condense-recall-guarded-cumulative-1m-query-v1"
@@ -136,6 +135,7 @@ class FastRetrievalQuestion:
     dated_question_sha256: str
     predecessor_receipt_sha256: str
     retrieval_receipt_sha256: str
+    protected_chunk_ids: tuple[str, ...]
     retained_request_token_state_bytes: int
     question: str
     dated_question: str
@@ -517,6 +517,27 @@ def _parse_question(
     predecessor_receipt_sha = _validate_receipt_sha256(
         predecessor_receipt, f"{label}.predecessor_receipt"
     )
+    packed_chunk_ids = _require_string_list(
+        predecessor_receipt.get("packed_chunk_ids"),
+        f"{label}.predecessor_receipt.packed_chunk_ids",
+    )
+    protected_chunk_ids = _require_string_list(
+        predecessor_receipt.get("protected_chunk_ids"),
+        f"{label}.predecessor_receipt.protected_chunk_ids",
+    )
+    if (
+        not protected_chunk_ids
+        or len(set(protected_chunk_ids)) != len(protected_chunk_ids)
+    ):
+        raise FastArtifactValidationError(
+            f"{label}.predecessor_receipt protected chunk IDs must be non-empty "
+            "and unique"
+        )
+    if packed_chunk_ids != protected_chunk_ids:
+        raise FastArtifactValidationError(
+            f"{label}.predecessor_receipt protected chunk IDs must exactly match "
+            "the packed S0 coordinates"
+        )
     retrieval_receipt = _require_mapping(
         raw.get("retrieval_receipt"), f"{label}.retrieval_receipt"
     )
@@ -787,6 +808,11 @@ def _parse_question(
 
     first_stage = stages[0]
     final_stage = stages[-1]
+    if len(protected_chunk_ids) != len(first_stage.evidence):
+        raise FastArtifactValidationError(
+            f"{label}.predecessor_receipt protected chunk coordinates do not "
+            "match the S0 evidence cardinality"
+        )
     if (
         predecessor_receipt.get("prompt_messages_sha256")
         != first_stage.prompt_messages_sha256
@@ -804,6 +830,7 @@ def _parse_question(
         )
     expected_retrieval_values: tuple[tuple[str, object], ...] = (
         ("predecessor_receipt_sha256", predecessor_receipt_sha),
+        ("protected_chunk_ids", protected_chunk_ids),
         ("protected_evidence_ids", first_stage.evidence_ids),
         ("final_evidence_ids", final_stage.evidence_ids),
         ("final_context_sha256", final_stage.context_sha256),
@@ -853,6 +880,7 @@ def _parse_question(
         dated_question_sha256=dated_sha,
         predecessor_receipt_sha256=predecessor_receipt_sha,
         retrieval_receipt_sha256=retrieval_receipt_sha,
+        protected_chunk_ids=protected_chunk_ids,
         retained_request_token_state_bytes=0,
         question=question,
         dated_question=dated_question,

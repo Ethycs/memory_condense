@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 from memory_condense.associations.head_memory_models import HeadAddress, HeadMemoryItem
 from memory_condense.domain.decay import decay_factor
+from memory_condense.modeling.qwen_prefix import gqa_key_group_index, head_vote_mean
 
 
 class HeadKVStore:
@@ -32,7 +33,6 @@ class HeadKVStore:
         self.head_vote_k = min(head_vote_k, query_heads)
         self.items: list[HeadMemoryItem] = []
         self._episode_ids: set[str] = set()
-        self._episode_to_index: dict[str, int] = {}
         self.turn = 0
 
     def write(self, item: HeadMemoryItem) -> None:
@@ -80,17 +80,6 @@ class HeadKVStore:
             )
         self.items.append(item)
         self._episode_ids.add(item.episode_id)
-        self._episode_to_index[item.episode_id] = len(self.items) - 1
-
-    def indices_for_episode_ids(self, episode_ids: Sequence[str]) -> list[int]:
-        """Resolve existing episode IDs to de-duplicated item indices."""
-        return list(
-            dict.fromkeys(
-                self._episode_to_index[episode_id]
-                for episode_id in episode_ids
-                if episode_id in self._episode_to_index
-            )
-        )
 
     def address(
         self,
@@ -127,8 +116,12 @@ class HeadKVStore:
                 raise IndexError("candidate index is outside the memory store")
         candidate_items = [self.items[index] for index in item_indices]
         top_k = max(1, min(int(top_k), len(candidate_items)))
-        groups_per_key = self.query_heads // self.key_value_heads
-        key_groups = torch.arange(self.query_heads, device=self.device) // groups_per_key
+        key_groups = gqa_key_group_index(
+            torch,
+            query_heads=self.query_heads,
+            key_value_heads=self.key_value_heads,
+            device=self.device,
+        )
         slot_ranges: list[tuple[int, int]] = [(0, 0)] * len(self.items)
         slot_cursor = 0
         for item_index, item in zip(item_indices, candidate_items, strict=True):
@@ -210,8 +203,7 @@ class HeadKVStore:
             attention_weights,
         )
         head_scores = episode_mass.mean(dim=1)
-        strongest = torch.topk(head_scores, k=self.head_vote_k, dim=0).values
-        aggregate = strongest.mean(dim=0)
+        aggregate = head_vote_mean(torch, head_scores, k=self.head_vote_k, dim=0)
         candidate_tensor = torch.tensor(
             item_indices, dtype=torch.long, device=self.device
         )
@@ -333,10 +325,6 @@ class HeadKVStore:
             item = self.items.pop(index)
             self._episode_ids.remove(item.episode_id)
             removed.append(item.episode_id)
-        if removed:
-            self._episode_to_index = {
-                item.episode_id: index for index, item in enumerate(self.items)
-            }
         return removed
 
     def _utility(self, item: HeadMemoryItem, age_half_life: float) -> float:

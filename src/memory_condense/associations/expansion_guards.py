@@ -11,10 +11,12 @@ drift on the shared parts; arm-specific validations stay at each call site.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
-from memory_condense.associations.association_store import AssociationStore
 from memory_condense.domain.schemas import RetrievalResult
+
+if TYPE_CHECKING:
+    from memory_condense.associations.association_store import AssociationStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,10 +57,34 @@ def guard_expansion_request(
 
 
 def require_artifact(store: AssociationStore, artifact_id: str) -> None:
-    """Raise the shared ``KeyError`` for an unknown association artifact."""
+    """Raise the shared ``KeyError`` for an unknown association artifact.
 
-    if store.get_artifact(artifact_id) is None:
-        raise KeyError(f"unknown association artifact: {artifact_id}")
+    The store owns the check; the arms call it through this free function so
+    they never depend on the store's private surface directly.
+    """
+
+    store._require_artifact(artifact_id)
+
+
+def protected_anchor_ids(
+    anchors: Sequence[RetrievalResult],
+    *,
+    lexical_protection_threshold: float | None,
+) -> tuple[str, ...]:
+    """Anchors whose lexical evidence may not be displaced by an association.
+
+    ``None`` disables protection entirely, and an anchor with no lexical score
+    was never lexically evidenced, so it is not protected either.
+    """
+
+    if lexical_protection_threshold is None:
+        return ()
+    return tuple(
+        result.chunk.chunk_id
+        for result in anchors
+        if result.lexical_score is not None
+        and result.lexical_score >= lexical_protection_threshold
+    )
 
 
 def exceeds_prompt_budget(

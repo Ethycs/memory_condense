@@ -68,6 +68,8 @@ from memory_condense.search.episodes import (
     EpisodeRetrievalPolicy,
     EpisodeRetrievalPlan,
     NestedEpisodeLinker,
+    combine_episode_seeds as _combine_episode_seeds,
+    episode_seed_payload as _episode_seed_payload,
 )
 
 
@@ -385,49 +387,6 @@ def _pack_additions(
             return packet
         addition_cap -= max(1, total - max_context_tokens)
     return None  # pragma: no cover - loop returns at cap zero
-
-
-def _episode_seed_payload(seed: Any) -> dict[str, object]:
-    return {
-        "episode_id": seed.episode_id,
-        "anchor_chunk_id": seed.anchor_chunk_id,
-        "score": seed.score,
-        "route": seed.route,
-        "path": list(seed.path),
-    }
-
-
-def _combine_episode_seeds(
-    direct: Sequence[Any],
-    representative: Sequence[Any],
-) -> tuple[Any, ...]:
-    selected: dict[str, Any] = {}
-    for seed in (*direct, *representative):
-        prior = selected.get(seed.episode_id)
-        if prior is None or (
-            -seed.score,
-            seed.anchor_chunk_id,
-            seed.route,
-            seed.path,
-        ) < (
-            -prior.score,
-            prior.anchor_chunk_id,
-            prior.route,
-            prior.path,
-        ):
-            selected[seed.episode_id] = seed
-    return tuple(
-        sorted(
-            selected.values(),
-            key=lambda item: (
-                -item.score,
-                item.episode_id,
-                item.anchor_chunk_id,
-                item.route,
-                item.path,
-            ),
-        )
-    )
 
 
 def _widen_direct_episode_policy(

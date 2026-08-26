@@ -149,7 +149,7 @@ def test_pruning_uses_decayed_qk_mass_and_ov_transport() -> None:
     assert survivor.ov_transport == 3.0
 
 
-def test_episode_index_lookup_is_rebuilt_after_pruning() -> None:
+def test_pruning_keeps_pinned_items_and_reindexes_survivors() -> None:
     store = HeadKVStore(
         query_heads=2,
         key_value_heads=1,
@@ -170,10 +170,8 @@ def test_episode_index_lookup_is_rebuilt_after_pruning() -> None:
     )
     store.write(_item("last", [[-1.0, 0.0]], [[-1.0, 0.0]], [0.0]))
 
-    assert store.indices_for_episode_ids(["last", "first", "last"]) == [2, 0]
-
     assert store.prune(2) == ["remove"]
-    assert store.indices_for_episode_ids(["last", "missing", "first"]) == [1, 0]
+    assert [item.episode_id for item in store.items] == ["first", "last"]
 
 
 def test_residual_entry_and_positive_cav_prior_are_separate_scores() -> None:
@@ -274,27 +272,16 @@ def test_association_graph_removes_pruned_sources_and_destinations() -> None:
     assert graph.neighbors("b") == ()
 
 
-def test_association_graph_bounds_degree_with_qk_and_ov_utility() -> None:
+def test_association_graph_ranks_one_directed_source_by_qk_score() -> None:
     graph = HeadAssociationGraph()
-    graph.add(
-        "source",
-        "weak",
-        torch.tensor([0.1, 0.1]),
-        reverse=False,
-        ov_transport=0.0,
-    )
-    graph.add(
-        "source",
-        "useful",
-        torch.tensor([0.2, 0.2]),
-        reverse=False,
-        ov_transport=2.0,
-    )
+    graph.add("source", "weak", torch.tensor([0.1, 0.1]), reverse=False)
+    graph.add("source", "useful", torch.tensor([0.2, 0.2]), reverse=False)
 
-    assert graph.prune_neighbors(1) == 1
-    edge = graph.neighbors("source")[0]
-    assert edge.destination_id == "useful"
-    assert edge.ov_transport == 2.0
+    assert graph.edge_count == 2
+    assert [edge.destination_id for edge in graph.neighbors("source")] == [
+        "useful",
+        "weak",
+    ]
 
 
 def test_composition_recycles_only_duplicate_anchor_slots() -> None:

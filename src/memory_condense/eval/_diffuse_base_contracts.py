@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import shutil
@@ -14,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from memory_condense.eval._artifact_json import canonical_json_bytes
 from memory_condense.eval.cache_receipts import canonical_sha256
 from memory_condense.eval.diffuse_longmemeval_inputs import (
     GoldBlindLongMemEvalSample,
@@ -310,19 +310,6 @@ class DiffuseDerivedStore:
     path: Path
     origin: DiffuseDerivedOrigin
     base: VerifiedDiffuseLongMemEvalBase
-
-
-def canonical_json_bytes(value: object) -> bytes:
-    return (
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    ).encode("utf-8")
 
 
 def model_bytes(value: BaseModel) -> bytes:

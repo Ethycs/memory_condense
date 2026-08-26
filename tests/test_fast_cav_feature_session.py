@@ -11,9 +11,11 @@ torch = pytest.importorskip("torch")
 from memory_condense.domain._discourse_identity import identity_sha256
 from memory_condense.eval.fast_cav_feature_session import (
     FAST_CAV_FEATURE_BACKEND_FORMAT,
+    FAST_CAV_ORDERING_PROXY_ROLE,
     FastCAVFeatureSessionError,
     run_fast_cav_feature_session,
 )
+from memory_condense.eval.fast_cav_links import FAST_CAV_LINK_COMPLEXITY
 from memory_condense.eval.recall_guarded_cumulative_fast_artifact import (
     CAMPAIGN_FORMAT,
     ORIGINAL_1M_RETRIEVAL_SHA256,
@@ -122,6 +124,7 @@ def _artifact() -> FastRetrievalArtifact:
         dated_question_sha256=_quote(dated_question),
         predecessor_receipt_sha256=_digest("predecessor"),
         retrieval_receipt_sha256=_digest("retrieval"),
+        protected_chunk_ids=("chunk-alpha",),
         retained_request_token_state_bytes=0,
         question=question_text,
         dated_question=dated_question,
@@ -201,6 +204,11 @@ class _FakeRouter:
     num_cavs = 2
     runtime_identity_sha256 = _digest("router-runtime")
     bank_identity_sha256 = _digest("router-bank")
+    concept_artifact_file_sha256s = (
+        _digest("concept-artifact-0"),
+        _digest("concept-artifact-1"),
+    )
+    concept_tensor_keys = ("concept_a.layer_2", "concept_b.layer_2")
 
     def __init__(self, *, tamper_identity: bool = False) -> None:
         self.calls: list[tuple[tuple[float, ...], ...]] = []
@@ -284,6 +292,22 @@ def test_one_encoder_call_router_packet_reuse_and_tensor_free_receipts():
         receipt.stage_receipts[2].readout.readout_sha256
         == receipt.stage_receipts[3].readout.readout_sha256
     )
+    assert (
+        receipt.stage_receipts[2].links.link_receipt_sha256
+        == receipt.stage_receipts[3].links.link_receipt_sha256
+    )
+    for stage in receipt.stage_receipts:
+        links = stage.links
+        assert links is not None
+        assert links.complexity_contract == FAST_CAV_LINK_COMPLEXITY
+        assert links.extraction_shape == (router.num_cavs, len(stage.evidence_ids))
+        assert links.reinjection_shape == (len(stage.evidence_ids), router.num_cavs)
+        assert links.evidence_ids == stage.evidence_ids
+        assert links.source_ids == stage.source_ids
+        assert links.evidence_pair_matrix_constructed is False
+        assert links.evidence_pair_matrix_cell_count == 0
+        assert links.retained_tensor_bytes == 0
+        assert stage.readout_role == FAST_CAV_ORDERING_PROXY_ROLE
     assert receipt.stage("question-0", STAGE_IDS[1]) is receipt.stage_receipts[1]
     assert receipt.question_stages("question-0") == receipt.stage_receipts
     assert receipt.result_retained_tensor_bytes == 0
@@ -312,6 +336,10 @@ def test_duplicate_text_keeps_distinct_evidence_provenance():
     )
     assert third.evidence_text_sha256s[1] == third.evidence_text_sha256s[2]
     assert third.evidence_feature_row_indices == (0, 1, 1)
+    assert third.links is not None
+    assert third.links.evidence_ids == third.evidence_ids
+    assert third.links.source_ids == third.source_ids
+    assert third.links.evidence_text_sha256s == third.evidence_text_sha256s
     assert third.readout.original_atom_order == third.evidence_ids
     assert router.calls[2][1] == router.calls[2][2]
 

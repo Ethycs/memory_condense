@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+def cav_layer_key(name: str, layer: int) -> str:
+    """Name one concept's per-layer vector inside a CAV safetensors artifact."""
+    return f"{name}.layer_{layer}"
+
+
 @dataclass(frozen=True, slots=True)
 class CAVBank:
     names: tuple[str, ...]
@@ -22,6 +27,16 @@ class CAVBank:
         if vector.ndim == 2:
             vector = vector.mean(dim=0)
         return vector @ self.vectors.T - self.thresholds
+
+    def signatures(self, pooled: Any) -> Any:
+        """Project a batch of already-pooled residuals onto every concept.
+
+        Rows stay on the CPU: the batched path never materializes an attention
+        map, so the bank is moved to the pooled vectors rather than the reverse.
+        """
+        vectors = self.vectors.float().cpu()
+        thresholds = self.thresholds.float().cpu()
+        return pooled.float() @ vectors.T - thresholds
 
     @classmethod
     def load(
@@ -46,7 +61,7 @@ class CAVBank:
         thresholds: list[float] = []
         with safe_open(vectors_path, framework="pt", device="cpu") as artifact:
             for name in names:
-                key = f"{name}.layer_{layer}"
+                key = cav_layer_key(name, layer)
                 if key not in artifact.keys():
                     raise KeyError(f"missing CAV vector: {key}")
                 vectors.append(artifact.get_tensor(key).float())

@@ -6,11 +6,14 @@ from typing import Callable, Sequence
 
 from memory_condense.associations.association_store import AssociationStore
 from memory_condense.associations.associative_composition import (
+    anchor_candidates,
     compose_associative_candidates,
+    hydration_memo,
 )
 from memory_condense.associations.expansion_guards import (
     exceeds_prompt_budget,
     guard_expansion_request,
+    protected_anchor_ids,
     require_artifact,
 )
 from memory_condense.associations.head_memory_models import (
@@ -65,21 +68,8 @@ def expand_associative_results(
 
     anchor_ids = [result.chunk.chunk_id for result in bounded_anchors]
     anchor_id_set = set(anchor_ids)
-    anchor_candidates = [
-        AssociativeMemoryCandidate(
-            episode_id=result.chunk.chunk_id,
-            text=result.chunk.text,
-            score=result.score,
-            route="hybrid",
-        )
-        for result in bounded_anchors
-    ]
-    hydration_cache: dict[str, RetrievalResult | None] = {}
-
-    def hydrate_base(chunk_id: str) -> RetrievalResult | None:
-        if chunk_id not in hydration_cache:
-            hydration_cache[chunk_id] = hydrate(chunk_id, score=0.0)
-        return hydration_cache[chunk_id]
+    candidates = anchor_candidates(bounded_anchors)
+    hydrate_base = hydration_memo(hydrate)
 
     # Recursive traversal carries only external IDs and scalar evidence. The
     # retained pool is trimmed after every hop, so neither graph state nor a
@@ -188,21 +178,15 @@ def expand_associative_results(
         )
 
     composition = compose_associative_candidates(
-        anchor_candidates,
+        candidates,
         qk_neighbors=qk_neighbors,
         residual_candidates=cav_neighbors,
         top_k=result_cap,
         qk_reserve=qk_reserve,
         association_slots=association_slots,
-        protected_anchor_ids=(
-            ()
-            if lexical_protection_threshold is None
-            else tuple(
-                result.chunk.chunk_id
-                for result in bounded_anchors
-                if result.lexical_score is not None
-                and result.lexical_score >= lexical_protection_threshold
-            )
+        protected_anchor_ids=protected_anchor_ids(
+            bounded_anchors,
+            lexical_protection_threshold=lexical_protection_threshold,
         ),
     )
     direct = {result.chunk.chunk_id: result for result in bounded_anchors}

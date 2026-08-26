@@ -4,8 +4,9 @@ The session consumes the immutable projection produced by
 ``recall_guarded_cumulative_fast_artifact``.  It never opens the source
 artifact, corpus, or a store.  Exact question and evidence strings are
 deduplicated globally, encoded by one ``encode_layers`` call, routed with a
-fixed CAV bank, and reduced immediately to tensor-free matched-readout
-receipts.
+fixed CAV bank, and reduced immediately to tensor-free two-pass link receipts.
+The existing X/X1 cosine ordering remains a separate proxy readout; it is not
+treated as the CAV linking mechanism itself.
 
 The encoder and router remain caller-owned.  In particular, this function
 does not close or persist either runtime and never returns token IDs, hidden
@@ -20,6 +21,12 @@ from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Mapping
 
 from memory_condense.domain._discourse_identity import identity_sha256
+from memory_condense.eval.fast_cav_links import (
+    FastCAVConceptProvenance,
+    FastCAVLinkReceipt,
+    build_fast_cav_concepts_from_router,
+    build_fast_cav_link_receipt,
+)
 from memory_condense.eval.recall_guarded_cumulative_fast_artifact import (
     CAMPAIGN_FORMAT,
     RETRIEVAL_FORMAT,
@@ -40,8 +47,13 @@ from memory_condense.search.fusion.steered_readout import (
 
 
 FAST_CAV_FEATURE_BACKEND_FORMAT = "qwen3_prefix.encode_layers.mean_pool.v1"
-FAST_CAV_STAGE_RECEIPT_FORMAT = "memory-condense-fast-cav-stage-receipt-v1"
-FAST_CAV_SESSION_RECEIPT_FORMAT = "memory-condense-fast-cav-session-receipt-v1"
+LEGACY_FAST_CAV_STAGE_RECEIPT_FORMAT = "memory-condense-fast-cav-stage-receipt-v1"
+LEGACY_FAST_CAV_SESSION_RECEIPT_FORMAT = "memory-condense-fast-cav-session-receipt-v1"
+FAST_CAV_STAGE_RECEIPT_FORMAT = "memory-condense-fast-cav-stage-receipt-v2"
+FAST_CAV_SESSION_RECEIPT_FORMAT = "memory-condense-fast-cav-session-receipt-v2"
+FAST_CAV_ORDERING_PROXY_ROLE = (
+    "x-x1-cosine-ordering-proxy-not-cav-linking-v1"
+)
 FAST_CAV_MAX_ENCODER_ROWS = 1024
 FAST_CAV_MAX_HIDDEN_DIM = 4096
 FAST_CAV_MAX_BATCH_SIZE = 1024
@@ -116,7 +128,7 @@ def _tuple_of_exact_strings(values: object, label: str) -> tuple[str, ...]:
 
 
 def _stage_receipt_payload(receipt: "FastCAVStageReceipt") -> dict[str, Any]:
-    return {
+    payload = {
         "format": receipt.format,
         "artifact_sha256": receipt.artifact_sha256,
         "placement_ordinal": receipt.placement_ordinal,
@@ -149,6 +161,11 @@ def _stage_receipt_payload(receipt: "FastCAVStageReceipt") -> dict[str, Any]:
         "retained_token_id_count": receipt.retained_token_id_count,
         "persisted_token_state_bytes": receipt.persisted_token_state_bytes,
     }
+    if receipt.format == FAST_CAV_STAGE_RECEIPT_FORMAT:
+        assert type(receipt.links) is FastCAVLinkReceipt
+        payload["link_receipt_sha256"] = receipt.links.link_receipt_sha256
+        payload["readout_role"] = receipt.readout_role
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +199,8 @@ class FastCAVStageReceipt:
     router_call_ordinal: int
     reused_router_result: bool
     readout: MatchedSteeredReadout
+    links: FastCAVLinkReceipt | None = None
+    readout_role: str = ""
     result_retained_tensor_bytes: int = 0
     retained_token_id_count: int = 0
     persisted_token_state_bytes: int = 0
@@ -189,7 +208,8 @@ class FastCAVStageReceipt:
     stage_output_sha256: str = ""
 
     def __post_init__(self) -> None:
-        if self.format != FAST_CAV_STAGE_RECEIPT_FORMAT:
+        legacy = self.format == LEGACY_FAST_CAV_STAGE_RECEIPT_FORMAT
+        if not legacy and self.format != FAST_CAV_STAGE_RECEIPT_FORMAT:
             raise FastCAVFeatureSessionError("fast CAV stage format changed")
         for label in (
             "artifact_sha256",
@@ -257,9 +277,42 @@ class FastCAVStageReceipt:
             )
         if type(self.reused_router_result) is not bool:
             raise FastCAVFeatureSessionError("reused_router_result must be an exact bool")
+        if legacy and (self.links is not None or self.readout_role != ""):
+            raise FastCAVFeatureSessionError(
+                "legacy CAV stage cannot claim v2 linking semantics"
+            )
+        if not legacy:
+            links = self.links
+            if type(links) is not FastCAVLinkReceipt:
+                raise FastCAVFeatureSessionError(
+                    "links must be an exact FastCAVLinkReceipt"
+                )
+            if (
+                links.packet_identity_sha256 != self.packet_identity_sha256
+                or links.router_runtime_identity_sha256
+                != self.router_runtime_identity_sha256
+                or links.router_bank_identity_sha256
+                != self.router_bank_identity_sha256
+                or links.evidence_ids != evidence_ids
+                or links.source_ids != source_ids
+                or links.evidence_text_sha256s != self.evidence_text_sha256s
+            ):
+                raise FastCAVFeatureSessionError(
+                    "two-pass CAV links changed packet or evidence provenance"
+                )
+            if (
+                links.retained_token_id_count != 0
+                or links.retained_tensor_bytes != 0
+                or links.persisted_token_state_bytes != 0
+            ):
+                raise FastCAVFeatureSessionError("two-pass CAV links retained state")
         if type(self.readout) is not MatchedSteeredReadout:
             raise FastCAVFeatureSessionError(
                 "readout must be an exact MatchedSteeredReadout"
+            )
+        if not legacy and self.readout_role != FAST_CAV_ORDERING_PROXY_ROLE:
+            raise FastCAVFeatureSessionError(
+                "X/X1 ordering must remain explicitly labeled as a proxy readout"
             )
         if self.readout.original_atom_order != evidence_ids:
             raise FastCAVFeatureSessionError(
@@ -366,7 +419,8 @@ class FastCAVFeatureSessionReceipt:
     session_receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
-        if self.format != FAST_CAV_SESSION_RECEIPT_FORMAT:
+        legacy = self.format == LEGACY_FAST_CAV_SESSION_RECEIPT_FORMAT
+        if not legacy and self.format != FAST_CAV_SESSION_RECEIPT_FORMAT:
             raise FastCAVFeatureSessionError("fast CAV session format changed")
         if self.feature_backend_format != FAST_CAV_FEATURE_BACKEND_FORMAT:
             raise FastCAVFeatureSessionError("feature backend algorithm changed")
@@ -443,8 +497,15 @@ class FastCAVFeatureSessionReceipt:
             )
         if len(self.stage_receipts) != stage_count:
             raise FastCAVFeatureSessionError("stage receipt count changed")
+        expected_stage_format = (
+            LEGACY_FAST_CAV_STAGE_RECEIPT_FORMAT
+            if legacy
+            else FAST_CAV_STAGE_RECEIPT_FORMAT
+        )
+        if any(item.format != expected_stage_format for item in self.stage_receipts):
+            raise FastCAVFeatureSessionError("session mixed CAV receipt generations")
 
-        observed_packets: dict[str, tuple[int, str]] = {}
+        observed_packets: dict[str, tuple[int, str, str]] = {}
         logical_rows = 0
         placements: set[tuple[str, str]] = set()
         for ordinal, item in enumerate(self.stage_receipts):
@@ -478,6 +539,7 @@ class FastCAVFeatureSessionReceipt:
                 != self.router_runtime_identity_sha256
                 or item.router_bank_identity_sha256
                 != self.router_bank_identity_sha256
+                or (item.links is not None and len(item.links.concepts) != self.router_num_cavs)
             ):
                 raise FastCAVFeatureSessionError("stage changed router provenance")
             placement = (item.question_id, item.stage_id)
@@ -492,17 +554,20 @@ class FastCAVFeatureSessionReceipt:
                     raise FastCAVFeatureSessionError(
                         "first packet placement cannot claim router reuse"
                     )
+                link_sha = "" if item.links is None else item.links.link_receipt_sha256
                 observed_packets[item.packet_identity_sha256] = (
                     item.router_call_ordinal,
+                    link_sha,
                     item.readout.readout_sha256,
                 )
             else:
                 if not item.reused_router_result or seen != (
                     item.router_call_ordinal,
+                    "" if item.links is None else item.links.link_receipt_sha256,
                     item.readout.readout_sha256,
                 ):
                     raise FastCAVFeatureSessionError(
-                        "reused packet changed its router/readout receipt"
+                        "reused packet changed its CAV links or proxy readout"
                     )
         if logical_rows != self.logical_evidence_placement_count:
             raise FastCAVFeatureSessionError("logical evidence placement count changed")
@@ -780,7 +845,10 @@ def _encoder_identity(
     )
 
 
-def _router_identity(router: Any, layer: int) -> tuple[str, str, int, int, int]:
+def _router_identity(
+    router: Any,
+    layer: int,
+) -> tuple[str, str, int, int, int, tuple[FastCAVConceptProvenance, ...]]:
     route_one = getattr(router, "route_one", None)
     if not callable(route_one):
         raise TypeError("router must expose callable route_one(X)")
@@ -813,7 +881,15 @@ def _router_identity(router: Any, layer: int) -> tuple[str, str, int, int, int]:
         minimum=1,
         maximum=16,
     )
-    return runtime_sha, bank_sha, hidden_dim, max_atoms, num_cavs
+    concepts = build_fast_cav_concepts_from_router(
+        router,
+        runtime_identity_sha256=runtime_sha,
+        bank_identity_sha256=bank_sha,
+        layer=layer,
+        hidden_dim=hidden_dim,
+        num_cavs=num_cavs,
+    )
+    return runtime_sha, bank_sha, hidden_dim, max_atoms, num_cavs, concepts
 
 
 def _require_torch() -> Any:
@@ -934,9 +1010,14 @@ def run_fast_cav_feature_session(
         encoder_prefix_layers,
     ) = _encoder_identity(encoder, layer)
     router_identity = _router_identity(router, layer)
-    router_runtime_sha, router_bank_sha, router_hidden_dim, max_atoms, num_cavs = (
-        router_identity
-    )
+    (
+        router_runtime_sha,
+        router_bank_sha,
+        router_hidden_dim,
+        max_atoms,
+        num_cavs,
+        concepts,
+    ) = router_identity
 
     evidence_texts = {
         row.evidence_text
@@ -971,7 +1052,7 @@ def run_fast_cav_feature_session(
     receipt: FastCAVFeatureSessionReceipt | None = None
     packet_cache: dict[
         tuple[str, tuple[tuple[str, str, str], ...]],
-        tuple[int, MatchedSteeredReadout, str],
+        tuple[int, FastCAVLinkReceipt, MatchedSteeredReadout, str],
     ] = {}
     try:
         encoded = encode_layers(
@@ -1044,6 +1125,7 @@ def run_fast_cav_feature_session(
                 reused = cached is not None
                 if cached is None:
                     router_call_ordinal = len(packet_cache)
+                    links: FastCAVLinkReceipt | None = None
                     readout: MatchedSteeredReadout | None = None
                     stage_indices = tuple(text_index[value] for value in stage.exact_texts)
                     try:
@@ -1067,6 +1149,17 @@ def run_fast_cav_feature_session(
                             dtype=feature_tensor.dtype,
                             device=feature_tensor.device,
                         )
+                        links = build_fast_cav_link_receipt(
+                            packet_identity_sha256=packet_sha,
+                            router_runtime_identity_sha256=router_runtime_sha,
+                            router_bank_identity_sha256=router_bank_sha,
+                            concepts=concepts,
+                            evidence_ids=evidence_ids,
+                            source_ids=source_ids,
+                            evidence_text_sha256s=evidence_text_sha256s,
+                            extraction_attention=routed.extraction_attention,
+                            reinjection_attention=routed.reinjection_attention,
+                        )
                         readout = matched_steered_readout(
                             atom_ids=evidence_ids,
                             node_features=node_features,
@@ -1082,11 +1175,13 @@ def run_fast_cav_feature_session(
                         routed = None
                     if type(readout) is not MatchedSteeredReadout:
                         raise RuntimeError("matched readout did not return its exact receipt")
+                    if type(links) is not FastCAVLinkReceipt:
+                        raise RuntimeError("CAV routing did not return its exact link receipt")
                     if _router_identity(router, layer) != router_identity:
                         raise RuntimeError("router identity changed during packet routing")
-                    cached = (router_call_ordinal, readout, packet_sha)
+                    cached = (router_call_ordinal, links, readout, packet_sha)
                     packet_cache[packet_key] = cached
-                router_call_ordinal, readout, cached_packet_sha = cached
+                router_call_ordinal, links, readout, cached_packet_sha = cached
                 if cached_packet_sha != packet_sha:
                     raise RuntimeError("packet identity collision detected")
                 stage_receipts.append(
@@ -1118,6 +1213,8 @@ def run_fast_cav_feature_session(
                         router_call_ordinal=router_call_ordinal,
                         reused_router_result=reused,
                         readout=readout,
+                        links=links,
+                        readout_role=FAST_CAV_ORDERING_PROXY_ROLE,
                     )
                 )
                 placement_ordinal += 1
@@ -1178,8 +1275,11 @@ __all__ = [
     "FAST_CAV_MAX_BATCH_SIZE",
     "FAST_CAV_MAX_ENCODER_ROWS",
     "FAST_CAV_MAX_HIDDEN_DIM",
+    "FAST_CAV_ORDERING_PROXY_ROLE",
     "FAST_CAV_SESSION_RECEIPT_FORMAT",
     "FAST_CAV_STAGE_RECEIPT_FORMAT",
+    "LEGACY_FAST_CAV_SESSION_RECEIPT_FORMAT",
+    "LEGACY_FAST_CAV_STAGE_RECEIPT_FORMAT",
     "FastCAVFeatureSessionError",
     "FastCAVFeatureSessionReceipt",
     "FastCAVStageReceipt",

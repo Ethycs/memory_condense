@@ -28,6 +28,8 @@ from .retrieval import (
     EpisodeLookup,
     EpisodeRetrievalPlan,
     EpisodeRetrievalPolicy,
+    combine_episode_seeds,
+    episode_seed_payload,
     expand_episode_seeds,
 )
 from .surprise import (
@@ -81,8 +83,10 @@ __all__ = [
     "RepresentativeHydrator",
     "SurpriseScorer",
     "SurpriseSequenceScorer",
+    "combine_episode_seeds",
     "dense_cosine",
     "episode_source_candidates_from_results",
+    "episode_seed_payload",
     "expand_episode_seeds",
     "lexical_cosine",
     "retrieve_episode_representatives",

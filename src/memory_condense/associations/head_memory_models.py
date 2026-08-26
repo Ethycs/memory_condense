@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 
 @dataclass(slots=True)
@@ -97,6 +97,57 @@ class MemoryLinkResult:
     workspace_tokens: int
     passes: int = 1
     total_candidate_inspections: int = 0
+
+    @classmethod
+    def merge(cls, results: Sequence[MemoryLinkResult]) -> MemoryLinkResult:
+        """Fold several independent workspace passes into one result.
+
+        Each counter keeps its own rule: workspace sizes describe the largest
+        single pass that had to be held in memory, while pass and inspection
+        counts describe the whole sweep and therefore add up. Hits are pooled
+        and re-ranked, and the source CAV signature is averaged over the
+        passes that produced one, but only when they agree on its width.
+        ``getattr`` fallbacks keep the fold usable for duck-typed linker
+        results predating the two optional counters.
+        """
+
+        hits = [hit for result in results for hit in getattr(result, "hits", ())]
+        signatures = [
+            tuple(float(value) for value in result.source_cav_signature)
+            for result in results
+            if getattr(result, "source_cav_signature", ())
+        ]
+        signature: tuple[float, ...] = ()
+        if signatures and len({len(value) for value in signatures}) == 1:
+            signature = tuple(
+                sum(values) / len(values) for values in zip(*signatures, strict=True)
+            )
+        return cls(
+            hits=tuple(
+                sorted(
+                    hits,
+                    key=lambda hit: (
+                        float(hit.qk_score),
+                        float(hit.ov_transport),
+                        hit.episode_id,
+                    ),
+                    reverse=True,
+                )
+            ),
+            source_cav_signature=signature,
+            workspace_candidates=max(
+                int(result.workspace_candidates) for result in results
+            ),
+            workspace_tokens=max(int(result.workspace_tokens) for result in results),
+            passes=sum(int(getattr(result, "passes", 1)) for result in results),
+            total_candidate_inspections=sum(
+                int(
+                    getattr(result, "total_candidate_inspections", 0)
+                    or result.workspace_candidates
+                )
+                for result in results
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)

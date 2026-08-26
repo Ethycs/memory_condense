@@ -9,9 +9,10 @@ of the serializable policy state.
 
 from __future__ import annotations
 
+import inspect
 import math
-from dataclasses import dataclass, field
-from typing import Any, Sequence
+from dataclasses import dataclass, field, fields
+from typing import Any, Callable, Sequence
 
 from memory_condense.domain.decay import decay_factor
 
@@ -81,7 +82,6 @@ class TransitionCandidate:
 class ScoredTransition:
     candidate: TransitionCandidate
     score: float
-    learned_utility: float
     head_gates: tuple[float, ...]
 
 
@@ -99,11 +99,8 @@ class TransitionDecision:
 
 @dataclass(frozen=True, slots=True)
 class TransitionFeedback:
-    role_transition: str
     actual_destination_id: str | None
     target_was_selected: bool
-    selected_count: int
-    mean_reward: float
 
 
 @dataclass(slots=True)
@@ -133,21 +130,29 @@ class _DecayedStatistic:
         self.last_turn = turn
 
     def as_dict(self) -> dict[str, float | int]:
-        return {
-            "reward_sum": self.reward_sum,
-            "mass": self.mass,
-            "observations": self.observations,
-            "last_turn": self.last_turn,
-        }
+        return {spec.name: getattr(self, spec.name) for spec in fields(self)}
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> _DecayedStatistic:
         return cls(
-            reward_sum=_finite(value.get("reward_sum", 0.0), "reward_sum"),
-            mass=max(0.0, _finite(value.get("mass", 0.0), "mass")),
-            observations=max(0, int(value.get("observations", 0))),
-            last_turn=max(0, int(value.get("last_turn", 0))),
+            **{
+                spec.name: _STATISTIC_PARSERS[spec.name](
+                    value.get(spec.name, spec.default), spec.name
+                )
+                for spec in fields(cls)
+            }
         )
+
+
+#: One parser per statistic field. Both directions of the round trip are
+#: driven by ``fields()``, so a new field that forgets its parser fails loudly
+#: here rather than silently dropping out of persisted snapshots.
+_STATISTIC_PARSERS: dict[str, Callable[[Any, str], float | int]] = {
+    "reward_sum": _finite,
+    "mass": lambda value, name: max(0.0, _finite(value, name)),
+    "observations": lambda value, _name: max(0, int(value)),
+    "last_turn": lambda value, _name: max(0, int(value)),
+}
 
 
 class CausalTransitionPolicy:
@@ -168,7 +173,6 @@ class CausalTransitionPolicy:
         transition_weight: float = 0.25,
         velocity_weight: float = 0.0,
         gate_temperature: float = 1.0,
-        exploration_weight: float = 0.0,
         max_edge_statistics: int = 10_000,
     ) -> None:
         if half_life_turns <= 0.0:
@@ -177,8 +181,6 @@ class CausalTransitionPolicy:
             raise ValueError("prior_mass must be positive")
         if transition_weight < 0.0 or velocity_weight < 0.0 or gate_temperature < 0.0:
             raise ValueError("transition and gate weights must be non-negative")
-        if exploration_weight < 0.0:
-            raise ValueError("exploration_weight must be non-negative")
         if max_edge_statistics < 1:
             raise ValueError("max_edge_statistics must be positive")
         self.half_life_turns = float(half_life_turns)
@@ -186,7 +188,6 @@ class CausalTransitionPolicy:
         self.transition_weight = float(transition_weight)
         self.velocity_weight = float(velocity_weight)
         self.gate_temperature = float(gate_temperature)
-        self.exploration_weight = float(exploration_weight)
         self.max_edge_statistics = int(max_edge_statistics)
         self._heads: dict[tuple[str, int], _DecayedStatistic] = {}
         self._edges: dict[tuple[str, str, str], _DecayedStatistic] = {}
@@ -199,14 +200,11 @@ class CausalTransitionPolicy:
 
     def _edge_value(
         self, role: str, source_id: str, destination_id: str, turn: int
-    ) -> tuple[float, float]:
+    ) -> float:
         statistic = self._edges.get((role, source_id, destination_id))
         if statistic is None:
-            return 0.0, 0.0
-        return (
-            statistic.value(turn, self.half_life_turns, self.prior_mass),
-            statistic.effective_mass(turn, self.half_life_turns),
-        )
+            return 0.0
+        return statistic.value(turn, self.half_life_turns, self.prior_mass)
 
     def head_gates(
         self, from_role: str, to_role: str, *, head_count: int, turn: int
@@ -260,11 +258,6 @@ class CausalTransitionPolicy:
             from_role, expected_next_role, head_count=head_count, turn=turn
         )
 
-        total_mass = 1.0 + sum(
-            statistic.effective_mass(turn, self.half_life_turns)
-            for statistic in self._edges.values()
-            if turn >= statistic.last_turn
-        )
         scored: list[ScoredTransition] = []
         for candidate in bounded:
             attention_total = sum(candidate.head_attention)
@@ -277,7 +270,7 @@ class CausalTransitionPolicy:
                 if attention_total > 0.0
                 else 0.0
             )
-            edge_utility, edge_mass = self._edge_value(
+            edge_utility = self._edge_value(
                 role, source_id, candidate.destination_id, turn
             )
             velocity_utility = 0.0
@@ -286,20 +279,14 @@ class CausalTransitionPolicy:
                     mass * _cosine(candidate.head_cav_deltas[head], velocity)
                     for head, mass in enumerate(candidate.head_attention)
                 ) / attention_total
-            exploration = self.exploration_weight * math.sqrt(
-                math.log1p(total_mass) / (1.0 + edge_mass)
-            )
-            learned = head_utility + edge_utility
             scored.append(
                 ScoredTransition(
                     candidate=candidate,
                     score=(
                         candidate.base_score
-                        + self.transition_weight * learned
+                        + self.transition_weight * (head_utility + edge_utility)
                         + self.velocity_weight * velocity_utility
-                        + exploration
                     ),
-                    learned_utility=learned,
                     head_gates=gates,
                 )
             )
@@ -340,7 +327,6 @@ class CausalTransitionPolicy:
             for left, right in zip(decision.source_cav, next_values, strict=True)
         )
         role = _role_key(decision.from_role, actual_next_role)
-        rewards: list[float] = []
         target_was_selected = False
 
         for scored in decision.selected:
@@ -380,21 +366,20 @@ class CausalTransitionPolicy:
                 statistic.update(reward, observation_turn, self.half_life_turns)
                 head_rewards.append(reward)
 
-            edge_reward = sum(head_rewards) / len(head_rewards)
             edge = self._edges.setdefault(
                 (role, decision.source_id, candidate.destination_id),
                 _DecayedStatistic(last_turn=observation_turn),
             )
-            edge.update(edge_reward, observation_turn, self.half_life_turns)
-            rewards.append(edge_reward)
+            edge.update(
+                sum(head_rewards) / len(head_rewards),
+                observation_turn,
+                self.half_life_turns,
+            )
 
         self._prune_edges(observation_turn)
         return TransitionFeedback(
-            role_transition=role,
             actual_destination_id=actual_destination_id,
             target_was_selected=target_was_selected,
-            selected_count=len(decision.selected),
-            mean_reward=sum(rewards) / len(rewards) if rewards else 0.0,
         )
 
     def _prune_edges(self, turn: int) -> None:
@@ -416,18 +401,27 @@ class CausalTransitionPolicy:
         for key in weakest[:overflow]:
             del self._edges[key]
 
+    @classmethod
+    def _config_names(cls) -> tuple[str, ...]:
+        """Every constructor knob, in declaration order.
+
+        Each is stored under its own name, so the snapshot's ``config`` block
+        and the ``cls(**config)`` restore stay in step with the signature
+        instead of with two hand-maintained lists.
+        """
+
+        return tuple(
+            name
+            for name, parameter in inspect.signature(cls).parameters.items()
+            if parameter.kind is parameter.KEYWORD_ONLY
+        )
+
     def snapshot(self) -> dict[str, Any]:
         """Serialize compact learned statistics, never pending turn state."""
         return {
             "version": self.SNAPSHOT_VERSION,
             "config": {
-                "half_life_turns": self.half_life_turns,
-                "prior_mass": self.prior_mass,
-                "transition_weight": self.transition_weight,
-                "velocity_weight": self.velocity_weight,
-                "gate_temperature": self.gate_temperature,
-                "exploration_weight": self.exploration_weight,
-                "max_edge_statistics": self.max_edge_statistics,
+                name: getattr(self, name) for name in self._config_names()
             },
             "heads": [
                 {"role": role, "head": head, **statistic.as_dict()}
@@ -450,7 +444,16 @@ class CausalTransitionPolicy:
     def from_snapshot(cls, payload: dict[str, Any]) -> CausalTransitionPolicy:
         if int(payload.get("version", 0)) != cls.SNAPSHOT_VERSION:
             raise ValueError("unsupported transition-policy snapshot version")
-        policy = cls(**dict(payload.get("config", {})))
+        # Retired knobs may still sit in snapshots written by an older build;
+        # replaying one must continue to work at this snapshot version.
+        config = dict(payload.get("config", {}))
+        policy = cls(
+            **{
+                name: config[name]
+                for name in cls._config_names()
+                if name in config
+            }
+        )
         for raw in payload.get("heads", []):
             role = str(raw["role"])
             head = int(raw["head"])

@@ -26,9 +26,17 @@ from dotenv import load_dotenv
 from memory_condense.domain.discourse import identity_sha256, quote_sha256
 from memory_condense.eval.benchmark import exact_match, f1_score
 from memory_condense.eval.fast_cav_feature_session import (
+    FAST_CAV_SESSION_RECEIPT_FORMAT,
+    LEGACY_FAST_CAV_SESSION_RECEIPT_FORMAT,
     FastCAVFeatureSessionReceipt,
     FastCAVStageReceipt,
     run_fast_cav_feature_session,
+)
+from memory_condense.eval.fast_cav_links import (
+    FastCAVConceptProvenance,
+    FastCAVExtractionLink,
+    FastCAVLinkReceipt,
+    FastCAVReinjectionLink,
 )
 from memory_condense.eval.fast_cav_prompts import (
     ARM_IDS,
@@ -44,7 +52,8 @@ from memory_condense.eval.recall_guarded_cumulative_fast_artifact import (
 )
 from memory_condense.search.fusion.fixed_cav_router import FixedCAVRuntimeReceipt
 from memory_condense.search.fusion.steered_readout import MatchedSteeredReadout
-FEATURE_MANIFEST_FORMAT = "memory-condense-fast-1m-cav-features-v1"
+LEGACY_FEATURE_MANIFEST_FORMAT = "memory-condense-fast-1m-cav-features-v1"
+FEATURE_MANIFEST_FORMAT = "memory-condense-fast-1m-cav-features-v2"
 ANSWER_MANIFEST_FORMAT = "memory-condense-fast-1m-cav-answers-v1"
 SCORE_MANIFEST_FORMAT = "memory-condense-fast-1m-cav-scores-v1"
 ZERO_STATE_CONTRACT = "tensor-free-fast-1m-cav-phase-boundary-v1"
@@ -216,8 +225,13 @@ def _read_feature_orders(
     path: Path,
 ) -> tuple[tuple[TensorFreeStageOrder, ...], dict[str, Any], str]:
     payload, digest = _read_canonical_json(path)
-    if payload.get("format") != FEATURE_MANIFEST_FORMAT:
+    manifest_format = payload.get("format")
+    if manifest_format not in {
+        LEGACY_FEATURE_MANIFEST_FORMAT,
+        FEATURE_MANIFEST_FORMAT,
+    }:
         raise ValueError("feature manifest has an unsupported format")
+    legacy = manifest_format == LEGACY_FEATURE_MANIFEST_FORMAT
     if payload.get("retrieval_sha256") != artifact.raw_sha256:
         raise ValueError("feature manifest belongs to another retrieval artifact")
     zero_state = payload.get("zero_state")
@@ -261,6 +275,13 @@ def _read_feature_orders(
     raw_session = payload.get("feature_session")
     if not isinstance(raw_session, dict):
         raise ValueError("feature manifest has no session receipt")
+    expected_session_format = (
+        LEGACY_FAST_CAV_SESSION_RECEIPT_FORMAT
+        if legacy
+        else FAST_CAV_SESSION_RECEIPT_FORMAT
+    )
+    if raw_session.get("format") != expected_session_format:
+        raise ValueError("feature manifest mixed receipt generations")
     raw_stage_receipts = raw_session.get("stage_receipts")
     if not isinstance(raw_stage_receipts, list):
         raise ValueError("feature session stage receipts changed")
@@ -283,6 +304,32 @@ def _read_feature_orders(
         readout = MatchedSteeredReadout(**readout_body)
         stage_body = dict(raw_stage)
         stage_body["readout"] = readout
+        raw_links = raw_stage.get("links")
+        if not legacy:
+            if not isinstance(raw_links, dict):
+                raise ValueError("linked feature stage has no CAV link receipt")
+            link_body = dict(raw_links)
+            link_body["concepts"] = tuple(
+                FastCAVConceptProvenance(**row)
+                for row in link_body.get("concepts", ())
+            )
+            link_body["extraction_links"] = tuple(
+                FastCAVExtractionLink(**row)
+                for row in link_body.get("extraction_links", ())
+            )
+            link_body["reinjection_links"] = tuple(
+                FastCAVReinjectionLink(**row)
+                for row in link_body.get("reinjection_links", ())
+            )
+            for key in (
+                "evidence_ids",
+                "source_ids",
+                "evidence_text_sha256s",
+                "extraction_shape",
+                "reinjection_shape",
+            ):
+                link_body[key] = tuple(link_body.get(key, ()))
+            stage_body["links"] = FastCAVLinkReceipt(**link_body)
         for key in (
             "evidence_feature_row_indices",
             "evidence_ids",
@@ -296,7 +343,12 @@ def _read_feature_orders(
     session_body["stage_ids"] = tuple(session_body.get("stage_ids", ()))
     session_body["stage_receipts"] = tuple(typed_stage_receipts)
     typed_session = FastCAVFeatureSessionReceipt(**session_body)
-    if _canonical_json_bytes(asdict(typed_session)) != _canonical_json_bytes(raw_session):
+    typed_projection = asdict(typed_session)
+    if legacy:
+        for stage in typed_projection["stage_receipts"]:
+            stage.pop("links")
+            stage.pop("readout_role")
+    if _canonical_json_bytes(typed_projection) != _canonical_json_bytes(raw_session):
         raise ValueError("feature session typed receipt projection changed")
 
     raw_router = payload.get("router_runtime_receipt")

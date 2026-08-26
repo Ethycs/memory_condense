@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 
 import pytest
@@ -19,11 +19,16 @@ from memory_condense.eval.fast_cav_prompts import (
     build_fast_cav_prompt_population,
 )
 from memory_condense.eval.fast_cav_feature_session import (
+    LEGACY_FAST_CAV_SESSION_RECEIPT_FORMAT,
+    LEGACY_FAST_CAV_STAGE_RECEIPT_FORMAT,
+    FastCAVFeatureSessionReceipt,
+    FastCAVStageReceipt,
     run_fast_cav_feature_session,
 )
 from memory_condense.eval.fast_completion_runtime import FastCompletionRuntime
 from memory_condense.eval.run_fast_1m_cav import (
     FEATURE_MANIFEST_FORMAT,
+    LEGACY_FEATURE_MANIFEST_FORMAT,
     ZERO_STATE_CONTRACT,
     _answer_artifact,
     _atomic_write_json,
@@ -38,6 +43,7 @@ from memory_condense.eval.run_fast_1m_cav import (
     run_preflight,
 )
 from memory_condense.search.fusion.fixed_cav_router import FixedCAVRouter
+from memory_condense.search.fusion.steered_readout import MatchedSteeredReadout
 from tests.test_fast_completion_runtime import _FakeClient
 from tests.test_fast_cav_feature_session import (
     _FakeEncoder,
@@ -86,6 +92,25 @@ def _feature_manifest(tmp_path: Path):
     path = tmp_path / "features.json"
     digest = _atomic_write_json(path, payload)
     return artifact, session, orders, payload, path, digest
+
+
+def _legacy_session(
+    session: FastCAVFeatureSessionReceipt,
+) -> FastCAVFeatureSessionReceipt:
+    legacy_stages = []
+    for stage in session.stage_receipts:
+        body = {row.name: getattr(stage, row.name) for row in fields(stage)}
+        body.pop("links")
+        body.pop("readout_role")
+        body["format"] = LEGACY_FAST_CAV_STAGE_RECEIPT_FORMAT
+        body["stage_output_sha256"] = ""
+        assert type(body["readout"]) is MatchedSteeredReadout
+        legacy_stages.append(FastCAVStageReceipt(**body))
+    body = {row.name: getattr(session, row.name) for row in fields(session)}
+    body["stage_receipts"] = tuple(legacy_stages)
+    body["format"] = LEGACY_FAST_CAV_SESSION_RECEIPT_FORMAT
+    body["session_receipt_sha256"] = ""
+    return FastCAVFeatureSessionReceipt(**body)
 
 
 def _completed_answer_manifest(tmp_path: Path):
@@ -174,6 +199,33 @@ def test_feature_manifest_round_trip_binds_tensor_free_orders(tmp_path: Path) ->
         session.session_receipt_sha256
     )
     assert all(row.retained_tensor_bytes == 0 for row in observed)
+
+
+def test_existing_style_v1_feature_manifest_remains_exactly_readable(
+    tmp_path: Path,
+) -> None:
+    artifact, session, _orders, payload, _path, _digest = _feature_manifest(tmp_path)
+    legacy_session = _legacy_session(session)
+    legacy_orders = _orders_from_session(legacy_session)
+    payload["format"] = LEGACY_FEATURE_MANIFEST_FORMAT
+    payload["feature_session"] = asdict(legacy_session)
+    payload["stage_orders"] = _orders_payload(legacy_orders)
+    for stage in payload["feature_session"]["stage_receipts"]:
+        stage.pop("links")
+        stage.pop("readout_role")
+        assert "links" not in stage
+        assert "readout_role" not in stage
+    path = tmp_path / "legacy-features.json"
+    expected_digest = _atomic_write_json(path, payload)
+
+    observed, observed_payload, observed_digest = _read_feature_orders(artifact, path)
+
+    assert observed == legacy_orders
+    assert observed_digest == expected_digest
+    assert observed_payload["format"] == LEGACY_FEATURE_MANIFEST_FORMAT
+    assert observed_payload["feature_session"]["session_receipt_sha256"] == (
+        legacy_session.session_receipt_sha256
+    )
 
 
 def test_feature_manifest_rejects_order_receipt_tampering(tmp_path: Path) -> None:

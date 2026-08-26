@@ -3,12 +3,50 @@
 from __future__ import annotations
 
 import re
-from typing import Sequence
+from typing import Callable, Mapping, Sequence
 
 from memory_condense.associations.head_memory_models import (
     AssociativeComposition,
     AssociativeMemoryCandidate,
 )
+from memory_condense.domain.schemas import RetrievalResult
+
+
+def anchor_candidates(
+    anchors: Sequence[RetrievalResult],
+) -> list[AssociativeMemoryCandidate]:
+    """Pack ranked direct anchors as ``hybrid``-route composition candidates."""
+
+    return [
+        AssociativeMemoryCandidate(
+            episode_id=result.chunk.chunk_id,
+            text=result.chunk.text,
+            score=result.score,
+            route="hybrid",
+        )
+        for result in anchors
+    ]
+
+
+def hydration_memo(
+    hydrate: Callable[..., RetrievalResult | None],
+    *,
+    seed: Mapping[str, RetrievalResult] | None = None,
+) -> Callable[[str], RetrievalResult | None]:
+    """Memoize base hydration so one expansion never re-reads a chunk.
+
+    Misses are cached too: a chunk that no longer hydrates stays absent for
+    the rest of the call instead of being retried by every route.
+    """
+
+    cache: dict[str, RetrievalResult | None] = dict(seed or {})
+
+    def hydrated(chunk_id: str) -> RetrievalResult | None:
+        if chunk_id not in cache:
+            cache[chunk_id] = hydrate(chunk_id, score=0.0)
+        return cache[chunk_id]
+
+    return hydrated
 
 
 def compose_associative_candidates(

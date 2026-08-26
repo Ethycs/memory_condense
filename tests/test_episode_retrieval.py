@@ -9,6 +9,7 @@ import memory_condense.search.episodes.builder as episode_builder_module
 
 from memory_condense.domain.discourse import (
     Episode,
+    EpisodeSeed,
     EvidenceSpan,
     make_episode_id,
     quote_sha256,
@@ -20,9 +21,11 @@ from memory_condense.search.episodes import (
     CohesionBoundaryRefiner,
     EpisodeBuilder,
     EpisodeRetrievalPolicy,
-    LexicalEmbeddingChangeScorer,
     FixedIntervalBoundaryDetector,
+    LexicalEmbeddingChangeScorer,
     SurpriseScorer,
+    combine_episode_seeds,
+    episode_seed_payload,
     expand_episode_seeds,
     score_surprise_sequence,
     select_episode_representatives,
@@ -30,6 +33,54 @@ from memory_condense.search.episodes import (
 
 
 ARTIFACT = "disc-test-artifact"
+
+
+def test_episode_seed_helpers_preserve_exact_payload_and_deterministic_order() -> None:
+    direct_winner = EpisodeSeed(
+        episode_id="episode-b",
+        anchor_chunk_id="chunk-b",
+        score=0.8,
+        route="episode_direct",
+        path=("direct-b", "episode-b"),
+    )
+    representative_loser = EpisodeSeed(
+        episode_id="episode-b",
+        anchor_chunk_id="chunk-z",
+        score=0.8,
+        route="representative",
+        path=("representative-b", "episode-b"),
+    )
+    representative_first = EpisodeSeed(
+        episode_id="episode-a",
+        anchor_chunk_id="chunk-a",
+        score=0.9,
+        route="representative",
+        path=("representative-a", "episode-a"),
+    )
+
+    combined = combine_episode_seeds(
+        (direct_winner,),
+        (representative_loser, representative_first),
+    )
+
+    assert combined == (representative_first, direct_winner)
+    assert [episode_seed_payload(seed) for seed in combined] == [
+        {
+            "episode_id": "episode-a",
+            "anchor_chunk_id": "chunk-a",
+            "score": 0.9,
+            "route": "representative",
+            "path": ["representative-a", "episode-a"],
+        },
+        {
+            "episode_id": "episode-b",
+            "anchor_chunk_id": "chunk-b",
+            "score": 0.8,
+            "route": "episode_direct",
+            "path": ["direct-b", "episode-b"],
+        },
+    ]
+    assert episode_seed_payload(direct_winner) == direct_winner.identity_payload()
 
 
 def _span(index: int, *, source_id: str = "source-a", text: str | None = None) -> EvidenceSpan:

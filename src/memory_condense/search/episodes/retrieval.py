@@ -161,6 +161,47 @@ class DirectChunkSeed:
         object.__setattr__(self, "path", path)
 
 
+def episode_seed_payload(seed: EpisodeSeed) -> dict[str, object]:
+    """Return the canonical identity payload for one episode seed."""
+
+    return seed.identity_payload()
+
+
+def combine_episode_seeds(
+    direct: Sequence[EpisodeSeed],
+    representative: Sequence[EpisodeSeed],
+) -> tuple[EpisodeSeed, ...]:
+    """Deduplicate two seed routes and return their deterministic ranking."""
+
+    selected: dict[str, EpisodeSeed] = {}
+    for seed in (*direct, *representative):
+        prior = selected.get(seed.episode_id)
+        if prior is None or (
+            -seed.score,
+            seed.anchor_chunk_id,
+            seed.route,
+            seed.path,
+        ) < (
+            -prior.score,
+            prior.anchor_chunk_id,
+            prior.route,
+            prior.path,
+        ):
+            selected[seed.episode_id] = seed
+    return tuple(
+        sorted(
+            selected.values(),
+            key=lambda seed: (
+                -seed.score,
+                seed.episode_id,
+                seed.anchor_chunk_id,
+                seed.route,
+                seed.path,
+            ),
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class EpisodeRetrievalPlan:
     """Text-free, self-hashed result of bounded episode expansion."""
@@ -198,16 +239,7 @@ class EpisodeRetrievalPlan:
     def identity_payload(self, *, include_receipt: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
             "policy_sha256": self.policy_sha256,
-            "seeds": [
-                {
-                    "episode_id": item.episode_id,
-                    "anchor_chunk_id": item.anchor_chunk_id,
-                    "score": item.score,
-                    "route": item.route,
-                    "path": list(item.path),
-                }
-                for item in self.seeds
-            ],
+            "seeds": [episode_seed_payload(item) for item in self.seeds],
             "direct_fallbacks": [
                 {
                     "chunk_id": item.chunk_id,
@@ -583,5 +615,7 @@ __all__ = [
     "EpisodeLookup",
     "EpisodeRetrievalPlan",
     "EpisodeRetrievalPolicy",
+    "combine_episode_seeds",
+    "episode_seed_payload",
     "expand_episode_seeds",
 ]

@@ -26,7 +26,6 @@ from memory_condense.domain.discourse import (
     ClosurePolicy,
     EvidencePacket,
     EvidenceSpan,
-    EpisodeSeed,
     QueryProgram,
     identity_sha256,
     quote_sha256,
@@ -49,6 +48,8 @@ from memory_condense.search.episodes import (
     EpisodeSourceCandidate,
     EpisodeSourceCandidateScope,
     NestedEpisodeLinker,
+    combine_episode_seeds as _combine_episode_seeds,
+    episode_seed_payload as _episode_seed_payload,
 )
 
 
@@ -691,49 +692,6 @@ def retrieve_longmemeval_diffuse_packet(
         messages=messages,
         evidence_coordinates=coordinates,
         receipt=receipt,
-    )
-
-
-def _episode_seed_payload(seed: EpisodeSeed) -> dict[str, object]:
-    return {
-        "episode_id": seed.episode_id,
-        "anchor_chunk_id": seed.anchor_chunk_id,
-        "score": seed.score,
-        "route": seed.route,
-        "path": list(seed.path),
-    }
-
-
-def _combine_episode_seeds(
-    direct: Sequence[EpisodeSeed],
-    representative: Sequence[EpisodeSeed],
-) -> tuple[EpisodeSeed, ...]:
-    selected: dict[str, EpisodeSeed] = {}
-    for seed in (*direct, *representative):
-        prior = selected.get(seed.episode_id)
-        if prior is None or (
-            -seed.score,
-            seed.anchor_chunk_id,
-            seed.route,
-            seed.path,
-        ) < (
-            -prior.score,
-            prior.anchor_chunk_id,
-            prior.route,
-            prior.path,
-        ):
-            selected[seed.episode_id] = seed
-    return tuple(
-        sorted(
-            selected.values(),
-            key=lambda seed: (
-                -seed.score,
-                seed.episode_id,
-                seed.anchor_chunk_id,
-                seed.route,
-                seed.path,
-            ),
-        )
     )
 
 

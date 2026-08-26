@@ -1,9 +1,20 @@
-"""Sparse persistent QK/OV edge operations."""
+"""Sparse persistent QK/OV edge operations.
+
+``AssociationEdgeStoreMixin`` is one of three mixins composed into
+``AssociationStore``. It is not standalone: the composer must supply
+
+* ``self._db`` -- an open :class:`~memory_condense.persistence.db.Database`;
+* ``self._edge_neighbor_cache`` -- an ``OrderedDict`` bounded by ``_cache_put``;
+* ``self._cache_limit`` -- ``0`` to disable neighbor caching entirely;
+* ``self._cache_put(cache, key, value)`` -- bounded cache insertion;
+* ``self._require_artifact(artifact_id)`` and ``self._pack_f32`` /
+  ``self._unpack_f32`` -- provided by ``AssociationArtifactStoreMixin``.
+"""
 
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -12,6 +23,24 @@ from memory_condense.associations.association_models import (
     evidence_weighted_mean,
 )
 from memory_condense.persistence.db import INDEXED_CHUNK_SQL
+
+#: The columns ``_stored_edge`` transcribes, in the order it reads them.
+_HEAD_EDGE_COLUMN_NAMES = (
+    "source_chunk_id",
+    "destination_chunk_id",
+    "head_weights",
+    "qk_score",
+    "ov_transport",
+    "evidence_count",
+    "traversal_count",
+    "last_access_turn",
+    "temporal_forward",
+)
+
+
+def head_edge_columns(prefix: str = "") -> str:
+    """Project the stored-edge columns, optionally through a table alias."""
+    return ", ".join(f"{prefix}{name}" for name in _HEAD_EDGE_COLUMN_NAMES)
 
 
 class AssociationEdgeStoreMixin:
@@ -141,26 +170,20 @@ class AssociationEdgeStoreMixin:
             ),
         )
 
-    def neighbors(
-        self,
-        source_chunk_id: str,
-        artifact_id: str,
-        *,
-        top_k: int,
-        exclude: Sequence[str] = (),
-        now_turn: int | None = None,
-        usage_half_life: float = 100.0,
-        usage_weight: float = 0.05,
-    ) -> tuple[StoredHeadEdge, ...]:
-        return self.neighbors_many(
-            [source_chunk_id],
-            artifact_id,
-            top_k_per_source=top_k,
-            exclude=exclude,
-            now_turn=now_turn,
-            usage_half_life=usage_half_life,
-            usage_weight=usage_weight,
-        )[source_chunk_id]
+    def _stored_edge(self, row: Sequence[Any], artifact_id: str) -> StoredHeadEdge:
+        """Transcribe one ``head_edge_columns`` row into a stored edge."""
+        return StoredHeadEdge(
+            source_chunk_id=row[0],
+            destination_chunk_id=row[1],
+            artifact_id=artifact_id,
+            head_weights=self._unpack_f32(row[2]),
+            qk_score=float(row[3]),
+            ov_transport=float(row[4]),
+            evidence_count=int(row[5]),
+            traversal_count=int(row[6]),
+            last_access_turn=int(row[7]),
+            temporal_forward=None if row[8] is None else bool(row[8]),
+        )
 
     def neighbors_many(
         self,
@@ -171,8 +194,6 @@ class AssociationEdgeStoreMixin:
         exclude: Sequence[str] = (),
         exclude_frontier: bool = True,
         now_turn: int | None = None,
-        usage_half_life: float = 100.0,
-        usage_weight: float = 0.05,
     ) -> dict[str, tuple[StoredHeadEdge, ...]]:
         """Fetch bounded adjacency for many anchors in one SQLite query."""
         if top_k_per_source < 0:
@@ -190,8 +211,6 @@ class AssociationEdgeStoreMixin:
             tuple(sorted(set(exclude))),
             bool(exclude_frontier),
             turn,
-            float(usage_half_life),
-            float(usage_weight),
         )
         cached = (
             self._edge_neighbor_cache.get(cache_key)
@@ -211,10 +230,7 @@ class AssociationEdgeStoreMixin:
             excluded.update(sources)
         placeholders = ",".join("?" for _ in sources)
         rows = self._db.execute(
-            "SELECT e.source_chunk_id, e.destination_chunk_id, e.head_weights, "
-            "e.qk_score, "
-            "e.ov_transport, e.evidence_count, e.traversal_count, "
-            "e.last_access_turn, e.temporal_forward "
+            f"SELECT {head_edge_columns('e.')} "
             "FROM chunk_head_edges AS e "
             "JOIN chunks AS c ON c.chunk_id = e.destination_chunk_id "
             f"WHERE e.source_chunk_id IN ({placeholders}) AND e.artifact_id = ? "
@@ -225,35 +241,17 @@ class AssociationEdgeStoreMixin:
             source_id: [] for source_id in sources
         }
         for row in rows:
-            source_id, destination_id = row[0], row[1]
-            if destination_id in excluded:
+            if row[1] in excluded:
                 continue
-            weights = self._unpack_f32(row[2])
-            if len(weights) != artifact.head_count:
+            edge = self._stored_edge(row, artifact_id)
+            if len(edge.head_weights) != artifact.head_count:
                 raise ValueError("stored head weight width does not match its artifact")
-            edges_by_source[source_id].append(
-                StoredHeadEdge(
-                    source_chunk_id=source_id,
-                    destination_chunk_id=destination_id,
-                    artifact_id=artifact_id,
-                    head_weights=weights,
-                    qk_score=float(row[3]),
-                    ov_transport=float(row[4]),
-                    evidence_count=int(row[5]),
-                    traversal_count=int(row[6]),
-                    last_access_turn=int(row[7]),
-                    temporal_forward=None if row[8] is None else bool(row[8]),
-                )
-            )
+            edges_by_source[edge.source_chunk_id].append(edge)
         result: dict[str, tuple[StoredHeadEdge, ...]] = {}
         for source_id, edges in edges_by_source.items():
             edges.sort(
                 key=lambda edge: (
-                    edge.utility(
-                        now_turn=turn,
-                        usage_half_life=usage_half_life,
-                        usage_weight=usage_weight,
-                    ),
+                    edge.utility(now_turn=turn),
                     edge.destination_chunk_id,
                 ),
                 reverse=True,
@@ -270,9 +268,7 @@ class AssociationEdgeStoreMixin:
         now_turn: int | None = None,
     ) -> int:
         self._require_artifact(artifact_id)
-        turn = self._db.current_turn() if now_turn is None else int(now_turn)
-        if turn < 0:
-            raise ValueError("now_turn must be non-negative")
+        turn = self._resolved_turn(now_turn, field_name="now_turn")
         touched = 0
         for source_id, destination_id in dict.fromkeys(pairs):
             cur = self._db.execute(

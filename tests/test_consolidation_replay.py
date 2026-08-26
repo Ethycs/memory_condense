@@ -6,6 +6,7 @@ import re
 import shutil
 import sqlite3
 import zlib
+from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import datetime, timezone
 
 import numpy as np
@@ -14,9 +15,15 @@ import pytest
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.eval.consolidation_replay import (
     FrozenQueryEmbedder,
-    _source_rows,
+    RETRIEVAL_ACCESS_EVENT_FORMAT,
+    RetrievalAccessCaptureSink,
+    RetrievalAccessCaptureValidationError,
+    RetrievalAccessEvent,
     _comparison,
+    _source_rows,
+    retrieval_access_capture_sha256,
     stage_causal_store,
+    verify_retrieval_access_capture,
 )
 from memory_condense.eval.causal_benchmark import (
     CAUSAL_BUILD_PROTOCOL,
@@ -28,6 +35,7 @@ from memory_condense.eval.causal_benchmark import (
 from memory_condense.eval.compiled_cache import compiled_store_ingest_fn
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
 from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
+from memory_condense.domain._discourse_identity import identity_sha256
 from memory_condense.domain.schemas import Chunk
 
 
@@ -187,6 +195,200 @@ def test_causal_staging_never_retrieves_the_current_or_future_turn(tmp_path):
     assert any("alpha evidence" in text for text in selected_text)
     assert any("beta evidence" in text for text in selected_text)
     assert all("How do alpha and beta relate?" not in text for text in selected_text)
+
+
+def test_retrieval_access_events_are_causal_deterministic_and_text_free(tmp_path):
+    source = tmp_path / "access-source"
+    live = ReplayEmbedder()
+    turns = [
+        ("assistant", "alpha evidence existed before either question"),
+        ("user", "What does alpha establish?"),
+        ("assistant", "beta evidence appeared after the first question"),
+        ("user", "How do alpha and beta relate?"),
+    ]
+    with MemoryCondenser(
+        data_dir=source,
+        embedder=live,
+        auto_extract=False,
+        chunker_min_tokens=1,
+        chunker_max_tokens=40,
+    ) as condenser:
+        for role, text in turns:
+            condenser.ingest(role, text)
+
+    queries = [text for role, text in turns if role == "user"]
+    frozen = FrozenQueryEmbedder(
+        {query: live.embed_query(query) for query in queries}
+    )
+    first: list[RetrievalAccessEvent] = []
+    second: list[RetrievalAccessEvent] = []
+    first_capture_sink = RetrievalAccessCaptureSink()
+    second_capture_sink = RetrievalAccessCaptureSink()
+    capture_policy_sha256 = "a" * 64
+    first_result = stage_causal_store(
+        source / "memory.db",
+        tmp_path / "access-staged-first",
+        frozen,
+        retrieval_k=3,
+        max_event_nodes=3,
+        new_event_nodes=1,
+        max_prompt_tokens=128,
+        retrieval_access_events=first,
+        retrieval_access_capture_sink=first_capture_sink,
+        retrieval_access_capture_policy_sha256=capture_policy_sha256,
+    )
+    second_result = stage_causal_store(
+        source / "memory.db",
+        tmp_path / "access-staged-second",
+        frozen,
+        retrieval_k=3,
+        max_event_nodes=3,
+        new_event_nodes=1,
+        max_prompt_tokens=128,
+        retrieval_access_events=second,
+        retrieval_access_capture_sink=second_capture_sink,
+        retrieval_access_capture_policy_sha256=capture_policy_sha256,
+    )
+
+    assert first == second
+    first_capture = first_capture_sink.capture
+    second_capture = second_capture_sink.capture
+    assert first_capture.events == tuple(first)
+    assert second_capture.events == tuple(second)
+    assert first_capture.capture_sha256 == second_capture.capture_sha256
+    assert first_capture.payload() == second_capture.payload()
+    assert first_capture.capture_policy_sha256 == capture_policy_sha256
+    assert first_capture.retained_request_token_state_bytes == 0
+    serialized_capture = json.dumps(first_capture.payload(), sort_keys=True)
+    assert "_authorization_tag" not in serialized_capture
+    assert not any(
+        phrase in serialized_capture
+        for phrase in ("What does", "How do", "alpha evidence", "beta evidence")
+    )
+    assert [event.event_id for event in first] == [
+        "causal-user:2",
+        "causal-user:4",
+    ]
+    assert [event.now_turn for event in first] == [1, 3]
+    assert all(isinstance(event.chunk_ids, tuple) for event in first)
+    for event in first:
+        assert event.event_sha256 == identity_sha256(
+            {
+                "format": RETRIEVAL_ACCESS_EVENT_FORMAT,
+                "event_id": event.event_id,
+                "now_turn": event.now_turn,
+                "chunk_ids": event.chunk_ids,
+            }
+        )
+        assert event.identity_payload() == {
+            "format": RETRIEVAL_ACCESS_EVENT_FORMAT,
+            "event_id": event.event_id,
+            "now_turn": event.now_turn,
+            "chunk_ids": event.chunk_ids,
+        }
+        assert set(asdict(event)) == {
+            "event_id",
+            "now_turn",
+            "chunk_ids",
+            "event_sha256",
+        }
+        assert not any(
+            phrase in json.dumps(asdict(event))
+            for phrase in ("What does", "How do", "alpha evidence", "beta evidence")
+        )
+        with pytest.raises(FrozenInstanceError):
+            event.now_turn = 999
+
+    ordered = next(event for event in first if len(event.chunk_ids) > 1)
+    reordered = RetrievalAccessEvent(
+        event_id=ordered.event_id,
+        now_turn=ordered.now_turn,
+        chunk_ids=tuple(reversed(ordered.chunk_ids)),
+    )
+    assert reordered.chunk_ids != ordered.chunk_ids
+    assert reordered.event_sha256 != ordered.event_sha256
+
+    with sqlite3.connect(source / "memory.db") as connection:
+        chunk_ordinals = {
+            chunk_id: ordinal
+            for chunk_id, ordinal in connection.execute(
+                "SELECT chunks.chunk_id, turns.ordinal FROM chunks "
+                "JOIN turns ON turns.turn_id = chunks.turn_id"
+            )
+        }
+    assert all(
+        chunk_ordinals[chunk_id] <= event.now_turn
+        for event in first
+        for chunk_id in event.chunk_ids
+    )
+
+    # Opting into ID-only receipts does not alter the established return shape
+    # or the consolidation events/statistics produced by staging.
+    assert isinstance(first_result, tuple) and len(first_result) == 2
+    assert first_result == second_result
+
+    substituted = list(first_capture.events)
+    substituted[0] = RetrievalAccessEvent(
+        substituted[0].event_id,
+        substituted[0].now_turn,
+        (),
+    )
+    substituted_tuple = tuple(substituted)
+    independently_resealed = replace(
+        first_capture,
+        events=substituted_tuple,
+        capture_sha256=retrieval_access_capture_sha256(
+            source_database_sha256=first_capture.source_database_sha256,
+            capture_policy_sha256=first_capture.capture_policy_sha256,
+            retrieval_k=first_capture.retrieval_k,
+            expansion_tokens=first_capture.expansion_tokens,
+            max_prompt_tokens=first_capture.max_prompt_tokens,
+            events=substituted_tuple,
+        ),
+    )
+    with pytest.raises(
+        RetrievalAccessCaptureValidationError,
+        match="not issued by this staging process",
+    ):
+        verify_retrieval_access_capture(independently_resealed)
+
+
+def test_causal_staging_default_api_does_not_require_access_collection(tmp_path):
+    source = tmp_path / "default-api-source"
+    embedder = ReplayEmbedder()
+    with MemoryCondenser(
+        data_dir=source,
+        embedder=embedder,
+        auto_extract=False,
+        chunker_min_tokens=1,
+        chunker_max_tokens=40,
+    ) as condenser:
+        condenser.ingest("assistant", "The marker is amber.")
+        condenser.ingest("user", "What is the marker?")
+
+    result = stage_causal_store(
+        source / "memory.db",
+        tmp_path / "default-api-staged",
+        FrozenQueryEmbedder(
+            {"What is the marker?": embedder.embed_query("What is the marker?")}
+        ),
+        retrieval_k=1,
+        max_event_nodes=3,
+        new_event_nodes=1,
+    )
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    events, stats = result
+    assert isinstance(events, list)
+    assert set(stats) == {
+        "source_turns",
+        "events",
+        "completed_episodes",
+        "outcome_chunks_bound",
+        "skipped_large_prompt",
+        "skipped_insufficient_candidates",
+    }
 
 
 def test_causal_staging_closes_episode_before_next_source_timestamp(tmp_path):

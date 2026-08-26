@@ -12,7 +12,64 @@ from memory_condense.associations.head_memory_models import (
     MemoryLinkResult,
     NestedMemoryInspection,
 )
-from memory_condense.modeling.qwen_prefix import Qwen3PrefixEncoder
+from memory_condense.modeling.qwen_prefix import (
+    Qwen3PrefixEncoder,
+    gqa_key_group_index,
+    head_vote_mean,
+)
+
+
+def numbered_memory_block(
+    texts: Sequence[str],
+) -> tuple[str, list[tuple[int, int]], int]:
+    """Join ``[Memory i] text`` parts, tracking each part's character span.
+
+    Returns the joined text, one ``(start, stop)`` span per part, and the
+    cursor a caller needs to append a further section.
+    """
+    parts: list[str] = []
+    character_spans: list[tuple[int, int]] = []
+    cursor = 0
+    for position, text in enumerate(texts):
+        part = f"[Memory {position}] {text}\n"
+        parts.append(part)
+        character_spans.append((cursor, cursor + len(part)))
+        cursor += len(part)
+    return "".join(parts), character_spans, cursor
+
+
+def token_span_for_characters(
+    offsets: Sequence[Sequence[int]],
+    character_span: tuple[int, int],
+) -> list[int]:
+    """Resolve a character span to every token index that overlaps it."""
+    start, stop = character_span
+    return [
+        token_index
+        for token_index, (token_start, token_stop) in enumerate(offsets)
+        if token_stop > start and token_start < stop
+    ]
+
+
+def _bounded_unique_candidates(
+    candidates: Sequence[AssociativeMemoryCandidate],
+    *,
+    limit: int,
+    kind: str,
+) -> list[AssociativeMemoryCandidate]:
+    """Take the first ``limit`` distinct episodes, preserving caller order."""
+    bounded: list[AssociativeMemoryCandidate] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.episode_id in seen:
+            continue
+        seen.add(candidate.episode_id)
+        bounded.append(candidate)
+        if len(bounded) >= limit:
+            break
+    if not bounded:
+        raise ValueError(f"at least one unique {kind} candidate is required")
+    return bounded
 
 
 class QwenMemoryLinker:
@@ -54,21 +111,6 @@ class QwenMemoryLinker:
         self.max_neighbors_per_episode = int(max_neighbors_per_episode)
         self.head_vote_k = int(head_vote_k)
 
-    def signature(self, source_text: str) -> tuple[float, ...]:
-        """Compile one memory to compact CAV coordinates without retaining K/V."""
-        if self.cav_bank is None:
-            return ()
-        tokenized = self.encoder.tokenizer(source_text, return_tensors="pt")
-        token_count = int(tokenized["input_ids"].shape[1])
-        if token_count > self.max_workspace_tokens:
-            raise MemoryError(
-                f"signature workspace needs {token_count} tokens, above the "
-                f"hard cap of {self.max_workspace_tokens}; chunk the memory first"
-            )
-        capture = self.encoder.capture(source_text, layer=self.cav_bank.layer)
-        values = self.cav_bank.signature(capture.residual)
-        return tuple(float(value) for value in values.cpu().tolist())
-
     def signatures(
         self,
         source_texts: Sequence[str],
@@ -89,9 +131,7 @@ class QwenMemoryLinker:
             layers=(self.cav_bank.layer,),
             batch_size=batch_size,
         )[self.cav_bank.layer]
-        vectors = self.cav_bank.vectors.float().cpu()
-        thresholds = self.cav_bank.thresholds.float().cpu()
-        values = pooled.float() @ vectors.T - thresholds
+        values = self.cav_bank.signatures(pooled)
         return tuple(
             tuple(float(value) for value in row.tolist())
             for row in values
@@ -106,30 +146,16 @@ class QwenMemoryLinker:
     ) -> MemoryLinkResult:
         """Score a bounded candidate workspace and immediately shed activations."""
         torch = self.encoder._torch
-        bounded: list[AssociativeMemoryCandidate] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            if candidate.episode_id in seen:
-                continue
-            seen.add(candidate.episode_id)
-            bounded.append(candidate)
-            if len(bounded) >= self.max_candidates:
-                break
-        if not bounded:
-            raise ValueError("at least one unique link candidate is required")
+        bounded = _bounded_unique_candidates(
+            candidates, limit=self.max_candidates, kind="link"
+        )
 
-        parts: list[str] = []
-        character_spans: list[tuple[int, int]] = []
-        cursor = 0
-        for position, candidate in enumerate(bounded):
-            part = f"[Memory {position}] {candidate.text}\n"
-            parts.append(part)
-            character_spans.append((cursor, cursor + len(part)))
-            cursor += len(part)
+        memory_text, character_spans, cursor = numbered_memory_block(
+            [candidate.text for candidate in bounded]
+        )
         query_part = f"[New memory] {source_text}\n"
-        parts.append(query_part)
         query_character_span = (cursor, cursor + len(query_part))
-        joint_text = "".join(parts)
+        joint_text = memory_text + query_part
 
         tokenized = self.encoder.tokenizer(
             joint_text,
@@ -144,16 +170,10 @@ class QwenMemoryLinker:
             )
         offsets = tokenized["offset_mapping"][0].tolist()
 
-        def token_span(character_span: tuple[int, int]) -> list[int]:
-            start, stop = character_span
-            return [
-                token_index
-                for token_index, (token_start, token_stop) in enumerate(offsets)
-                if token_stop > start and token_start < stop
-            ]
-
-        candidate_token_spans = [token_span(span) for span in character_spans]
-        source_tokens = token_span(query_character_span)
+        candidate_token_spans = [
+            token_span_for_characters(offsets, span) for span in character_spans
+        ]
+        source_tokens = token_span_for_characters(offsets, query_character_span)
         if not source_tokens or any(not span for span in candidate_token_spans):
             raise ValueError("tokenizer produced an empty memory span")
 
@@ -169,16 +189,11 @@ class QwenMemoryLinker:
         )
         attention = capture.attention[0].float()
         decoder_attention = self.encoder.model.layers[self.layer].self_attn
-        groups_per_key = (
-            self.encoder.config.num_attention_heads
-            // self.encoder.config.num_key_value_heads
-        )
-        key_groups = (
-            torch.arange(
-                self.encoder.config.num_attention_heads,
-                device=self.encoder.device,
-            )
-            // groups_per_key
+        key_groups = gqa_key_group_index(
+            torch,
+            query_heads=self.encoder.config.num_attention_heads,
+            key_value_heads=self.encoder.config.num_key_value_heads,
+            device=self.encoder.device,
         )
         expanded_values = capture.values[0][key_groups]
         hits: list[MemoryLinkHit] = []
@@ -188,10 +203,9 @@ class QwenMemoryLinker:
             ):
                 block = attention[:, source_tokens, :][:, :, memory_tokens]
                 head_weights = block.sum(dim=-1).mean(dim=-1)
-                strongest = torch.topk(
-                    head_weights,
-                    k=min(self.head_vote_k, len(head_weights)),
-                ).values
+                strongest = head_vote_mean(
+                    torch, head_weights, k=self.head_vote_k
+                )
                 candidate_values = expanded_values[:, memory_tokens, :]
                 moved_values = torch.einsum(
                     "hqs,hsd->qhd", block.to(candidate_values.dtype), candidate_values
@@ -225,7 +239,7 @@ class QwenMemoryLinker:
                 hits.append(
                     MemoryLinkHit(
                         episode_id=candidate.episode_id,
-                        qk_score=float(strongest.mean()),
+                        qk_score=float(strongest),
                         ov_transport=float(update.float().square().mean().sqrt()),
                         head_weights=tuple(
                             float(value) for value in head_weights.cpu().tolist()
@@ -274,17 +288,9 @@ class QwenMemoryLinker:
                 "construct this linker without a CAV bank"
             )
         torch = self.encoder._torch
-        bounded: list[AssociativeMemoryCandidate] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            if candidate.episode_id in seen:
-                continue
-            seen.add(candidate.episode_id)
-            bounded.append(candidate)
-            if len(bounded) >= self.max_candidates:
-                break
-        if not bounded:
-            raise ValueError("at least one unique coverage candidate is required")
+        bounded = _bounded_unique_candidates(
+            candidates, limit=self.max_candidates, kind="coverage"
+        )
 
         texts: list[str] = []
         memory_character_spans: list[tuple[int, int]] = []
@@ -388,16 +394,11 @@ class QwenMemoryLinker:
                     cos,
                     sin,
                 )
-                groups_per_key = (
-                    self.encoder.config.num_attention_heads
-                    // self.encoder.config.num_key_value_heads
-                )
-                key_groups = (
-                    torch.arange(
-                        self.encoder.config.num_attention_heads,
-                        device=self.encoder.device,
-                    )
-                    // groups_per_key
+                key_groups = gqa_key_group_index(
+                    torch,
+                    query_heads=self.encoder.config.num_attention_heads,
+                    key_value_heads=self.encoder.config.num_key_value_heads,
+                    device=self.encoder.device,
                 )
                 expanded_keys = keys[:, key_groups]
                 expanded_values = values[:, key_groups]
@@ -409,19 +410,12 @@ class QwenMemoryLinker:
                 )
                 for row, candidate in enumerate(bounded):
                     row_offsets = offsets[row].tolist()
-
-                    def token_span(character_span: tuple[int, int]) -> list[int]:
-                        start, stop = character_span
-                        return [
-                            token_index
-                            for token_index, (token_start, token_stop) in enumerate(
-                                row_offsets
-                            )
-                            if token_stop > start and token_start < stop
-                        ]
-
-                    memory_tokens = token_span(memory_character_spans[row])
-                    readout_tokens = token_span(readout_character_spans[row])
+                    memory_tokens = token_span_for_characters(
+                        row_offsets, memory_character_spans[row]
+                    )
+                    readout_tokens = token_span_for_characters(
+                        row_offsets, readout_character_spans[row]
+                    )
                     if not memory_tokens or not readout_tokens:
                         raise ValueError("tokenizer produced an empty coverage span")
                     query_states = queries[row, :, readout_tokens, :]
@@ -450,10 +444,9 @@ class QwenMemoryLinker:
                         torch.logsumexp(memory_logits, dim=-1)
                         - math.log(len(memory_tokens))
                     ).mean(dim=-1)
-                    strongest = torch.topk(
-                        length_normalized_logits,
-                        k=min(self.head_vote_k, len(length_normalized_logits)),
-                    ).values
+                    strongest = head_vote_mean(
+                        torch, length_normalized_logits, k=self.head_vote_k
+                    )
                     candidate_values = expanded_values[row, :, memory_tokens, :]
                     moved_values = torch.einsum(
                         "hqs,hsd->qhd",
@@ -468,7 +461,7 @@ class QwenMemoryLinker:
                     hits.append(
                         MemoryLinkHit(
                             episode_id=candidate.episode_id,
-                            qk_score=float(strongest.mean()),
+                            qk_score=float(strongest),
                             ov_transport=float(
                                 update.float().square().mean().sqrt()
                             ),

@@ -46,11 +46,12 @@ globally date-sorts ten unrelated histories.
 
 ## Environment boundary
 
-`pixi.toml` is a separate optional workspace. There is intentionally no lock
-yet: installing/locking Mem0, spaCy, Qdrant, the local sentence-transformer
-stack and the `Qdrant/bm25` artifact requires explicit network authorization.
-The extraction LLM and a hard-capped provider shim still must be selected
-before a real run can be frozen.
+`pixi.toml` is a separate workspace and `pixi.lock` now freezes its resolved
+package graph. Lock presence alone does not certify the active runtime: the
+exact environment still requires a pre/post probe, local model/resource
+verification, and the independently checked execution receipt. The extraction
+LLM and hard-capped provider shim must also be bound before a real run is
+certified.
 
 The direct architecture comparison requires the exact same local BGE-M3
 revision and checkpoint as memory-condense, with `local_files_only=true` and

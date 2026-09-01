@@ -24,7 +24,7 @@ import statistics
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -57,9 +57,11 @@ from memory_condense.domain._tokenizer import (
 )
 from memory_condense.domain.discourse import (
     ClosurePlan,
+    EvidenceSpan,
     EvidencePacket,
     ObligationResult,
     identity_sha256,
+    make_atom_id,
     quote_sha256,
 )
 from memory_condense.domain.integrity import file_sha256
@@ -115,7 +117,7 @@ from tools._locked_em_repair_adapter import (
     load_locked_em_repair_population,
     project_prevalidated_locked_em_repair_population,
 )
-from tools._routed_repair_routing import RoutedRepairReason, route_question
+from tools._routed_repair_routing import route_question
 
 
 REPRESENTATIVE_ARM = "S0_PLUS_REPRESENTATIVE_BRIDGE"
@@ -124,13 +126,13 @@ ARM_LABELS = (REPRESENTATIVE_ARM, GLOBAL_ARM)
 PLAN_INDEX = {REPRESENTATIVE_ARM: 1, GLOBAL_ARM: 2}
 
 ELIGIBILITY_FORMAT = (
-    "memory-condense-independent-closure-eligibility-manifest-v1"
+    "memory-condense-independent-closure-eligibility-manifest-v9"
 )
-PREFLIGHT_FORMAT = "memory-condense-independent-closure-arms-preflight-v3"
-QUESTION_FORMAT = "memory-condense-independent-closure-question-v3"
-SHARD_INDEX_FORMAT = "memory-condense-independent-closure-shard-index-v3"
-MERGED_FORMAT = "memory-condense-independent-closure-retrieval-v3"
-POLICY_FORMAT = "memory-condense-independent-closure-policy-v3"
+PREFLIGHT_FORMAT = "memory-condense-independent-closure-arms-preflight-v9"
+QUESTION_FORMAT = "memory-condense-independent-closure-question-v9"
+SHARD_INDEX_FORMAT = "memory-condense-independent-closure-shard-index-v9"
+MERGED_FORMAT = "memory-condense-independent-closure-retrieval-v9"
+POLICY_FORMAT = "memory-condense-independent-closure-policy-v9"
 
 DEFAULT_RETRIEVAL = Path(
     "eval_results/longmemeval-1m-recall-guarded-cumulative-validation-20260822"
@@ -142,7 +144,7 @@ DEFAULT_BASELINE_ANSWERS = Path(
 DEFAULT_STORE_ROOT = DEFAULT_RETRIEVAL.parent
 DEFAULT_OUTPUT_ROOT = Path(
     "eval_results/longmemeval-1m-locked-retrieval-mechanism-arms-20260826"
-    "/independent-closure-v3"
+    "/independent-closure-v9"
 )
 DEFAULT_RUNTIME_SOURCE_ROOT = Path(
     "eval_results/locked-campaign-a66ff05-worktree/src"
@@ -154,7 +156,7 @@ EXPECTED_BASELINE_ANSWERS_SHA256 = (
     "d7fc47b8d1f372f002230c6ffe489dac8cd11bd71b35b8d3008b1255da2a38cd"
 )
 EXPECTED_QUESTION_COUNT = 100
-EXPECTED_ELIGIBLE_COUNT = 57
+EXPECTED_ELIGIBLE_COUNT = 79
 EXPECTED_RUNTIME_IMPLEMENTATION_SHA256 = (
     "cf2577f21a7a1af1b9c5f331c7eb1672c5ba13af84ccdc2f718259192bb36e09"
 )
@@ -173,6 +175,20 @@ _FORBIDDEN_GOLD_KEYS = frozenset(
         "reference",
         "reference_answer",
     }
+)
+_BYPASS_SCORE_PROVIDER_IDENTITY_FIELDS = frozenset(
+    {
+        "model_id",
+        "model_revision",
+        "checkpoint_sha256",
+        "device",
+        "dtype",
+        "runtime",
+        "retained_transformer_state_bytes",
+    }
+)
+_BYPASS_SCORE_PROVIDER_NONEMPTY_TEXT_FIELDS = frozenset(
+    {"model_id", "checkpoint_sha256", "device", "dtype", "runtime"}
 )
 _ORCHESTRATION_SOURCE_SURFACE = (
     Path("tools/run_locked_independent_closure_arms.py"),
@@ -350,6 +366,20 @@ def _prevalidated_sources(
     return population, retrieval
 
 
+def _question_only_closure_eligible(route: Any) -> bool:
+    """Select questions that request temporal or complete-frontier retrieval.
+
+    Both modifiers are compiled solely from the dated question.  In particular,
+    relative-time lookups need artifact-global retrieval even when they do not
+    contain an explicit ordering phrase or request a complete set.
+    """
+
+    return bool(
+        route.modifiers.requires_temporal_metadata
+        or route.modifiers.requires_complete_frontier
+    )
+
+
 def _question_row(
     ordinal: int,
     adapter_row: Any,
@@ -374,9 +404,9 @@ def _question_row(
         raise ValueError(f"sealed S0 receipts changed at ordinal {ordinal}")
     stage_receipt = CumulativeRetrievalStageReceipt(**dict(receipt_raw))
     predecessor = CausalCoveragePredecessorReceipt(**dict(predecessor_raw))
-    if canonical_json_bytes(asdict(stage_receipt)) != canonical_json_bytes(receipt_raw):
+    if canonical_json_bytes(_json_projection(stage_receipt)) != canonical_json_bytes(receipt_raw):
         raise ValueError(f"S0 stage receipt is noncanonical at ordinal {ordinal}")
-    if canonical_json_bytes(asdict(predecessor)) != canonical_json_bytes(predecessor_raw):
+    if canonical_json_bytes(_json_projection(predecessor)) != canonical_json_bytes(predecessor_raw):
         raise ValueError(f"S0 predecessor receipt is noncanonical at ordinal {ordinal}")
     messages = _messages(stage.get("provider_messages"), ordinal=ordinal)
     evidence: list[dict[str, str]] = []
@@ -430,10 +460,7 @@ def _question_row(
         question.dated_question, question.question_sha256, ordinal
     )
     route = route_question(question.dated_question)
-    eligible = bool(
-        route.reason is RoutedRepairReason.TEMPORAL_ORDER
-        or route.modifiers.requires_complete_frontier
-    )
+    eligible = _question_only_closure_eligible(route)
     eligibility = route.identity_payload()
     elapsed = raw.get("elapsed_seconds")
     if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool) or elapsed < 0:
@@ -538,9 +565,9 @@ def _prepare_population(
             "route_receipt": dict(item.eligibility),
             "eligible": item.eligible,
             "eligibility_basis": (
-                "explicit_temporal_order_or_complete_frontier_demand"
+                "temporal_metadata_or_complete_frontier_demand"
                 if item.eligible
-                else "question_does_not_request_distributed_complete_frontier"
+                else "question_requests_neither_temporal_metadata_nor_complete_frontier"
             ),
         }
         body["row_identity_sha256"] = identity_sha256(body)
@@ -550,10 +577,10 @@ def _prepare_population(
         "selection_input": "dated_question_text_only",
         "selection_policy": {
             "eligible_when": (
-                "route.reason == temporal_order OR "
+                "route.modifiers.requires_temporal_metadata == true OR "
                 "route.modifiers.requires_complete_frontier == true"
             ),
-            "focus": "temporal_order_and_dispersed_complete_frontier_demand",
+            "focus": "temporal_or_dispersed_complete_frontier_demand",
             "source_labels_used": False,
             "gold_topology_used": False,
         },
@@ -703,7 +730,7 @@ def _validate_store(
     store_dir = shard_root / "combined-store"
     combined, compilation, _staging, _learning = _read_combined_manifest(store_dir)
     if (
-        asdict(combined) != reference.get("combined_store_receipt")
+        _json_projection(combined) != reference.get("combined_store_receipt")
         or combined.receipt_sha256
         != reference.get("combined_store_receipt_sha256")
         or compilation.receipt_sha256 != reference.get("compilation_receipt_sha256")
@@ -784,8 +811,12 @@ def _policy_receipt(
             ),
             "primary_attribution_precedence": list(ARM_LABELS),
             "shared_candidate_rule": (
-                "representative attribution wins when the same byte-identical "
-                "atom is reachable by both plans"
+                "representative attribution wins when the same span-derived "
+                "atom ID and byte-identical label-free source identity are "
+                "reachable by both plans; plan-local labels may differ"
+            ),
+            "route_atom_identity_rule": (
+                "each route retains its exact full atom identity and hash"
             ),
             "actual_reachability_field": "discovering_methods",
             "discovery_credit": (
@@ -806,12 +837,36 @@ def _policy_receipt(
                 "zero_duplicate_primary_attributions",
                 "pairwise_primary_attribution_sets_are_disjoint",
                 "union_primary_attribution_sets_equals_declared_structural_candidate_universe",
-                "shared_atom_ids_have_identical_identity_payloads",
+                "shared_atom_ids_have_identical_label_free_source_identities",
                 "each_selected_route_target_has_exactly_one_terminal_disposition",
                 "selected_route_discovery_credit_is_preserved",
             ],
         },
         "parent_for_each_arm": "exact_sealed_s0_only",
+        "s0_provider_visible_preservation_gate": {
+            "exact_fields": (
+                "all predecessor and root-stage fields except the historical "
+                "coverage report hash and its three derived hashes; exact evidence, "
+                "order, provider messages, candidate trace, and receipt linkage"
+            ),
+            "historical_fields_recorded_not_compared": [
+                "predecessor.coverage_selector_report_sha256",
+                "predecessor.receipt_sha256",
+                "root_stage.method_evidence_sha256",
+                "root_stage.receipt_sha256",
+            ],
+            "historical_report_limitation": (
+                "the historical payload was not persisted; its digest seals both "
+                "substantive report fields and non-replayable elapsed_s telemetry"
+            ),
+            "fresh_report_attestation": (
+                "persist and self-seal the full fresh certified report plus a "
+                "projection stripping top-level elapsed_s and, only when the "
+                "score provider ran, nested score_provider_report.elapsed_s; "
+                "a certified non-set-query bypass instead preserves the exact "
+                "identity-only score-provider report"
+            ),
+        },
         "cross_arm_budget_borrowing": False,
         "addition_token_cap_per_arm": ADDITION_TOKEN_CAP,
         "total_context_token_cap": MAX_CONTEXT_TOKENS,
@@ -1069,13 +1124,44 @@ def _atom_rows(atoms: Sequence[Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _json_projection(value: Any) -> Any:
+    """Project immutable dataclass state without deepcopying frozen mappings.
+
+    ``dataclasses.asdict`` recursively calls ``copy.deepcopy`` on leaf values.
+    Domain receipts intentionally freeze mappings with ``MappingProxyType``,
+    which cannot be pickled or deep-copied. Artifact serialization needs only
+    an isolated JSON value tree, so recurse explicitly and reject unsupported
+    values instead of mutating or copying the sealed domain object.
+    """
+
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _json_projection(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        projected: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("artifact mappings require string keys")
+            projected[key] = _json_projection(item)
+        return projected
+    if isinstance(value, (tuple, list)):
+        return [_json_projection(item) for item in value]
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    raise TypeError(
+        f"unsupported artifact projection value: {type(value).__qualname__}"
+    )
+
+
 def _packet_projection(packet: EvidencePacket | None) -> dict[str, Any] | None:
     if packet is None:
         return None
     atoms = _atom_rows(packet.atoms)
     bundles = [item.identity_payload() for item in packet.bundles]
     return {
-        "packet_receipt": asdict(packet.receipt),
+        "packet_receipt": _json_projection(packet.receipt),
         "context": packet.context,
         "context_sha256": quote_sha256(packet.context),
         "atom_count": len(atoms),
@@ -1228,7 +1314,7 @@ def _build_arm(
     projected_bundles = [item.identity_payload() for item in projection.plan.bundles]
     dedup = {
         "selected_plan_sha256": selected_plan.plan_sha256,
-        "projection_receipt": asdict(projection.receipt),
+        "projection_receipt": _json_projection(projection.receipt),
         "excluded_atom_count": len(projection.receipt.excluded_atom_ids),
         "excluded_atom_ids": list(projection.receipt.excluded_atom_ids),
         "post_dedup_atom_count": len(projected_atoms),
@@ -1321,6 +1407,55 @@ def _atom_identity_index(
         order.append(atom_id)
         result[atom_id] = dict(identity)
     return order, result
+
+
+def _structural_source_identity(
+    identity: Mapping[str, Any], *, label: str
+) -> dict[str, Any]:
+    """Remove only the plan-local label from an exact atom identity.
+
+    ``atom_id`` is derived from the authoritative span, but BundleBuilder
+    assigns ``EvidenceAtom.label`` independently inside each closure plan.
+    Cross-arm structural attribution is therefore source-based while every
+    route still seals and exposes its complete atom identity.
+    """
+
+    expected_fields = {
+        "atom_id",
+        "span",
+        "text_sha256",
+        "label",
+        "role",
+        "created_at",
+    }
+    if set(identity) != expected_fields:
+        raise RuntimeError(f"{label} atom identity fields changed")
+    atom_label = identity.get("label")
+    raw_span = identity.get("span")
+    if not isinstance(atom_label, str) or not atom_label:
+        raise RuntimeError(f"{label} atom identity has no plan-local label")
+    if not isinstance(raw_span, Mapping):
+        raise RuntimeError(f"{label} atom span identity is missing")
+    try:
+        span = EvidenceSpan(**dict(raw_span))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} atom span identity changed") from exc
+    if _json_projection(span) != dict(raw_span):
+        raise RuntimeError(f"{label} atom span identity is noncanonical")
+    if identity.get("atom_id") != make_atom_id(span):
+        raise RuntimeError(f"{label} atom ID does not bind its exact span")
+    if identity.get("text_sha256") != span.quote_sha256:
+        raise RuntimeError(f"{label} atom text digest does not bind its span")
+    if (
+        identity.get("role") != span.role
+        or identity.get("created_at") != span.created_at
+    ):
+        raise RuntimeError(f"{label} atom metadata does not bind its span")
+    projection = dict(identity)
+    del projection["label"]
+    if not projection:
+        raise RuntimeError(f"{label} structural source identity is empty")
+    return projection
 
 
 def _receipt_sha256(value: object, label: str) -> str:
@@ -1573,7 +1708,9 @@ def _arm_target_projection(arm: Mapping[str, Any]) -> dict[str, Any]:
                     "atom_identities_sha256"
                 ],
                 "selection_disposition": selection_disposition,
-                "selection_packet_receipt_sha256": selection_receipt_sha256,
+                "selection_packet_receipt_sha256": (
+                    selection_receipt_sha256 if selected_here else None
+                ),
                 "dedup_disposition": dedup_disposition,
                 "dedup_projection_receipt_sha256": dedup_receipt_sha256,
                 "admission_disposition": admission_disposition,
@@ -1637,6 +1774,16 @@ def _structural_candidate_attribution(
         )[1]
         for label in ARM_LABELS
     }
+    source_identities = {
+        label: {
+            atom_id: _structural_source_identity(
+                identity,
+                label=f"{label} candidate {atom_id}",
+            )
+            for atom_id, identity in identities[label].items()
+        }
+        for label in ARM_LABELS
+    }
     atom_order = tuple(
         dict.fromkeys(
             atom_id
@@ -1653,15 +1800,17 @@ def _structural_candidate_attribution(
             if atom_id in projections[label]["reachable_structural_candidate_ids"]
         ]
         identity_payload = identities[routes[0]][atom_id]
+        source_identity_payload = source_identities[routes[0]][atom_id]
         if any(
-            canonical_json_bytes(identities[label][atom_id])
-            != canonical_json_bytes(identity_payload)
+            canonical_json_bytes(source_identities[label][atom_id])
+            != canonical_json_bytes(source_identity_payload)
             for label in routes[1:]
         ):
             raise RuntimeError(
-                "shared structural atom ID has different identity payloads"
+                "shared structural atom ID has different source identities"
             )
         atom_identity_sha256 = identity_sha256(identity_payload)
+        source_identity_sha256 = identity_sha256(source_identity_payload)
         primary = routes[0]
         target_id = identity_sha256(
             {
@@ -1670,7 +1819,7 @@ def _structural_candidate_attribution(
                 "question_id": question_id,
                 "question_identity_sha256": question_sha,
                 "kind": "evidence_atom",
-                "atom_identity_sha256": atom_identity_sha256,
+                "structural_source_identity_sha256": source_identity_sha256,
             }
         )
         attribution_sets[primary].append(target_id)
@@ -1705,8 +1854,14 @@ def _structural_candidate_attribution(
                 "target_id": target_id,
                 "kind": "evidence_atom",
                 "evidence_atom_id": atom_id,
-                "evidence_atom_identity_sha256": atom_identity_sha256,
-                "evidence_atom_identity": identity_payload,
+                "primary_route_atom_identity_sha256": atom_identity_sha256,
+                "primary_route_atom_identity": identity_payload,
+                "structural_source_identity_sha256": source_identity_sha256,
+                "structural_source_identity": source_identity_payload,
+                "route_atom_identity_sha256s": {
+                    label: identity_sha256(identities[label][atom_id])
+                    for label in routes
+                },
                 "primary_attribution": primary,
                 "discovering_methods": routes,
                 "secondary_reachability": routes[1:],
@@ -1775,7 +1930,7 @@ def _structural_candidate_attribution(
             "primary_attribution_union_equals_declared_structural_candidate_universe": (
                 union_matches
             ),
-            "shared_atom_identity_mismatch_count": 0,
+            "shared_structural_source_identity_mismatch_count": 0,
             "selected_terminal_disposition_missing_count": 0,
             "selected_discovery_credit_loss_count": 0,
         },
@@ -1880,21 +2035,217 @@ def _aggregate_structural_candidate_attribution(
     return body
 
 
+def _stable_predecessor_projection(receipt: Any) -> dict[str, Any]:
+    projection = _json_projection(receipt)
+    projection.pop("coverage_selector_report_sha256", None)
+    projection.pop("receipt_sha256", None)
+    return projection
+
+
+def _stable_s0_stage_projection(receipt: Any) -> dict[str, Any]:
+    projection = _json_projection(receipt)
+    projection.pop("method_evidence_sha256", None)
+    projection.pop("receipt_sha256", None)
+    return projection
+
+
+def _coverage_report_normalization(
+    report: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Remove only genuine runtime timing from one certified S0 report.
+
+    The frozen selector deliberately does not call its score provider for a
+    scalar (non-set) query.  That path has no nested elapsed time and emits an
+    exact construction-time provider identity instead.  Accepting a missing
+    nested timer for any other shape would turn a malformed or partial scorer
+    call into an apparent timing-only replay difference, so the distinction is
+    validated here rather than inferred from field absence alone.
+    """
+
+    projection = dict(report)
+    if "elapsed_s" not in projection:
+        raise RuntimeError("fresh S0 coverage report is missing timing telemetry")
+    elapsed = projection.pop("elapsed_s")
+    score_provider = projection.get("score_provider_report")
+    if (
+        type(elapsed) not in {int, float}
+        or not isinstance(score_provider, Mapping)
+    ):
+        raise RuntimeError("fresh S0 coverage report is missing timing telemetry")
+    normalized_score_provider = dict(score_provider)
+    removed_fields = ["elapsed_s"]
+    if "elapsed_s" in normalized_score_provider:
+        if projection.get("selection_status") == "bypassed":
+            raise RuntimeError(
+                "fresh S0 bypass report unexpectedly invoked its score provider"
+            )
+        score_elapsed = normalized_score_provider.pop("elapsed_s")
+        if type(score_elapsed) not in {int, float}:
+            raise RuntimeError(
+                "fresh S0 score-provider timing telemetry changed type"
+            )
+        removed_fields.append("score_provider_report.elapsed_s")
+    elif not (
+        projection.get("selection_status") == "bypassed"
+        and projection.get("bypass_reason") == "not a set query"
+        and projection.get("requires_completeness") is False
+        and projection.get("score_provider_fallback") == ""
+        and projection.get("fallback_reason") == ""
+    ):
+        raise RuntimeError(
+            "fresh S0 invoked score-provider report is missing timing telemetry"
+        )
+    else:
+        if set(normalized_score_provider) != _BYPASS_SCORE_PROVIDER_IDENTITY_FIELDS:
+            raise RuntimeError(
+                "fresh S0 bypass score-provider identity fields changed"
+            )
+        for key in _BYPASS_SCORE_PROVIDER_IDENTITY_FIELDS - {
+            "retained_transformer_state_bytes"
+        }:
+            value = normalized_score_provider.get(key)
+            if type(value) is not str or (
+                key in _BYPASS_SCORE_PROVIDER_NONEMPTY_TEXT_FIELDS and not value
+            ):
+                raise RuntimeError(
+                    "fresh S0 bypass score-provider identity values changed"
+                )
+        _require_sha256(
+            normalized_score_provider["checkpoint_sha256"],
+            "fresh S0 bypass score-provider checkpoint",
+        )
+        if type(
+            normalized_score_provider.get("retained_transformer_state_bytes")
+        ) is not int or normalized_score_provider[
+            "retained_transformer_state_bytes"
+        ] != 0:
+            raise RuntimeError(
+                "fresh S0 bypass score provider retained transformer state"
+            )
+    projection["score_provider_report"] = normalized_score_provider
+    return projection, removed_fields
+
+
+def _normalized_coverage_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    return _coverage_report_normalization(report)[0]
+
+
 def _validate_exact_s0_result(
-    question: _Question, result: RecallGuardedCumulativeRetrieval
-) -> None:
-    if canonical_json_bytes(asdict(result.predecessor.receipt)) != canonical_json_bytes(
-        asdict(question.predecessor_receipt)
+    question: _Question,
+    result: RecallGuardedCumulativeRetrieval,
+    *,
+    observed_coverage_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_predecessor = _stable_predecessor_projection(
+        question.predecessor_receipt
+    )
+    observed_predecessor = _stable_predecessor_projection(
+        result.predecessor.receipt
+    )
+    if canonical_json_bytes(observed_predecessor) != canonical_json_bytes(
+        expected_predecessor
     ):
-        raise RuntimeError("fresh cumulative retrieval changed exact sealed S0 receipt")
-    if canonical_json_bytes(asdict(result.ladder.stages[0])) != canonical_json_bytes(
-        asdict(question.s0_stage_receipt)
-    ):
-        raise RuntimeError("fresh cumulative retrieval changed exact sealed S0 stage")
+        raise RuntimeError(
+            "fresh cumulative retrieval changed stable sealed S0 receipt fields"
+        )
+    expected_stage = _stable_s0_stage_projection(question.s0_stage_receipt)
+    observed_stage = _stable_s0_stage_projection(result.ladder.stages[0])
+    if canonical_json_bytes(observed_stage) != canonical_json_bytes(expected_stage):
+        raise RuntimeError(
+            "fresh cumulative retrieval changed stable sealed S0 stage fields"
+        )
     if list(result.predecessor.messages) != list(question.s0_messages):
         raise RuntimeError("fresh cumulative retrieval changed exact sealed S0 prompt")
     if tuple(result.predecessor.excerpts) != question.protected_excerpts:
         raise RuntimeError("fresh cumulative retrieval changed exact sealed S0 evidence")
+    expected_report_sha = _require_sha256(
+        question.predecessor_receipt.coverage_selector_report_sha256,
+        "expected S0 coverage selector report",
+    )
+    observed_report_sha = _require_sha256(
+        result.predecessor.receipt.coverage_selector_report_sha256,
+        "observed S0 coverage selector report",
+    )
+    fresh_report = dict(observed_coverage_report)
+    if identity_sha256(fresh_report) != observed_report_sha:
+        raise RuntimeError(
+            "fresh S0 coverage report payload does not match its receipt"
+        )
+    normalized_report, normalization_removed_fields = (
+        _coverage_report_normalization(fresh_report)
+    )
+    expected_predecessor_receipt_sha = _require_sha256(
+        question.predecessor_receipt.receipt_sha256,
+        "expected S0 predecessor receipt",
+    )
+    observed_predecessor_receipt_sha = _require_sha256(
+        result.predecessor.receipt.receipt_sha256,
+        "observed S0 predecessor receipt",
+    )
+    expected_root_stage_receipt_sha = _require_sha256(
+        question.s0_stage_receipt.receipt_sha256,
+        "expected S0 root stage receipt",
+    )
+    observed_root_stage_receipt_sha = _require_sha256(
+        result.ladder.stages[0].receipt_sha256,
+        "observed S0 root stage receipt",
+    )
+    expected_root_method_sha = _require_sha256(
+        question.s0_stage_receipt.method_evidence_sha256,
+        "expected S0 root method evidence",
+    )
+    observed_root_method_sha = _require_sha256(
+        result.ladder.stages[0].method_evidence_sha256,
+        "observed S0 root method evidence",
+    )
+    if (
+        expected_root_method_sha != expected_predecessor_receipt_sha
+        or observed_root_method_sha != observed_predecessor_receipt_sha
+    ):
+        raise RuntimeError("fresh S0 root stage broke predecessor receipt linkage")
+    expected_predecessor_projection_sha = identity_sha256(expected_predecessor)
+    observed_predecessor_projection_sha = identity_sha256(observed_predecessor)
+    expected_stage_projection_sha = identity_sha256(expected_stage)
+    observed_stage_projection_sha = identity_sha256(observed_stage)
+    validation = {
+        "expected_stable_predecessor_projection_sha256": (
+            expected_predecessor_projection_sha
+        ),
+        "observed_stable_predecessor_projection_sha256": (
+            observed_predecessor_projection_sha
+        ),
+        "expected_stable_root_stage_projection_sha256": (
+            expected_stage_projection_sha
+        ),
+        "observed_stable_root_stage_projection_sha256": (
+            observed_stage_projection_sha
+        ),
+        "expected_predecessor_receipt_sha256": expected_predecessor_receipt_sha,
+        "observed_predecessor_receipt_sha256": observed_predecessor_receipt_sha,
+        "expected_root_method_evidence_sha256": expected_root_method_sha,
+        "observed_root_method_evidence_sha256": observed_root_method_sha,
+        "expected_root_stage_receipt_sha256": expected_root_stage_receipt_sha,
+        "observed_root_stage_receipt_sha256": observed_root_stage_receipt_sha,
+        "expected_coverage_selector_report_sha256": expected_report_sha,
+        "observed_coverage_selector_report_sha256": observed_report_sha,
+        "observed_coverage_selector_report": fresh_report,
+        "observed_normalized_coverage_selector_report_sha256": identity_sha256(
+            normalized_report
+        ),
+        "coverage_report_hash_exact_match": expected_report_sha == observed_report_sha,
+        "stable_predecessor_fields_exact": (
+            expected_predecessor_projection_sha
+            == observed_predecessor_projection_sha
+        ),
+        "stable_root_stage_fields_exact": (
+            expected_stage_projection_sha == observed_stage_projection_sha
+        ),
+        "evidence_order_and_prompt_exact": True,
+        "fresh_report_normalization_removed_fields": (
+            normalization_removed_fields
+        ),
+    }
+    return validation
 
 
 def _question_artifact(
@@ -1909,7 +2260,16 @@ def _question_artifact(
     source_surface_sha256s: Mapping[str, str],
     elapsed_seconds: float,
 ) -> dict[str, Any]:
-    _validate_exact_s0_result(question, result)
+    coverage_report = getattr(
+        condenser, "last_coverage_selection_report", None
+    )
+    if not isinstance(coverage_report, Mapping):
+        raise RuntimeError("fresh cumulative retrieval omitted its S0 coverage report")
+    s0_validation = _validate_exact_s0_result(
+        question,
+        result,
+        observed_coverage_report=coverage_report,
+    )
     raw_arms = [
         _build_arm(
             label=label,
@@ -1959,13 +2319,14 @@ def _question_artifact(
         },
         "s0": {
             "stage_id": "causal_graph_coverage_predecessor",
-            "stage_receipt": asdict(question.s0_stage_receipt),
-            "predecessor_receipt": asdict(question.predecessor_receipt),
+            "stage_receipt": _json_projection(question.s0_stage_receipt),
+            "predecessor_receipt": _json_projection(question.predecessor_receipt),
             "evidence": list(question.s0_evidence),
             "provider_messages": list(question.s0_messages),
             "provider_messages_sha256": identity_sha256(
                 list(question.s0_messages)
             ),
+            "fresh_validation": s0_validation,
         },
         "retrieval_invocation": {
             "count": 1,
@@ -2048,12 +2409,95 @@ def _validate_question_artifact(
         raise ValueError(f"question artifact binding changed at {question.ordinal}")
     s0 = artifact.get("s0")
     if not isinstance(s0, Mapping) or (
-        s0.get("stage_receipt") != asdict(question.s0_stage_receipt)
-        or s0.get("predecessor_receipt") != asdict(question.predecessor_receipt)
+        s0.get("stage_receipt") != _json_projection(question.s0_stage_receipt)
+        or s0.get("predecessor_receipt") != _json_projection(question.predecessor_receipt)
         or s0.get("evidence") != list(question.s0_evidence)
         or s0.get("provider_messages") != list(question.s0_messages)
     ):
         raise ValueError(f"question artifact S0 changed at {question.ordinal}")
+    fresh_validation = s0.get("fresh_validation")
+    expected_stable_predecessor_sha = identity_sha256(
+        _stable_predecessor_projection(question.predecessor_receipt)
+    )
+    expected_stable_stage_sha = identity_sha256(
+        _stable_s0_stage_projection(question.s0_stage_receipt)
+    )
+    if (
+        not isinstance(fresh_validation, Mapping)
+        or fresh_validation.get(
+            "expected_stable_predecessor_projection_sha256"
+        )
+        != expected_stable_predecessor_sha
+        or fresh_validation.get(
+            "observed_stable_predecessor_projection_sha256"
+        )
+        != expected_stable_predecessor_sha
+        or fresh_validation.get(
+            "expected_stable_root_stage_projection_sha256"
+        )
+        != expected_stable_stage_sha
+        or fresh_validation.get(
+            "observed_stable_root_stage_projection_sha256"
+        )
+        != expected_stable_stage_sha
+        or fresh_validation.get("expected_predecessor_receipt_sha256")
+        != question.predecessor_receipt.receipt_sha256
+        or fresh_validation.get("expected_root_method_evidence_sha256")
+        != question.predecessor_receipt.receipt_sha256
+        or fresh_validation.get("expected_root_stage_receipt_sha256")
+        != question.s0_stage_receipt.receipt_sha256
+        or fresh_validation.get("expected_coverage_selector_report_sha256")
+        != question.predecessor_receipt.coverage_selector_report_sha256
+        or fresh_validation.get("stable_predecessor_fields_exact") is not True
+        or fresh_validation.get("stable_root_stage_fields_exact") is not True
+        or fresh_validation.get("evidence_order_and_prompt_exact") is not True
+    ):
+        raise ValueError(
+            f"question artifact stable S0 validation changed at {question.ordinal}"
+        )
+    for key in (
+        "observed_predecessor_receipt_sha256",
+        "observed_root_method_evidence_sha256",
+        "observed_root_stage_receipt_sha256",
+        "observed_coverage_selector_report_sha256",
+        "observed_normalized_coverage_selector_report_sha256",
+    ):
+        _require_sha256(fresh_validation.get(key), f"fresh S0 validation {key}")
+    report_match = fresh_validation.get("coverage_report_hash_exact_match")
+    observed_predecessor_receipt_sha = fresh_validation.get(
+        "observed_predecessor_receipt_sha256"
+    )
+    observed_root_method_sha = fresh_validation.get(
+        "observed_root_method_evidence_sha256"
+    )
+    fresh_report = fresh_validation.get("observed_coverage_selector_report")
+    if not isinstance(fresh_report, Mapping):
+        raise ValueError(
+            f"question artifact S0 runtime attestation changed at {question.ordinal}"
+        )
+    normalized_fresh_report, normalized_removed_fields = (
+        _coverage_report_normalization(fresh_report)
+    )
+    if (
+        type(report_match) is not bool
+        or report_match
+        != (
+            fresh_validation.get("expected_coverage_selector_report_sha256")
+            == fresh_validation.get("observed_coverage_selector_report_sha256")
+        )
+        or observed_root_method_sha != observed_predecessor_receipt_sha
+        or identity_sha256(dict(fresh_report))
+        != fresh_validation.get("observed_coverage_selector_report_sha256")
+        or identity_sha256(normalized_fresh_report)
+        != fresh_validation.get(
+            "observed_normalized_coverage_selector_report_sha256"
+        )
+        or normalized_removed_fields
+        != fresh_validation.get("fresh_report_normalization_removed_fields")
+    ):
+        raise ValueError(
+            f"question artifact S0 runtime attestation changed at {question.ordinal}"
+        )
     arms = artifact.get("arms")
     if not isinstance(arms, list) or tuple(
         item.get("arm_label") if isinstance(item, Mapping) else None for item in arms

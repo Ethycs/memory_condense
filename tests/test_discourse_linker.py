@@ -101,6 +101,29 @@ def test_rule_linker_never_creates_implicit_cross_source_edges() -> None:
     assert result.relations == ()
 
 
+def test_rule_linker_sequence_uses_nearest_prior_in_each_interleaved_source() -> None:
+    inputs = (
+        _input(1, "Alpha began with option A.", source="alpha"),
+        _input(2, "Beta began with option B.", source="beta"),
+        _input(3, "Alpha continued with option C.", source="alpha"),
+        _input(4, "Beta continued with option D.", source="beta"),
+    )
+
+    result = RuleBasedDiscourseLinker().link("artifact-interleaved", inputs)
+
+    units = {item.unit_id: item for item in result.units}
+    sequence_pairs = {
+        (
+            units[relation.members[0].unit_id].evidence[0].source_id,
+            units[relation.members[0].unit_id].asserted_ordinal,
+            units[relation.members[1].unit_id].asserted_ordinal,
+        )
+        for relation in result.relations
+        if relation.relation_type == "sequence"
+    }
+    assert sequence_pairs == {("alpha", 1, 3), ("beta", 2, 4)}
+
+
 def test_rule_linker_output_is_deterministic_and_contains_no_generated_evidence() -> None:
     inputs = (
         _input(2, "The hard budget must remain fixed."),

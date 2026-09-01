@@ -270,6 +270,67 @@ def test_nonterminal_finish_reason_is_not_published_as_an_answer(
     assert len(list(checkpoint_dir.glob("*.response.json"))) == 0
 
 
+def test_provider_completion_over_configured_cap_is_not_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "calls"
+    population = [_messages("one")]
+    client = _FakeClient(checkpoint_dir)
+    runtime = _runtime(checkpoint_dir, client, population=population)
+    real_count_tokens = fast_runtime.count_tokens
+
+    def over_cap_answer(text: str) -> int:
+        if text.startswith("answer-"):
+            return 33
+        return real_count_tokens(text)
+
+    monkeypatch.setattr(fast_runtime, "count_tokens", over_cap_answer)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"completion token proxy.*max_new_tokens: 33 > 32",
+    ):
+        runtime.run()
+
+    assert len(client.chat.completions.requests) == 1
+    assert len(list(checkpoint_dir.glob("*.request.json"))) == 1
+    assert list(checkpoint_dir.glob("*.response.json")) == []
+
+
+def test_canonical_replay_rejects_completion_over_configured_cap(
+    tmp_path: Path,
+) -> None:
+    checkpoint_dir = tmp_path / "calls"
+    population = [_messages("one")]
+    first = _runtime(
+        checkpoint_dir,
+        _FakeClient(checkpoint_dir),
+        population=population,
+    )
+    first.run()
+    first.close()
+    response_path = next(checkpoint_dir.glob("*.response.json"))
+    completion = "over-cap completion " * 64
+    completion_token_proxy = fast_runtime.count_tokens(completion)
+    assert completion_token_proxy > 32
+    _reseal(
+        response_path,
+        completion=completion,
+        completion_sha256=fast_runtime.quote_sha256(completion),
+        completion_token_proxy=completion_token_proxy,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"completion token proxy violates the configured max_new_tokens: "
+            rf"{completion_token_proxy} > 32"
+        ),
+    ):
+        _runtime(checkpoint_dir, None, population=population)
+
+
 def test_late_over_cap_prompt_rejects_before_path_or_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

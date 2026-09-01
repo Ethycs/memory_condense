@@ -45,6 +45,16 @@ from .protocol import Mem0ComparisonProtocolError
 
 MEM0_PROMPT_PACK_PROTOCOL = "memory-condense-mem0-prompt-pack-v2"
 MEM0_RETRIEVAL_ROW_FORMAT = "memory-condense-mem0-retrieval-row-v2"
+MEM0_TYPED_EPOCH = "mem0-typed-v1"
+MEM0_TYPED_PROMPT_PACK_PROTOCOL = "memory-condense-mem0-prompt-pack-v3"
+MEM0_TYPED_RETRIEVAL_ROW_FORMAT = "memory-condense-mem0-retrieval-row-v3"
+MEM0_REQUEST_WINDOW_REF_FORMAT = "memory-condense-mem0-request-window-ref-v1"
+MEM0_REQUEST_WINDOW_SEMANTICS = (
+    "diagnostic_request_window_not_fact_evidence_v1"
+)
+MEM0_TYPED_PROMPT_CAP_SEMANTICS = (
+    "full_wrapped_prompt_plus_output_reserve_within_8000_v1"
+)
 MEM0_MAX_PROMPT_TOKEN_PROXY = 8_000
 MEM0_RUNTIME_PROTOCOL = "mem0-oss-2.0.18-certified-local-v1"
 MEM0_PROMPT_CAP_SEMANTICS = (
@@ -71,6 +81,86 @@ class Mem0PromptProtocolError(Mem0ComparisonProtocolError):
 
 
 @dataclass(frozen=True, slots=True)
+class PromptRequestWindowRef:
+    """Text-free add-window identity retained outside the answer context.
+
+    A request window identifies which input turns could have influenced one
+    inferred Mem0 memory.  It is useful for audit and conservative
+    candidate-to-candidate grouping, but it is not a citation to any fact.
+    """
+
+    sample_id: str
+    source: str
+    session: str
+    session_index: int
+    original_session_index: int
+    batch_index: int
+    date: str
+    turn_start: int
+    turn_count: int
+    roles: tuple[str, ...]
+    receipt_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.sample_id, "sample_id"),
+            (self.source, "source"),
+            (self.session, "session"),
+            (self.date, "date"),
+        ):
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise Mem0PromptProtocolError(
+                    f"request-window {label} must be normalized text"
+                )
+        for value, label, minimum in (
+            (self.session_index, "session_index", 0),
+            (self.original_session_index, "original_session_index", 0),
+            (self.batch_index, "batch_index", 1),
+            (self.turn_start, "turn_start", 0),
+            (self.turn_count, "turn_count", 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise Mem0PromptProtocolError(
+                    f"request-window {label} must be an integer >= {minimum}"
+                )
+        if (
+            not isinstance(self.roles, tuple)
+            or len(self.roles) != self.turn_count
+            or any(
+                not isinstance(role, str)
+                or not role
+                or role != role.strip()
+                for role in self.roles
+            )
+        ):
+            raise Mem0PromptProtocolError(
+                "request-window roles must match turn_count"
+            )
+        expected = _canonical_sha256(self.as_dict(include_receipt=False))
+        if self.receipt_sha256 and self.receipt_sha256 != expected:
+            raise Mem0PromptProtocolError("request-window receipt changed")
+        object.__setattr__(self, "receipt_sha256", expected)
+
+    def as_dict(self, *, include_receipt: bool = True) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "batch_index": self.batch_index,
+            "date": self.date,
+            "format": MEM0_REQUEST_WINDOW_REF_FORMAT,
+            "original_session_index": self.original_session_index,
+            "roles": list(self.roles),
+            "sample_id": self.sample_id,
+            "session": self.session,
+            "session_index": self.session_index,
+            "source": self.source,
+            "turn_count": self.turn_count,
+            "turn_start": self.turn_start,
+        }
+        if include_receipt:
+            value["receipt_sha256"] = self.receipt_sha256
+        return value
+
+
+@dataclass(frozen=True, slots=True)
 class PromptMemory:
     """Sanitized memory fields that are sufficient for prompt reconstruction."""
 
@@ -80,11 +170,14 @@ class PromptMemory:
     score: float | None
     created_at: str
     attribution_kind: str
+    request_window_attribution: tuple[PromptRequestWindowRef, ...] = ()
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(
+        self, *, include_request_window_attribution: bool = False
+    ) -> dict[str, Any]:
         """Return the exact JSON-safe representation used by pool hashes."""
 
-        return {
+        value: dict[str, Any] = {
             "rank": self.rank,
             "memory_id": self.memory_id,
             "text": self.text,
@@ -92,6 +185,17 @@ class PromptMemory:
             "created_at": self.created_at,
             "attribution_kind": self.attribution_kind,
         }
+        if include_request_window_attribution:
+            windows = [row.as_dict() for row in self.request_window_attribution]
+            value.update(
+                {
+                    "created_at_source_event_time_authoritative": False,
+                    "request_window_attribution": windows,
+                    "request_window_attribution_sha256": _canonical_sha256(windows),
+                    "request_window_semantics": MEM0_REQUEST_WINDOW_SEMANTICS,
+                }
+            )
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +260,10 @@ class PackedMem0Prompt:
     recent_window_semantics: str
     attribution_kind: str
     supports_exact_source_provenance: bool
+    retrieval_row_format: str = MEM0_RETRIEVAL_ROW_FORMAT
+    typed_epoch: str | None = None
+    request_window_attribution_preserved: bool = False
+    created_at_source_event_time_authoritative: bool = False
 
     @property
     def raw_memory_count(self) -> int:
@@ -206,10 +314,33 @@ class PackedMem0Prompt:
                 "search_latency_s must be a finite non-negative number"
             )
 
-        raw_pool = [candidate.as_dict() for candidate in self.raw_pool]
-        packed_pool = [candidate.as_dict() for candidate in self.packed_pool]
+        typed = self.typed_epoch == MEM0_TYPED_EPOCH
+        if typed != self.request_window_attribution_preserved:
+            raise Mem0PromptProtocolError(
+                "typed epoch and request-window preservation disagree"
+            )
+        if self.created_at_source_event_time_authoritative:
+            raise Mem0PromptProtocolError(
+                "Mem0 created_at cannot be source-event authoritative"
+            )
+        expected_protocol = (
+            MEM0_TYPED_PROMPT_PACK_PROTOCOL if typed else MEM0_PROMPT_PACK_PROTOCOL
+        )
+        expected_format = (
+            MEM0_TYPED_RETRIEVAL_ROW_FORMAT if typed else MEM0_RETRIEVAL_ROW_FORMAT
+        )
+        if self.protocol != expected_protocol or self.retrieval_row_format != expected_format:
+            raise Mem0PromptProtocolError("prompt-pack epoch/schema mismatch")
+        raw_pool = [
+            candidate.as_dict(include_request_window_attribution=typed)
+            for candidate in self.raw_pool
+        ]
+        packed_pool = [
+            candidate.as_dict(include_request_window_attribution=typed)
+            for candidate in self.packed_pool
+        ]
         row: dict[str, Any] = {
-            "format": MEM0_RETRIEVAL_ROW_FORMAT,
+            "format": self.retrieval_row_format,
             "prompt_pack_protocol": self.protocol,
             "question_id": question_id,
             "query": self.query,
@@ -257,6 +388,20 @@ class PackedMem0Prompt:
                 ),
             },
         }
+        if typed:
+            row.update(
+                {
+                    "created_at_source_event_time_authoritative": False,
+                    "hard_request_token_cap": MEM0_MAX_PROMPT_TOKEN_PROXY,
+                    "prompt_budget_compliant": (
+                        self.request_token_proxy <= MEM0_MAX_PROMPT_TOKEN_PROXY
+                    ),
+                    "prompt_cap_semantics": MEM0_TYPED_PROMPT_CAP_SEMANTICS,
+                    "request_window_attribution_preserved": True,
+                    "request_window_semantics": MEM0_REQUEST_WINDOW_SEMANTICS,
+                    "typed_epoch": MEM0_TYPED_EPOCH,
+                }
+            )
         row["retrieval_row_sha256"] = _canonical_sha256(row)
         return row
 
@@ -459,7 +604,44 @@ def _official_date_label(value: str) -> str:
         return parsed.strftime("%A, %B %d, %Y")
 
 
-def _normalize_candidate(value: Any, expected_rank: int) -> PromptMemory:
+def _normalize_request_window_ref(
+    value: Any, *, candidate_label: str, window_index: int
+) -> PromptRequestWindowRef:
+    label = f"{candidate_label}.request_window_attribution[{window_index}]"
+    raw_roles = _required(value, "roles", label=label)
+    if not isinstance(raw_roles, Sequence) or isinstance(
+        raw_roles, (str, bytes, bytearray)
+    ):
+        raise Mem0PromptProtocolError(f"{label}.roles must be a sequence")
+    roles = tuple(raw_roles)
+    ref = PromptRequestWindowRef(
+        sample_id=_required(value, "sample_id", label=label),
+        source=_required(value, "source", label=label),
+        session=_required(value, "session", label=label),
+        session_index=_required(value, "session_index", label=label),
+        original_session_index=_required(
+            value, "original_session_index", label=label
+        ),
+        batch_index=_required(value, "batch_index", label=label),
+        date=_required(value, "date", label=label),
+        turn_start=_required(value, "turn_start", label=label),
+        turn_count=_required(value, "turn_count", label=label),
+        roles=roles,
+        receipt_sha256=(
+            value.get("receipt_sha256", "")
+            if isinstance(value, Mapping)
+            else getattr(value, "receipt_sha256", "")
+        ),
+    )
+    return ref
+
+
+def _normalize_candidate(
+    value: Any,
+    expected_rank: int,
+    *,
+    preserve_request_window_attribution: bool = False,
+) -> PromptMemory:
     label = f"raw_pool[{expected_rank - 1}]"
     rank = _required(value, "rank", label=label)
     if isinstance(rank, bool) or not isinstance(rank, int) or rank != expected_rank:
@@ -506,6 +688,62 @@ def _normalize_candidate(value: Any, expected_rank: int) -> PromptMemory:
         raise Mem0PromptProtocolError(
             f"{label}.attribution_kind is not request-window attribution"
         )
+    windows: tuple[PromptRequestWindowRef, ...] = ()
+    if preserve_request_window_attribution:
+        raw_windows = _required(
+            value, "request_window_attribution", label=label
+        )
+        if not isinstance(raw_windows, Sequence) or isinstance(
+            raw_windows, (str, bytes, bytearray)
+        ):
+            raise Mem0PromptProtocolError(
+                f"{label}.request_window_attribution must be a sequence"
+            )
+        windows = tuple(
+            _normalize_request_window_ref(
+                window,
+                candidate_label=label,
+                window_index=index,
+            )
+            for index, window in enumerate(raw_windows)
+        )
+        if not windows:
+            raise Mem0PromptProtocolError(
+                f"{label}.request_window_attribution must not be empty"
+            )
+        expected_window_sha = _canonical_sha256(
+            [window.as_dict() for window in windows]
+        )
+        supplied_window_sha = (
+            value.get("request_window_attribution_sha256")
+            if isinstance(value, Mapping)
+            else getattr(value, "request_window_attribution_sha256", None)
+        )
+        if supplied_window_sha is not None and supplied_window_sha != expected_window_sha:
+            raise Mem0PromptProtocolError(
+                f"{label}.request_window_attribution_sha256 mismatch"
+            )
+        supplied_semantics = (
+            value.get("request_window_semantics")
+            if isinstance(value, Mapping)
+            else getattr(value, "request_window_semantics", None)
+        )
+        if (
+            supplied_semantics is not None
+            and supplied_semantics != MEM0_REQUEST_WINDOW_SEMANTICS
+        ):
+            raise Mem0PromptProtocolError(
+                f"{label}.request_window_semantics mismatch"
+            )
+        authoritative = (
+            value.get("created_at_source_event_time_authoritative")
+            if isinstance(value, Mapping)
+            else getattr(value, "created_at_source_event_time_authoritative", None)
+        )
+        if authoritative not in {None, False}:
+            raise Mem0PromptProtocolError(
+                f"{label}.created_at cannot be source-event authoritative"
+            )
     return PromptMemory(
         rank=rank,
         memory_id=memory_id,
@@ -513,6 +751,7 @@ def _normalize_candidate(value: Any, expected_rank: int) -> PromptMemory:
         score=score,
         created_at=created_at,
         attribution_kind=attribution,
+        request_window_attribution=windows,
     )
 
 
@@ -567,6 +806,7 @@ def pack_mem0_prompt(
     *,
     evaluation_identity: Mapping[str, Any],
     max_prompt_tokens: int | None = None,
+    typed_epoch: str | None = None,
 ) -> PackedMem0Prompt:
     """Independently reconstruct one budgeted Mem0 responder request.
 
@@ -582,6 +822,9 @@ def pack_mem0_prompt(
     source-validation preflight; it is mandatory and content-addressed.
     """
 
+    if typed_epoch not in {None, MEM0_TYPED_EPOCH}:
+        raise Mem0PromptProtocolError("unknown Mem0 prompt-pack epoch")
+    preserve_windows = typed_epoch == MEM0_TYPED_EPOCH
     source_identity = validate_source_evaluation_identity(evaluation_identity)
     policy_prompt_cap = int(source_identity["max_prompt_tokens"])
     if max_prompt_tokens is None:
@@ -659,7 +902,11 @@ def pack_mem0_prompt(
     ):
         raise Mem0PromptProtocolError("search_result.raw_pool must be a sequence")
     raw_pool = tuple(
-        _normalize_candidate(candidate, rank)
+        _normalize_candidate(
+            candidate,
+            rank,
+            preserve_request_window_attribution=preserve_windows,
+        )
         for rank, candidate in enumerate(raw_value, start=1)
     )
     memory_ids = [candidate.memory_id for candidate in raw_pool]
@@ -669,7 +916,17 @@ def pack_mem0_prompt(
     empty_context, empty_messages, empty_proxy = _qa_messages(question, ())
     if empty_context:
         raise Mem0PromptProtocolError("empty Mem0 context unexpectedly rendered text")
-    if empty_proxy > max_prompt_tokens:
+    responder_reserve = int(source_identity["responder_output_token_reserve"])
+    effective_prompt_cap = (
+        max_prompt_tokens - responder_reserve
+        if preserve_windows
+        else max_prompt_tokens
+    )
+    if effective_prompt_cap < 1:
+        raise Mem0PromptProtocolError(
+            "typed output reserve leaves no prompt-token budget"
+        )
+    if empty_proxy > effective_prompt_cap:
         raise Mem0PromptProtocolError(
             "the exact QA prompt without memories exceeds max_prompt_tokens"
         )
@@ -697,7 +954,7 @@ def pack_mem0_prompt(
         _proposed_context, _proposed_messages, proposed_proxy = _qa_messages(
             question, (*packed, candidate)
         )
-        selected = proposed_proxy <= max_prompt_tokens
+        selected = proposed_proxy <= effective_prompt_cap
         if selected:
             packed.append(candidate)
             prompt_proxy_after = proposed_proxy
@@ -715,7 +972,7 @@ def pack_mem0_prompt(
         )
 
     context, messages, prompt_proxy = _qa_messages(question, packed)
-    if prompt_proxy != prompt_proxy_after or prompt_proxy > max_prompt_tokens:
+    if prompt_proxy != prompt_proxy_after or prompt_proxy > effective_prompt_cap:
         raise Mem0PromptProtocolError(
             "final deterministic QA prompt recount disagrees with admission"
         )
@@ -730,25 +987,30 @@ def pack_mem0_prompt(
             "prompt-token proxy differs from the frozen chat counter"
         )
 
-    raw_payload = [candidate.as_dict() for candidate in raw_pool]
-    packed_payload = [candidate.as_dict() for candidate in packed]
+    raw_payload = [
+        candidate.as_dict(include_request_window_attribution=preserve_windows)
+        for candidate in raw_pool
+    ]
+    packed_payload = [
+        candidate.as_dict(include_request_window_attribution=preserve_windows)
+        for candidate in packed
+    ]
     identity = dict(tokenizer_proxy_identity())
     return PackedMem0Prompt(
-        protocol=MEM0_PROMPT_PACK_PROTOCOL,
+        protocol=(
+            MEM0_TYPED_PROMPT_PACK_PROTOCOL
+            if preserve_windows
+            else MEM0_PROMPT_PACK_PROTOCOL
+        ),
         query=question,
         context=context,
         context_tokens=count_tokens(context),
         messages=messages,
         prompt_token_proxy=prompt_proxy,
-        max_prompt_token_proxy=max_prompt_tokens,
-        residual_prompt_token_proxy=max_prompt_tokens - prompt_proxy,
-        responder_output_token_reserve=int(
-            source_identity["responder_output_token_reserve"]
-        ),
-        request_token_proxy=(
-            prompt_proxy
-            + int(source_identity["responder_output_token_reserve"])
-        ),
+        max_prompt_token_proxy=effective_prompt_cap,
+        residual_prompt_token_proxy=effective_prompt_cap - prompt_proxy,
+        responder_output_token_reserve=responder_reserve,
+        request_token_proxy=(prompt_proxy + responder_reserve),
         raw_pool=raw_pool,
         packed_pool=tuple(packed),
         diagnostics=tuple(diagnostics),
@@ -773,6 +1035,38 @@ def pack_mem0_prompt(
         recent_window_semantics=MEM0_RECENT_WINDOW_SEMANTICS,
         attribution_kind=MEM0_ATTRIBUTION_KIND,
         supports_exact_source_provenance=False,
+        retrieval_row_format=(
+            MEM0_TYPED_RETRIEVAL_ROW_FORMAT
+            if preserve_windows
+            else MEM0_RETRIEVAL_ROW_FORMAT
+        ),
+        typed_epoch=typed_epoch,
+        request_window_attribution_preserved=preserve_windows,
+        created_at_source_event_time_authoritative=False,
+    )
+
+
+def pack_mem0_typed_prompt(
+    question: str,
+    search_result: Any,
+    *,
+    evaluation_identity: Mapping[str, Any],
+    max_prompt_tokens: int | None = None,
+) -> PackedMem0Prompt:
+    """Build the versioned ``mem0-typed-v1`` pack with window diagnostics.
+
+    Request windows remain outside ``context`` and ``messages``.  The model
+    therefore sees exactly the same dated inferred-memory text as the legacy
+    packer while the local artifact retains the attribution needed to audit
+    and conservatively group candidates.
+    """
+
+    return pack_mem0_prompt(
+        question,
+        search_result,
+        evaluation_identity=evaluation_identity,
+        max_prompt_tokens=max_prompt_tokens,
+        typed_epoch=MEM0_TYPED_EPOCH,
     )
 
 
@@ -811,15 +1105,23 @@ __all__ = [
     "MEM0_EFFECTIVE_RECENT_WINDOW",
     "MEM0_PROMPT_CAP_SEMANTICS",
     "MEM0_PROMPT_PACK_PROTOCOL",
+    "MEM0_REQUEST_WINDOW_REF_FORMAT",
+    "MEM0_REQUEST_WINDOW_SEMANTICS",
     "MEM0_RECENT_WINDOW_SEMANTICS",
     "MEM0_RETRIEVAL_ROW_FORMAT",
     "MEM0_SOURCE_JUDGE_MODEL",
     "MEM0_SOURCE_RESPONDER_MODEL",
+    "MEM0_TYPED_EPOCH",
+    "MEM0_TYPED_PROMPT_PACK_PROTOCOL",
+    "MEM0_TYPED_PROMPT_CAP_SEMANTICS",
+    "MEM0_TYPED_RETRIEVAL_ROW_FORMAT",
     "Mem0PromptProtocolError",
     "PackedMem0Prompt",
     "PromptMemory",
+    "PromptRequestWindowRef",
     "PromptPackDiagnostic",
     "pack_mem0_prompt",
+    "pack_mem0_typed_prompt",
     "render_official_created_at_context",
     "validate_source_evaluation_identity",
     "verify_provider_input_tokens",

@@ -234,8 +234,21 @@ def tool_implementation_sha256(root: str | Path | None = None) -> str:
 
     package = Path(root).resolve() if root is not None else Path(__file__).parent
     digest = hashlib.sha256()
-    for path in sorted(package.rglob("*.py"), key=lambda item: item.as_posix()):
-        relative = path.relative_to(package).as_posix().encode("utf-8")
+    sources: list[Path] = []
+    excluded = {".pixi", ".venv", "__pycache__"}
+    # The isolated Pixi environment is a separately locked runtime input, not
+    # comparison-tool source. Prune it before traversal; filtering after
+    # ``rglob`` needlessly enumerated tens of thousands of environment files.
+    for current, directories, files in os.walk(package):
+        directories[:] = sorted(
+            name for name in directories if name not in excluded
+        )
+        sources.extend(
+            Path(current) / name for name in files if name.endswith(".py")
+        )
+    for path in sorted(sources, key=lambda item: item.as_posix()):
+        relative_path = path.relative_to(package)
+        relative = relative_path.as_posix().encode("utf-8")
         payload = path.read_bytes()
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)

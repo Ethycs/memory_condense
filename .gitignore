@@ -35,6 +35,14 @@ eval_results/
 /.agent_tmp/
 /.agent_test_tmp/
 /.pytest_cache/
+/.test-tmp*/
+/.tmp/
+/tmp/
+
+# Legacy root-level evaluation staging; canonical runs belong in eval_results/
+/.*-combined-*/
+/.v*-recheck-*/
+/.v*-real-canary-*/
 
 # Environment
 .env

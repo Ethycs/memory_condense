@@ -9,6 +9,7 @@ from typing import Sequence
 
 from memory_condense.associations.association_store import AssociationArtifact
 from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
+from memory_condense.ingest.transcript_source import TranscriptFile
 from memory_condense.persistence.db import INDEXED_CHUNK_SQL
 
 
@@ -150,6 +151,44 @@ class IngestWorkflowMixin:
         for chunk in embedded:
             by_turn.setdefault(chunk.turn_id, []).append(chunk)
         return [(turn, by_turn.get(turn.turn_id, [])) for turn, _ in staged]
+
+    def ingest_transcript(
+        self,
+        transcript: "TranscriptFile",
+        *,
+        only_pending: bool = True,
+    ) -> dict[str, object]:
+        """Ingest a vendor chat export, re-reading only what changed.
+
+        ``transcript`` owns the byte index; this refreshes it, ingests the
+        conversations that are new or edited since the last call, and returns
+        a summary. With ``only_pending=False`` every conversation is ingested
+        regardless of the delta, which is the correct choice for a fresh store.
+
+        Message IDs become turn IDs and conversation IDs become source IDs, so
+        re-ingesting an edited conversation replays the same identities rather
+        than duplicating the history under fresh ones.
+        """
+
+        delta = transcript.refresh()
+        index = transcript.index
+        if index is None:
+            raise RuntimeError("transcript refresh completed without an index")
+        spans = delta.pending if only_pending else index.spans
+        messages = list(transcript.iter_messages(spans))
+        records = [message.as_ingest_record() for message in messages]
+        ingested = self.ingest_many(records) if records else []
+        return {
+            "path": str(index.path),
+            "layout": index.layout,
+            "sha256": index.sha256,
+            "byte_size": index.byte_size,
+            "status": delta.status,
+            "conversations_indexed": len(index.spans),
+            "conversations_ingested": len(spans),
+            "messages_ingested": len(ingested),
+            "removed_conversations": list(delta.removed),
+        }
 
     def compile_cav_signatures(
         self,

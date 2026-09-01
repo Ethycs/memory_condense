@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import subprocess
 import sys
@@ -28,11 +29,17 @@ from tools.v4_population_firebreak.population import (
     _parse_record,
     reconstruct_population,
 )
-from tools.v4_population_firebreak.treatment import TREATMENT_INPUT_FORMAT
+from tools.v4_population_firebreak.treatment import (
+    PRODUCTION_CONFIRMATION_TREATMENT_LOCK,
+    TREATMENT_INPUT_FORMAT,
+    ConfirmationTreatmentStaticLock,
+    load_confirmation_treatment_input,
+)
 from tools.v4_population_firebreak.verifier import (
     PRODUCTION_LOCK,
     ExpectedPopulationLock,
     PartitionExpectation,
+    export_confirmation_treatment_input,
     verify_evaluator_firebreak,
 )
 
@@ -188,6 +195,61 @@ def _all_strings(value: object) -> list[str]:
     return []
 
 
+def _all_keys(value: object) -> set[str]:
+    if isinstance(value, list):
+        return {key for item in value for key in _all_keys(item)}
+    if isinstance(value, dict):
+        return set(value) | {
+            key for item in value.values() for key in _all_keys(item)
+        }
+    return set()
+
+
+def _synthetic_confirmation_lock(
+    fixture: _Fixture,
+) -> ConfirmationTreatmentStaticLock:
+    confirmation = fixture.expected.partitions["confirmation"]
+    return ConfirmationTreatmentStaticLock(
+        dataset_sha256=fixture.expected.dataset_sha256,
+        split_manifest_sha256=fixture.expected.split_manifest_sha256,
+        sample_count=confirmation.count,
+        ordered_question_ids_sha256=confirmation.ordered_question_ids_sha256,
+        ordered_normalized_sample_bindings_sha256=(
+            confirmation.ordered_normalized_sample_bindings_sha256
+        ),
+        ordered_raw_record_bindings_sha256=(
+            confirmation.ordered_raw_record_bindings_sha256
+        ),
+    )
+
+
+def _export_synthetic_confirmation(
+    fixture: _Fixture,
+    path: Path,
+) -> dict[str, object]:
+    return export_confirmation_treatment_input(
+        dataset_path=fixture.dataset,
+        split_manifest_path=fixture.split,
+        output_path=path,
+        expected=fixture.expected,
+    )
+
+
+def _load_synthetic_confirmation(
+    fixture: _Fixture,
+    path: Path,
+    *,
+    file_sha256: str,
+    projection_sha256: str,
+):
+    return treatment_module._load_confirmation_treatment_input(
+        path,
+        expected_file_sha256=file_sha256,
+        expected_sanitized_projection_sha256=projection_sha256,
+        static_lock=_synthetic_confirmation_lock(fixture),
+    )
+
+
 def test_verified_receipt_emits_only_counts_hashes_and_protocol_metadata(
     tmp_path: Path,
 ) -> None:
@@ -291,6 +353,19 @@ def test_duplicate_or_missing_treatment_role_fails_closed(tmp_path: Path) -> Non
             exposure_audit_path=fixture.exposure,
             treatment_input_paths=[fixture.analysis],
             expected=fixture.expected,
+        )
+
+
+def test_confirmation_role_cannot_be_selected_by_caller(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    with pytest.raises(FirebreakError, match="cannot be caller-selected"):
+        verify_evaluator_firebreak(
+            dataset_path=fixture.dataset,
+            split_manifest_path=fixture.split,
+            exposure_audit_path=fixture.exposure,
+            treatment_input_paths=[fixture.confirmation],
+            expected=fixture.expected,
+            required_roles=("confirmation",),
         )
 
 
@@ -606,6 +681,188 @@ def test_analysis_consumer_hash_gate_precedes_decode(
         )
 
 
+def test_confirmation_export_is_role_fixed_and_label_free(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    output = tmp_path / "confirmation-treatment-v1.json"
+    receipt = _export_synthetic_confirmation(fixture, output)
+    value = json.loads(output.read_text(encoding="utf-8"))
+
+    assert "role" not in inspect.signature(
+        export_confirmation_treatment_input
+    ).parameters
+    assert "role" not in inspect.signature(
+        load_confirmation_treatment_input
+    ).parameters
+    assert value["role"] == "confirmation"
+    assert value["sample_count"] == 2
+    assert receipt["firebreak"]["provider_calls"] == 0
+    assert receipt["firebreak"]["role_fixed_to_confirmation"] is True
+    forbidden_keys = {
+        "answer",
+        "reference",
+        "reference_answer",
+        "gold",
+        "gold_answer",
+        "category",
+        "question_type",
+        "answer_session_ids",
+        "evidence",
+        "evidence_sources",
+        "score",
+        "scorer",
+        "judge_correct",
+        "exposure",
+        "exposure_membership",
+    }
+    assert forbidden_keys.isdisjoint(_all_keys(value))
+    rendered = output.read_text(encoding="utf-8")
+    assert all(answer not in rendered for answer in fixture.answer_values)
+    assert "kind-a" not in rendered
+    assert "kind-b" not in rendered
+
+    binding = receipt["treatment_input"]
+    loaded = _load_synthetic_confirmation(
+        fixture,
+        output,
+        file_sha256=binding["file_sha256"],
+        projection_sha256=binding["sanitized_projection_sha256"],
+    )
+    assert len(loaded.samples) == 2
+    assert loaded.ordered_question_ids_sha256 == (
+        fixture.expected.partitions["confirmation"].ordered_question_ids_sha256
+    )
+    assert all(len(sample.questions) == 1 for sample in loaded.samples)
+    assert all(
+        not hasattr(sample.questions[0], "answer") for sample in loaded.samples
+    )
+
+
+def test_confirmation_consumer_hash_gate_precedes_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def forbidden_decode(*_args, **_kwargs):
+        raise AssertionError("wrong-hash confirmation must not be decoded")
+
+    monkeypatch.setattr(treatment_module, "parse_json_bytes", forbidden_decode)
+    with pytest.raises(FirebreakError, match="differs from its receipt"):
+        load_confirmation_treatment_input(
+            fixture.confirmation,
+            expected_file_sha256="0" * 64,
+            expected_sanitized_projection_sha256="1" * 64,
+        )
+
+
+def test_confirmation_consumer_rejects_wrong_role_count_and_static_roots(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    exported = tmp_path / "confirmation-treatment-v1.json"
+    receipt = _export_synthetic_confirmation(fixture, exported)
+    binding = receipt["treatment_input"]
+    original = json.loads(exported.read_text(encoding="utf-8"))
+
+    mutations = (
+        ("wrong-role.json", lambda value: value.__setitem__("role", "analysis"), "role is fixed"),
+        (
+            "wrong-count.json",
+            lambda value: value["samples"].pop(),
+            "wrong population size",
+        ),
+        (
+            "wrong-dataset.json",
+            lambda value: value.__setitem__("dataset_sha256", "0" * 64),
+            "another dataset",
+        ),
+        (
+            "wrong-normalized-root.json",
+            lambda value: value.__setitem__(
+                "ordered_normalized_sample_bindings_sha256", "0" * 64
+            ),
+            "normalized source bindings",
+        ),
+        (
+            "wrong-raw-root.json",
+            lambda value: value.__setitem__(
+                "ordered_raw_record_bindings_sha256", "0" * 64
+            ),
+            "raw source bindings",
+        ),
+    )
+    for filename, mutate, message in mutations:
+        value = copy.deepcopy(original)
+        mutate(value)
+        path = tmp_path / filename
+        _write_json(path, value)
+        with pytest.raises(FirebreakError, match=message):
+            _load_synthetic_confirmation(
+                fixture,
+                path,
+                file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                projection_sha256=binding["sanitized_projection_sha256"],
+            )
+
+
+def test_confirmation_consumer_rejects_rebased_order_and_projection(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    exported = tmp_path / "confirmation-treatment-v1.json"
+    receipt = _export_synthetic_confirmation(fixture, exported)
+    binding = receipt["treatment_input"]
+    original = json.loads(exported.read_text(encoding="utf-8"))
+
+    reordered = copy.deepcopy(original)
+    reordered["samples"].reverse()
+    reordered_projection = canonical_sha256(reordered["samples"])
+    reordered["sanitized_projection_sha256"] = reordered_projection
+    reordered_path = tmp_path / "rebased-order.json"
+    _write_json(reordered_path, reordered)
+    with pytest.raises(FirebreakError, match="reordered or overlap"):
+        _load_synthetic_confirmation(
+            fixture,
+            reordered_path,
+            file_sha256=hashlib.sha256(reordered_path.read_bytes()).hexdigest(),
+            projection_sha256=reordered_projection,
+        )
+
+    modified = copy.deepcopy(original)
+    modified["samples"][0]["questions"][0]["question"] += " tampered"
+    modified_path = tmp_path / "rebased-projection.json"
+    _write_json(modified_path, modified)
+    with pytest.raises(FirebreakError, match="projection differs"):
+        _load_synthetic_confirmation(
+            fixture,
+            modified_path,
+            file_sha256=hashlib.sha256(modified_path.read_bytes()).hexdigest(),
+            projection_sha256=binding["sanitized_projection_sha256"],
+        )
+
+
+def test_confirmation_consumer_closed_schema_rejects_rebased_scorer_field(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    exported = tmp_path / "confirmation-treatment-v1.json"
+    _export_synthetic_confirmation(fixture, exported)
+    value = json.loads(exported.read_text(encoding="utf-8"))
+    value["samples"][0]["questions"][0]["reference_answer"] = "forbidden"
+    projection_sha256 = canonical_sha256(value["samples"])
+    value["sanitized_projection_sha256"] = projection_sha256
+    path = tmp_path / "rebased-scorer-field.json"
+    _write_json(path, value)
+
+    with pytest.raises(FirebreakError, match="non-closed schema"):
+        _load_synthetic_confirmation(
+            fixture,
+            path,
+            file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            projection_sha256=projection_sha256,
+        )
+
+
 def test_production_lock_preserves_exact_v2_roots_and_200_confirmation() -> None:
     assert PRODUCTION_LOCK.dataset_sha256 == (
         "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
@@ -623,6 +880,28 @@ def test_production_lock_preserves_exact_v2_roots_and_200_confirmation() -> None
     assert confirmation.count == 200
     assert confirmation.ordered_question_ids_sha256 == (
         "6270b044792dbda79cd79a104ab6a519b2f81980c47522c19a196583d8c0d102"
+    )
+    assert confirmation.ordered_normalized_sample_bindings_sha256 == (
+        "cbabcc97cad2f945c397fd980ef3bb3fb65ba8403dbeadf38b1b8224bc4a066d"
+    )
+    assert confirmation.ordered_raw_record_bindings_sha256 == (
+        "cf86373d06725b26117e9ce96ce906a16d545d346a1d2888f200d425f7a27fd9"
+    )
+    assert PRODUCTION_CONFIRMATION_TREATMENT_LOCK == (
+        ConfirmationTreatmentStaticLock(
+            dataset_sha256=PRODUCTION_LOCK.dataset_sha256,
+            split_manifest_sha256=PRODUCTION_LOCK.split_manifest_sha256,
+            sample_count=confirmation.count,
+            ordered_question_ids_sha256=(
+                confirmation.ordered_question_ids_sha256
+            ),
+            ordered_normalized_sample_bindings_sha256=(
+                confirmation.ordered_normalized_sample_bindings_sha256
+            ),
+            ordered_raw_record_bindings_sha256=(
+                confirmation.ordered_raw_record_bindings_sha256
+            ),
+        )
     )
     assert PRODUCTION_LOCK.exposed_confirmation_count == 15
     assert PRODUCTION_LOCK.exposed_confirmation_ordered_ids_sha256 == (

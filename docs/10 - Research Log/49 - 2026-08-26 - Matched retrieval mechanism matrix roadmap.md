@@ -1,13 +1,15 @@
 # Matched retrieval mechanisms get protected budgets before composition
 
-**Status:** execution active. The sealed S0 control scored 57/100 and the
-isolated EM-fact arm scored 60/100 (+8 rescues, -5 regressions, net +3) under
-an exact 43-call changed-prediction Sol judge. Both judge artifacts replay
-byte-identically with zero calls. The remaining isolated arms and the final
-composition are pending.
+**Status:** the common-renderer closure pair is complete; the broader matrix
+remains active. Matched `S0_CONTROL_V2` scored 53/100. Representative bridge
+and artifact global each scored 52/100 (two rescues, three regressions, net
+-1), replayed byte-identically, and are rejected from positive-only
+composition. The earlier 57/100 S0, 60/100 EM-fact, and 53/100 CAV observations
+used historical renderers and are not relabeled as common-renderer causal
+marginals. See Research Log 59 for the completed v9 campaign.
 
-The next experiment separates mechanisms by what they are allowed to change.
-It will compare one exact S0 control, five isolated additions/linking modes,
+This experiment separates mechanisms by what they are allowed to change. It
+compares one exact S0 control, five isolated additions/linking modes,
 one representation arm, and one positive-only composition. Each arm gets a protected budget and a paired
 semantic marginal. A mechanism may enter composition only after its isolated
 arm improves the control; adding a later layer is never, by itself, evidence
@@ -17,22 +19,23 @@ that the layer helps.
 
 | Arm | Mechanism role | What may change | What must remain fixed | Primary causal question | Status |
 | --- | --- | --- | --- | --- | --- |
-| `S0_CONTROL` | retrieval control | nothing | exact sealed S0 membership, order, packet, and answer operator | What does the strongest protected root answer by itself? | sealed: 57/100 |
-| `S0_PLUS_EM_FACTS` | representation of episodic retrieval | full selected `S1 - S0` becomes cited atomic facts | select full S1 first; remove S0 duplicates only afterward; preserve S0; attach no raw EM tail | Does fact representation make the already selected episodic delta usable? | sealed: 60/100, net +3 |
-| `S0_PLUS_REPRESENTATIVE_BRIDGE` | bridge retrieval membership | independently selected representative-episode rows | generate and pack directly against S0; do not inherit S1 consumption or the sealed S2 tail | Does a protected bridge budget recover cross-session temporal evidence? | 57-question preflight sealed; retrieval pending |
-| `S0_PLUS_ARTIFACT_GLOBAL` | distant/global retrieval membership | independently selected artifact-global rows | generate and pack directly against S0; do not inherit S1/S2 consumption or the sealed S3 tail | Does a protected global budget recover distant evidence missed by local routes? | 57-question preflight sealed; retrieval pending |
+| `S0_CONTROL` | retrieval control | nothing | exact sealed S0 membership, order, packet, and answer operator | What does the strongest protected root answer by itself? | common-renderer S0-v2 sealed: 53/100; historical-renderer observation: 57/100 |
+| `S0_PLUS_EM_FACTS` | representation of episodic retrieval | full selected `S1 - S0` becomes cited atomic facts | select full S1 first; remove S0 duplicates only afterward; preserve S0; attach no raw EM tail | Does fact representation make the already selected episodic delta usable? | historical-renderer observation: 60/100 versus 57; common-renderer confirmation pending |
+| `S0_PLUS_REPRESENTATIVE_BRIDGE` | bridge retrieval membership | independently selected representative-episode rows | generate and pack directly against S0; do not inherit S1 consumption or the sealed S2 tail | Does a protected bridge budget recover cross-session temporal evidence? | v9 complete: 52/100 versus matched 53, net -1; rejected |
+| `S0_PLUS_ARTIFACT_GLOBAL` | distant/global retrieval membership | independently selected artifact-global rows | generate and pack directly against S0; do not inherit S1/S2 consumption or the sealed S3 tail | Does a protected global budget recover distant evidence missed by local routes? | v9 complete: 52/100 versus matched 53, net -1; rejected |
 | `S0_PLUS_HEBBIAN` | retrieval membership | at most one robust S0-seeded Hebbian query/admission addition | preserve every S0 row and the common answer-operator policy | Does causal co-access add a useful missing neighbor without displacing control evidence? | pending |
-| `S0_PLUS_CAV_LINKS` | linking | a bounded concept-link guide | exact S0 evidence membership and order; zero evidence additions | Do genuine CAV links help the responder connect evidence already in S0? | pending |
-| `S0_PLUS_ACCEPTED_COMPOSITION` | gated composition | only isolated mechanisms with positive paired marginal | reuse accepted EM facts and Hebbian membership; recompute CAV links over the combined packet; preserve S0 | Do independently useful mechanisms retain their gain when composed in order? | pending |
+| `S0_PLUS_CAV_LINKS` | linking | a bounded concept-link guide | exact S0 evidence membership and order; zero evidence additions | Do genuine CAV links help the responder connect evidence already in S0? | historical-renderer observation: 53/100 versus 57; common-renderer confirmation pending |
+| `S0_PLUS_ACCEPTED_COMPOSITION` | gated composition | only isolated mechanisms with positive paired marginal | reuse accepted EM facts and Hebbian membership; recompute CAV links over the combined packet; preserve S0 | Do independently useful mechanisms retain their gain when composed in order? | pending; both v9 closure arms excluded |
 
 S0 is the exact sealed causal/coverage root, not a synonym for "direct-only"
 retrieval. The same answer model and operator policy must be used across the
 primary arms, while each arm's necessary representation scaffold is declared,
-sealed, and charged to that arm. A new common renderer is preferable; until it
-exists, the historical S0, EM, and CAV prompt templates must not be described
-as exactly matched. The routed numeric operator measured in Research Logs
-47--48 is excluded: it changes the answer operator and therefore cannot
-establish a retrieval-mechanism marginal.
+sealed, and charged to that arm. `matched_typed_slots_v2` is now the common
+renderer for S0-v2 and the completed closure descendants. The historical S0,
+EM, and CAV prompt templates must not be described as exactly matched until
+those remaining mechanisms are ported to the same renderer. The routed
+numeric operator measured in Research Logs 47--48 is excluded: it changes the
+answer operator and therefore cannot establish a retrieval-mechanism marginal.
 
 ## Raw S1 is an external anchor
 
@@ -232,7 +235,10 @@ The gates are:
 - strictly positive paired Sol semantic marginal before composition; and
 - zero-call, byte-identical replay before a result is promoted.
 
-All primary scores, rescues, regressions, call counts, artifact hashes, and
-composition decisions are **pending**. The locked 100-question population is
-already analysis-used, so even a positive matrix result will require an
+The representative and global primary scores, rescues, regressions, calls,
+hashes, and composition decisions are complete in Research Log 59. Each arm
+finished at 52/100 versus the matched 53/100 control and is excluded. Hebbian,
+common-renderer EM/CAV confirmation, and any composition from genuinely
+positive cells remain pending. The locked 100-question population is already
+analysis-used, so even a future positive matrix result will require an
 untouched confirmation population before a generalization or 95/100 claim.

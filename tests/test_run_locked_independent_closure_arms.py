@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import copy
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,6 +16,54 @@ from tools import run_locked_independent_closure_arms as runner
 
 POPULATION_SHA = "a" * 64
 QUESTION_SHA = "b" * 64
+REAL_V3_ELIGIBILITY = Path(
+    "eval_results/longmemeval-1m-locked-retrieval-mechanism-arms-20260826"
+    "/independent-closure-v3/eligibility-manifest.json"
+)
+REAL_TARGET_OWNER_PLAN = Path(
+    "docs/10 - Research Log/data/longmemeval-locked-100-target-owner-plan-v1.json"
+)
+
+
+def test_json_projection_handles_frozen_nested_dataclass_without_mutation() -> None:
+    @dataclass(frozen=True)
+    class Leaf:
+        names: tuple[str, ...]
+
+    @dataclass(frozen=True)
+    class Receipt:
+        values: MappingProxyType[str, object]
+        leaf: Leaf
+
+    frozen_values = MappingProxyType(
+        {"reason": "budget", "nested": MappingProxyType({"count": 2})}
+    )
+    receipt = Receipt(values=frozen_values, leaf=Leaf(("a", "b")))
+
+    first = runner._json_projection(receipt)
+    second = runner._json_projection(receipt)
+
+    assert first == second == {
+        "values": {"reason": "budget", "nested": {"count": 2}},
+        "leaf": {"names": ["a", "b"]},
+    }
+    assert receipt.values is frozen_values
+    assert receipt.values["nested"] is frozen_values["nested"]
+    with pytest.raises(TypeError):
+        receipt.values["new"] = "mutation"  # type: ignore[index]
+
+
+def test_json_projection_is_canonically_equivalent_to_asdict_when_supported() -> None:
+    @dataclass(frozen=True)
+    class Ordinary:
+        names: tuple[str, ...]
+        metadata: dict[str, int]
+
+    value = Ordinary(names=("a", "b"), metadata={"count": 2})
+
+    assert runner.canonical_json_bytes(
+        runner._json_projection(value)
+    ) == runner.canonical_json_bytes(asdict(value))
 
 
 def _args(root: Path) -> argparse.Namespace:
@@ -38,6 +87,40 @@ def _args(root: Path) -> argparse.Namespace:
     )
 
 
+def _test_atom_identity(
+    alias: str, *, identity_suffix: str = "", atom_label: str = "test-candidate"
+) -> dict[str, Any]:
+    source_key = f"{alias}{identity_suffix}"
+    text = f"sealed source evidence for {source_key}"
+    text_sha = runner.quote_sha256(text)
+    span = {
+        "chunk_id": f"chunk-{source_key}",
+        "start_char": 0,
+        "end_char": len(text),
+        "quote_sha256": text_sha,
+        "ordinal": 0,
+        "source_id": f"source-{source_key}",
+        "turn_start_char": 0,
+        "turn_id": f"turn-{source_key}",
+        "role": "user",
+        "created_at": "2023-01-01T00:00:00Z",
+    }
+    return {
+        "atom_id": f"atom-{runner.identity_sha256(span)[:24]}",
+        "span": span,
+        "text_sha256": text_sha,
+        "label": atom_label,
+        "role": span["role"],
+        "created_at": span["created_at"],
+    }
+
+
+def _test_atom_id(alias: str, *, identity_suffix: str = "") -> str:
+    return str(
+        _test_atom_identity(alias, identity_suffix=identity_suffix)["atom_id"]
+    )
+
+
 def _arm(
     label: str,
     *,
@@ -47,15 +130,24 @@ def _arm(
     projected: tuple[str, ...] | None = None,
     admitted: tuple[str, ...] = (),
     identity_suffix: str = "",
+    atom_label: str = "test-candidate",
     selection_overflow: bool = False,
 ) -> dict[str, Any]:
-    def identity(atom_id: str) -> dict[str, str]:
-        return {"atom_id": atom_id, "identity_suffix": identity_suffix}
+    def identity(alias: str) -> dict[str, Any]:
+        return _test_atom_identity(
+            alias,
+            identity_suffix=identity_suffix,
+            atom_label=atom_label,
+        )
 
-    def rows(atom_ids: tuple[str, ...]) -> list[dict[str, Any]]:
+    def rows(aliases: tuple[str, ...]) -> list[dict[str, Any]]:
         return [
-            {"atom_id": item, "identity": identity(item)} for item in atom_ids
+            {"atom_id": identity(item)["atom_id"], "identity": identity(item)}
+            for item in aliases
         ]
+
+    def atom_ids(aliases: tuple[str, ...]) -> list[str]:
+        return [str(identity(item)["atom_id"]) for item in aliases]
 
     projected_ids = (
         tuple(item for item in selected if item not in set(excluded))
@@ -110,11 +202,11 @@ def _arm(
                 "selected_plan_sha256": "f" * 64,
                 "projection_receipt": {
                     "source_plan_sha256": "f" * 64,
-                    "excluded_atom_ids": list(excluded),
+                    "excluded_atom_ids": atom_ids(excluded),
                     "receipt_sha256": "1" * 64,
                 },
                 "excluded_atom_count": len(excluded),
-                "excluded_atom_ids": list(excluded),
+                "excluded_atom_ids": atom_ids(excluded),
                 "post_dedup_atom_count": len(projected_identities),
                 "post_dedup_atom_identities_sha256": runner.identity_sha256(
                     projected_identities
@@ -150,6 +242,81 @@ def _attribution(*arms: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+@pytest.mark.parametrize(
+    "dated_question",
+    (
+        "[Question asked at 2023/04/05 (Wed) 19:25]\n"
+        "What is the artist that I started to listen to last Friday?",
+        "[Question asked at 2023/05/26 (Fri) 00:18]\n"
+        "Which streaming service did I start using most recently?",
+        "[Question asked at 2023/05/05 (Fri) 16:42]\n"
+        "What gardening-related activity did I do two weeks ago?",
+        "[Question asked at 2023/03/28 (Tue) 20:35]\n"
+        "What was the significant buisiness milestone I mentioned four weeks ago?",
+    ),
+)
+def test_relative_time_questions_are_closure_eligible(dated_question: str) -> None:
+    route = runner.route_question(dated_question)
+
+    assert route.modifiers.requires_temporal_metadata is True
+    assert route.modifiers.requires_complete_frontier is False
+    assert runner._question_only_closure_eligible(route) is True
+
+
+def test_timeless_point_lookup_is_not_closure_eligible() -> None:
+    route = runner.route_question(
+        "[Question asked at 2023/05/30 (Tue) 23:40]\n"
+        "What degree did I graduate with?"
+    )
+
+    assert route.modifiers.requires_temporal_metadata is False
+    assert route.modifiers.requires_complete_frontier is False
+    assert runner._question_only_closure_eligible(route) is False
+
+
+@pytest.mark.skipif(
+    not REAL_V3_ELIGIBILITY.is_file(), reason="sealed v3 eligibility is absent"
+)
+def test_v9_question_only_rule_is_a_79_question_superset() -> None:
+    payload = json.loads(REAL_V3_ELIGIBILITY.read_text(encoding="utf-8"))
+    eligible = tuple(
+        row["ordinal"]
+        for row in payload["questions"]
+        if runner._question_only_closure_eligible(
+            runner.route_question(row["dated_question"])
+        )
+    )
+
+    assert len(eligible) == runner.EXPECTED_ELIGIBLE_COUNT == 79
+    assert {6, 21, 43, 93} <= set(eligible)
+
+
+@pytest.mark.skipif(
+    not REAL_V3_ELIGIBILITY.is_file() or not REAL_TARGET_OWNER_PLAN.is_file(),
+    reason="sealed eligibility or posthoc target-owner plan is absent",
+)
+def test_v9_eligibility_covers_every_bridge_and_global_owned_question() -> None:
+    eligibility = json.loads(REAL_V3_ELIGIBILITY.read_text(encoding="utf-8"))
+    target_plan = json.loads(REAL_TARGET_OWNER_PLAN.read_text(encoding="utf-8"))
+    eligible_ordinals = {
+        row["ordinal"]
+        for row in eligibility["questions"]
+        if runner._question_only_closure_eligible(
+            runner.route_question(row["dated_question"])
+        )
+    }
+    owned_targets = [
+        row
+        for row in target_plan["desired_targets"]
+        if row["primary_owner"] in {"representative", "global"}
+    ]
+
+    # This is a posthoc preflight audit only. The target plan never enters the
+    # runtime predicate or any retrieval/answer prompt.
+    assert len(owned_targets) == 51
+    assert {row["ordinal"] for row in owned_targets} <= eligible_ordinals
+
+
 def test_structural_attribution_is_total_and_separates_s0_coverage() -> None:
     representative = _arm(
         runner.REPRESENTATIVE_ARM,
@@ -174,11 +341,11 @@ def test_structural_attribution_is_total_and_separates_s0_coverage() -> None:
         "duplicate_primary_attribution_count": 0,
         "pairwise_primary_attribution_intersection_count": 0,
         "primary_attribution_union_equals_declared_structural_candidate_universe": True,
-        "shared_atom_identity_mismatch_count": 0,
+        "shared_structural_source_identity_mismatch_count": 0,
         "selected_terminal_disposition_missing_count": 0,
         "selected_discovery_credit_loss_count": 0,
     }
-    shared = targets["shared"]
+    shared = targets[_test_atom_id("shared")]
     assert shared["primary_attribution"] == runner.REPRESENTATIVE_ARM
     assert shared["discovering_methods"] == list(runner.ARM_LABELS)
     assert shared["secondary_reachability"] == [runner.GLOBAL_ARM]
@@ -190,14 +357,20 @@ def test_structural_attribution_is_total_and_separates_s0_coverage() -> None:
         runner.REPRESENTATIVE_ARM
     ]
     assert shared["reachability"][0]["final_coverage_source"] == "S0_CONTROL"
+    assert shared["reachability"][0]["selection_packet_receipt_sha256"] == (
+        "e" * 64
+    )
+    assert shared["reachability"][1]["selection_packet_receipt_sha256"] is None
     assert shared["primary_attribution_outcome"] == {
         "discovery_credit_preserved": True,
         "mechanism_admission_credit": False,
         "exact_s0_overlap_discovered": True,
         "secondary_route_only_admission": False,
     }
-    assert targets["global-only"]["primary_attribution"] == runner.GLOBAL_ARM
-    assert targets["global-only"]["admitted_after_dedup_by"] == [
+    assert targets[_test_atom_id("global-only")]["primary_attribution"] == (
+        runner.GLOBAL_ARM
+    )
+    assert targets[_test_atom_id("global-only")]["admitted_after_dedup_by"] == [
         runner.GLOBAL_ARM
     ]
     attributed = {
@@ -234,22 +407,178 @@ def test_secondary_only_admission_does_not_credit_primary_attribution() -> None:
     }
 
 
-def test_shared_atom_id_requires_byte_identical_identity_payload() -> None:
+def test_shared_atom_id_allows_only_plan_local_label_drift() -> None:
     representative = _arm(
         runner.REPRESENTATIVE_ARM,
         discovered=("shared",),
         selected=(),
-        identity_suffix="representative",
+        atom_label="representative_bridge",
     )
     global_arm = _arm(
         runner.GLOBAL_ARM,
         discovered=("shared",),
         selected=(),
-        identity_suffix="global",
+        atom_label="artifact_global",
     )
 
-    with pytest.raises(RuntimeError, match="different identity payloads"):
+    target = _attribution(representative, global_arm)["targets"][0]
+    relabeled = _attribution(
+        _arm(
+            runner.REPRESENTATIVE_ARM,
+            discovered=("shared",),
+            selected=(),
+            atom_label="another_representative_label",
+        ),
+        _arm(
+            runner.GLOBAL_ARM,
+            discovered=("shared",),
+            selected=(),
+            atom_label="another_global_label",
+        ),
+    )["targets"][0]
+
+    assert target["discovering_methods"] == list(runner.ARM_LABELS)
+    assert (
+        target["primary_route_atom_identity"]["label"]
+        == "representative_bridge"
+    )
+    assert "label" not in target["structural_source_identity"]
+    assert (
+        target["structural_source_identity_sha256"]
+        == runner.identity_sha256(target["structural_source_identity"])
+    )
+    assert len(
+        {row["atom_identity_sha256"] for row in target["reachability"]}
+    ) == 2
+    assert target["target_id"] == relabeled["target_id"]
+    assert (
+        target["primary_route_atom_identity_sha256"]
+        != relabeled["primary_route_atom_identity_sha256"]
+    )
+    assert set(target["route_atom_identity_sha256s"]) == set(runner.ARM_LABELS)
+
+
+def test_shared_atom_id_rejects_non_label_source_tampering() -> None:
+    representative = _arm(
+        runner.REPRESENTATIVE_ARM,
+        discovered=("shared",),
+        selected=(),
+    )
+    global_arm = _arm(
+        runner.GLOBAL_ARM,
+        discovered=("shared",),
+        selected=(),
+    )
+    global_identity = global_arm["candidate_pool"]["atom_identities"][0]
+    global_identity["text_sha256"] = "9" * 64
+    global_arm["candidate_pool"]["atom_identities_sha256"] = (
+        runner.identity_sha256(global_arm["candidate_pool"]["atom_identities"])
+    )
+
+    with pytest.raises(RuntimeError, match="text digest does not bind"):
         _attribution(representative, global_arm)
+
+
+@pytest.mark.parametrize("field", ("label", "role"))
+def test_structural_source_identity_rejects_missing_identity_field(field: str) -> None:
+    arm = _arm(runner.REPRESENTATIVE_ARM, discovered=("x",), selected=())
+    del arm["candidate_pool"]["atom_identities"][0][field]
+    arm["candidate_pool"]["atom_identities_sha256"] = runner.identity_sha256(
+        arm["candidate_pool"]["atom_identities"]
+    )
+
+    with pytest.raises(RuntimeError, match="identity fields changed"):
+        _attribution(arm, _arm(runner.GLOBAL_ARM, discovered=(), selected=()))
+
+
+def test_structural_source_identity_rejects_extra_identity_field() -> None:
+    arm = _arm(runner.REPRESENTATIVE_ARM, discovered=("x",), selected=())
+    arm["candidate_pool"]["atom_identities"][0]["unexpected"] = True
+    arm["candidate_pool"]["atom_identities_sha256"] = runner.identity_sha256(
+        arm["candidate_pool"]["atom_identities"]
+    )
+
+    with pytest.raises(RuntimeError, match="identity fields changed"):
+        _attribution(arm, _arm(runner.GLOBAL_ARM, discovered=(), selected=()))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("atom_id", "atom ID does not bind its exact span"),
+        ("role", "atom metadata does not bind its span"),
+    ),
+)
+def test_structural_source_identity_rejects_non_label_linkage_drift(
+    mutation: str, message: str
+) -> None:
+    arm = _arm(runner.REPRESENTATIVE_ARM, discovered=("x",), selected=())
+    identity = arm["candidate_pool"]["atom_identities"][0]
+    if mutation == "atom_id":
+        identity["atom_id"] = "atom-000000000000000000000000"
+    else:
+        identity["role"] = "assistant"
+    arm["candidate_pool"]["atom_identities_sha256"] = runner.identity_sha256(
+        arm["candidate_pool"]["atom_identities"]
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _attribution(arm, _arm(runner.GLOBAL_ARM, discovered=(), selected=()))
+
+
+def test_route_local_full_identity_remains_byte_exact() -> None:
+    arm = _arm(
+        runner.REPRESENTATIVE_ARM,
+        discovered=("x",),
+        selected=("x",),
+    )
+    arm["selected_before_dedup"]["atoms"][0]["identity"]["label"] = (
+        "changed-after-selection"
+    )
+    arm["selected_before_dedup"]["atom_identities_sha256"] = (
+        runner.identity_sha256(
+            [
+                row["identity"]
+                for row in arm["selected_before_dedup"]["atoms"]
+            ]
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="identity changed across projections"):
+        runner._arm_target_projection(arm)
+
+
+def test_v9_policy_seals_label_free_union_and_exact_route_identities() -> None:
+    policy = SimpleNamespace(retrieval_policy_sha256="1" * 64)
+    population = SimpleNamespace(eligibility_sha256="2" * 64)
+    runtime = {
+        "runtime_source_binding_sha256": "3" * 64,
+        "retrieval_implementation_sha256": "4" * 64,
+    }
+
+    receipt = runner._policy_receipt(
+        population,
+        policy,
+        runtime_source_binding=runtime,
+    )
+    attribution = receipt["structural_candidate_attribution"]
+
+    assert "label-free source identity" in attribution["shared_candidate_rule"]
+    assert "plan-local labels may differ" in attribution["shared_candidate_rule"]
+    assert attribution["route_atom_identity_rule"] == (
+        "each route retains its exact full atom identity and hash"
+    )
+    assert (
+        "shared_atom_ids_have_identical_label_free_source_identities"
+        in attribution["required_invariants"]
+    )
+    assert receipt["policy_receipt_sha256"] == runner.identity_sha256(
+        {
+            key: value
+            for key, value in receipt.items()
+            if key != "policy_receipt_sha256"
+        }
+    )
 
 
 def test_selected_dispositions_are_exhaustive_and_discovery_credit_survives() -> None:
@@ -270,16 +599,16 @@ def test_selected_dispositions_are_exhaustive_and_discovery_credit_survives() ->
     }
 
     assert dispositions == {
-        "s0": "exact_s0_overlap_after_selection",
-        "projection": "projection_drop_after_s0_dedup",
-        "admitted": "admitted_after_dedup",
-        "repack": "final_repack_budget_drop",
+        _test_atom_id("s0"): "exact_s0_overlap_after_selection",
+        _test_atom_id("projection"): "projection_drop_after_s0_dedup",
+        _test_atom_id("admitted"): "admitted_after_dedup",
+        _test_atom_id("repack"): "final_repack_budget_drop",
     }
     assert projection["preserved_discovery_credit_target_ids"] == [
-        "s0",
-        "projection",
-        "admitted",
-        "repack",
+        _test_atom_id("s0"),
+        _test_atom_id("projection"),
+        _test_atom_id("admitted"),
+        _test_atom_id("repack"),
     ]
     _attribution(representative, global_arm)
 
@@ -294,7 +623,9 @@ def test_selection_overflow_keeps_discovery_credit_and_terminal_reason() -> None
 
     projection = runner._arm_target_projection(representative)
 
-    assert projection["preserved_discovery_credit_target_ids"] == ["overflow"]
+    assert projection["preserved_discovery_credit_target_ids"] == [
+        _test_atom_id("overflow")
+    ]
     assert projection["route_target_dispositions"][0]["terminal_disposition"] == (
         "selection_overflow_noop"
     )
@@ -321,7 +652,16 @@ def test_target_identity_binds_population_question_and_atom_payload() -> None:
         question_identity_sha256=QUESTION_SHA,
         arms=arms,
     )["targets"][0]["target_id"]
-    assert len({first, changed_question, changed_population}) == 3
+    changed_source = _attribution(
+        _arm(
+            runner.REPRESENTATIVE_ARM,
+            discovered=("x",),
+            selected=(),
+            identity_suffix="changed-source",
+        ),
+        _arm(runner.GLOBAL_ARM, discovered=(), selected=()),
+    )["targets"][0]["target_id"]
+    assert len({first, changed_question, changed_population, changed_source}) == 4
 
 
 def test_target_projection_rejects_ids_outside_discovered_pool() -> None:
@@ -508,6 +848,314 @@ def test_retrieve_requires_exact_missing_question_authorization_before_open(
 @dataclass
 class _Receipt:
     receipt_sha256: str = "3" * 64
+
+
+@dataclass
+class _TimedPredecessorReceipt:
+    stable_field: str = "stable"
+    coverage_candidate_trace_sha256: str = "3" * 64
+    coverage_selector_report_sha256: str = "4" * 64
+    receipt_sha256: str = "5" * 64
+
+
+@dataclass
+class _TimedRootStageReceipt:
+    selected_evidence_ids: tuple[str, ...] = ("evidence-1",)
+    method_evidence_sha256: str = "6" * 64
+    receipt_sha256: str = "7" * 64
+
+
+def test_stable_s0_projection_excludes_report_and_derived_receipt_fields() -> None:
+    predecessor = _TimedPredecessorReceipt()
+    replayed_predecessor = _TimedPredecessorReceipt(
+        coverage_selector_report_sha256="8" * 64,
+        receipt_sha256="9" * 64,
+    )
+    changed_predecessor = _TimedPredecessorReceipt(stable_field="changed")
+    stage = _TimedRootStageReceipt()
+    replayed_stage = _TimedRootStageReceipt(
+        method_evidence_sha256="a" * 64,
+        receipt_sha256="b" * 64,
+    )
+    changed_stage = _TimedRootStageReceipt(selected_evidence_ids=("evidence-2",))
+
+    assert runner._stable_predecessor_projection(predecessor) == (
+        runner._stable_predecessor_projection(replayed_predecessor)
+    )
+    assert runner._stable_predecessor_projection(predecessor) != (
+        runner._stable_predecessor_projection(changed_predecessor)
+    )
+    assert runner._stable_s0_stage_projection(stage) == (
+        runner._stable_s0_stage_projection(replayed_stage)
+    )
+    assert runner._stable_s0_stage_projection(stage) != (
+        runner._stable_s0_stage_projection(changed_stage)
+    )
+
+
+def _coverage_report(*, elapsed: float, output_candidates: int = 3) -> dict[str, Any]:
+    return {
+        "elapsed_s": elapsed,
+        "output_candidates": output_candidates,
+        "selection_status": "applied",
+        "other_runtime": {"elapsed_s": 99.0},
+        "score_provider_report": {
+            "elapsed_s": elapsed / 2,
+            "model_id": "Qwen/Qwen3-0.6B",
+            "output_candidates": output_candidates,
+        },
+    }
+
+
+def _bypassed_coverage_report(*, elapsed: float) -> dict[str, Any]:
+    return {
+        "elapsed_s": elapsed,
+        "output_candidates": 3,
+        "selection_status": "bypassed",
+        "bypass_reason": "not a set query",
+        "requires_completeness": False,
+        "score_provider_fallback": "",
+        "fallback_reason": "",
+        "other_runtime": {"elapsed_s": 99.0},
+        "score_provider_report": {
+            "model_id": "Qwen/Qwen3-0.6B",
+            "model_revision": "",
+            "checkpoint_sha256": "a" * 64,
+            "device": "cuda:0",
+            "dtype": "bfloat16",
+            "runtime": "memory_condense.search.QwenScoreProvider",
+            "retained_transformer_state_bytes": 0,
+        },
+    }
+
+
+def test_normalized_coverage_report_removes_invoked_timing_paths() -> None:
+    report = _coverage_report(elapsed=4.0)
+    original = copy.deepcopy(report)
+
+    normalized, removed = runner._coverage_report_normalization(report)
+
+    assert report == original
+    assert removed == ["elapsed_s", "score_provider_report.elapsed_s"]
+    assert "elapsed_s" not in normalized
+    assert "elapsed_s" not in normalized["score_provider_report"]
+    assert normalized["other_runtime"]["elapsed_s"] == 99.0
+
+
+def test_normalized_coverage_report_accepts_exact_scalar_bypass_identity() -> None:
+    report = _bypassed_coverage_report(elapsed=4.0)
+    original = copy.deepcopy(report)
+
+    normalized, removed = runner._coverage_report_normalization(report)
+
+    assert report == original
+    assert removed == ["elapsed_s"]
+    assert "elapsed_s" not in normalized
+    assert normalized["score_provider_report"] == report["score_provider_report"]
+    assert normalized["other_runtime"]["elapsed_s"] == 99.0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda report: report.update(selection_status="applied"),
+            "invoked score-provider report is missing timing telemetry",
+        ),
+        (
+            lambda report: report.update(bypass_reason=""),
+            "invoked score-provider report is missing timing telemetry",
+        ),
+        (
+            lambda report: report.update(requires_completeness=True),
+            "invoked score-provider report is missing timing telemetry",
+        ),
+        (
+            lambda report: report.update(score_provider_fallback="partial"),
+            "invoked score-provider report is missing timing telemetry",
+        ),
+        (
+            lambda report: report.update(fallback_reason="empty candidates"),
+            "invoked score-provider report is missing timing telemetry",
+        ),
+        (
+            lambda report: report["score_provider_report"].update(extra=1),
+            "identity fields changed",
+        ),
+        (
+            lambda report: report["score_provider_report"].pop("runtime"),
+            "identity fields changed",
+        ),
+        (
+            lambda report: report["score_provider_report"].update(
+                retained_transformer_state_bytes=True
+            ),
+            "retained transformer state",
+        ),
+    ],
+)
+def test_normalized_coverage_report_rejects_noncanonical_bypass(
+    mutation: Any,
+    message: str,
+) -> None:
+    report = _bypassed_coverage_report(elapsed=4.0)
+    mutation(report)
+
+    with pytest.raises(RuntimeError, match=message):
+        runner._coverage_report_normalization(report)
+
+
+def test_normalized_coverage_report_rejects_bypass_with_nested_timing() -> None:
+    report = _bypassed_coverage_report(elapsed=4.0)
+    report["score_provider_report"]["elapsed_s"] = 0.5
+
+    with pytest.raises(RuntimeError, match="unexpectedly invoked"):
+        runner._coverage_report_normalization(report)
+
+
+def test_normalized_coverage_report_rejects_missing_or_boolean_top_timing() -> None:
+    missing = _bypassed_coverage_report(elapsed=4.0)
+    missing.pop("elapsed_s")
+    with pytest.raises(RuntimeError, match="missing timing telemetry"):
+        runner._coverage_report_normalization(missing)
+
+    boolean = _coverage_report(elapsed=4.0)
+    boolean["elapsed_s"] = True
+    with pytest.raises(RuntimeError, match="missing timing telemetry"):
+        runner._coverage_report_normalization(boolean)
+
+
+def test_timing_only_report_drift_preserves_normalized_identity() -> None:
+    first = _coverage_report(elapsed=4.0)
+    second = _coverage_report(elapsed=8.0)
+
+    assert runner.identity_sha256(first) != runner.identity_sha256(second)
+    assert runner.identity_sha256(
+        runner._normalized_coverage_report(first)
+    ) == runner.identity_sha256(runner._normalized_coverage_report(second))
+
+
+def _s0_validation_fixture() -> tuple[Any, Any, dict[str, Any]]:
+    report = _coverage_report(elapsed=4.0)
+    expected_predecessor = _TimedPredecessorReceipt()
+    observed_predecessor = _TimedPredecessorReceipt(
+        coverage_selector_report_sha256=runner.identity_sha256(report),
+        receipt_sha256="8" * 64,
+    )
+    expected_stage = _TimedRootStageReceipt(
+        method_evidence_sha256=expected_predecessor.receipt_sha256,
+    )
+    observed_stage = _TimedRootStageReceipt(
+        method_evidence_sha256=observed_predecessor.receipt_sha256,
+        receipt_sha256="9" * 64,
+    )
+    question = SimpleNamespace(
+        predecessor_receipt=expected_predecessor,
+        s0_stage_receipt=expected_stage,
+        s0_messages=({"role": "user", "content": "same prompt"},),
+        protected_excerpts=("same excerpt",),
+    )
+    result = SimpleNamespace(
+        predecessor=SimpleNamespace(
+            receipt=observed_predecessor,
+            messages=question.s0_messages,
+            excerpts=question.protected_excerpts,
+        ),
+        ladder=SimpleNamespace(stages=(observed_stage,)),
+    )
+    return question, result, report
+
+
+def test_fresh_s0_attestation_binds_report_and_bilateral_stable_fields() -> None:
+    question, result, report = _s0_validation_fixture()
+
+    validation = runner._validate_exact_s0_result(
+        question,
+        result,
+        observed_coverage_report=report,
+    )
+
+    assert validation["stable_predecessor_fields_exact"] is True
+    assert validation["stable_root_stage_fields_exact"] is True
+    assert validation["coverage_report_hash_exact_match"] is False
+    assert validation["observed_root_method_evidence_sha256"] == (
+        validation["observed_predecessor_receipt_sha256"]
+    )
+    assert validation["expected_stable_predecessor_projection_sha256"] == (
+        validation["observed_stable_predecessor_projection_sha256"]
+    )
+    assert validation["fresh_report_normalization_removed_fields"] == [
+        "elapsed_s",
+        "score_provider_report.elapsed_s",
+    ]
+
+
+def test_fresh_s0_attestation_records_scalar_bypass_normalization() -> None:
+    question, result, _report = _s0_validation_fixture()
+    report = _bypassed_coverage_report(elapsed=4.0)
+    result.predecessor.receipt = _TimedPredecessorReceipt(
+        coverage_selector_report_sha256=runner.identity_sha256(report),
+        receipt_sha256=result.predecessor.receipt.receipt_sha256,
+    )
+
+    validation = runner._validate_exact_s0_result(
+        question,
+        result,
+        observed_coverage_report=report,
+    )
+
+    assert validation["fresh_report_normalization_removed_fields"] == ["elapsed_s"]
+    assert validation["observed_normalized_coverage_selector_report_sha256"] == (
+        runner.identity_sha256(runner._normalized_coverage_report(report))
+    )
+
+
+def test_fresh_s0_attestation_rejects_report_drift_and_broken_linkage() -> None:
+    question, result, report = _s0_validation_fixture()
+    drifted_report = _coverage_report(elapsed=4.0, output_candidates=4)
+    with pytest.raises(RuntimeError, match="report payload"):
+        runner._validate_exact_s0_result(
+            question,
+            result,
+            observed_coverage_report=drifted_report,
+        )
+
+    broken_stage = _TimedRootStageReceipt(
+        method_evidence_sha256="a" * 64,
+        receipt_sha256=result.ladder.stages[0].receipt_sha256,
+    )
+    broken_result = SimpleNamespace(
+        predecessor=result.predecessor,
+        ladder=SimpleNamespace(stages=(broken_stage,)),
+    )
+    with pytest.raises(RuntimeError, match="receipt linkage"):
+        runner._validate_exact_s0_result(
+            question,
+            broken_result,
+            observed_coverage_report=report,
+        )
+
+    changed_receipt = _TimedPredecessorReceipt(
+        stable_field="changed",
+        coverage_selector_report_sha256=(
+            result.predecessor.receipt.coverage_selector_report_sha256
+        ),
+        receipt_sha256=result.predecessor.receipt.receipt_sha256,
+    )
+    changed_result = SimpleNamespace(
+        predecessor=SimpleNamespace(
+            receipt=changed_receipt,
+            messages=result.predecessor.messages,
+            excerpts=result.predecessor.excerpts,
+        ),
+        ladder=result.ladder,
+    )
+    with pytest.raises(RuntimeError, match="stable sealed S0 receipt"):
+        runner._validate_exact_s0_result(
+            question,
+            changed_result,
+            observed_coverage_report=report,
+        )
 
 
 @dataclass

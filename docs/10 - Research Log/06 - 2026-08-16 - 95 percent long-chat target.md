@@ -13,6 +13,15 @@
 > `d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442`.
 > All current long-haystack work uses split manifest v2 bound to that hash.
 
+> **Current-authority note, 2026-08-27:** The active long-haystack population is
+> the cleaned LongMemEval-S dataset above under
+> `data/longmemeval-95-target-split-v2.json`. Later references in this log to
+> `longmemeval_oracle.json`, split manifest v1, or its example command are
+> preserved as historical development context, not current launch authority.
+> The strongest current matched answer result is **71/100** on the
+> analysis-used validation population; see
+> [Research Log 63](63%20-%202026-08-27%20-%20Query-era%20matched%20answer%20campaign.md).
+
 ## Target
 
 The primary test is operational: ingest a completed set of turns, ask a later

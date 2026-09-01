@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 import tools.mem0_eval.run_shard as run_shard_module
+from tools.mem0_eval import resumable_runner
 from memory_condense.eval.benchmark import build_judge_prompt
 from memory_condense.eval.mem0_adapter import (
     MEM0_ATTRIBUTION_KIND,
@@ -514,6 +515,567 @@ def _scoring_authorization(
         embedder_model_identity=embedder,
         embedder_model_identity_sha256=canonical_json_sha256(embedder),
     )
+
+
+def _self_hashed(body: Mapping[str, Any]) -> dict[str, Any]:
+    row = dict(body)
+    return {**row, "receipt_sha256": canonical_json_sha256(row)}
+
+
+def _resumable_retrieval_fixture(
+    tmp_path: Path,
+) -> tuple[RawStressShard, Any, Path, Path]:
+    shard, legacy, _adapter = _run_stage_a(tmp_path)
+    retrieval_authorization = _retrieval_authorization(shard)
+    retrieval_authorization_sha256 = canonical_json_sha256(
+        asdict(retrieval_authorization)
+    )
+    plan = resumable_runner.build_resume_plan(
+        shard=shard,
+        authorization=retrieval_authorization,
+        authorization_sha256=retrieval_authorization_sha256,
+    )
+    exact_adds = shard.add_counts.add_requests
+    extraction, embedder_identity = _model_identities()
+    logical_segment = {
+        "kind": "mem0_memory_llm_generate_response_logical_calls",
+        "boundary": "Memory.llm.generate_response",
+        "count_semantics": "local_logical_wrapper_calls_not_http_attempts",
+        "external_http_attempts_certified": False,
+        "authorized_local_wrapper_retries": 0,
+        "external_retry_attempts_certified": False,
+        "authorized": exact_adds,
+        "attempted": exact_adds,
+        "completed": exact_adds,
+        "failed": 0,
+        "rejected": 0,
+        "infer_true_adds_started": exact_adds,
+        "infer_true_adds_exactly_one_call": exact_adds,
+        "one_logical_call_per_infer_true_add_certified": True,
+        "persisted_request_token_state": False,
+        "retained_request_token_state_bytes": 0,
+        "request_token_state_evidence_kind": (
+            "local_injected_request_token_state_contract"
+        ),
+        "external_provider_persistence_certified": False,
+    }
+    logical = {
+        "kind": "resumable_cumulative_logical_extraction",
+        "authorized": exact_adds,
+        "seeded_prefix": 0,
+        "segment_authorized": exact_adds,
+        "attempted": exact_adds,
+        "completed": exact_adds,
+        "failed": 0,
+        "rejected": 0,
+        "segment_receipt": logical_segment,
+        "segment_receipt_sha256": canonical_json_sha256(logical_segment),
+        "retries_authorized": 0,
+        "infer_true_adds_started": exact_adds,
+        "infer_true_adds_exactly_one_call": exact_adds,
+    }
+    request_identity = {
+        "format": "memory-condense-mem0-extraction-request-v1",
+        "route_identity_sha256": SHA_A,
+        "response_format": {"type": "json_object"},
+        "max_completion_tokens": 2_000,
+        "sampling_parameters": "omitted",
+        "sdk_retries": 0,
+        "http_transport_retries": 0,
+        "follow_redirects": False,
+        "trust_env": False,
+        "timeout_seconds": 600.0,
+        "connect_timeout_seconds": 30.0,
+        "cap_boundary": "httpx.BaseTransport.handle_request",
+    }
+    transport_segment = {
+        "kind": "local_transport_send_cap",
+        "role": "extraction",
+        "authorized": exact_adds,
+        "attempted": exact_adds,
+        "completed": exact_adds,
+        "failed": 0,
+        "rejected": 0,
+        "retries_authorized": 0,
+        "provider_usage_status": "provider_reported_exact",
+        "provider_usage_records": exact_adds,
+        "provider_input_tokens": 120,
+        "provider_output_tokens": 20,
+        "provider_total_tokens": 140,
+        "provider_latency_s": 1.25,
+        "production_eligible": True,
+        "provider": extraction["provider"],
+        "model": extraction["model"],
+        "revision": extraction["revision"],
+        "route_identity_sha256": SHA_A,
+        "request_identity_sha256": canonical_json_sha256(request_identity),
+        "gateway_url": "https://controlled.invalid/v1",
+        "max_completion_tokens": 2_000,
+        "sampling_parameters_omitted": True,
+        "sdk_retries": 0,
+        "http_transport_retries": 0,
+        "follow_redirects": False,
+        "trust_env": False,
+        "cap_boundary": "httpx.BaseTransport.handle_request",
+        "external_http_attempts_certified": True,
+        "external_provider_persistence_certified": False,
+    }
+    transport = {
+        "kind": "resumable_cumulative_http_transport",
+        "authorized": exact_adds,
+        "seeded_prefix": 0,
+        "segment_authorized": exact_adds,
+        "attempted": exact_adds,
+        "completed": exact_adds,
+        "failed": 0,
+        "rejected": 0,
+        "segment_receipt": transport_segment,
+        "segment_receipt_sha256": canonical_json_sha256(transport_segment),
+        "retries_authorized": 0,
+        "provider_usage_status": "provider_reported_exact",
+        "provider_usage_records": exact_adds,
+        "provider_input_tokens": 120,
+        "provider_output_tokens": 20,
+        "provider_total_tokens": 140,
+        "provider_latency_s": 1.25,
+    }
+    bound_embedder = _self_hashed(
+        {
+            "format": "memory-condense-bound-mem0-bge-m3-v1",
+            "concrete_type": (
+                "mem0.embeddings.huggingface.HuggingFaceEmbedding"
+            ),
+            "model": embedder_identity["model"],
+            "revision": embedder_identity["revision"],
+            "authorized_checkpoint_sha256": embedder_identity[
+                "checkpoint_sha256"
+            ],
+            "checkpoint_bytes_rehashed_per_factory": False,
+            "dimension": embedder_identity["dimension"],
+            "device": embedder_identity["device"],
+            "local_files_only": True,
+            "trust_remote_code": False,
+            "network_calls_authorized": 0,
+        }
+    )
+    bound_bm25 = _self_hashed(
+        {
+            "format": "memory-condense-bound-mem0-bm25-v1",
+            "model": "Qdrant/bm25",
+            "revision": "synthetic-locked-revision",
+            "asset_tree_sha256": SHA_D,
+            "cache_root": "C:/controlled/cache",
+            "file_count": 1,
+            "local_files_only": True,
+            "network_calls_authorized": 0,
+            "specific_model_path": "C:/controlled/cache/snapshot",
+            "retry_sleep_attempts": 0,
+            "bound_store_roles": ["memory", "entity"],
+            "encoder_instances": 2,
+            "distinct_encoder_instances": True,
+            "internal_lazy_download_path_reachable": False,
+        }
+    )
+    zero_transport = {
+        "kind": "local_transport_send_cap",
+        "role": "extraction",
+        "authorized": 0,
+        "attempted": 0,
+        "completed": 0,
+        "failed": 0,
+        "rejected": 0,
+        "retries_authorized": 0,
+        "provider_usage_status": "not_applicable_zero_authorized",
+        "provider_usage_records": 0,
+        "provider_input_tokens": 0,
+        "provider_output_tokens": 0,
+        "provider_total_tokens": 0,
+        "provider_latency_s": 0.0,
+        "production_eligible": True,
+        "provider": extraction["provider"],
+        "model": extraction["model"],
+        "revision": extraction["revision"],
+        "route_identity_sha256": SHA_A,
+        "gateway_url": "https://controlled.invalid/v1",
+        "sdk_retries": 0,
+        "http_transport_retries": 0,
+        "cap_boundary": "deny_before_provider_transport",
+        "external_http_attempts_certified": True,
+        "external_provider_persistence_certified": False,
+    }
+    factory = _self_hashed(
+        {
+            "format": "memory-condense-mem0-resumable-factory-v1",
+            "mode": "adopt",
+            "segment_authorized_calls": 0,
+            "full_authorized_calls": exact_adds,
+            "user_scope_sha256": plan.as_dict()["user_scope_sha256"],
+            "bound_embedder": bound_embedder,
+            "bound_bm25": bound_bm25,
+            "transport": zero_transport,
+        }
+    )
+    manifest = {
+        ".memory-condense-owned-state": {
+            "type": "file",
+            "bytes": 32,
+            "sha256": SHA_E,
+        }
+    }
+    manifest_sha = canonical_json_sha256(manifest)
+    state_tree = {
+        "path_name": "working",
+        "ownership_token_sha256": SHA_F,
+        "manifest": manifest,
+        "snapshot_manifest_sha256": manifest_sha,
+        "snapshot_tree_sha256": canonical_json_sha256(
+            {
+                "ownership_token_sha256": SHA_F,
+                "manifest_sha256": manifest_sha,
+            }
+        ),
+        "file_count": 1,
+        "total_bytes": 32,
+    }
+    ingestion_transport_closure = _self_hashed(
+        {
+            "format": "memory-condense-mem0-resumable-transport-closure-v1",
+            "segment_authorized_calls": exact_adds,
+            "transport_closed": True,
+            "budget_closed_exactly": True,
+            "provider_usage_complete": True,
+            "sdk_retries": 0,
+            "http_transport_retries": 0,
+            "transport_receipt": transport_segment,
+            "transport_receipt_sha256": canonical_json_sha256(
+                transport_segment
+            ),
+        }
+    )
+    live_launch_authority = {
+        "format": "memory-condense-mem0-live-launch-authority-v1",
+        "preflight_sha256": SHA_A,
+        "launch_manifest_sha256": SHA_B,
+        "shard_launch_sha256": SHA_D,
+        "shard_launch_payload_sha256": SHA_E,
+        "plan_sha256": plan.sha256,
+        "authorization_sha256": retrieval_authorization_sha256,
+        "journal_path_sha256": SHA_F,
+        "sample_offset": shard.sample_offset,
+        "namespace": plan.as_dict()["user_scope"],
+        "namespace_sha256": plan.as_dict()["user_scope_sha256"],
+        "mem0_policy_sha256": plan.as_dict()["mem0_policy_sha256"],
+        "mem0_tool_implementation_sha256": plan.as_dict()[
+            "mem0_tool_implementation_sha256"
+        ],
+        "mem0_environment_lock_sha256": plan.as_dict()[
+            "mem0_environment_lock_sha256"
+        ],
+        "retained_transformer_token_state_bytes": 0,
+    }
+    segment_authorization = _self_hashed(
+        {
+            "format": (
+                "memory-condense-mem0-one-use-segment-authorization-v1"
+            ),
+            "plan_sha256": plan.sha256,
+            "authorization_sha256": retrieval_authorization_sha256,
+            "journal_path_sha256": SHA_F,
+            "prefix_before": 0,
+            "prefix_after": exact_adds,
+            "generation": 0,
+            "prior_checkpoint_authority_sha256": SHA_3,
+            "authorized_provider_calls": exact_adds,
+            "authorized_add_operations": exact_adds,
+            "provider_retries": 0,
+            "namespace": plan.as_dict()["user_scope"],
+            "retained_transformer_token_state_bytes": 0,
+            "live_launch_authority": live_launch_authority,
+            "live_launch_authority_sha256": canonical_json_sha256(
+                live_launch_authority
+            ),
+        }
+    )
+    write_activity = _self_hashed(
+        {
+            "format": "memory-condense-mem0-resumable-write-activity-v1",
+            "embedding_attempted": exact_adds,
+            "embedding_completed": exact_adds,
+            "embedding_failed": 0,
+            "embedding_input_token_proxy": 4,
+            "embedding_latency_s": 0.5,
+            "storage_attempted": exact_adds,
+            "storage_completed": exact_adds,
+            "storage_failed": 0,
+            "storage_latency_s": 0.25,
+            "wrappers_installed": True,
+            "wrappers_restored": True,
+        }
+    )
+    observed_write = {
+        "add_attempted": exact_adds,
+        "add_completed": exact_adds,
+        "add_failed": 0,
+        "extraction_attempted": exact_adds,
+        "extraction_completed": exact_adds,
+        "extraction_failed": 0,
+        "extraction_raw_message_token_proxy": 0,
+        "extraction_provider_input_tokens": 120,
+        "extraction_provider_output_tokens": 20,
+        "extraction_usage_status": "provider_reported_exact",
+        "embedding_operations": exact_adds,
+        "embedding_input_token_proxy": 4,
+        "returned_memory_count": exact_adds,
+        "persisted_memory_count": exact_adds,
+        "persisted_storage_bytes": state_tree["total_bytes"],
+        "add_latency_s": 0.0,
+        "extraction_latency_s": 1.25,
+        "embedding_latency_s": 0.5,
+        "storage_latency_s": 0.25,
+    }
+    write_usage = _self_hashed(
+        {
+            "format": (
+                "memory-condense-mem0-complete-write-usage-attestation-v1"
+            ),
+            "plan_sha256": plan.sha256,
+            "authorization_sha256": retrieval_authorization_sha256,
+            "generation": 0,
+            "committed_prefix": exact_adds,
+            "prior_write_usage_attestation_sha256": None,
+            "segment_authorization_receipt": segment_authorization,
+            "segment_authorization_receipt_sha256": segment_authorization[
+                "receipt_sha256"
+            ],
+            "segment_write_activity_receipt": write_activity,
+            "segment_write_activity_receipt_sha256": write_activity[
+                "receipt_sha256"
+            ],
+            "transport_closure_receipt_sha256": (
+                ingestion_transport_closure["receipt_sha256"]
+            ),
+            "observed": observed_write,
+            "observed_sha256": canonical_json_sha256(observed_write),
+            "retained_transformer_token_state_bytes": 0,
+        }
+    )
+    terminal_transport_closure = _self_hashed(
+        {
+            "format": "memory-condense-mem0-resumable-transport-closure-v1",
+            "segment_authorized_calls": 0,
+            "transport_closed": True,
+            "budget_closed_exactly": True,
+            "provider_usage_complete": True,
+            "sdk_retries": 0,
+            "http_transport_retries": 0,
+            "transport_receipt": zero_transport,
+            "transport_receipt_sha256": canonical_json_sha256(zero_transport),
+        }
+    )
+    suspend = _self_hashed(
+        {
+            "format": "memory-condense-mem0-resumable-suspend-v1",
+            "history_sqlite_closed": True,
+            "qdrant_local_collections_closed": 2,
+            "qdrant_clients_closed": 1,
+            "qdrant_local_registries_closed": 1,
+            "transport_closed": True,
+            "transport_closure": terminal_transport_closure,
+            "transport_closure_sha256": terminal_transport_closure[
+                "receipt_sha256"
+            ],
+            "delete_col_calls": 0,
+            "owned_state_retained": True,
+            "owned_state_tree": state_tree,
+            "namespace_persisted_memory_count": exact_adds,
+        }
+    )
+    active_commit = SHA_1
+    checkpoint = SHA_2
+    seal_body = {
+        "format": "memory-condense-mem0-resume-journal-v2",
+        "kind": "prefix_sealed",
+        "sequence": 7,
+        "previous_entry_sha256": active_commit,
+        "generation": 0,
+        "committed_prefix": exact_adds,
+        "active_commit_entry_sha256": active_commit,
+        "snapshot_path": "state/snapshots/prefix-000002",
+        "snapshot_manifest_sha256": manifest_sha,
+        "snapshot_tree_sha256": state_tree["snapshot_tree_sha256"],
+        "ownership_token_sha256": SHA_F,
+        "handles_closed_receipt_sha256": SHA_3,
+        "transport_closure_receipt_sha256": ingestion_transport_closure[
+            "receipt_sha256"
+        ],
+        "write_usage_attestation": write_usage,
+        "write_usage_attestation_sha256": write_usage["receipt_sha256"],
+        "snapshot_authority_sha256": checkpoint,
+        "snapshot_authority_artifact_sha256": SHA_D,
+        "snapshot_receipt_sha256": SHA_E,
+        "rehydration_sha256": SHA_F,
+        "cumulative_extraction_attempted": exact_adds,
+        "cumulative_extraction_completed": exact_adds,
+        "cumulative_http_attempted": exact_adds,
+        "cumulative_http_completed": exact_adds,
+        "failures": 0,
+        "rejections": 0,
+    }
+    seal = {**seal_body, "entry_sha256": canonical_json_sha256(seal_body)}
+    execution_body = {
+        "kind": "exact_mem0_resumable_execution_v2",
+        "comparison_certified": True,
+        "external_http_attempts_certified": True,
+        "external_provider_persistence_certified": False,
+        "authorization_sha256": retrieval_authorization_sha256,
+        "plan_sha256": plan.sha256,
+        "checkpoint_authority_sha256": checkpoint,
+        "full_prefix": exact_adds,
+        "active_commit_entry_sha256": active_commit,
+        "logical_meter_receipt_sha256": canonical_json_sha256(logical),
+        "transport_receipt_sha256": canonical_json_sha256(transport),
+        "transport_closure_receipt_sha256": ingestion_transport_closure[
+            "receipt_sha256"
+        ],
+        "write_usage_attestation_sha256": write_usage["receipt_sha256"],
+        "source_implementation_sha256": (
+            retrieval_authorization.source_implementation_sha256
+        ),
+        "source_environment_lock_sha256": (
+            retrieval_authorization.source_environment_lock_sha256
+        ),
+        "mem0_tool_implementation_sha256": (
+            retrieval_authorization.mem0_tool_implementation_sha256
+        ),
+        "mem0_environment_lock_sha256": (
+            retrieval_authorization.mem0_environment_lock_sha256
+        ),
+        "terminal_factory_receipt_sha256": factory["receipt_sha256"],
+        "terminal_suspend_receipt_sha256": suspend["receipt_sha256"],
+    }
+    execution = _self_hashed(execution_body)
+    result = json.loads(legacy.artifact_path.read_text(encoding="utf-8"))
+    for field in ("content_sha256", "retrieval_trace", "environment_lock"):
+        result.pop(field, None)
+    result.update(
+        format=resumable_runner.RESUMABLE_TERMINAL_RESULT_FORMAT,
+        certification_status="exact_resumable_production",
+        comparison_certified=True,
+        execution_binding=execution,
+    )
+    result["identity"]["runtime_model_identity_probe"] = {
+        "kind": "exact_resumable_factory_bound",
+        "bound_embedder_receipt_sha256": bound_embedder["receipt_sha256"],
+        "bound_bm25_receipt_sha256": bound_bm25["receipt_sha256"],
+        "comparison_certified": True,
+    }
+    result["ingestion_receipt"]["comparison_certified"] = True
+    result["ingestion_receipt"]["user_scope_sha256"] = plan.as_dict()[
+        "user_scope_sha256"
+    ]
+    result["search_receipt"]["extraction_transport_calls_during_search"] = 0
+    result["mem0_usage"].update(
+        provider_prompt_tokens=120,
+        provider_completion_tokens=20,
+        provider_usage_status="provider_reported_exact",
+        token_counter_identity="synthetic-exact-token-counter-v1",
+        token_counter_identity_verified=True,
+    )
+    result["provenance"]["external_http_attempts_certified"] = True
+    result["provenance"]["external_retry_attempts_certified"] = True
+    result["provenance"]["provider_usage_status"] = "provider_reported_exact"
+    result["write_usage_attestation"] = write_usage
+    result["resumable_closure"] = {
+        "plan_sha256": plan.sha256,
+        "resume_plan": plan.as_dict(),
+        "checkpoint_authority_sha256": checkpoint,
+        "active_commit_entry_sha256": active_commit,
+        "journal_tail_entry_sha256": seal["entry_sha256"],
+        "journal_chain_sha256": SHA_A,
+        "commit_population_sha256": SHA_B,
+        "full_prefix_seal": seal,
+        "logical_meter_receipt": logical,
+        "transport_receipt": transport,
+        "transport_closure_receipt_sha256": ingestion_transport_closure[
+            "receipt_sha256"
+        ],
+        "write_usage_attestation": write_usage,
+        "write_usage_attestation_sha256": write_usage["receipt_sha256"],
+        "factory_receipt": factory,
+        "suspend_receipt": suspend,
+    }
+    search_events = [
+        {
+            "sequence": index,
+            "question_id": row["question_id"],
+            "query_sha256": hashlib.sha256(row["query"].encode()).hexdigest(),
+            "raw_memory_count": row["raw_memory_count"],
+            "raw_pool_sha256": row["raw_pool_sha256"],
+            "retrieval_row_sha256": row["retrieval_row_sha256"],
+        }
+        for index, row in enumerate(result["retrieval_rows"], start=1)
+    ]
+    stage_trace = {
+        "format": resumable_runner.RESUMABLE_TERMINAL_TRACE_FORMAT,
+        "status": "search_staged",
+        "sample_offset": shard.sample_offset,
+        "sample_id": shard.parsed_sample.sample_id,
+        "sample_sha256": shard.sample_sha256,
+        "plan_sha256": plan.sha256,
+        "checkpoint_authority_sha256": checkpoint,
+        "events": search_events,
+        "completed_search_operations": len(shard.question_ids),
+        "extraction_transport_calls": 0,
+        "handles_closed_receipt_sha256": suspend["receipt_sha256"],
+        "checkpoint_retained": True,
+        "transport_closure_receipt_sha256": ingestion_transport_closure[
+            "receipt_sha256"
+        ],
+        "write_usage_attestation_sha256": write_usage["receipt_sha256"],
+    }
+    stage = {
+        "format": resumable_runner.RESUME_TERMINAL_FORMAT,
+        "plan_sha256": plan.sha256,
+        "authorization_sha256": retrieval_authorization_sha256,
+        "committed_prefix": exact_adds,
+        "full_checkpoint_authority_sha256": checkpoint,
+        "completed_search_operations": len(shard.question_ids),
+        "extraction_calls_closed": True,
+        "provider_retries": 0,
+        "transport_closure_receipt_sha256": ingestion_transport_closure[
+            "receipt_sha256"
+        ],
+        "write_usage_attestation_sha256": write_usage["receipt_sha256"],
+        "terminal_result_sha256": canonical_json_sha256(result),
+        "terminal_trace_sha256": canonical_json_sha256(stage_trace),
+        "result": result,
+        "trace": stage_trace,
+    }
+    stage_file_sha = hashlib.sha256(
+        run_shard_module._canonical_bytes(stage) + b"\n"
+    ).hexdigest()
+    state = SimpleNamespace(
+        checkpoint_authority_sha256=checkpoint,
+        terminal_search={"terminal_stage_sha256": stage_file_sha},
+    )
+    artifact_path = tmp_path / "resumable-retrieval.json"
+    trace_path = tmp_path / "resumable-retrieval.trace.json"
+    artifact_bytes, trace_bytes, _artifact, _trace = (
+        resumable_runner._official_terminal_payloads(
+            stage=stage,
+            state=state,
+            artifact_target=artifact_path,
+            trace_target=trace_path,
+            environment_lock_path=LOCK_PATH,
+            environment_lock_sha256=LOCK_SHA256,
+        )
+    )
+    artifact_path.write_bytes(artifact_bytes)
+    trace_path.write_bytes(trace_bytes)
+    authorization = _scoring_authorization(
+        shard, hashlib.sha256(artifact_bytes).hexdigest()
+    )
+    return shard, authorization, artifact_path, trace_path
 
 
 def _successful_scoring_provider(
@@ -1317,6 +1879,110 @@ def test_scoring_stage_verifies_artifact_and_closes_exact_twenty_calls(
     assert all(row["judge_correct"] for row in result.report["question_results"])
     assert result.trace["mem0_state_touched"] is False
     assert not list(tmp_path.glob("*.staging"))
+
+
+def test_scoring_verifier_accepts_exact_resumable_terminal_artifact(
+    tmp_path: Path,
+) -> None:
+    shard, authorization, artifact_path, trace_path = (
+        _resumable_retrieval_fixture(tmp_path)
+    )
+
+    artifact, payload, rows = run_shard_module._verify_retrieval_artifact(
+        artifact_path=artifact_path,
+        trace_path=trace_path,
+        shard=shard,
+        authorization=authorization,
+        prompt_packer=run_shard_module._default_prompt_packer,
+    )
+
+    assert artifact["certification_status"] == "exact_resumable_production"
+    assert artifact["comparison_certified"] is True
+    assert artifact["execution_binding"]["external_http_attempts_certified"] is True
+    assert artifact["mem0_usage"]["provider_prompt_tokens"] == 120
+    assert artifact["mem0_usage"]["provider_completion_tokens"] == 20
+    assert artifact["mem0_usage"]["provider_usage_status"] == (
+        "provider_reported_exact"
+    )
+    assert artifact["write_usage_attestation"]["observed"] == artifact[
+        "resumable_closure"
+    ]["write_usage_attestation"]["observed"]
+    assert artifact["execution_binding"][
+        "transport_closure_receipt_sha256"
+    ] == artifact["resumable_closure"]["transport_closure_receipt_sha256"]
+    assert len(payload) == artifact_path.stat().st_size
+    assert len(rows) == len(shard.question_ids)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "factory_extra_field",
+        "http_route_digest",
+        "terminal_stage_digest",
+        "resume_plan_population",
+        "partial_provider_usage",
+        "mem0_provider_usage",
+        "write_usage_duplicate",
+        "transport_closure_digest",
+    ],
+)
+def test_scoring_verifier_rejects_rehashed_resumable_proof_tamper(
+    tmp_path: Path, mutation: str
+) -> None:
+    shard, _authorization, artifact_path, trace_path = (
+        _resumable_retrieval_fixture(tmp_path)
+    )
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if mutation == "factory_extra_field":
+        artifact["resumable_closure"]["factory_receipt"]["unexpected"] = True
+    elif mutation == "http_route_digest":
+        artifact["resumable_closure"]["transport_receipt"][
+            "segment_receipt"
+        ]["route_identity_sha256"] = "not-a-digest"
+    elif mutation == "terminal_stage_digest":
+        artifact["resumable_terminal"]["terminal_stage_file_sha256"] = SHA_D
+    elif mutation == "resume_plan_population":
+        artifact["resumable_closure"]["resume_plan"][
+            "authorized_add_operations"
+        ] += 1
+    elif mutation == "partial_provider_usage":
+        artifact["resumable_closure"]["transport_receipt"][
+            "segment_receipt"
+        ].pop("provider_output_tokens")
+    elif mutation == "mem0_provider_usage":
+        artifact["mem0_usage"]["provider_prompt_tokens"] += 1
+    elif mutation == "write_usage_duplicate":
+        duplicate = json.loads(
+            json.dumps(artifact["write_usage_attestation"])
+        )
+        duplicate["observed"]["persisted_memory_count"] -= 1
+        duplicate["observed_sha256"] = canonical_json_sha256(
+            duplicate["observed"]
+        )
+        duplicate.pop("receipt_sha256")
+        duplicate["receipt_sha256"] = canonical_json_sha256(duplicate)
+        artifact["write_usage_attestation"] = duplicate
+    else:
+        artifact["resumable_closure"][
+            "transport_closure_receipt_sha256"
+        ] = SHA_D
+    artifact.pop("content_sha256")
+    artifact["content_sha256"] = canonical_json_sha256(artifact)
+    payload = run_shard_module._render_json_bytes(artifact)
+    artifact_path.write_bytes(payload)
+    authorization = _scoring_authorization(
+        shard, hashlib.sha256(payload).hexdigest()
+    )
+
+    with pytest.raises((Mem0ShardRunError, ValueError)):
+        run_shard_module._verify_retrieval_artifact(
+            artifact_path=artifact_path,
+            trace_path=trace_path,
+            shard=shard,
+            authorization=authorization,
+            prompt_packer=run_shard_module._default_prompt_packer,
+        )
 
 
 def test_scoring_treats_zero_provider_input_usage_as_unavailable(

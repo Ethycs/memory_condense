@@ -9,16 +9,28 @@ from typing import Any, Iterable
 from .canonical import (
     FirebreakError,
     assert_snapshot_unchanged,
+    canonical_json_bytes,
     canonical_sha256,
     package_sha256,
     parse_json_bytes,
+    publish_no_clobber,
     read_snapshot,
     require_list,
     require_mapping,
     require_text,
 )
 from .population import Population, reconstruct_population
-from .treatment import validate_treatment_input
+from .treatment import (
+    CONFIRMATION_TREATMENT_INPUT_FORMAT,
+    ConfirmationTreatmentStaticLock,
+    _load_confirmation_treatment_input,
+    validate_treatment_input,
+)
+
+
+CONFIRMATION_EXPORT_RECEIPT_FORMAT = (
+    "memory-condense-v4-confirmation-treatment-export-receipt-v1"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +137,137 @@ PRODUCTION_LOCK = ExpectedPopulationLock(
 )
 
 
+def export_confirmation_treatment_input(
+    *,
+    dataset_path: str | Path,
+    split_manifest_path: str | Path,
+    output_path: str | Path,
+    expected: ExpectedPopulationLock = PRODUCTION_LOCK,
+) -> dict[str, Any]:
+    """Publish the exact confirmation partition through a label-free schema.
+
+    This evaluator-side function has no role argument and accepts no exposure
+    ledger.  It verifies all predeclared source roots before publishing only
+    the sanitized retrieval projection.  It performs no provider calls.
+    """
+
+    dataset = read_snapshot(dataset_path, "dataset")
+    split = read_snapshot(split_manifest_path, "split manifest")
+    if dataset.sha256 != expected.dataset_sha256 or dataset.size != expected.dataset_bytes:
+        raise FirebreakError("dataset identity differs from the locked population")
+    if split.sha256 != expected.split_manifest_sha256:
+        raise FirebreakError("split-manifest identity differs from the lock")
+
+    population = reconstruct_population(dataset, split)
+    _verify_population(population, expected)
+    static_lock = _confirmation_static_lock(expected)
+    confirmation = population.partitions["confirmation"]
+    samples = [sample.treatment_projection for sample in confirmation.samples]
+    projection_sha256 = canonical_sha256(samples)
+    value = {
+        "format": CONFIRMATION_TREATMENT_INPUT_FORMAT,
+        "role": "confirmation",
+        "dataset_sha256": static_lock.dataset_sha256,
+        "split_manifest_sha256": static_lock.split_manifest_sha256,
+        "sample_count": static_lock.sample_count,
+        "ordered_question_ids_sha256": (
+            static_lock.ordered_question_ids_sha256
+        ),
+        "ordered_normalized_sample_bindings_sha256": (
+            static_lock.ordered_normalized_sample_bindings_sha256
+        ),
+        "ordered_raw_record_bindings_sha256": (
+            static_lock.ordered_raw_record_bindings_sha256
+        ),
+        "sanitized_projection_sha256": projection_sha256,
+        "samples": samples,
+    }
+    payload = canonical_json_bytes(value) + b"\n"
+    publish_no_clobber(output_path, payload)
+    treatment = read_snapshot(output_path, "exported confirmation treatment input")
+    loaded = _load_confirmation_treatment_input(
+        output_path,
+        expected_file_sha256=treatment.sha256,
+        expected_sanitized_projection_sha256=projection_sha256,
+        static_lock=static_lock,
+    )
+    if len(loaded.samples) != static_lock.sample_count:
+        raise FirebreakError("confirmation treatment export is incomplete")
+
+    assert_snapshot_unchanged(dataset, "dataset")
+    assert_snapshot_unchanged(split, "split manifest")
+    assert_snapshot_unchanged(treatment, "exported confirmation treatment input")
+    return {
+        "format": CONFIRMATION_EXPORT_RECEIPT_FORMAT,
+        "status": "verified",
+        "verifier_implementation_sha256": package_sha256(Path(__file__).parent),
+        "dataset": {
+            "sha256": static_lock.dataset_sha256,
+            "bytes": population.dataset_bytes,
+            "contents_emitted": False,
+        },
+        "split_manifest": {
+            "sha256": static_lock.split_manifest_sha256,
+            "format": population.split_format,
+            "algorithm": population.split_algorithm,
+            "salt_sha256": canonical_sha256(population.split_salt),
+        },
+        "confirmation": {
+            "source_partition": "confirmation",
+            "count": static_lock.sample_count,
+            "ordered_question_ids_sha256": (
+                static_lock.ordered_question_ids_sha256
+            ),
+            "ordered_normalized_sample_bindings_sha256": (
+                static_lock.ordered_normalized_sample_bindings_sha256
+            ),
+            "ordered_raw_record_bindings_sha256": (
+                static_lock.ordered_raw_record_bindings_sha256
+            ),
+            "status": "designated_evaluator_held_final_only",
+        },
+        "treatment_input": {
+            "file_sha256": treatment.sha256,
+            "file_bytes": treatment.size,
+            "sample_count": static_lock.sample_count,
+            "ordered_question_ids_sha256": (
+                static_lock.ordered_question_ids_sha256
+            ),
+            "sanitized_projection_sha256": projection_sha256,
+            "scorer_labels_present": False,
+        },
+        "firebreak": {
+            "role_fixed_to_confirmation": True,
+            "closed_treatment_schema": True,
+            "reference_or_gold_in_treatment_input": False,
+            "scorer_or_category_fields_in_treatment_input": False,
+            "exposure_membership_in_treatment_input": False,
+            "provider_calls": 0,
+            "verifier_dependency_class": "python_standard_library_only",
+        },
+    }
+
+
+def _confirmation_static_lock(
+    expected: ExpectedPopulationLock,
+) -> ConfirmationTreatmentStaticLock:
+    confirmation = expected.partitions.get("confirmation")
+    if confirmation is None:
+        raise FirebreakError("confirmation partition is absent from the lock")
+    return ConfirmationTreatmentStaticLock(
+        dataset_sha256=expected.dataset_sha256,
+        split_manifest_sha256=expected.split_manifest_sha256,
+        sample_count=confirmation.count,
+        ordered_question_ids_sha256=confirmation.ordered_question_ids_sha256,
+        ordered_normalized_sample_bindings_sha256=(
+            confirmation.ordered_normalized_sample_bindings_sha256
+        ),
+        ordered_raw_record_bindings_sha256=(
+            confirmation.ordered_raw_record_bindings_sha256
+        ),
+    )
+
+
 def verify_evaluator_firebreak(
     *,
     dataset_path: str | Path,
@@ -141,6 +284,11 @@ def verify_evaluator_firebreak(
     text, gold values, evidence labels, predictions, or judge fields.
     """
 
+    if required_roles not in {
+        ("analysis",),
+        ("analysis", "confirmation"),
+    }:
+        raise FirebreakError("confirmation role cannot be caller-selected")
     if required_roles == ("analysis",):
         if exposure_audit_path is not None:
             raise FirebreakError(

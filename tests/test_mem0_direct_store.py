@@ -433,8 +433,10 @@ def test_ordered_and_sorted_set_population_hashes_cannot_be_confused(
     assert receipt["actual_mem0_runtime_environment"] == {
         "status": "unresolved",
         "isolated_environment_lock": "tools/mem0_eval/pixi.lock",
-        "isolated_environment_lock_present": False,
-        "isolated_environment_lock_sha256": None,
+        "isolated_environment_lock_present": True,
+        "isolated_environment_lock_sha256": (
+            "c12850c4ff743d12a06506c62285b5e26ac13811510c8cdf3d7bc2828e8a52df"
+        ),
         "actual_mem0_runtime_environment_frozen": False,
         "actual_mem0_runtime_verified": False,
         "actual_mem0_executed": False,
@@ -542,8 +544,11 @@ def test_provider_free_preflight_binds_source_tool_and_unresolved_runtime(
         receipt["actual_mem0_runtime_environment"][
             "isolated_environment_lock_present"
         ]
-        is False
+        is True
     )
+    assert receipt["actual_mem0_runtime_environment"][
+        "isolated_environment_lock_sha256"
+    ] == "c12850c4ff743d12a06506c62285b5e26ac13811510c8cdf3d7bc2828e8a52df"
     assert (
         receipt["actual_mem0_runtime_environment"][
             "actual_mem0_runtime_environment_frozen"

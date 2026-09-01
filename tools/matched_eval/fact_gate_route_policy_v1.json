@@ -1,0 +1,13 @@
+{
+  "admission_basis": "isolated_positive_marginal_only",
+  "admitted_routes": [
+    "numeric_reduce",
+    "state_chain"
+  ],
+  "classification_input": "dated_question_text_only",
+  "classifier_format": "memory-condense-routed-repair-routing-v1",
+  "construction_recall_claimed": false,
+  "format": "memory-condense-matched-fact-gate-route-policy-v1",
+  "policy_id": "matched_em_fact_gate_positive_cells_v1",
+  "source_target_expansion_claimed": false
+}

@@ -303,14 +303,17 @@ class RuleBasedDiscourseLinker:
         for index, current in enumerate(units):
             if index == 0:
                 continue
-            prior = units[index - 1]
             current_text = ordered[index].atom.text
             # Sequence is reconstructible source-local structure, not a
-            # semantic claim.  Cross-source adjacency is never created.
-            if (
-                prior.evidence[0].source_id is not None
-                and prior.evidence[0].source_id == current.evidence[0].source_id
-            ):
+            # semantic claim.  Interleaved source histories therefore connect
+            # to the nearest prior unit in the same source, while evidence
+            # without an authenticated source never acquires sequence edges.
+            prior = (
+                _nearest_prior(units[:index], current)
+                if current.evidence[0].source_id is not None
+                else None
+            )
+            if prior is not None:
                 relations.append(
                     _relation(
                         artifact_id=artifact_id,

@@ -10,7 +10,10 @@ from .analysis import (
     verify_analysis_treatment_input,
 )
 from .canonical import FirebreakError, canonical_json_bytes, publish_no_clobber
-from .verifier import verify_evaluator_firebreak
+from .verifier import (
+    export_confirmation_treatment_input,
+    verify_evaluator_firebreak,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,11 +40,34 @@ def main(argv: list[str] | None = None) -> int:
         "--export-analysis-treatment",
         help="publish a no-clobber canonical analysis treatment artifact",
     )
+    parser.add_argument(
+        "--export-confirmation-treatment",
+        help=(
+            "publish the role-fixed, no-clobber canonical confirmation "
+            "treatment artifact"
+        ),
+    )
     parser.add_argument("--output")
     args = parser.parse_args(argv)
     try:
         treatment_inputs = args.treatment_input or []
-        if args.export_analysis_treatment:
+        if args.export_analysis_treatment and args.export_confirmation_treatment:
+            raise FirebreakError("select exactly one treatment export mode")
+        if args.export_confirmation_treatment:
+            if args.analysis_only:
+                raise FirebreakError(
+                    "confirmation export cannot run in analysis-only mode"
+                )
+            if args.exposure_audit or treatment_inputs:
+                raise FirebreakError(
+                    "confirmation export cannot accept exposure or treatment inputs"
+                )
+            receipt = export_confirmation_treatment_input(
+                dataset_path=args.dataset,
+                split_manifest_path=args.split_manifest,
+                output_path=args.export_confirmation_treatment,
+            )
+        elif args.export_analysis_treatment:
             if not args.analysis_only:
                 raise FirebreakError(
                     "analysis export requires --analysis-only"

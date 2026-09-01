@@ -476,6 +476,13 @@ def test_isolated_bootstrap_hash_matches_frozen_source_fingerprint():
     ) == implementation_sha256()
 
 
+def test_isolated_bootstrap_hash_matches_mem0_policy_tool_hash():
+    tool_root = Path(__file__).resolve().parents[1] / "tools" / "mem0_eval"
+    assert bootstrap._tree_sha256(tool_root) == preflight.tool_implementation_sha256(
+        tool_root
+    )
+
+
 def test_isolated_bootstrap_fails_before_launch_on_source_drift(tmp_path):
     source = tmp_path / "src" / "memory_condense"
     tool = tmp_path / "tools" / "mem0_eval"
@@ -573,6 +580,31 @@ def test_isolated_bootstrap_sets_offline_guards_and_forwards_arguments(
     assert bootstrap.os.environ["TRANSFORMERS_OFFLINE"] == "1"
     assert bootstrap.os.environ["HF_HUB_DISABLE_TELEMETRY"] == "1"
     assert bootstrap.os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "true"
+    assert (
+        bootstrap.os.environ["MEM0_VERIFIED_BOOTSTRAP_SOURCE_SHA256"]
+        == source_digest
+    )
+    assert (
+        bootstrap.os.environ["MEM0_VERIFIED_BOOTSTRAP_TOOL_SHA256"]
+        == tool_digest
+    )
+    assert bootstrap.os.environ["MEM0_VERIFIED_BOOTSTRAP_NETWORK_DENIED"] == "1"
+    assert bootstrap.os.environ["CUSTOM_TIKTOKEN_CACHE_DIR"] == (
+        bootstrap.os.environ["TIKTOKEN_CACHE_DIR"]
+    )
+
+
+def test_isolated_bootstrap_rejects_unverified_tiktoken_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "tokenizer-cache"
+    cache.mkdir()
+    (cache / bootstrap._CL100K_CACHE_KEY).write_bytes(b"not-cl100k")  # noqa: SLF001
+    monkeypatch.setenv("MEM0_TIKTOKEN_CACHE_DIR", str(cache))
+
+    with pytest.raises(RuntimeError, match="cl100k tokenizer asset mismatch"):
+        bootstrap._bind_verified_tiktoken_cache()  # noqa: SLF001
 
 
 @pytest.mark.parametrize("mutated", ["source", "tool"])
@@ -693,6 +725,51 @@ def test_isolated_bootstrap_imports_preflight_against_exact_v3_source(
         assert completed.returncode == 0, f"{module}: {completed.stderr}"
         if module.endswith("preflight"):
             assert "Reconstruct the locked Mem0 comparison" in completed.stdout
+
+    compatibility = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            f"""
+import sys
+from types import SimpleNamespace
+sys.path[:0] = [{str(frozen / 'src')!r}, {str(repository)!r}]
+from memory_condense import _tokenizer
+from tools.mem0_eval import production_binding as binding
+assert binding.count_tokens is _tokenizer.count_tokens
+versions = {{
+    **dict(binding._MEM0_STACK_DEPENDENCY_VERSIONS),
+    **dict(binding._MEM0_SPACY_TRANSITIVE_VERSIONS),
+}}
+binding.importlib.metadata.version = versions.__getitem__
+class ProbeDoc(list):
+    ents = (object(),)
+class NLP:
+    pipe_names = ("ner", "lemmatizer")
+    def __call__(self, _text):
+        return ProbeDoc([SimpleNamespace(lemma_="visit")])
+class SpacyModel:
+    @staticmethod
+    def load():
+        return NLP()
+binding.importlib.import_module = lambda name: (
+    SpacyModel if name == "en_core_web_sm" else None
+)
+binding._new_exact_bm25_encoder = lambda: (
+    SimpleNamespace(),
+    {{"model": "Qdrant/bm25"}},
+)
+assert binding._exact_mem0_stack_preflight().certified is True
+""",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert compatibility.returncode == 0, compatibility.stderr
 
 
 def test_preflight_output_is_atomic_no_clobber(

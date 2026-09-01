@@ -677,6 +677,12 @@ class FastCompletionRuntime:
             or response.get("completion_token_proxy") != count_tokens(completion)
         ):
             raise ValueError(f"completion response text does not verify: {response_path}")
+        completion_token_proxy = int(response["completion_token_proxy"])
+        if completion_token_proxy > self._max_new_tokens:
+            raise ValueError(
+                "completion token proxy violates the configured max_new_tokens: "
+                f"{completion_token_proxy} > {self._max_new_tokens}: {response_path}"
+            )
         _messages, prompt_tokens = self._prompts_by_hash[messages_sha]
         if response.get("prompt_token_proxy") != prompt_tokens:
             raise ValueError(f"completion prompt usage changed: {response_path}")
@@ -718,7 +724,7 @@ class FastCompletionRuntime:
             response_model=str(response["response_model"]),
             finish_reason=str(response["finish_reason"]),
             prompt_token_proxy=prompt_tokens,
-            completion_token_proxy=int(response["completion_token_proxy"]),
+            completion_token_proxy=completion_token_proxy,
             reported_prompt_tokens=response["reported_prompt_tokens"],
             reported_completion_tokens=response["reported_completion_tokens"],
             reported_total_tokens=response["reported_total_tokens"],
@@ -816,6 +822,13 @@ class FastCompletionRuntime:
         completion = str(_field(message, "content", "") or "").strip()
         if not completion:
             raise RuntimeError("provider returned no completion text")
+        completion_token_proxy = count_tokens(completion)
+        if completion_token_proxy > self._max_new_tokens:
+            raise RuntimeError(
+                "provider completion token proxy violates the configured "
+                "max_new_tokens: "
+                f"{completion_token_proxy} > {self._max_new_tokens}"
+            )
         finish_reason = _field(choice, "finish_reason")
         if finish_reason != "stop":
             raise RuntimeError(
@@ -851,7 +864,7 @@ class FastCompletionRuntime:
             "response_model": str(_field(response, "model", "") or ""),
             "finish_reason": finish_reason,
             "prompt_token_proxy": prompt_tokens,
-            "completion_token_proxy": count_tokens(completion),
+            "completion_token_proxy": completion_token_proxy,
             "reported_prompt_tokens": reported_prompt_tokens,
             "reported_completion_tokens": _reported_count(
                 usage, "completion_tokens"

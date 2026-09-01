@@ -1,10 +1,12 @@
 """Fail-closed policy binding for the locked Mem0 comparison campaign.
 
 The source validation policy freezes the LongMemEval population and the
-answer/judge protocol.  It does not select a Mem0 extraction model, embedder,
-runtime stack, or authorize Mem0 calls.  This module verifies a second,
-arm-specific manifest and is the only supported bridge from those frozen
-artifacts to :mod:`tools.mem0_eval.run_shard` authorization objects.
+answer/judge protocol.  This module owns the only admissible Mem0 extraction
+route and embedder identities, verifies a second arm-specific manifest, and is
+the only supported bridge from those frozen artifacts to
+:mod:`tools.mem0_eval.run_shard` authorization objects.  A manifest may leave
+the extraction decision null for inspection, but no alternative non-null
+provider/model/revision is accepted.
 
 No provider client or Mem0 package is imported here.  The manifest is parsed
 from one immutable byte snapshot, all JSON is finite and secret-free, and the
@@ -52,15 +54,52 @@ if TYPE_CHECKING:
     from .run_shard import RetrievalStageAuthorization, ScoringStageAuthorization
 
 
-MEM0_POLICY_FORMAT = "memory-condense-mem0-comparison-policy-v1"
-MEM0_POLICY_STATUS = "validation_frozen"
+MEM0_POLICY_FORMAT = "memory-condense-mem0-comparison-policy-v3"
+MEM0_POLICY_STATUS = "production_candidate_frozen"
 MEM0_ARM_ID = "mem0_oss_2_0_18_direct_1m_v1"
+MEM0_PRODUCTION_CANDIDATE_FORMAT = (
+    "memory-condense-mem0-standalone-locked100-production-candidate-v1"
+)
+MEM0_PRODUCTION_ELIGIBLE = "eligible_for_production_execution"
+MEM0_PRODUCTION_INELIGIBLE = "ineligible"
+MEM0_NEUTRAL_FALLBACK = "I don't know."
+MEM0_LOCKED_NAMESPACE_COUNT = 10
+MEM0_LOCKED_ADD_OPERATIONS = 24_923
+MEM0_LOCKED_EXTRACTION_CALLS = 24_923
+MEM0_LOCKED_SEARCH_OPERATIONS = 100
+MEM0_LOCKED_QUESTION_COUNT = 100
 MEM0_RUNTIME_PROTOCOL = "mem0-oss-2.0.18-certified-local-v1"
 MEM0_INPUT_ORDER_PROTOCOL = (
     "locked-record-order+official-within-record-date-sort+"
     "consecutive-1-or-2-turn-slices-v1"
 )
 MEM0_EXTRACTION_BOUNDARY = "Memory.llm.generate_response"
+MEM0_EXTRACTION_ROUTE_FORMAT = "memory-condense-mem0-extraction-route-v1"
+MEM0_EXTRACTION_PROVIDER = "openai"
+MEM0_EXTRACTION_CALLER_MODEL = "openai/codex_sdk/gpt-5.6-terra"
+MEM0_EXTRACTION_MODEL = "codex_sdk/gpt-5.6-terra"
+MEM0_EXTRACTION_RESPONSE_MODEL = MEM0_EXTRACTION_MODEL
+MEM0_EXTRACTION_GATEWAY_URL = "https://central-dev.zt:4000/v1"
+MEM0_EXTRACTION_TRANSPORT = "direct-openai-httpx-truststore-v1"
+MEM0_EXTRACTION_OPENAI_VERSION = "2.53.0"
+MEM0_EXTRACTION_HTTPX_VERSION = "0.28.1"
+MEM0_EXTRACTION_TRUSTSTORE_VERSION = "0.10.4"
+MEM0_EXTRACTION_ROUTE_IDENTITY = MappingProxyType(
+    {
+        "format": MEM0_EXTRACTION_ROUTE_FORMAT,
+        "provider": MEM0_EXTRACTION_PROVIDER,
+        "caller_model": MEM0_EXTRACTION_CALLER_MODEL,
+        "gateway_model": MEM0_EXTRACTION_MODEL,
+        "required_response_model": MEM0_EXTRACTION_RESPONSE_MODEL,
+        "gateway_url": MEM0_EXTRACTION_GATEWAY_URL,
+        "transport": MEM0_EXTRACTION_TRANSPORT,
+        "openai_version": MEM0_EXTRACTION_OPENAI_VERSION,
+        "httpx_version": MEM0_EXTRACTION_HTTPX_VERSION,
+        "truststore_version": MEM0_EXTRACTION_TRUSTSTORE_VERSION,
+        "sdk_retries": 0,
+        "temperature_policy": "omitted",
+    }
+)
 MEM0_PROVENANCE_KIND = "request_window_non_evidence"
 MEM0_SOURCE_SESSION_DATE_EXPOSURE = "diagnostics_only_not_model_input"
 MEM0_RETRIEVED_CREATED_AT_EXPOSURE = "answer_prompt_date_headings"
@@ -71,6 +110,46 @@ MEM0_EMBEDDER_REVISION = DEFAULT_MODEL_REVISION
 MEM0_EMBEDDER_CHECKPOINT_SHA256 = BGE_M3_CHECKPOINT_SHA256
 MEM0_EMBEDDER_DIMENSION = DEFAULT_MODEL_DIM
 MEM0_EMBEDDER_DTYPE = "float32"
+
+MEM0_STANDALONE_ANSWER_POLICY = {
+    "mode": "standalone_mem0_retrieval_only_v1",
+    "prediction_inputs": ["question", "mem0_retrieved_memories"],
+    "external_predictions_authorized": 0,
+    "forbidden_prediction_sources": [
+        "baseline_prediction",
+        "memory_condense_prediction",
+        "parent_prediction",
+        "treatment_prediction",
+    ],
+    "fallback_prediction": MEM0_NEUTRAL_FALLBACK,
+    "fallback_origin": "fixed_policy_literal_only",
+    "provider_failure_is_invalid": True,
+}
+MEM0_INGESTION_POLICY = {
+    "infer": True,
+    "one_namespace_per_shard": True,
+    "cross_namespace_reads_authorized": False,
+}
+MEM0_LOCKED_POPULATION_EXPECTATIONS = {
+    "namespace_count": MEM0_LOCKED_NAMESPACE_COUNT,
+    "add_operations": MEM0_LOCKED_ADD_OPERATIONS,
+    "extraction_calls": MEM0_LOCKED_EXTRACTION_CALLS,
+    "search_operations": MEM0_LOCKED_SEARCH_OPERATIONS,
+    "questions": MEM0_LOCKED_QUESTION_COUNT,
+}
+MEM0_EXTRACTION_USAGE_POLICY = {
+    "logical_call_boundary": MEM0_EXTRACTION_BOUNDARY,
+    "logical_calls_per_infer_true_add": 1,
+    "provider_retries": 0,
+    "logical_calls_must_close_exactly": True,
+    "provider_usage_semantics": (
+        "provider_reported_exact_or_explicitly_unavailable_v1"
+    ),
+    "missing_provider_usage_semantics": "unavailable_never_zero",
+    "silent_zero_fill_authorized": False,
+    "extraction_work_reported_separately": True,
+    "cost_comparison_requires_usage_status": True,
+}
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _FORBIDDEN_SECRET_KEYS = {
@@ -107,6 +186,22 @@ _SECRET_VALUE_RE = re.compile(
     r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})",
     re.IGNORECASE,
 )
+_UNRESOLVED_TEXT_MARKERS = {
+    "<pending>",
+    "<tbd>",
+    "<unresolved>",
+    "pending",
+    "tbd",
+    "unknown",
+    "unresolved",
+}
+_FORBIDDEN_HYBRID_PREDICTION_KEYS = {
+    "baseline_prediction",
+    "memory_condense_prediction",
+    "our_prediction",
+    "parent_prediction",
+    "treatment_prediction",
+}
 
 
 class Mem0PolicyError(ValueError):
@@ -136,6 +231,17 @@ def canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+# The central-dev gateway exposes the route alias, not an immutable weights
+# revision.  Bind exactly what this repository can observe and verify without
+# pretending that the digest identifies provider-side model weights.
+MEM0_EXTRACTION_ROUTE_IDENTITY_SHA256 = canonical_json_sha256(
+    dict(MEM0_EXTRACTION_ROUTE_IDENTITY)
+)
+MEM0_EXTRACTION_REVISION = (
+    f"observable-route-sha256:{MEM0_EXTRACTION_ROUTE_IDENTITY_SHA256}"
+)
+
+
 def _mapping(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise Mem0PolicyError(f"{label} must be an object")
@@ -155,6 +261,29 @@ def _text(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise Mem0PolicyError(f"{label} must be a non-empty string")
     return value.strip()
+
+
+def _required_decision_text(value: Any, label: str) -> str | None:
+    """Parse an explicitly unresolved or concretely frozen model decision.
+
+    ``None`` is the only unresolved representation.  Placeholder strings are
+    rejected so a candidate cannot look resolved merely because a non-empty
+    ``TBD`` value happened to satisfy a string check.
+    """
+
+    if value is None:
+        return None
+    decision = _text(value, label)
+    lowered = decision.casefold()
+    if (
+        lowered in _UNRESOLVED_TEXT_MARKERS
+        or "placeholder" in lowered
+        or lowered.startswith("example/")
+    ):
+        raise Mem0PolicyError(
+            f"{label} must be null while unresolved, not a placeholder string"
+        )
+    return decision
 
 
 def _sha256(value: Any, label: str) -> str:
@@ -223,6 +352,24 @@ def _reject_secret_material(value: Any, label: str = "policy") -> None:
             _reject_secret_material(child, f"{label}[{index}]")
     elif isinstance(value, str) and _SECRET_VALUE_RE.search(value):
         raise Mem0PolicyError(f"{label} contains credential-shaped material")
+
+
+def _reject_hybrid_prediction_material(
+    value: Any, label: str = "policy"
+) -> None:
+    """Reject embedded predictions from the treatment or any parent arm."""
+
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            if key.casefold() in _FORBIDDEN_HYBRID_PREDICTION_KEYS:
+                raise Mem0PolicyError(
+                    f"{label}.{key} would hybridize the standalone Mem0 arm"
+                )
+            _reject_hybrid_prediction_material(child, f"{label}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_hybrid_prediction_material(child, f"{label}[{index}]")
 
 
 def _immutable_json(value: Any) -> Any:
@@ -296,6 +443,60 @@ def expected_shard_policy_rows(
     return tuple(rows)
 
 
+def observed_campaign_population(
+    shard_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Derive the campaign-wide namespace and operation population."""
+
+    return {
+        "namespace_count": len(shard_rows),
+        "add_operations": sum(
+            _integer(
+                row.get("authorized_add_operations"),
+                "shard.authorized_add_operations",
+            )
+            for row in shard_rows
+        ),
+        "extraction_calls": sum(
+            _integer(
+                row.get("authorized_extraction_calls"),
+                "shard.authorized_extraction_calls",
+            )
+            for row in shard_rows
+        ),
+        "search_operations": sum(
+            _integer(
+                row.get("authorized_search_operations"),
+                "shard.authorized_search_operations",
+            )
+            for row in shard_rows
+        ),
+        "questions": sum(
+            _integer(row.get("questions"), "shard.questions")
+            for row in shard_rows
+        ),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class Mem0ProductionCandidate:
+    """Validated standalone/fairness contract and its derived readiness."""
+
+    format: str
+    status: str
+    unresolved_required_fields: tuple[str, ...]
+    blockers: tuple[str, ...]
+    standalone_answer: Mapping[str, Any]
+    ingestion: Mapping[str, Any]
+    population_expectations: Mapping[str, Any]
+    observed_population: Mapping[str, Any]
+    extraction_usage: Mapping[str, Any]
+
+    @property
+    def eligible(self) -> bool:
+        return self.status == MEM0_PRODUCTION_ELIGIBLE and not self.blockers
+
+
 @dataclass(frozen=True, slots=True)
 class Mem0ShardPolicy:
     sample_offset: int
@@ -324,9 +525,28 @@ class Mem0ComparisonPolicy:
     stable_payload: Mapping[str, Any]
     extraction_identity: Mapping[str, Any]
     embedder_identity: Mapping[str, Any]
+    production_candidate: Mem0ProductionCandidate
     scoring: Mapping[str, Any]
     payload: Mapping[str, Any]
     shards: Mapping[int, Mem0ShardPolicy]
+
+    @property
+    def production_eligible(self) -> bool:
+        return self.production_candidate.eligible
+
+    def require_production_eligible(self) -> None:
+        """Reject execution while a required decision or identity is open."""
+
+        if self.production_candidate.eligible:
+            return
+        unresolved = ", ".join(
+            self.production_candidate.unresolved_required_fields
+        ) or "none"
+        blockers = ", ".join(self.production_candidate.blockers) or "unknown"
+        raise Mem0PolicyError(
+            "Mem0 production candidate is ineligible: "
+            f"blockers={blockers}; unresolved_required_fields={unresolved}"
+        )
 
     def recheck(self) -> None:
         """Fail if policy, lock, source plan, or tool bytes changed since load."""
@@ -349,6 +569,7 @@ class Mem0ComparisonPolicy:
         from .run_shard import RetrievalStageAuthorization
 
         self.recheck()
+        self.require_production_eligible()
         row = self._shard(shard)
         return RetrievalStageAuthorization(
             sample_offset=row.sample_offset,
@@ -395,6 +616,7 @@ class Mem0ComparisonPolicy:
         from .run_shard import ScoringStageAuthorization
 
         self.recheck()
+        self.require_production_eligible()
         row = self._shard(shard)
         artifact_digest = _sha256(
             retrieval_artifact_sha256, "retrieval_artifact_sha256"
@@ -525,8 +747,25 @@ def _validate_model_identity(value: Any, label: str, *, embedder: bool) -> dict[
             "http_attempts_certified",
         }
     _exact_keys(identity, expected, label)
-    for field in ("provider", "model", "revision"):
-        _text(identity[field], f"{label}.{field}")
+    if embedder:
+        for field in ("provider", "model", "revision"):
+            _text(identity[field], f"{label}.{field}")
+    else:
+        for field in ("provider", "model", "revision"):
+            identity[field] = _required_decision_text(
+                identity[field], f"{label}.{field}"
+            )
+        frozen_extraction = {
+            "provider": MEM0_EXTRACTION_PROVIDER,
+            "model": MEM0_EXTRACTION_MODEL,
+            "revision": MEM0_EXTRACTION_REVISION,
+        }
+        for field, wanted in frozen_extraction.items():
+            if identity[field] is not None and identity[field] != wanted:
+                raise Mem0PolicyError(
+                    f"{label}.{field} does not match the frozen Terra "
+                    "extraction route"
+                )
     supplied_digest = _sha256(
         identity.pop("model_identity_sha256"), f"{label}.model_identity_sha256"
     )
@@ -577,6 +816,99 @@ def _validate_model_identity(value: Any, label: str, *, embedder: bool) -> dict[
         raise Mem0PolicyError(f"{label}.model_identity_sha256 mismatch")
     identity["model_identity_sha256"] = supplied_digest
     return identity
+
+
+def _validate_production_candidate(
+    value: Any,
+    *,
+    extraction: Mapping[str, Any],
+    shard_rows: Sequence[Mapping[str, Any]],
+) -> Mem0ProductionCandidate:
+    candidate = _mapping(value, "production_candidate")
+    _exact_keys(
+        candidate,
+        {
+            "format",
+            "status",
+            "unresolved_required_fields",
+            "blockers",
+            "standalone_answer",
+            "ingestion",
+            "population_expectations",
+            "extraction_usage",
+        },
+        "production_candidate",
+    )
+    if candidate["format"] != MEM0_PRODUCTION_CANDIDATE_FORMAT:
+        raise Mem0PolicyError("production-candidate format mismatch")
+    _must_equal(
+        candidate["standalone_answer"],
+        MEM0_STANDALONE_ANSWER_POLICY,
+        "production_candidate.standalone_answer",
+    )
+    _must_equal(
+        candidate["ingestion"],
+        MEM0_INGESTION_POLICY,
+        "production_candidate.ingestion",
+    )
+    _must_equal(
+        candidate["population_expectations"],
+        MEM0_LOCKED_POPULATION_EXPECTATIONS,
+        "production_candidate.population_expectations",
+    )
+    _must_equal(
+        candidate["extraction_usage"],
+        MEM0_EXTRACTION_USAGE_POLICY,
+        "production_candidate.extraction_usage",
+    )
+
+    unresolved = tuple(
+        f"mem0.extraction_identity.{field}"
+        for field in ("provider", "model", "revision")
+        if extraction[field] is None
+    )
+    observed = observed_campaign_population(shard_rows)
+    population_matches = (
+        _canonical_json(observed)
+        == _canonical_json(MEM0_LOCKED_POPULATION_EXPECTATIONS)
+    )
+    blockers: list[str] = []
+    if unresolved:
+        blockers.append("required_fields_unresolved")
+    if not population_matches:
+        blockers.append("locked_population_mismatch")
+    expected_status = (
+        MEM0_PRODUCTION_ELIGIBLE
+        if not blockers
+        else MEM0_PRODUCTION_INELIGIBLE
+    )
+    _must_equal(
+        candidate["unresolved_required_fields"],
+        list(unresolved),
+        "production_candidate.unresolved_required_fields",
+    )
+    _must_equal(
+        candidate["blockers"],
+        blockers,
+        "production_candidate.blockers",
+    )
+    if candidate["status"] != expected_status:
+        raise Mem0PolicyError(
+            "production_candidate.status contradicts derived eligibility"
+        )
+    return Mem0ProductionCandidate(
+        format=MEM0_PRODUCTION_CANDIDATE_FORMAT,
+        status=expected_status,
+        unresolved_required_fields=unresolved,
+        blockers=tuple(blockers),
+        standalone_answer=_immutable_json(MEM0_STANDALONE_ANSWER_POLICY),
+        ingestion=_immutable_json(MEM0_INGESTION_POLICY),
+        population_expectations=_immutable_json(
+            MEM0_LOCKED_POPULATION_EXPECTATIONS
+        ),
+        observed_population=_immutable_json(observed),
+        extraction_usage=_immutable_json(MEM0_EXTRACTION_USAGE_POLICY),
+    )
 
 
 def _validate_stable_payload(
@@ -754,8 +1086,17 @@ def _validate_mem0(value: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str
     storage = _mapping(mem0["storage"], "mem0.storage")
     _must_equal(
         storage,
-        {"provider": "qdrant", "local_owned_state": True, "on_disk": True,
-         "fresh_process_per_shard": True, "cleanup_required": True},
+        {
+            "provider": "qdrant",
+            "local_owned_state": True,
+            "on_disk": True,
+            "fresh_process_per_shard": True,
+            "resumable_across_fresh_processes": True,
+            "resume_requires_closed_owned_state": True,
+            "immutable_prefix_checkpoint_adds": 256,
+            "terminal_output_before_checkpoint_gc": True,
+            "cleanup_required": True,
+        },
         "mem0.storage",
     )
     provenance = _mapping(mem0["provenance"], "mem0.provenance")
@@ -832,7 +1173,7 @@ def _validate_scoring(value: Any, source_plan: SourceValidationPlan) -> dict[str
     return scoring
 
 
-def load_mem0_comparison_policy(
+def inspect_mem0_comparison_policy(
     path: str | Path,
     *,
     source_plan: SourceValidationPlan,
@@ -840,7 +1181,7 @@ def load_mem0_comparison_policy(
     expected_shards: Sequence[RawStressShard],
     tool_root: str | Path | None = None,
 ) -> Mem0ComparisonPolicy:
-    """Load and verify the exact Mem0 model/runtime/call authorization."""
+    """Inspect a frozen candidate without granting execution authorization."""
 
     policy_path = Path(path).resolve()
     lock_path = Path(mem0_environment_lock).resolve()
@@ -853,9 +1194,20 @@ def load_mem0_comparison_policy(
         raise Mem0PolicyError(f"cannot parse Mem0 comparison policy: {exc}") from exc
     policy = _mapping(value, "policy")
     _reject_secret_material(policy)
+    _reject_hybrid_prediction_material(policy)
     _exact_keys(
         policy,
-        {"format", "status", "arm_id", "source", "tool", "mem0", "scoring", "shards"},
+        {
+            "format",
+            "status",
+            "arm_id",
+            "source",
+            "tool",
+            "mem0",
+            "production_candidate",
+            "scoring",
+            "shards",
+        },
         "policy",
     )
     if policy["format"] != MEM0_POLICY_FORMAT:
@@ -886,6 +1238,11 @@ def load_mem0_comparison_policy(
     _must_equal(raw_rows, expected_rows, "policy.shards")
     if tuple(row["sample_offset"] for row in expected_rows) != source_plan.sample_offsets:
         raise Mem0PolicyError("policy shards do not match source sample offsets")
+    production_candidate = _validate_production_candidate(
+        policy["production_candidate"],
+        extraction=extraction,
+        shard_rows=expected_rows,
+    )
     shard_map = {
         row["sample_offset"]: Mem0ShardPolicy(
             sample_offset=row["sample_offset"],
@@ -912,6 +1269,7 @@ def load_mem0_comparison_policy(
         stable_payload=_immutable_json(mem0["stable_payload"]),
         extraction_identity=_immutable_json(extraction),
         embedder_identity=_immutable_json(embedder),
+        production_candidate=production_candidate,
         scoring=_immutable_json(scoring),
         payload=_immutable_json(policy),
         shards=MappingProxyType(shard_map),
@@ -922,15 +1280,71 @@ def load_mem0_comparison_policy(
     return result
 
 
+def load_mem0_comparison_policy(
+    path: str | Path,
+    *,
+    source_plan: SourceValidationPlan,
+    mem0_environment_lock: str | Path,
+    expected_shards: Sequence[RawStressShard],
+    tool_root: str | Path | None = None,
+) -> Mem0ComparisonPolicy:
+    """Load the candidate only when it can authorize the exact locked arm.
+
+    Use :func:`inspect_mem0_comparison_policy` to audit a deliberately
+    ineligible candidate.  Production callers get no policy object while any
+    required model decision is unresolved or the population is not exactly
+    the frozen ten-namespace workload.
+    """
+
+    result = inspect_mem0_comparison_policy(
+        path,
+        source_plan=source_plan,
+        mem0_environment_lock=mem0_environment_lock,
+        expected_shards=expected_shards,
+        tool_root=tool_root,
+    )
+    result.require_production_eligible()
+    return result
+
+
 __all__ = [
     "MEM0_ARM_ID",
+    "MEM0_EXTRACTION_CALLER_MODEL",
+    "MEM0_EXTRACTION_USAGE_POLICY",
     "MEM0_EXTRACTION_BOUNDARY",
+    "MEM0_EXTRACTION_GATEWAY_URL",
+    "MEM0_EXTRACTION_HTTPX_VERSION",
+    "MEM0_EXTRACTION_MODEL",
+    "MEM0_EXTRACTION_OPENAI_VERSION",
+    "MEM0_EXTRACTION_PROVIDER",
+    "MEM0_EXTRACTION_RESPONSE_MODEL",
+    "MEM0_EXTRACTION_REVISION",
+    "MEM0_EXTRACTION_ROUTE_FORMAT",
+    "MEM0_EXTRACTION_ROUTE_IDENTITY",
+    "MEM0_EXTRACTION_ROUTE_IDENTITY_SHA256",
+    "MEM0_EXTRACTION_TRANSPORT",
+    "MEM0_EXTRACTION_TRUSTSTORE_VERSION",
+    "MEM0_INGESTION_POLICY",
+    "MEM0_LOCKED_ADD_OPERATIONS",
+    "MEM0_LOCKED_EXTRACTION_CALLS",
+    "MEM0_LOCKED_NAMESPACE_COUNT",
+    "MEM0_LOCKED_POPULATION_EXPECTATIONS",
+    "MEM0_LOCKED_QUESTION_COUNT",
+    "MEM0_LOCKED_SEARCH_OPERATIONS",
+    "MEM0_NEUTRAL_FALLBACK",
     "MEM0_POLICY_FORMAT",
     "MEM0_POLICY_STATUS",
+    "MEM0_PRODUCTION_CANDIDATE_FORMAT",
+    "MEM0_PRODUCTION_ELIGIBLE",
+    "MEM0_PRODUCTION_INELIGIBLE",
+    "MEM0_STANDALONE_ANSWER_POLICY",
     "Mem0ComparisonPolicy",
     "Mem0PolicyError",
+    "Mem0ProductionCandidate",
     "Mem0ShardPolicy",
     "canonical_json_sha256",
     "expected_shard_policy_rows",
+    "inspect_mem0_comparison_policy",
     "load_mem0_comparison_policy",
+    "observed_campaign_population",
 ]

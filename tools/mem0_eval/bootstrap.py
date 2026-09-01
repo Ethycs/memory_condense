@@ -10,17 +10,32 @@ import re
 import runpy
 import socket
 import sys
+import tempfile
 from pathlib import Path
 from typing import Sequence
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_CL100K_CACHE_KEY = "9b5ad71b2ce5302211f9c61530b329a4922fc6a4"
+_CL100K_CACHE_SHA256 = (
+    "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
+)
 
 
 def _tree_sha256(package: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(package.rglob("*.py"), key=lambda item: item.as_posix()):
-        relative = path.relative_to(package).as_posix().encode("utf-8")
+    sources: list[Path] = []
+    excluded = {".pixi", ".venv", "__pycache__"}
+    for current, directories, files in os.walk(package):
+        directories[:] = sorted(
+            name for name in directories if name not in excluded
+        )
+        sources.extend(
+            Path(current) / name for name in files if name.endswith(".py")
+        )
+    for path in sorted(sources, key=lambda item: item.as_posix()):
+        relative_path = path.relative_to(package)
+        relative = relative_path.as_posix().encode("utf-8")
         payload = path.read_bytes()
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
@@ -36,6 +51,38 @@ def _deny_network() -> None:
     socket.create_connection = blocked  # type: ignore[assignment]
     socket.socket.connect = blocked  # type: ignore[method-assign]
     socket.socket.connect_ex = blocked  # type: ignore[method-assign]
+
+
+def _bind_verified_tiktoken_cache() -> Path:
+    """Bind LiteLLM to one hash-verified local cl100k asset.
+
+    LiteLLM 1.96.2 replaces ``TIKTOKEN_CACHE_DIR`` with its bundled cache
+    unless ``CUSTOM_TIKTOKEN_CACHE_DIR`` is set.  That bundle does not contain
+    cl100k, so a frozen-v3 import otherwise attempts a download before the
+    comparison tool can run.  The standard tiktoken cache is an environment
+    asset, not tool source; verify its exact bytes before exposing its path.
+    """
+
+    configured = os.environ.get("MEM0_TIKTOKEN_CACHE_DIR")
+    cache_dir = Path(
+        configured
+        if configured is not None
+        else Path(tempfile.gettempdir()) / "data-gym-cache"
+    ).resolve(strict=True)
+    if not cache_dir.is_dir() or cache_dir.is_symlink():
+        raise RuntimeError("Mem0 tiktoken cache must be a real directory")
+    asset = cache_dir / _CL100K_CACHE_KEY
+    if not asset.is_file() or asset.is_symlink():
+        raise RuntimeError("hash-verified cl100k tokenizer asset is absent")
+    observed = hashlib.sha256(asset.read_bytes()).hexdigest()
+    if observed != _CL100K_CACHE_SHA256:
+        raise RuntimeError(
+            "cl100k tokenizer asset mismatch: "
+            f"{observed} != {_CL100K_CACHE_SHA256}"
+        )
+    os.environ["CUSTOM_TIKTOKEN_CACHE_DIR"] = str(cache_dir)
+    os.environ["TIKTOKEN_CACHE_DIR"] = str(cache_dir)
+    return cache_dir
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -206,8 +253,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
     os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "true"
+    _bind_verified_tiktoken_cache()
     if not args.allow_network:
         _deny_network()
+        os.environ["MEM0_VERIFIED_BOOTSTRAP_NETWORK_DENIED"] = "1"
+    else:
+        os.environ["MEM0_VERIFIED_BOOTSTRAP_NETWORK_DENIED"] = "0"
+    # The launched module can bind its artifact to this already-verified
+    # bootstrap authority without trusting a caller-selected import path.
+    os.environ["MEM0_VERIFIED_BOOTSTRAP_SOURCE_SHA256"] = expected_source
+    os.environ["MEM0_VERIFIED_BOOTSTRAP_TOOL_SHA256"] = expected_tool
     sys.path.insert(0, str(tool_import_root))
     sys.path.insert(0, str(source_import_root))
     _verify_import_resolution(source_package, tool_package)

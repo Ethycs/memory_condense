@@ -54,6 +54,33 @@ _CONTRACTS = {
     "verify_bge_m3_checkpoint": ("embedding", "modeling.embedding"),
     "BenchmarkSample": ("loader", "ingest.loader"),
     "parse_longmemeval": ("loader", "ingest.loader"),
+    # The frozen v3 adapter kept runtime/protocol helpers in one module; v4
+    # split them by responsibility.  Resumable execution resolves these exact
+    # private seams through the already authenticated source layout instead of
+    # probing/falling back after an import error.
+    "_OwnedMem0Backend": (
+        "eval.mem0_adapter",
+        "eval.mem0_runtime",
+    ),
+    "_assert_mem0_state_binding": (
+        "eval.mem0_adapter",
+        "eval.mem0_runtime",
+    ),
+    "_assert_no_live_mem0_telemetry": (
+        "eval.mem0_adapter",
+        "eval.mem0_runtime",
+    ),
+    "_memory_id": ("eval.mem0_adapter", "eval.mem0_protocol"),
+    "_redacted_stable_config": (
+        "eval.mem0_adapter",
+        "eval.mem0_runtime",
+    ),
+    "_remove_owned_state": (
+        "eval.mem0_adapter",
+        "eval.mem0_runtime",
+    ),
+    "_response_rows": ("eval.mem0_adapter", "eval.mem0_protocol"),
+    "_sha256_json": ("eval.mem0_adapter", "eval.mem0_runtime"),
 }
 
 
@@ -79,4 +106,12 @@ __all__ = [
     "parse_longmemeval",
     "tokenizer_proxy_identity",
     "verify_bge_m3_checkpoint",
+    "_OwnedMem0Backend",
+    "_assert_mem0_state_binding",
+    "_assert_no_live_mem0_telemetry",
+    "_memory_id",
+    "_redacted_stable_config",
+    "_remove_owned_state",
+    "_response_rows",
+    "_sha256_json",
 ]

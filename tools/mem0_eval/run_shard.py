@@ -67,6 +67,25 @@ from .protocol import (
 SHARD_SCHEMA_VERSION = 2
 RETRIEVAL_ARTIFACT_FORMAT = "memory-condense-mem0-retrieval-artifact-v2"
 RETRIEVAL_TRACE_FORMAT = "memory-condense-mem0-retrieval-trace-v2"
+RESUMABLE_RETRIEVAL_CERTIFICATION = "exact_resumable_production"
+RESUMABLE_EXECUTION_BINDING_KIND = "exact_mem0_resumable_execution_v2"
+RESUMABLE_FACTORY_FORMAT = "memory-condense-mem0-resumable-factory-v1"
+RESUMABLE_SUSPEND_FORMAT = "memory-condense-mem0-resumable-suspend-v1"
+RESUMABLE_TRANSPORT_CLOSURE_FORMAT = (
+    "memory-condense-mem0-resumable-transport-closure-v1"
+)
+RESUMABLE_WRITE_ACTIVITY_FORMAT = (
+    "memory-condense-mem0-resumable-write-activity-v1"
+)
+RESUMABLE_WRITE_USAGE_FORMAT = (
+    "memory-condense-mem0-complete-write-usage-attestation-v1"
+)
+RESUMABLE_SEGMENT_AUTHORIZATION_FORMAT = (
+    "memory-condense-mem0-one-use-segment-authorization-v1"
+)
+RESUMABLE_LIVE_LAUNCH_AUTHORITY_FORMAT = (
+    "memory-condense-mem0-live-launch-authority-v1"
+)
 SCORING_TRACE_FORMAT = "memory-condense-mem0-scoring-trace-v2"
 SCORING_RECEIPT_FORMAT = "memory-condense-mem0-scoring-receipt-v2"
 SHARD_REPORT_TYPE = "mem0_longmemeval_stress_shard"
@@ -1505,7 +1524,57 @@ def _post_cleanup_adapter_state(
     }
 
 
-def _candidate_payload(candidate: Any, expected_rank: int) -> dict[str, Any]:
+def _request_window_ref_payload(value: Any, *, label: str) -> dict[str, Any]:
+    """Normalize one text-free diagnostic add-window reference."""
+
+    from .prompt_pack import (
+        MEM0_REQUEST_WINDOW_REF_FORMAT,
+        PromptRequestWindowRef,
+    )
+
+    if isinstance(value, Mapping):
+        raw = dict(value)
+    else:
+        fields = (
+            "sample_id",
+            "source",
+            "session",
+            "session_index",
+            "original_session_index",
+            "batch_index",
+            "date",
+            "turn_start",
+            "turn_count",
+            "roles",
+        )
+        try:
+            raw = {field: getattr(value, field) for field in fields}
+        except AttributeError as exc:
+            raise ValueError(f"{label} is not a complete request window") from exc
+    if raw.get("format") not in {None, MEM0_REQUEST_WINDOW_REF_FORMAT}:
+        raise ValueError(f"{label} format mismatch")
+    ref = PromptRequestWindowRef(
+        sample_id=raw.get("sample_id"),
+        source=raw.get("source"),
+        session=raw.get("session"),
+        session_index=raw.get("session_index"),
+        original_session_index=raw.get("original_session_index"),
+        batch_index=raw.get("batch_index"),
+        date=raw.get("date"),
+        turn_start=raw.get("turn_start"),
+        turn_count=raw.get("turn_count"),
+        roles=tuple(raw.get("roles", ())),
+        receipt_sha256=raw.get("receipt_sha256", ""),
+    )
+    return ref.as_dict()
+
+
+def _candidate_payload(
+    candidate: Any,
+    expected_rank: int,
+    *,
+    preserve_request_window_attribution: bool = False,
+) -> dict[str, Any]:
     rank = getattr(candidate, "rank", None)
     if rank != expected_rank:
         raise ValueError("Mem0 raw-pool ranks must be contiguous and stable")
@@ -1525,7 +1594,7 @@ def _candidate_payload(candidate: Any, expected_rank: int) -> dict[str, Any]:
     )
     if getattr(candidate, "attribution_kind", None) != MEM0_ATTRIBUTION_KIND:
         raise ValueError("Mem0 candidate attribution kind mismatch")
-    return {
+    payload: dict[str, Any] = {
         "rank": rank,
         "memory_id": memory_id,
         "text": text,
@@ -1533,6 +1602,54 @@ def _candidate_payload(candidate: Any, expected_rank: int) -> dict[str, Any]:
         "created_at": created_at,
         "attribution_kind": MEM0_ATTRIBUTION_KIND,
     }
+    if preserve_request_window_attribution:
+        from .prompt_pack import MEM0_REQUEST_WINDOW_SEMANTICS
+
+        raw_windows = getattr(candidate, "request_window_attribution", None)
+        if not isinstance(raw_windows, Sequence) or isinstance(
+            raw_windows, (str, bytes, bytearray)
+        ):
+            raise TypeError(
+                "Mem0 typed candidate request-window attribution must be a sequence"
+            )
+        windows = [
+            _request_window_ref_payload(
+                window,
+                label=f"candidate request_window_attribution[{index}]",
+            )
+            for index, window in enumerate(raw_windows)
+        ]
+        if not windows:
+            raise ValueError(
+                "Mem0 typed candidate request-window attribution must not be empty"
+            )
+        payload.update(
+            {
+                "created_at_source_event_time_authoritative": False,
+                "request_window_attribution": windows,
+                "request_window_attribution_sha256": canonical_json_sha256(windows),
+                "request_window_semantics": MEM0_REQUEST_WINDOW_SEMANTICS,
+            }
+        )
+    return payload
+
+
+def candidate_payload_for_mem0_typed_v1(
+    candidate: Any, expected_rank: int
+) -> dict[str, Any]:
+    """Preserve diagnostic request windows for the new typed epoch.
+
+    The legacy ``_candidate_payload`` default deliberately remains byte-for-
+    byte compatible with the locked v2 artifact.  New-epoch callers must use
+    this explicit boundary so a request window cannot be mistaken for exact
+    source provenance or silently discarded.
+    """
+
+    return _candidate_payload(
+        candidate,
+        expected_rank,
+        preserve_request_window_attribution=True,
+    )
 
 
 def _default_prompt_packer(
@@ -2315,6 +2432,1815 @@ def _frozen_search_result(
     )
 
 
+def _scoring_exact_keys(
+    value: Any, expected: set[str], label: str
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise Mem0ShardRunError(f"{label} must be an object", stage="scoring")
+    row = _strict_json(value, path=label)
+    assert isinstance(row, dict)
+    if set(row) != expected:
+        raise Mem0ShardRunError(
+            f"{label} fields mismatch: "
+            f"missing={sorted(expected - set(row))!r}, "
+            f"extra={sorted(set(row) - expected)!r}",
+            stage="scoring",
+        )
+    return row
+
+
+def _scoring_self_hashed(
+    value: Any,
+    *,
+    expected_keys: set[str],
+    label: str,
+    digest_field: str = "receipt_sha256",
+) -> dict[str, Any]:
+    row = _scoring_exact_keys(value, expected_keys, label)
+    digest = row.get(digest_field)
+    _require_sha256(digest, f"{label}.{digest_field}")
+    body = dict(row)
+    del body[digest_field]
+    if canonical_json_sha256(body) != digest:
+        raise Mem0ShardRunError(f"{label} self-digest mismatch", stage="scoring")
+    return row
+
+
+def _verify_resumable_counter_receipt(
+    value: Any,
+    *,
+    exact_adds: int,
+    logical: bool,
+    extraction_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    label = "resumable logical receipt" if logical else "resumable HTTP receipt"
+    common = {
+        "kind",
+        "authorized",
+        "seeded_prefix",
+        "segment_authorized",
+        "attempted",
+        "completed",
+        "failed",
+        "rejected",
+        "segment_receipt",
+        "segment_receipt_sha256",
+        "retries_authorized",
+    }
+    row = _scoring_exact_keys(
+        value,
+        common
+        | (
+            {
+                "infer_true_adds_started",
+                "infer_true_adds_exactly_one_call",
+            }
+            if logical
+            else {
+                "provider_usage_status",
+                "provider_usage_records",
+                "provider_input_tokens",
+                "provider_output_tokens",
+                "provider_total_tokens",
+                "provider_latency_s",
+            }
+        ),
+        label,
+    )
+    seeded = _require_count(row.get("seeded_prefix"), f"{label}.seeded_prefix")
+    segment = _require_count(
+        row.get("segment_authorized"), f"{label}.segment_authorized", minimum=1
+    )
+    if seeded >= exact_adds or segment != exact_adds - seeded:
+        raise Mem0ShardRunError(
+            f"{label} suffix partition mismatch", stage="scoring"
+        )
+    expected_common = {
+        "kind": (
+            "resumable_cumulative_logical_extraction"
+            if logical
+            else "resumable_cumulative_http_transport"
+        ),
+        "authorized": exact_adds,
+        "attempted": exact_adds,
+        "completed": exact_adds,
+        "failed": 0,
+        "rejected": 0,
+        "retries_authorized": 0,
+    }
+    for field, expected in expected_common.items():
+        if row.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"{label} {field} mismatch", stage="scoring"
+            )
+    if logical:
+        for field in (
+            "infer_true_adds_started",
+            "infer_true_adds_exactly_one_call",
+        ):
+            if row.get(field) != exact_adds:
+                raise Mem0ShardRunError(
+                    f"{label} {field} mismatch", stage="scoring"
+                )
+        segment_row = _scoring_exact_keys(
+            row.get("segment_receipt"),
+            {
+                "kind",
+                "boundary",
+                "count_semantics",
+                "external_http_attempts_certified",
+                "authorized_local_wrapper_retries",
+                "external_retry_attempts_certified",
+                "authorized",
+                "attempted",
+                "completed",
+                "failed",
+                "rejected",
+                "infer_true_adds_started",
+                "infer_true_adds_exactly_one_call",
+                "one_logical_call_per_infer_true_add_certified",
+                "persisted_request_token_state",
+                "retained_request_token_state_bytes",
+                "request_token_state_evidence_kind",
+                "external_provider_persistence_certified",
+            },
+            f"{label}.segment_receipt",
+        )
+        expected_segment = {
+            "kind": "mem0_memory_llm_generate_response_logical_calls",
+            "boundary": "Memory.llm.generate_response",
+            "count_semantics": "local_logical_wrapper_calls_not_http_attempts",
+            "external_http_attempts_certified": False,
+            "authorized_local_wrapper_retries": 0,
+            "external_retry_attempts_certified": False,
+            "authorized": segment,
+            "attempted": segment,
+            "completed": segment,
+            "failed": 0,
+            "rejected": 0,
+            "infer_true_adds_started": segment,
+            "infer_true_adds_exactly_one_call": segment,
+            "one_logical_call_per_infer_true_add_certified": True,
+            "persisted_request_token_state": False,
+            "retained_request_token_state_bytes": 0,
+            "request_token_state_evidence_kind": (
+                "local_injected_request_token_state_contract"
+            ),
+            "external_provider_persistence_certified": False,
+        }
+        if segment_row != expected_segment:
+            raise Mem0ShardRunError(
+                f"{label} segment boundary mismatch", stage="scoring"
+            )
+    else:
+        segment_row = _scoring_exact_keys(
+            row.get("segment_receipt"),
+            {
+                "kind",
+                "role",
+                "authorized",
+                "attempted",
+                "completed",
+                "failed",
+                "rejected",
+                "retries_authorized",
+                "provider_usage_status",
+                "provider_usage_records",
+                "provider_input_tokens",
+                "provider_output_tokens",
+                "provider_total_tokens",
+                "provider_latency_s",
+                "production_eligible",
+                "provider",
+                "model",
+                "revision",
+                "route_identity_sha256",
+                "request_identity_sha256",
+                "gateway_url",
+                "max_completion_tokens",
+                "sampling_parameters_omitted",
+                "sdk_retries",
+                "http_transport_retries",
+                "follow_redirects",
+                "trust_env",
+                "cap_boundary",
+                "external_http_attempts_certified",
+                "external_provider_persistence_certified",
+            },
+            f"{label}.segment_receipt",
+        )
+        required_transport = {
+            "kind": "local_transport_send_cap",
+            "role": "extraction",
+            "authorized": segment,
+            "attempted": segment,
+            "completed": segment,
+            "failed": 0,
+            "rejected": 0,
+            "retries_authorized": 0,
+            "provider_usage_status": "provider_reported_exact",
+            "provider_usage_records": segment,
+            "production_eligible": True,
+            "provider": extraction_identity["provider"],
+            "model": extraction_identity["model"],
+            "revision": extraction_identity["revision"],
+            "sampling_parameters_omitted": True,
+            "sdk_retries": 0,
+            "http_transport_retries": 0,
+            "follow_redirects": False,
+            "trust_env": False,
+            "cap_boundary": "httpx.BaseTransport.handle_request",
+            "external_http_attempts_certified": True,
+            "external_provider_persistence_certified": False,
+        }
+        for field, expected in required_transport.items():
+            if segment_row.get(field) != expected:
+                raise Mem0ShardRunError(
+                    f"{label} segment {field} mismatch", stage="scoring"
+                )
+        _require_sha256(
+            segment_row.get("route_identity_sha256"),
+            f"{label}.segment_receipt.route_identity_sha256",
+        )
+        _require_sha256(
+            segment_row.get("request_identity_sha256"),
+            f"{label}.segment_receipt.request_identity_sha256",
+        )
+        _require_nonempty(
+            segment_row.get("gateway_url"),
+            f"{label}.segment_receipt.gateway_url",
+        )
+        _require_count(
+            segment_row.get("max_completion_tokens"),
+            f"{label}.segment_receipt.max_completion_tokens",
+            minimum=1,
+        )
+        segment_input = _require_count(
+            segment_row.get("provider_input_tokens"),
+            f"{label}.segment_receipt.provider_input_tokens",
+        )
+        segment_output = _require_count(
+            segment_row.get("provider_output_tokens"),
+            f"{label}.segment_receipt.provider_output_tokens",
+        )
+        segment_total = _require_count(
+            segment_row.get("provider_total_tokens"),
+            f"{label}.segment_receipt.provider_total_tokens",
+        )
+        if segment_total != segment_input + segment_output:
+            raise Mem0ShardRunError(
+                f"{label} segment provider-token total mismatch", stage="scoring"
+            )
+        segment_latency = segment_row.get("provider_latency_s")
+        if (
+            isinstance(segment_latency, bool)
+            or not isinstance(segment_latency, (int, float))
+            or not math.isfinite(float(segment_latency))
+            or float(segment_latency) < 0.0
+        ):
+            raise Mem0ShardRunError(
+                f"{label} segment provider latency is invalid", stage="scoring"
+            )
+        request_identity = {
+            "format": "memory-condense-mem0-extraction-request-v1",
+            "route_identity_sha256": segment_row["route_identity_sha256"],
+            "response_format": {"type": "json_object"},
+            "max_completion_tokens": segment_row["max_completion_tokens"],
+            "sampling_parameters": "omitted",
+            "sdk_retries": 0,
+            "http_transport_retries": 0,
+            "follow_redirects": False,
+            "trust_env": False,
+            "timeout_seconds": 600.0,
+            "connect_timeout_seconds": 30.0,
+            "cap_boundary": "httpx.BaseTransport.handle_request",
+        }
+        if segment_row["request_identity_sha256"] != canonical_json_sha256(
+            request_identity
+        ):
+            raise Mem0ShardRunError(
+                f"{label} segment request identity mismatch", stage="scoring"
+            )
+        cumulative_records = _require_count(
+            row.get("provider_usage_records"),
+            f"{label}.provider_usage_records",
+        )
+        cumulative_input = _require_count(
+            row.get("provider_input_tokens"),
+            f"{label}.provider_input_tokens",
+        )
+        cumulative_output = _require_count(
+            row.get("provider_output_tokens"),
+            f"{label}.provider_output_tokens",
+        )
+        cumulative_total = _require_count(
+            row.get("provider_total_tokens"),
+            f"{label}.provider_total_tokens",
+        )
+        cumulative_latency = row.get("provider_latency_s")
+        if (
+            row.get("provider_usage_status") != "provider_reported_exact"
+            or cumulative_records != exact_adds
+            or cumulative_total != cumulative_input + cumulative_output
+            or cumulative_input < segment_input
+            or cumulative_output < segment_output
+            or isinstance(cumulative_latency, bool)
+            or not isinstance(cumulative_latency, (int, float))
+            or not math.isfinite(float(cumulative_latency))
+            or float(cumulative_latency) < float(segment_latency)
+        ):
+            raise Mem0ShardRunError(
+                f"{label} cumulative provider usage mismatch", stage="scoring"
+            )
+    if canonical_json_sha256(segment_row) != row.get("segment_receipt_sha256"):
+        raise Mem0ShardRunError(
+            f"{label} segment digest mismatch", stage="scoring"
+        )
+    return row
+
+
+def _verify_resumable_factory_receipt(
+    value: Any,
+    *,
+    exact_adds: int,
+    extraction_identity: Mapping[str, Any],
+    embedder_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    factory = _scoring_self_hashed(
+        value,
+        expected_keys={
+            "format",
+            "mode",
+            "segment_authorized_calls",
+            "full_authorized_calls",
+            "user_scope_sha256",
+            "bound_embedder",
+            "bound_bm25",
+            "transport",
+            "receipt_sha256",
+        },
+        label="resumable terminal factory receipt",
+    )
+    for field, expected in {
+        "format": RESUMABLE_FACTORY_FORMAT,
+        "mode": "adopt",
+        "segment_authorized_calls": 0,
+        "full_authorized_calls": exact_adds,
+    }.items():
+        if factory.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable terminal factory {field} mismatch", stage="scoring"
+            )
+    _require_count(
+        factory.get("segment_authorized_calls"),
+        "resumable terminal factory segment authorization",
+    )
+    _require_count(
+        factory.get("full_authorized_calls"),
+        "resumable terminal factory full authorization",
+        minimum=1,
+    )
+    _require_sha256(
+        factory.get("user_scope_sha256"), "resumable factory user_scope_sha256"
+    )
+    embedder = _scoring_self_hashed(
+        factory.get("bound_embedder"),
+        expected_keys={
+            "format",
+            "concrete_type",
+            "model",
+            "revision",
+            "authorized_checkpoint_sha256",
+            "checkpoint_bytes_rehashed_per_factory",
+            "dimension",
+            "device",
+            "local_files_only",
+            "trust_remote_code",
+            "network_calls_authorized",
+            "receipt_sha256",
+        },
+        label="resumable bound embedder receipt",
+    )
+    embedder_required = {
+        "format": "memory-condense-bound-mem0-bge-m3-v1",
+        "concrete_type": "mem0.embeddings.huggingface.HuggingFaceEmbedding",
+        "model": embedder_identity["model"],
+        "revision": embedder_identity["revision"],
+        "authorized_checkpoint_sha256": embedder_identity["checkpoint_sha256"],
+        "checkpoint_bytes_rehashed_per_factory": False,
+        "dimension": embedder_identity["dimension"],
+        "device": embedder_identity["device"],
+        "local_files_only": True,
+        "trust_remote_code": False,
+        "network_calls_authorized": 0,
+    }
+    for field, expected in embedder_required.items():
+        if embedder.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable bound embedder {field} mismatch", stage="scoring"
+            )
+    bm25 = _scoring_self_hashed(
+        factory.get("bound_bm25"),
+        expected_keys={
+            "format",
+            "model",
+            "revision",
+            "asset_tree_sha256",
+            "cache_root",
+            "file_count",
+            "local_files_only",
+            "network_calls_authorized",
+            "specific_model_path",
+            "retry_sleep_attempts",
+            "bound_store_roles",
+            "encoder_instances",
+            "distinct_encoder_instances",
+            "internal_lazy_download_path_reachable",
+            "receipt_sha256",
+        },
+        label="resumable bound BM25 receipt",
+    )
+    bm25_required = {
+        "format": "memory-condense-bound-mem0-bm25-v1",
+        "model": MEM0_BM25_MODEL,
+        "local_files_only": True,
+        "network_calls_authorized": 0,
+        "retry_sleep_attempts": 0,
+        "bound_store_roles": ["memory", "entity"],
+        "encoder_instances": 2,
+        "distinct_encoder_instances": True,
+        "internal_lazy_download_path_reachable": False,
+    }
+    for field, expected in bm25_required.items():
+        if bm25.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable bound BM25 {field} mismatch", stage="scoring"
+            )
+    _require_nonempty(bm25.get("revision"), "resumable BM25 revision")
+    _require_sha256(bm25.get("asset_tree_sha256"), "resumable BM25 asset tree")
+    _require_nonempty(bm25.get("cache_root"), "resumable BM25 cache root")
+    _require_nonempty(
+        bm25.get("specific_model_path"), "resumable BM25 specific model path"
+    )
+    _require_count(bm25.get("file_count"), "resumable BM25 file count", minimum=1)
+
+    transport = _scoring_exact_keys(
+        factory.get("transport"),
+        {
+            "kind",
+            "role",
+            "authorized",
+            "attempted",
+            "completed",
+            "failed",
+            "rejected",
+            "retries_authorized",
+            "provider_usage_status",
+            "provider_usage_records",
+            "provider_input_tokens",
+            "provider_output_tokens",
+            "provider_total_tokens",
+            "provider_latency_s",
+            "production_eligible",
+            "provider",
+            "model",
+            "revision",
+            "route_identity_sha256",
+            "gateway_url",
+            "sdk_retries",
+            "http_transport_retries",
+            "cap_boundary",
+            "external_http_attempts_certified",
+            "external_provider_persistence_certified",
+        },
+        "resumable terminal zero-call transport",
+    )
+    zero_transport_required = {
+        "kind": "local_transport_send_cap",
+        "role": "extraction",
+        "authorized": 0,
+        "attempted": 0,
+        "completed": 0,
+        "failed": 0,
+        "rejected": 0,
+        "retries_authorized": 0,
+        "provider_usage_status": "not_applicable_zero_authorized",
+        "provider_usage_records": 0,
+        "provider_input_tokens": 0,
+        "provider_output_tokens": 0,
+        "provider_total_tokens": 0,
+        "provider_latency_s": 0.0,
+        "production_eligible": True,
+        "provider": extraction_identity["provider"],
+        "model": extraction_identity["model"],
+        "revision": extraction_identity["revision"],
+        "sdk_retries": 0,
+        "http_transport_retries": 0,
+        "cap_boundary": "deny_before_provider_transport",
+        "external_http_attempts_certified": True,
+        "external_provider_persistence_certified": False,
+    }
+    for field, expected in zero_transport_required.items():
+        if transport.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable terminal transport {field} mismatch", stage="scoring"
+            )
+    for field in (
+        "authorized",
+        "attempted",
+        "completed",
+        "failed",
+        "rejected",
+        "retries_authorized",
+        "provider_usage_records",
+        "provider_input_tokens",
+        "provider_output_tokens",
+        "provider_total_tokens",
+        "sdk_retries",
+        "http_transport_retries",
+    ):
+        _require_count(
+            transport.get(field), f"resumable terminal transport {field}"
+        )
+    zero_latency = transport.get("provider_latency_s")
+    if (
+        isinstance(zero_latency, bool)
+        or not isinstance(zero_latency, (int, float))
+        or float(zero_latency) != 0.0
+    ):
+        raise Mem0ShardRunError(
+            "resumable terminal transport latency mismatch", stage="scoring"
+        )
+    _require_sha256(
+        transport.get("route_identity_sha256"),
+        "resumable terminal transport route identity",
+    )
+    _require_nonempty(
+        transport.get("gateway_url"), "resumable terminal transport gateway"
+    )
+    return factory
+
+
+def _verify_resumable_transport_closure(
+    value: Any,
+    *,
+    expected_transport: Mapping[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    closure = _scoring_self_hashed(
+        value,
+        expected_keys={
+            "format",
+            "segment_authorized_calls",
+            "transport_closed",
+            "budget_closed_exactly",
+            "provider_usage_complete",
+            "sdk_retries",
+            "http_transport_retries",
+            "transport_receipt",
+            "transport_receipt_sha256",
+            "receipt_sha256",
+        },
+        label=label,
+    )
+    transport = _strict_json(expected_transport)
+    assert isinstance(transport, dict)
+    authorized = _require_count(
+        transport.get("authorized"), f"{label}.transport.authorized"
+    )
+    required = {
+        "format": RESUMABLE_TRANSPORT_CLOSURE_FORMAT,
+        "segment_authorized_calls": authorized,
+        "transport_closed": True,
+        "budget_closed_exactly": True,
+        "provider_usage_complete": True,
+        "sdk_retries": 0,
+        "http_transport_retries": 0,
+        "transport_receipt": transport,
+        "transport_receipt_sha256": canonical_json_sha256(transport),
+    }
+    for field, expected in required.items():
+        if closure.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"{label} {field} mismatch", stage="scoring"
+            )
+    for field in (
+        "segment_authorized_calls",
+        "sdk_retries",
+        "http_transport_retries",
+    ):
+        _require_count(closure.get(field), f"{label}.{field}")
+    for field in (
+        "transport_closed",
+        "budget_closed_exactly",
+        "provider_usage_complete",
+    ):
+        if closure.get(field) is not True:
+            raise Mem0ShardRunError(
+                f"{label}.{field} is not an exact boolean", stage="scoring"
+            )
+    return closure
+
+
+def _verify_resumable_suspend_receipt(
+    value: Any, *, expected_transport: Mapping[str, Any]
+) -> dict[str, Any]:
+    receipt = _scoring_self_hashed(
+        value,
+        expected_keys={
+            "format",
+            "history_sqlite_closed",
+            "qdrant_local_collections_closed",
+            "qdrant_clients_closed",
+            "qdrant_local_registries_closed",
+            "transport_closed",
+            "transport_closure",
+            "transport_closure_sha256",
+            "delete_col_calls",
+            "owned_state_retained",
+            "owned_state_tree",
+            "namespace_persisted_memory_count",
+            "receipt_sha256",
+        },
+        label="resumable suspension receipt",
+    )
+    for field, expected in {
+        "format": RESUMABLE_SUSPEND_FORMAT,
+        "history_sqlite_closed": True,
+        "transport_closed": True,
+        "delete_col_calls": 0,
+        "owned_state_retained": True,
+    }.items():
+        if receipt.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable suspension {field} mismatch", stage="scoring"
+            )
+    for field in (
+        "qdrant_local_collections_closed",
+        "qdrant_clients_closed",
+        "qdrant_local_registries_closed",
+    ):
+        _require_count(receipt.get(field), f"resumable suspension {field}", minimum=1)
+    transport_closure = _verify_resumable_transport_closure(
+        receipt.get("transport_closure"),
+        expected_transport=expected_transport,
+        label="resumable suspension transport closure",
+    )
+    if receipt.get("transport_closure_sha256") != transport_closure["receipt_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable suspension transport-closure binding mismatch",
+            stage="scoring",
+        )
+    _require_count(
+        receipt.get("namespace_persisted_memory_count"),
+        "resumable suspension namespace persisted-memory count",
+    )
+    tree = _scoring_exact_keys(
+        receipt.get("owned_state_tree"),
+        {
+            "path_name",
+            "ownership_token_sha256",
+            "manifest",
+            "snapshot_manifest_sha256",
+            "snapshot_tree_sha256",
+            "file_count",
+            "total_bytes",
+        },
+        "resumable suspended state tree",
+    )
+    _require_nonempty(tree.get("path_name"), "resumable state path name")
+    token_sha = _require_sha256(
+        tree.get("ownership_token_sha256"), "resumable state ownership token"
+    )
+    manifest = tree.get("manifest")
+    if not isinstance(manifest, dict):
+        raise Mem0ShardRunError(
+            "resumable state manifest is invalid", stage="scoring"
+        )
+    manifest_sha = canonical_json_sha256(manifest)
+    if tree.get("snapshot_manifest_sha256") != manifest_sha:
+        raise Mem0ShardRunError(
+            "resumable state manifest digest mismatch", stage="scoring"
+        )
+    expected_tree_sha = canonical_json_sha256(
+        {"ownership_token_sha256": token_sha, "manifest_sha256": manifest_sha}
+    )
+    if tree.get("snapshot_tree_sha256") != expected_tree_sha:
+        raise Mem0ShardRunError(
+            "resumable state tree digest mismatch", stage="scoring"
+        )
+    if tree.get("file_count") != len(manifest):
+        raise Mem0ShardRunError(
+            "resumable state file count mismatch", stage="scoring"
+        )
+    expected_bytes = 0
+    for path, entry in manifest.items():
+        _require_nonempty(path, "resumable state manifest path")
+        if not isinstance(entry, dict) or entry.get("type") not in {
+            "file",
+            "directory",
+        }:
+            raise Mem0ShardRunError(
+                "resumable state manifest entry is invalid", stage="scoring"
+            )
+        if entry["type"] == "file":
+            if set(entry) != {"type", "bytes", "sha256"}:
+                raise Mem0ShardRunError(
+                    "resumable state file receipt fields changed", stage="scoring"
+                )
+            expected_bytes += _require_count(
+                entry.get("bytes"), "resumable state file bytes"
+            )
+            _require_sha256(entry.get("sha256"), "resumable state file digest")
+        elif set(entry) != {"type"}:
+            raise Mem0ShardRunError(
+                "resumable state directory receipt fields changed", stage="scoring"
+            )
+    if tree.get("total_bytes") != expected_bytes:
+        raise Mem0ShardRunError(
+            "resumable state byte count mismatch", stage="scoring"
+        )
+    return receipt
+
+
+def _verify_resumable_write_usage(
+    value: Any,
+    *,
+    expected_plan: Mapping[str, Any],
+    seal: Mapping[str, Any],
+    transport: Mapping[str, Any],
+    terminal_suspend: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify the complete cumulative write receipt and all nested authorities."""
+
+    usage = _scoring_self_hashed(
+        value,
+        expected_keys={
+            "format",
+            "plan_sha256",
+            "authorization_sha256",
+            "generation",
+            "committed_prefix",
+            "prior_write_usage_attestation_sha256",
+            "segment_authorization_receipt",
+            "segment_authorization_receipt_sha256",
+            "segment_write_activity_receipt",
+            "segment_write_activity_receipt_sha256",
+            "transport_closure_receipt_sha256",
+            "observed",
+            "observed_sha256",
+            "retained_transformer_token_state_bytes",
+            "receipt_sha256",
+        },
+        label="resumable write-usage attestation",
+    )
+    full_prefix = expected_plan["authorized_add_operations"]
+    seeded_prefix = transport["seeded_prefix"]
+    segment_calls = transport["segment_authorized"]
+    if segment_calls > 256:
+        raise Mem0ShardRunError(
+            "resumable write-usage segment exceeds the fixed 256-add cadence",
+            stage="scoring",
+        )
+    for field, expected in {
+        "format": RESUMABLE_WRITE_USAGE_FORMAT,
+        "plan_sha256": canonical_json_sha256(expected_plan),
+        "authorization_sha256": expected_plan["authorization_sha256"],
+        "generation": seal["generation"],
+        "committed_prefix": full_prefix,
+        "retained_transformer_token_state_bytes": 0,
+    }.items():
+        if usage.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable write-usage {field} mismatch", stage="scoring"
+            )
+    _require_count(
+        usage.get("generation"), "resumable write-usage generation"
+    )
+    _require_count(
+        usage.get("committed_prefix"),
+        "resumable write-usage committed prefix",
+        minimum=1,
+    )
+    _require_count(
+        usage.get("retained_transformer_token_state_bytes"),
+        "resumable write-usage retained transformer bytes",
+    )
+    prior_usage_sha = usage.get("prior_write_usage_attestation_sha256")
+    if seeded_prefix == 0:
+        if prior_usage_sha is not None:
+            raise Mem0ShardRunError(
+                "first write-usage segment claims a prior seal", stage="scoring"
+            )
+    else:
+        _require_sha256(
+            prior_usage_sha, "resumable write-usage prior attestation"
+        )
+
+    authorization = _scoring_self_hashed(
+        usage.get("segment_authorization_receipt"),
+        expected_keys={
+            "format",
+            "plan_sha256",
+            "authorization_sha256",
+            "journal_path_sha256",
+            "prefix_before",
+            "prefix_after",
+            "generation",
+            "prior_checkpoint_authority_sha256",
+            "authorized_provider_calls",
+            "authorized_add_operations",
+            "provider_retries",
+            "namespace",
+            "retained_transformer_token_state_bytes",
+            "live_launch_authority",
+            "live_launch_authority_sha256",
+            "receipt_sha256",
+        },
+        label="resumable one-use segment authorization",
+    )
+    if usage.get("segment_authorization_receipt_sha256") != authorization[
+        "receipt_sha256"
+    ]:
+        raise Mem0ShardRunError(
+            "resumable write-usage authorization binding mismatch",
+            stage="scoring",
+        )
+    _require_sha256(
+        authorization.get("journal_path_sha256"),
+        "resumable segment journal path identity",
+    )
+    _require_sha256(
+        authorization.get("prior_checkpoint_authority_sha256"),
+        "resumable segment prior checkpoint authority",
+    )
+    for field, expected in {
+        "format": RESUMABLE_SEGMENT_AUTHORIZATION_FORMAT,
+        "plan_sha256": canonical_json_sha256(expected_plan),
+        "authorization_sha256": expected_plan["authorization_sha256"],
+        "prefix_before": seeded_prefix,
+        "prefix_after": full_prefix,
+        "generation": seal["generation"],
+        "authorized_provider_calls": segment_calls,
+        "authorized_add_operations": segment_calls,
+        "provider_retries": 0,
+        "namespace": expected_plan["user_scope"],
+        "retained_transformer_token_state_bytes": 0,
+    }.items():
+        if authorization.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable segment authorization {field} mismatch",
+                stage="scoring",
+            )
+    for field, minimum in (
+        ("prefix_before", 0),
+        ("prefix_after", 1),
+        ("generation", 0),
+        ("authorized_provider_calls", 1),
+        ("authorized_add_operations", 1),
+        ("provider_retries", 0),
+        ("retained_transformer_token_state_bytes", 0),
+    ):
+        _require_count(
+            authorization.get(field),
+            f"resumable segment authorization {field}",
+            minimum=minimum,
+        )
+
+    launch = _scoring_exact_keys(
+        authorization.get("live_launch_authority"),
+        {
+            "format",
+            "preflight_sha256",
+            "launch_manifest_sha256",
+            "shard_launch_sha256",
+            "shard_launch_payload_sha256",
+            "plan_sha256",
+            "authorization_sha256",
+            "journal_path_sha256",
+            "sample_offset",
+            "namespace",
+            "namespace_sha256",
+            "mem0_policy_sha256",
+            "mem0_tool_implementation_sha256",
+            "mem0_environment_lock_sha256",
+            "retained_transformer_token_state_bytes",
+        },
+        "resumable live launch authority",
+    )
+    for field, expected in {
+        "format": RESUMABLE_LIVE_LAUNCH_AUTHORITY_FORMAT,
+        "plan_sha256": canonical_json_sha256(expected_plan),
+        "authorization_sha256": expected_plan["authorization_sha256"],
+        "journal_path_sha256": authorization["journal_path_sha256"],
+        "sample_offset": expected_plan["sample_offset"],
+        "namespace": expected_plan["user_scope"],
+        "namespace_sha256": expected_plan["user_scope_sha256"],
+        "mem0_policy_sha256": expected_plan["mem0_policy_sha256"],
+        "mem0_tool_implementation_sha256": expected_plan[
+            "mem0_tool_implementation_sha256"
+        ],
+        "mem0_environment_lock_sha256": expected_plan[
+            "mem0_environment_lock_sha256"
+        ],
+        "retained_transformer_token_state_bytes": 0,
+    }.items():
+        if launch.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable live launch {field} mismatch", stage="scoring"
+            )
+    _require_count(
+        launch.get("sample_offset"), "resumable live launch sample offset"
+    )
+    _require_count(
+        launch.get("retained_transformer_token_state_bytes"),
+        "resumable live launch retained transformer bytes",
+    )
+    for field in (
+        "preflight_sha256",
+        "launch_manifest_sha256",
+        "shard_launch_sha256",
+        "shard_launch_payload_sha256",
+    ):
+        _require_sha256(launch.get(field), f"resumable live launch {field}")
+    if authorization.get("live_launch_authority_sha256") != canonical_json_sha256(
+        launch
+    ):
+        raise Mem0ShardRunError(
+            "resumable live-launch authority digest mismatch", stage="scoring"
+        )
+
+    activity = _scoring_self_hashed(
+        usage.get("segment_write_activity_receipt"),
+        expected_keys={
+            "format",
+            "embedding_attempted",
+            "embedding_completed",
+            "embedding_failed",
+            "embedding_input_token_proxy",
+            "embedding_latency_s",
+            "storage_attempted",
+            "storage_completed",
+            "storage_failed",
+            "storage_latency_s",
+            "wrappers_installed",
+            "wrappers_restored",
+            "receipt_sha256",
+        },
+        label="resumable segment write activity",
+    )
+    if usage.get("segment_write_activity_receipt_sha256") != activity[
+        "receipt_sha256"
+    ]:
+        raise Mem0ShardRunError(
+            "resumable write-activity binding mismatch", stage="scoring"
+        )
+    if (
+        activity.get("format") != RESUMABLE_WRITE_ACTIVITY_FORMAT
+        or activity.get("wrappers_installed") is not True
+        or activity.get("wrappers_restored") is not True
+    ):
+        raise Mem0ShardRunError(
+            "resumable write-activity boundary mismatch", stage="scoring"
+        )
+    for kind in ("embedding", "storage"):
+        attempted = _require_count(
+            activity.get(f"{kind}_attempted"),
+            f"resumable {kind} writes attempted",
+        )
+        completed = _require_count(
+            activity.get(f"{kind}_completed"),
+            f"resumable {kind} writes completed",
+        )
+        failed = _require_count(
+            activity.get(f"{kind}_failed"),
+            f"resumable {kind} writes failed",
+        )
+        latency = activity.get(f"{kind}_latency_s")
+        if (
+            attempted != completed
+            or failed != 0
+            or isinstance(latency, bool)
+            or not isinstance(latency, (int, float))
+            or not math.isfinite(float(latency))
+            or float(latency) < 0.0
+        ):
+            raise Mem0ShardRunError(
+                f"resumable {kind} write activity did not close",
+                stage="scoring",
+            )
+    _require_count(
+        activity.get("embedding_input_token_proxy"),
+        "resumable embedding input-token proxy",
+    )
+
+    observed = _scoring_exact_keys(
+        usage.get("observed"),
+        {
+            "add_attempted",
+            "add_completed",
+            "add_failed",
+            "extraction_attempted",
+            "extraction_completed",
+            "extraction_failed",
+            "extraction_raw_message_token_proxy",
+            "extraction_provider_input_tokens",
+            "extraction_provider_output_tokens",
+            "extraction_usage_status",
+            "embedding_operations",
+            "embedding_input_token_proxy",
+            "returned_memory_count",
+            "persisted_memory_count",
+            "persisted_storage_bytes",
+            "add_latency_s",
+            "extraction_latency_s",
+            "embedding_latency_s",
+            "storage_latency_s",
+        },
+        "resumable observed write usage",
+    )
+    if usage.get("observed_sha256") != canonical_json_sha256(observed):
+        raise Mem0ShardRunError(
+            "resumable observed write-usage digest mismatch", stage="scoring"
+        )
+    for field, expected in {
+        "add_attempted": full_prefix,
+        "add_completed": full_prefix,
+        "add_failed": 0,
+        "extraction_attempted": full_prefix,
+        "extraction_completed": full_prefix,
+        "extraction_failed": 0,
+        "extraction_provider_input_tokens": transport[
+            "provider_input_tokens"
+        ],
+        "extraction_provider_output_tokens": transport[
+            "provider_output_tokens"
+        ],
+        "extraction_usage_status": "provider_reported_exact",
+        "persisted_memory_count": terminal_suspend[
+            "namespace_persisted_memory_count"
+        ],
+    }.items():
+        if observed.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable observed write usage {field} mismatch",
+                stage="scoring",
+            )
+    for field in (
+        "extraction_raw_message_token_proxy",
+        "embedding_operations",
+        "embedding_input_token_proxy",
+        "returned_memory_count",
+        "persisted_memory_count",
+        "persisted_storage_bytes",
+    ):
+        _require_count(observed.get(field), f"resumable observed {field}")
+    if (
+        observed["persisted_memory_count"] > observed["returned_memory_count"]
+        or observed["embedding_operations"] < activity["embedding_completed"]
+        or observed["embedding_input_token_proxy"]
+        < activity["embedding_input_token_proxy"]
+    ):
+        raise Mem0ShardRunError(
+            "resumable observed write population is inconsistent",
+            stage="scoring",
+        )
+    for field in (
+        "add_latency_s",
+        "extraction_latency_s",
+        "embedding_latency_s",
+        "storage_latency_s",
+    ):
+        latency = observed.get(field)
+        if (
+            isinstance(latency, bool)
+            or not isinstance(latency, (int, float))
+            or not math.isfinite(float(latency))
+            or float(latency) < 0.0
+        ):
+            raise Mem0ShardRunError(
+                f"resumable observed {field} is invalid", stage="scoring"
+            )
+    if float(observed["extraction_latency_s"]) != float(
+        transport["provider_latency_s"]
+    ):
+        raise Mem0ShardRunError(
+            "resumable extraction latency differs from transport",
+            stage="scoring",
+        )
+
+    ingestion_closure = _verify_resumable_transport_closure(
+        {
+            "format": RESUMABLE_TRANSPORT_CLOSURE_FORMAT,
+            "segment_authorized_calls": segment_calls,
+            "transport_closed": True,
+            "budget_closed_exactly": True,
+            "provider_usage_complete": True,
+            "sdk_retries": 0,
+            "http_transport_retries": 0,
+            "transport_receipt": transport["segment_receipt"],
+            "transport_receipt_sha256": transport[
+                "segment_receipt_sha256"
+            ],
+            "receipt_sha256": usage["transport_closure_receipt_sha256"],
+        },
+        expected_transport=transport["segment_receipt"],
+        label="reconstructed ingestion transport closure",
+    )
+    if ingestion_closure["receipt_sha256"] != seal[
+        "transport_closure_receipt_sha256"
+    ]:
+        raise Mem0ShardRunError(
+            "resumable seal transport-closure binding mismatch", stage="scoring"
+        )
+    return usage
+
+
+def _expected_resumable_plan(
+    shard: RawStressShard, authorization: ScoringStageAuthorization
+) -> tuple[dict[str, Any], str]:
+    exact_adds = shard.add_counts.add_requests
+    retrieval_authorization = RetrievalStageAuthorization(
+        sample_offset=shard.sample_offset,
+        sample_sha256=shard.sample_sha256,
+        raw_history_bundle_sha256=shard.raw_history_bundle_sha256,
+        question_ids=shard.question_ids,
+        authorized_add_operations=exact_adds,
+        authorized_extraction_calls=exact_adds,
+        authorized_search_operations=len(shard.question_ids),
+        source_validation_policy_sha256=(
+            authorization.source_validation_policy_sha256
+        ),
+        source_implementation_sha256=authorization.source_implementation_sha256,
+        source_environment_lock_sha256=(
+            authorization.source_environment_lock_sha256
+        ),
+        mem0_policy_sha256=authorization.mem0_policy_sha256,
+        mem0_tool_implementation_sha256=(
+            authorization.mem0_tool_implementation_sha256
+        ),
+        mem0_environment_lock_sha256=(
+            authorization.mem0_environment_lock_sha256
+        ),
+        mem0_stable_config_sha256=authorization.mem0_stable_config_sha256,
+        source_evaluation_identity=_strict_json(
+            authorization.source_evaluation_identity
+        ),
+        mem0_stable_payload=_strict_json(authorization.mem0_stable_payload),
+        extraction_model_identity=_strict_json(
+            authorization.extraction_model_identity
+        ),
+        extraction_model_identity_sha256=(
+            authorization.extraction_model_identity_sha256
+        ),
+        embedder_model_identity=_strict_json(authorization.embedder_model_identity),
+        embedder_model_identity_sha256=(
+            authorization.embedder_model_identity_sha256
+        ),
+        mem0_provider_retries=0,
+    )
+    retrieval_authorization_sha256 = canonical_json_sha256(
+        asdict(retrieval_authorization)
+    )
+    corpus = build_adapter_prepared_corpus(shard)
+    ordered: list[str] = []
+    for batch in corpus.batches:
+        ref = batch.ref
+        ordered.append(
+            canonical_json_sha256(
+                {
+                    "source_ref": {
+                        "sample_id": ref.sample_id,
+                        "source": ref.source,
+                        "session": ref.session,
+                        "session_index": ref.session_index,
+                        "original_session_index": ref.original_session_index,
+                        "batch_index": ref.batch_index,
+                        "date": ref.date,
+                        "turn_start": ref.turn_start,
+                        "turn_count": ref.turn_count,
+                        "roles": list(ref.roles),
+                    },
+                    "messages": [list(message) for message in batch.messages],
+                }
+            )
+        )
+    scope = f"longmemeval:resumable:{retrieval_authorization_sha256[:32]}"
+    plan = {
+        "format": "memory-condense-mem0-resume-plan-v1",
+        "authorization_sha256": retrieval_authorization_sha256,
+        "mem0_policy_sha256": authorization.mem0_policy_sha256,
+        "source_validation_policy_sha256": (
+            authorization.source_validation_policy_sha256
+        ),
+        "source_implementation_sha256": authorization.source_implementation_sha256,
+        "source_environment_lock_sha256": (
+            authorization.source_environment_lock_sha256
+        ),
+        "mem0_tool_implementation_sha256": (
+            authorization.mem0_tool_implementation_sha256
+        ),
+        "mem0_environment_lock_sha256": (
+            authorization.mem0_environment_lock_sha256
+        ),
+        "sample_offset": shard.sample_offset,
+        "sample_sha256": shard.sample_sha256,
+        "raw_history_bundle_sha256": shard.raw_history_bundle_sha256,
+        "ordered_batch_sha256s": ordered,
+        "ordered_batches_sha256": canonical_json_sha256(ordered),
+        "authorized_add_operations": exact_adds,
+        "authorized_extraction_calls": exact_adds,
+        "authorized_search_operations": len(shard.question_ids),
+        "user_scope": scope,
+        "user_scope_sha256": hashlib.sha256(scope.encode("utf-8")).hexdigest(),
+    }
+    return plan, canonical_json_sha256(plan)
+
+
+def _verify_resumable_execution_and_closure(
+    *,
+    artifact: Mapping[str, Any],
+    shard: RawStressShard,
+    authorization: ScoringStageAuthorization,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    exact_adds = shard.add_counts.add_requests
+    expected_plan, expected_plan_sha = _expected_resumable_plan(
+        shard, authorization
+    )
+    execution = _scoring_self_hashed(
+        artifact.get("execution_binding"),
+        expected_keys={
+            "kind",
+            "comparison_certified",
+            "external_http_attempts_certified",
+            "external_provider_persistence_certified",
+            "authorization_sha256",
+            "plan_sha256",
+            "checkpoint_authority_sha256",
+            "full_prefix",
+            "active_commit_entry_sha256",
+            "logical_meter_receipt_sha256",
+            "transport_receipt_sha256",
+            "transport_closure_receipt_sha256",
+            "write_usage_attestation_sha256",
+            "source_implementation_sha256",
+            "source_environment_lock_sha256",
+            "mem0_tool_implementation_sha256",
+            "mem0_environment_lock_sha256",
+            "terminal_factory_receipt_sha256",
+            "terminal_suspend_receipt_sha256",
+            "receipt_sha256",
+        },
+        label="resumable execution binding",
+    )
+    execution_required = {
+        "kind": RESUMABLE_EXECUTION_BINDING_KIND,
+        "comparison_certified": True,
+        "external_http_attempts_certified": True,
+        "external_provider_persistence_certified": False,
+        "authorization_sha256": expected_plan["authorization_sha256"],
+        "plan_sha256": expected_plan_sha,
+        "full_prefix": exact_adds,
+        "source_implementation_sha256": authorization.source_implementation_sha256,
+        "source_environment_lock_sha256": (
+            authorization.source_environment_lock_sha256
+        ),
+        "mem0_tool_implementation_sha256": (
+            authorization.mem0_tool_implementation_sha256
+        ),
+        "mem0_environment_lock_sha256": (
+            authorization.mem0_environment_lock_sha256
+        ),
+    }
+    for field, expected in execution_required.items():
+        if execution.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable execution {field} mismatch", stage="scoring"
+            )
+    _require_count(
+        execution.get("full_prefix"), "resumable execution full prefix", minimum=1
+    )
+    for field in (
+        "comparison_certified",
+        "external_http_attempts_certified",
+    ):
+        if execution.get(field) is not True:
+            raise Mem0ShardRunError(
+                f"resumable execution {field} is not an exact boolean",
+                stage="scoring",
+            )
+    if execution.get("external_provider_persistence_certified") is not False:
+        raise Mem0ShardRunError(
+            "resumable execution persistence flag is not an exact boolean",
+            stage="scoring",
+        )
+    for field in (
+        "checkpoint_authority_sha256",
+        "active_commit_entry_sha256",
+        "logical_meter_receipt_sha256",
+        "transport_receipt_sha256",
+        "transport_closure_receipt_sha256",
+        "write_usage_attestation_sha256",
+        "terminal_factory_receipt_sha256",
+        "terminal_suspend_receipt_sha256",
+    ):
+        _require_sha256(execution.get(field), f"resumable execution {field}")
+
+    closure = _scoring_exact_keys(
+        artifact.get("resumable_closure"),
+        {
+            "plan_sha256",
+            "resume_plan",
+            "checkpoint_authority_sha256",
+            "active_commit_entry_sha256",
+            "journal_tail_entry_sha256",
+            "journal_chain_sha256",
+            "commit_population_sha256",
+            "full_prefix_seal",
+            "logical_meter_receipt",
+            "transport_receipt",
+            "transport_closure_receipt_sha256",
+            "write_usage_attestation",
+            "write_usage_attestation_sha256",
+            "factory_receipt",
+            "suspend_receipt",
+        },
+        "resumable closure",
+    )
+    if closure.get("resume_plan") != expected_plan:
+        raise Mem0ShardRunError(
+            "resumable plan differs from locked shard", stage="scoring"
+        )
+    for field, expected in {
+        "plan_sha256": expected_plan_sha,
+        "checkpoint_authority_sha256": execution["checkpoint_authority_sha256"],
+        "active_commit_entry_sha256": execution["active_commit_entry_sha256"],
+    }.items():
+        if closure.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable closure {field} mismatch", stage="scoring"
+            )
+    for field in (
+        "journal_tail_entry_sha256",
+        "journal_chain_sha256",
+        "commit_population_sha256",
+    ):
+        _require_sha256(closure.get(field), f"resumable closure {field}")
+
+    seal = _scoring_exact_keys(
+        closure.get("full_prefix_seal"),
+        {
+            "format",
+            "kind",
+            "sequence",
+            "previous_entry_sha256",
+            "generation",
+            "committed_prefix",
+            "active_commit_entry_sha256",
+            "snapshot_path",
+            "snapshot_manifest_sha256",
+            "snapshot_tree_sha256",
+            "ownership_token_sha256",
+            "handles_closed_receipt_sha256",
+            "transport_closure_receipt_sha256",
+            "write_usage_attestation",
+            "write_usage_attestation_sha256",
+            "snapshot_authority_sha256",
+            "snapshot_authority_artifact_sha256",
+            "snapshot_receipt_sha256",
+            "rehydration_sha256",
+            "cumulative_extraction_attempted",
+            "cumulative_extraction_completed",
+            "cumulative_http_attempted",
+            "cumulative_http_completed",
+            "failures",
+            "rejections",
+            "entry_sha256",
+        },
+        "resumable full-prefix seal",
+    )
+    seal_digest = seal.get("entry_sha256")
+    _require_sha256(seal_digest, "resumable prefix-seal entry_sha256")
+    seal_body = dict(seal)
+    del seal_body["entry_sha256"]
+    if canonical_json_sha256(seal_body) != seal_digest:
+        raise Mem0ShardRunError(
+            "resumable prefix-seal entry digest mismatch", stage="scoring"
+        )
+    seal_required = {
+        "format": "memory-condense-mem0-resume-journal-v2",
+        "kind": "prefix_sealed",
+        "committed_prefix": exact_adds,
+        "active_commit_entry_sha256": execution["active_commit_entry_sha256"],
+        "previous_entry_sha256": execution["active_commit_entry_sha256"],
+        "snapshot_authority_sha256": execution[
+            "checkpoint_authority_sha256"
+        ],
+        "cumulative_extraction_attempted": exact_adds,
+        "cumulative_extraction_completed": exact_adds,
+        "cumulative_http_attempted": exact_adds,
+        "cumulative_http_completed": exact_adds,
+        "failures": 0,
+        "rejections": 0,
+    }
+    for field, expected in seal_required.items():
+        if seal.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable full-prefix seal {field} mismatch", stage="scoring"
+            )
+    _require_count(seal.get("sequence"), "resumable prefix-seal sequence", minimum=1)
+    _require_count(seal.get("generation"), "resumable prefix-seal generation")
+    for field, minimum in (
+        ("committed_prefix", 1),
+        ("cumulative_extraction_attempted", 1),
+        ("cumulative_extraction_completed", 1),
+        ("cumulative_http_attempted", 1),
+        ("cumulative_http_completed", 1),
+        ("failures", 0),
+        ("rejections", 0),
+    ):
+        _require_count(
+            seal.get(field), f"resumable prefix-seal {field}", minimum=minimum
+        )
+    _require_nonempty(seal.get("snapshot_path"), "resumable snapshot path")
+    for field in (
+        "snapshot_manifest_sha256",
+        "snapshot_tree_sha256",
+        "ownership_token_sha256",
+        "handles_closed_receipt_sha256",
+        "transport_closure_receipt_sha256",
+        "write_usage_attestation_sha256",
+        "snapshot_authority_artifact_sha256",
+        "snapshot_receipt_sha256",
+        "rehydration_sha256",
+    ):
+        _require_sha256(seal.get(field), f"resumable prefix-seal {field}")
+    if closure.get("journal_tail_entry_sha256") != seal_digest:
+        raise Mem0ShardRunError(
+            "resumable closure tail is not its full-prefix seal", stage="scoring"
+        )
+
+    extraction_identity = _strict_json(authorization.extraction_model_identity)
+    embedder_identity = _strict_json(authorization.embedder_model_identity)
+    assert isinstance(extraction_identity, dict)
+    assert isinstance(embedder_identity, dict)
+    logical = _verify_resumable_counter_receipt(
+        closure.get("logical_meter_receipt"),
+        exact_adds=exact_adds,
+        logical=True,
+        extraction_identity=extraction_identity,
+    )
+    transport = _verify_resumable_counter_receipt(
+        closure.get("transport_receipt"),
+        exact_adds=exact_adds,
+        logical=False,
+        extraction_identity=extraction_identity,
+    )
+    if canonical_json_sha256(logical) != execution["logical_meter_receipt_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable logical receipt binding mismatch", stage="scoring"
+        )
+    if canonical_json_sha256(transport) != execution["transport_receipt_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable HTTP receipt binding mismatch", stage="scoring"
+        )
+    factory = _verify_resumable_factory_receipt(
+        closure.get("factory_receipt"),
+        exact_adds=exact_adds,
+        extraction_identity=extraction_identity,
+        embedder_identity=embedder_identity,
+    )
+    suspend = _verify_resumable_suspend_receipt(
+        closure.get("suspend_receipt"), expected_transport=factory["transport"]
+    )
+    write_usage = _verify_resumable_write_usage(
+        closure.get("write_usage_attestation"),
+        expected_plan=expected_plan,
+        seal=seal,
+        transport=transport,
+        terminal_suspend=suspend,
+    )
+    if (
+        artifact.get("write_usage_attestation") != write_usage
+        or seal.get("write_usage_attestation") != write_usage
+        or closure.get("write_usage_attestation_sha256")
+        != write_usage["receipt_sha256"]
+        or seal.get("write_usage_attestation_sha256")
+        != write_usage["receipt_sha256"]
+        or execution.get("write_usage_attestation_sha256")
+        != write_usage["receipt_sha256"]
+        or closure.get("transport_closure_receipt_sha256")
+        != write_usage["transport_closure_receipt_sha256"]
+        or seal.get("transport_closure_receipt_sha256")
+        != write_usage["transport_closure_receipt_sha256"]
+        or execution.get("transport_closure_receipt_sha256")
+        != write_usage["transport_closure_receipt_sha256"]
+    ):
+        raise Mem0ShardRunError(
+            "resumable write-usage receipt chain mismatch", stage="scoring"
+        )
+    if factory["receipt_sha256"] != execution["terminal_factory_receipt_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable factory execution binding mismatch", stage="scoring"
+        )
+    if suspend["receipt_sha256"] != execution["terminal_suspend_receipt_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable suspension execution binding mismatch", stage="scoring"
+        )
+    if factory["user_scope_sha256"] != expected_plan["user_scope_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable terminal factory scope mismatch", stage="scoring"
+        )
+    return execution, closure
+
+
+def _verify_resumable_terminal_payloads(
+    *,
+    artifact: Mapping[str, Any],
+    trace: Mapping[str, Any],
+    execution: Mapping[str, Any],
+    closure: Mapping[str, Any],
+    shard: RawStressShard,
+    authorization: ScoringStageAuthorization,
+    environment_lock: Mapping[str, Any],
+) -> None:
+    terminal = _scoring_exact_keys(
+        artifact.get("resumable_terminal"),
+        {
+            "terminal_stage_file_sha256",
+            "stage_result_sha256",
+            "stage_trace_sha256",
+            "checkpoint_authority_sha256",
+            "active_state_removed_before_publication",
+            "full_checkpoint_retained_until_publication",
+        },
+        "resumable terminal binding",
+    )
+    for field in (
+        "terminal_stage_file_sha256",
+        "stage_result_sha256",
+        "stage_trace_sha256",
+        "checkpoint_authority_sha256",
+    ):
+        _require_sha256(terminal.get(field), f"resumable terminal {field}")
+    if (
+        terminal["checkpoint_authority_sha256"]
+        != execution["checkpoint_authority_sha256"]
+        or terminal.get("active_state_removed_before_publication") is not True
+        or terminal.get("full_checkpoint_retained_until_publication") is not True
+    ):
+        raise Mem0ShardRunError(
+            "resumable terminal publication proof mismatch", stage="scoring"
+        )
+
+    trace_row = _scoring_exact_keys(
+        trace,
+        {
+            "format",
+            "status",
+            "certification_status",
+            "comparison_certified",
+            "execution_binding",
+            "stage",
+            "sample_offset",
+            "sample_id",
+            "sample_sha256",
+            "events",
+            "cleanup",
+            "environment_lock",
+            "elapsed_s",
+            "resumable_terminal_stage_file_sha256",
+        },
+        "resumable retrieval trace",
+    )
+    for field, expected in {
+        "format": RETRIEVAL_TRACE_FORMAT,
+        "status": "complete",
+        "certification_status": RESUMABLE_RETRIEVAL_CERTIFICATION,
+        "comparison_certified": True,
+        "execution_binding": dict(execution),
+        "stage": "retrieval",
+        "sample_offset": shard.sample_offset,
+        "sample_id": shard.parsed_sample.sample_id,
+        "sample_sha256": shard.sample_sha256,
+        "environment_lock": dict(environment_lock),
+        "resumable_terminal_stage_file_sha256": terminal[
+            "terminal_stage_file_sha256"
+        ],
+    }.items():
+        if trace_row.get(field) != expected:
+            raise Mem0ShardRunError(
+                f"resumable retrieval trace {field} mismatch", stage="scoring"
+            )
+    elapsed = trace_row.get("elapsed_s")
+    if (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(float(elapsed))
+        or float(elapsed) < 0.0
+    ):
+        raise Mem0ShardRunError(
+            "resumable retrieval trace elapsed time is invalid", stage="scoring"
+        )
+    cleanup = _scoring_exact_keys(
+        trace_row.get("cleanup"),
+        {
+            "attempted",
+            "completed",
+            "state_absent_before",
+            "state_absent_after",
+            "active_scope_cleared",
+            "adapter_closed",
+            "ledger_empty",
+            "registered_scopes_empty",
+            "scope_protocol_empty",
+            "backend_closed_or_cleared",
+            "owned_state_path_absent",
+            "extraction_meter_restore_attempted",
+            "extraction_meter_restored_before_cleanup",
+            "resumable_zero_call_search",
+            "terminal_stage_retained_until_publication",
+            "full_checkpoint_retained_until_publication",
+            "persisted_request_token_state",
+            "retained_request_token_state_bytes",
+            "request_token_state_evidence_kind",
+            "external_provider_persistence_certified",
+            "environment_lock",
+        },
+        "resumable retrieval cleanup",
+    )
+    cleanup_required = {
+        "attempted": True,
+        "completed": True,
+        "state_absent_before": False,
+        "state_absent_after": True,
+        "active_scope_cleared": True,
+        "adapter_closed": True,
+        "ledger_empty": True,
+        "registered_scopes_empty": True,
+        "scope_protocol_empty": True,
+        "backend_closed_or_cleared": True,
+        "owned_state_path_absent": True,
+        "extraction_meter_restore_attempted": False,
+        "extraction_meter_restored_before_cleanup": True,
+        "resumable_zero_call_search": True,
+        "terminal_stage_retained_until_publication": True,
+        "full_checkpoint_retained_until_publication": True,
+        "persisted_request_token_state": False,
+        "retained_request_token_state_bytes": 0,
+        "request_token_state_evidence_kind": (
+            "local_injected_request_token_state_contract"
+        ),
+        "external_provider_persistence_certified": False,
+        "environment_lock": dict(environment_lock),
+    }
+    if cleanup != cleanup_required:
+        raise Mem0ShardRunError(
+            "resumable retrieval cleanup proof mismatch", stage="scoring"
+        )
+
+    events = trace_row.get("events")
+    searches = len(shard.question_ids)
+    if not isinstance(events, list) or len(events) != searches + 3:
+        raise Mem0ShardRunError(
+            "resumable retrieval trace event population mismatch", stage="scoring"
+        )
+    if [row.get("sequence") for row in events if isinstance(row, dict)] != list(
+        range(1, len(events) + 1)
+    ):
+        raise Mem0ShardRunError(
+            "resumable retrieval trace event sequence mismatch", stage="scoring"
+        )
+    first = events[0]
+    if first != {
+        "sequence": 1,
+        "event": "full_prefix_checkpoint_verified",
+        "checkpoint_authority_sha256": execution[
+            "checkpoint_authority_sha256"
+        ],
+    }:
+        raise Mem0ShardRunError(
+            "resumable retrieval trace checkpoint event mismatch", stage="scoring"
+        )
+    search_events: list[dict[str, Any]] = []
+    retrieval_rows = artifact.get("retrieval_rows")
+    assert isinstance(retrieval_rows, list)
+    for index, (event, question_id, retrieval_row) in enumerate(
+        zip(
+            events[1 : searches + 1],
+            shard.question_ids,
+            retrieval_rows,
+            strict=True,
+        ),
+        start=1,
+    ):
+        expected_event = {
+            "sequence": index + 1,
+            "event": "search_complete",
+            "question_id": question_id,
+            "query_sha256": hashlib.sha256(
+                retrieval_row["query"].encode("utf-8")
+            ).hexdigest(),
+            "raw_memory_count": retrieval_row["raw_memory_count"],
+            "raw_pool_sha256": retrieval_row["raw_pool_sha256"],
+            "retrieval_row_sha256": retrieval_row["retrieval_row_sha256"],
+        }
+        if event != expected_event:
+            raise Mem0ShardRunError(
+                "resumable retrieval trace search event mismatch", stage="scoring"
+            )
+        search_events.append(
+            {
+                "sequence": index,
+                "question_id": question_id,
+                "query_sha256": expected_event["query_sha256"],
+                "raw_memory_count": expected_event["raw_memory_count"],
+                "raw_pool_sha256": expected_event["raw_pool_sha256"],
+                "retrieval_row_sha256": expected_event["retrieval_row_sha256"],
+            }
+        )
+    if events[-2] != {
+        "sequence": searches + 2,
+        "event": "terminal_stage_sealed",
+        "terminal_result_sha256": terminal["stage_result_sha256"],
+        "terminal_trace_sha256": terminal["stage_trace_sha256"],
+    } or events[-1] != {
+        "sequence": searches + 3,
+        "event": "active_state_removed_with_checkpoint_retained",
+    }:
+        raise Mem0ShardRunError(
+            "resumable terminal trace tail mismatch", stage="scoring"
+        )
+
+    stage_result = dict(artifact)
+    for field in (
+        "content_sha256",
+        "retrieval_trace",
+        "environment_lock",
+        "resumable_terminal",
+    ):
+        stage_result.pop(field, None)
+    stage_result["format"] = "memory-condense-mem0-resumable-terminal-result-v2"
+    if canonical_json_sha256(stage_result) != terminal["stage_result_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable terminal result reconstruction mismatch", stage="scoring"
+        )
+    suspend = closure["suspend_receipt"]
+    stage_trace = {
+        "format": "memory-condense-mem0-resumable-terminal-trace-v2",
+        "status": "search_staged",
+        "sample_offset": shard.sample_offset,
+        "sample_id": shard.parsed_sample.sample_id,
+        "sample_sha256": shard.sample_sha256,
+        "plan_sha256": execution["plan_sha256"],
+        "checkpoint_authority_sha256": execution[
+            "checkpoint_authority_sha256"
+        ],
+        "events": search_events,
+        "completed_search_operations": searches,
+        "extraction_transport_calls": 0,
+        "handles_closed_receipt_sha256": suspend["receipt_sha256"],
+        "checkpoint_retained": True,
+        "transport_closure_receipt_sha256": closure[
+            "transport_closure_receipt_sha256"
+        ],
+        "write_usage_attestation_sha256": closure[
+            "write_usage_attestation_sha256"
+        ],
+    }
+    if canonical_json_sha256(stage_trace) != terminal["stage_trace_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable terminal trace reconstruction mismatch", stage="scoring"
+        )
+    stage = {
+        "format": "memory-condense-mem0-terminal-search-v2",
+        "plan_sha256": execution["plan_sha256"],
+        "authorization_sha256": execution["authorization_sha256"],
+        "committed_prefix": shard.add_counts.add_requests,
+        "full_checkpoint_authority_sha256": execution[
+            "checkpoint_authority_sha256"
+        ],
+        "completed_search_operations": searches,
+        "extraction_calls_closed": True,
+        "provider_retries": 0,
+        "transport_closure_receipt_sha256": closure[
+            "transport_closure_receipt_sha256"
+        ],
+        "write_usage_attestation_sha256": closure[
+            "write_usage_attestation_sha256"
+        ],
+        "terminal_result_sha256": terminal["stage_result_sha256"],
+        "terminal_trace_sha256": terminal["stage_trace_sha256"],
+        "result": stage_result,
+        "trace": stage_trace,
+    }
+    stage_file_sha = hashlib.sha256(_canonical_bytes(stage) + b"\n").hexdigest()
+    if stage_file_sha != terminal["terminal_stage_file_sha256"]:
+        raise Mem0ShardRunError(
+            "resumable terminal staging file digest mismatch", stage="scoring"
+        )
+
+
 def _verify_retrieval_artifact(
     *,
     artifact_path: Path,
@@ -2328,12 +4254,56 @@ def _verify_retrieval_artifact(
     if file_digest != authorization.retrieval_artifact_sha256:
         raise Mem0ShardRunError("retrieval artifact file digest mismatch", stage="scoring")
     _verify_content_sha(artifact, label="retrieval artifact")
+    certification_status = artifact.get("certification_status")
+    resumable_production = (
+        certification_status == RESUMABLE_RETRIEVAL_CERTIFICATION
+    )
+    if certification_status not in {
+        "injected_nonproduction",
+        RESUMABLE_RETRIEVAL_CERTIFICATION,
+    }:
+        raise Mem0ShardRunError(
+            "retrieval artifact certification status is unsupported",
+            stage="scoring",
+        )
+    if resumable_production:
+        _scoring_exact_keys(
+            artifact,
+            {
+                "format",
+                "status",
+                "certification_status",
+                "comparison_certified",
+                "execution_binding",
+                "sample_offset",
+                "sample_id",
+                "sample_sha256",
+                "raw_history_bundle_sha256",
+                "history_sample_ids_sha256",
+                "question_ids",
+                "question_ids_sha256",
+                "identity",
+                "protocol",
+                "raw_input_receipt",
+                "ingestion_receipt",
+                "resumable_closure",
+                "search_receipt",
+                "mem0_usage",
+                "write_usage_attestation",
+                "provenance",
+                "retrieval_rows",
+                "retrieval_trace",
+                "environment_lock",
+                "resumable_terminal",
+                "content_sha256",
+            },
+            "resumable retrieval artifact",
+        )
     required = {
         "format": RETRIEVAL_ARTIFACT_FORMAT,
         "status": "complete",
-        "certification_status": "injected_nonproduction",
-        "comparison_certified": False,
-        "execution_binding": _execution_binding_receipt(None),
+        "certification_status": certification_status,
+        "comparison_certified": resumable_production,
         "sample_offset": shard.sample_offset,
         "sample_id": shard.parsed_sample.sample_id,
         "sample_sha256": shard.sample_sha256,
@@ -2345,9 +4315,45 @@ def _verify_retrieval_artifact(
             raise Mem0ShardRunError(
                 f"retrieval artifact {field} mismatch", stage="scoring"
             )
+    resumable_execution: dict[str, Any] | None = None
+    resumable_closure: dict[str, Any] | None = None
+    if resumable_production:
+        resumable_execution, resumable_closure = (
+            _verify_resumable_execution_and_closure(
+                artifact=artifact,
+                shard=shard,
+                authorization=authorization,
+            )
+        )
+    elif artifact.get("execution_binding") != _execution_binding_receipt(None):
+        raise Mem0ShardRunError(
+            "retrieval artifact execution_binding mismatch", stage="scoring"
+        )
     identity = artifact.get("identity")
     if not isinstance(identity, dict):
         raise Mem0ShardRunError("retrieval artifact omitted identity", stage="scoring")
+    if resumable_production:
+        _scoring_exact_keys(
+            identity,
+            {
+                "source_validation_policy_sha256",
+                "source_implementation_sha256",
+                "source_environment_lock_sha256",
+                "mem0_policy_sha256",
+                "mem0_tool_implementation_sha256",
+                "mem0_environment_lock_sha256",
+                "mem0_stable_config_sha256",
+                "extraction_model_identity",
+                "extraction_model_identity_sha256",
+                "embedder_model_identity",
+                "embedder_model_identity_sha256",
+                "runtime_model_identity_probe",
+                "source_evaluation_identity",
+                "source_evaluation_identity_sha256",
+                "runtime_identity",
+            },
+            "resumable retrieval identity",
+        )
     identity_expected = {
         "source_validation_policy_sha256": authorization.source_validation_policy_sha256,
         "source_implementation_sha256": authorization.source_implementation_sha256,
@@ -2380,18 +4386,33 @@ def _verify_retrieval_artifact(
             raise Mem0ShardRunError(
                 f"retrieval artifact identity {field} mismatch", stage="scoring"
             )
-    if identity.get("runtime_model_identity_probe") != {
-        "kind": "unavailable_injected_nonproduction",
-        "extraction_model_identity_sha256": (
-            authorization.extraction_model_identity_sha256
-        ),
-        "embedder_model_identity_sha256": (
-            authorization.embedder_model_identity_sha256
-        ),
-        "before_match": False,
-        "after_match": False,
-        "comparison_certified": False,
-    }:
+    if resumable_production:
+        assert resumable_closure is not None
+        factory_receipt = resumable_closure["factory_receipt"]
+        expected_runtime_probe = {
+            "kind": "exact_resumable_factory_bound",
+            "bound_embedder_receipt_sha256": factory_receipt[
+                "bound_embedder"
+            ]["receipt_sha256"],
+            "bound_bm25_receipt_sha256": factory_receipt["bound_bm25"][
+                "receipt_sha256"
+            ],
+            "comparison_certified": True,
+        }
+    else:
+        expected_runtime_probe = {
+            "kind": "unavailable_injected_nonproduction",
+            "extraction_model_identity_sha256": (
+                authorization.extraction_model_identity_sha256
+            ),
+            "embedder_model_identity_sha256": (
+                authorization.embedder_model_identity_sha256
+            ),
+            "before_match": False,
+            "after_match": False,
+            "comparison_certified": False,
+        }
+    if identity.get("runtime_model_identity_probe") != expected_runtime_probe:
         raise Mem0ShardRunError(
             "retrieval runtime model-identity probe mismatch", stage="scoring"
         )
@@ -2483,12 +4504,245 @@ def _verify_retrieval_artifact(
         != "local_injected_request_token_state_contract"
         or ingestion_receipt.get("external_provider_persistence_certified")
         is not False
-        or ingestion_receipt.get("comparison_certified") is not False
+        or ingestion_receipt.get("comparison_certified") is not resumable_production
     ):
         raise Mem0ShardRunError(
             "retrieval ingestion request-token-state proof mismatch",
             stage="scoring",
         )
+    if resumable_production:
+        assert resumable_closure is not None
+        _scoring_exact_keys(
+            environment_lock,
+            {
+                "filename",
+                "authorized_sha256",
+                "sha256_before",
+                "sha256_after",
+                "unchanged",
+            },
+            "resumable environment-lock receipt",
+        )
+        protocol = _scoring_exact_keys(
+            artifact.get("protocol"),
+            {
+                "input_order",
+                "official_longmemeval_protocol",
+                "official_search_protocol",
+                "top_k",
+                "threshold",
+                "rendering_mode",
+                "max_prompt_tokens",
+            },
+            "resumable retrieval protocol",
+        )
+        if protocol != {
+            "input_order": INPUT_ORDER_PROTOCOL,
+            "official_longmemeval_protocol": True,
+            "official_search_protocol": True,
+            "top_k": MEM0_OFFICIAL_TOP_K,
+            "threshold": MEM0_OFFICIAL_THRESHOLD,
+            "rendering_mode": MEM0_CERTIFIED_RENDERING,
+            "max_prompt_tokens": 8_000,
+        }:
+            raise Mem0ShardRunError(
+                "resumable retrieval protocol mismatch", stage="scoring"
+            )
+        if artifact.get("raw_input_receipt") != shard_receipt(shard):
+            raise Mem0ShardRunError(
+                "resumable raw-input receipt mismatch", stage="scoring"
+            )
+        if artifact.get("history_sample_ids_sha256") != canonical_json_sha256(
+            list(shard.history_sample_ids)
+        ) or artifact.get("question_ids_sha256") != canonical_json_sha256(
+            list(shard.question_ids)
+        ):
+            raise Mem0ShardRunError(
+                "resumable population digest mismatch", stage="scoring"
+            )
+        ingestion = _scoring_exact_keys(
+            ingestion_receipt,
+            {
+                "raw_pairs",
+                "skipped_empty_pairs",
+                "authorized_add_operations",
+                "attempted_add_operations",
+                "completed_add_operations",
+                "failed_add_operations",
+                "extraction_model_calls",
+                "persisted_request_token_state",
+                "retained_request_token_state_bytes",
+                "request_token_state_evidence_kind",
+                "external_provider_persistence_certified",
+                "one_scope",
+                "user_scope_sha256",
+                "comparison_certified",
+            },
+            "resumable ingestion receipt",
+        )
+        plan = resumable_closure["resume_plan"]
+        ingestion_required = {
+            "raw_pairs": shard.add_counts.raw_pairs,
+            "skipped_empty_pairs": shard.add_counts.skipped_empty_pairs,
+            "authorized_add_operations": exact_adds,
+            "attempted_add_operations": exact_adds,
+            "completed_add_operations": exact_adds,
+            "failed_add_operations": 0,
+            "one_scope": True,
+            "user_scope_sha256": plan["user_scope_sha256"],
+            "comparison_certified": True,
+        }
+        for field, expected in ingestion_required.items():
+            if ingestion.get(field) != expected:
+                raise Mem0ShardRunError(
+                    f"resumable ingestion {field} mismatch", stage="scoring"
+                )
+        search_receipt = _scoring_exact_keys(
+            artifact.get("search_receipt"),
+            {
+                "authorized_search_operations",
+                "completed_search_operations",
+                "failed_search_operations",
+                "extraction_transport_calls_during_search",
+            },
+            "resumable search receipt",
+        )
+        if search_receipt != {
+            "authorized_search_operations": len(shard.question_ids),
+            "completed_search_operations": len(shard.question_ids),
+            "failed_search_operations": 0,
+            "extraction_transport_calls_during_search": 0,
+        }:
+            raise Mem0ShardRunError(
+                "resumable search receipt mismatch", stage="scoring"
+            )
+        usage = _scoring_exact_keys(
+            artifact.get("mem0_usage"),
+            {
+                "add_calls",
+                "add_attempted_calls",
+                "add_completed_calls",
+                "add_failed_calls",
+                "search_calls",
+                "add_latency_s",
+                "search_latency_s",
+                "add_raw_message_tokens",
+                "search_query_tokens",
+                "search_raw_memory_tokens",
+                "search_context_tokens",
+                "search_prompt_token_proxy",
+                "search_prompt_tokens",
+                "add_returned_memories",
+                "unique_ledger_memories",
+                "search_returned_memories",
+                "search_packed_memories",
+                "released_scopes",
+                "provider_prompt_tokens",
+                "provider_completion_tokens",
+                "provider_usage_status",
+                "token_counter_identity",
+                "token_counter_identity_verified",
+            },
+            "resumable Mem0 usage",
+        )
+        observed_write = resumable_closure["write_usage_attestation"]["observed"]
+        if any(
+            usage.get(field) != expected
+            for field, expected in {
+                "add_calls": exact_adds,
+                "add_attempted_calls": exact_adds,
+                "add_completed_calls": exact_adds,
+                "add_failed_calls": 0,
+                "search_calls": len(shard.question_ids),
+                "add_raw_message_tokens": observed_write[
+                    "extraction_raw_message_token_proxy"
+                ],
+                "add_returned_memories": observed_write[
+                    "returned_memory_count"
+                ],
+                "provider_prompt_tokens": observed_write[
+                    "extraction_provider_input_tokens"
+                ],
+                "provider_completion_tokens": observed_write[
+                    "extraction_provider_output_tokens"
+                ],
+                "provider_usage_status": "provider_reported_exact",
+            }.items()
+        ):
+            raise Mem0ShardRunError(
+                "resumable Mem0 usage accounting mismatch", stage="scoring"
+            )
+        for field in (
+            "add_calls",
+            "add_attempted_calls",
+            "add_completed_calls",
+            "add_failed_calls",
+            "search_calls",
+            "add_raw_message_tokens",
+            "search_query_tokens",
+            "search_raw_memory_tokens",
+            "search_context_tokens",
+            "search_prompt_token_proxy",
+            "search_prompt_tokens",
+            "add_returned_memories",
+            "unique_ledger_memories",
+            "search_returned_memories",
+            "search_packed_memories",
+            "released_scopes",
+            "provider_prompt_tokens",
+            "provider_completion_tokens",
+        ):
+            _require_count(usage.get(field), f"resumable Mem0 usage {field}")
+        for field in ("add_latency_s", "search_latency_s"):
+            latency = usage.get(field)
+            if (
+                isinstance(latency, bool)
+                or not isinstance(latency, (int, float))
+                or not math.isfinite(float(latency))
+                or float(latency) < 0.0
+            ):
+                raise Mem0ShardRunError(
+                    f"resumable Mem0 usage {field} is invalid", stage="scoring"
+                )
+        if (
+            usage["search_prompt_tokens"] != usage["search_prompt_token_proxy"]
+            or float(usage["add_latency_s"])
+            != float(observed_write["add_latency_s"])
+            or usage.get("token_counter_identity_verified") is not True
+            or not isinstance(usage.get("token_counter_identity"), str)
+            or not usage["token_counter_identity"]
+        ):
+            raise Mem0ShardRunError(
+                "resumable Mem0 usage observation binding mismatch",
+                stage="scoring",
+            )
+        provenance = _scoring_exact_keys(
+            artifact.get("provenance"),
+            {
+                "attribution_kind",
+                "supports_exact_source_provenance",
+                "source_session_date_exposure",
+                "retrieved_created_at_exposure",
+                "provider_usage_status",
+                "external_http_attempts_certified",
+                "external_retry_attempts_certified",
+                "external_provider_persistence_certified",
+            },
+            "resumable provenance receipt",
+        )
+        if provenance != {
+            "attribution_kind": MEM0_ATTRIBUTION_KIND,
+            "supports_exact_source_provenance": False,
+            "source_session_date_exposure": "diagnostics_only_not_model_input",
+            "retrieved_created_at_exposure": "answer_prompt_date_headings",
+            "provider_usage_status": "provider_reported_exact",
+            "external_http_attempts_certified": True,
+            "external_retry_attempts_certified": True,
+            "external_provider_persistence_certified": False,
+        }:
+            raise Mem0ShardRunError(
+                "resumable provenance receipt mismatch", stage="scoring"
+            )
     trace_meta = artifact.get("retrieval_trace")
     if not isinstance(trace_meta, dict):
         raise Mem0ShardRunError("retrieval artifact omitted trace binding", stage="scoring")
@@ -2500,7 +4754,7 @@ def _verify_retrieval_artifact(
     if trace_meta.get("sha256") != hashlib.sha256(trace_payload).hexdigest():
         raise Mem0ShardRunError("retrieval trace digest mismatch", stage="scoring")
     trace = _parse_json_object_bytes(trace_payload, filename=trace_path.name)
-    if (
+    if not resumable_production and (
         trace.get("format") != RETRIEVAL_TRACE_FORMAT
         or trace.get("status") != "complete"
         or trace.get("certification_status") != "injected_nonproduction"
@@ -2579,6 +4833,18 @@ def _verify_retrieval_artifact(
                 stage="scoring",
             )
         verified.append((row, pack))
+    if resumable_production:
+        assert resumable_execution is not None
+        assert resumable_closure is not None
+        _verify_resumable_terminal_payloads(
+            artifact=artifact,
+            trace=trace,
+            execution=resumable_execution,
+            closure=resumable_closure,
+            shard=shard,
+            authorization=authorization,
+            environment_lock=environment_lock,
+        )
     return artifact, artifact_bytes, verified
 
 

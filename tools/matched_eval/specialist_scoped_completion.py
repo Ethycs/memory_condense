@@ -39,6 +39,7 @@ FORMAT = "memory-condense-specialist-scoped-completion-v1"
 PROMPT_FORMAT = f"{FORMAT}-prompt-v1"
 SCOPE_FORMAT = f"{FORMAT}-scope-v1"
 DECISION_FORMAT = f"{FORMAT}-decision-v1"
+SPECIALIST_ADVISORY_FORMAT = "memory-condense-specialist-provider-advisory-v2"
 VALIDATION_CONTRACT_FORMAT = (
     "memory-condense-typed-memory-final-arm-v1-"
     "completion-validation-contract-v3"
@@ -1166,6 +1167,186 @@ def _profile_proof(
     )
 
 
+def _normalize_v2_specialist_advisory(
+    advisory: dict[str, Any],
+    *,
+    terminal_handles: set[str],
+    advisory_receipt_sha256: str,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Normalize the handle-only provider schema for the legacy proof compiler."""
+
+    common_keys = {"format", "handle_ids", "mechanism_id", "purpose"}
+    mechanism_id = require_text(
+        advisory.get("mechanism_id"), "specialist advisory mechanism"
+    )
+    require_text(advisory.get("purpose"), "specialist advisory purpose")
+    if advisory.get("operand_groups") is not None:
+        expected_keys = common_keys | {"operand_groups"}
+    elif "temporal_bundle" in advisory or "absence_certificate" in advisory:
+        expected_keys = common_keys | {
+            "absence_certificate",
+            "temporal_bundle",
+        }
+        _require(
+            advisory.get("temporal_bundle") is not None
+            or advisory.get("absence_certificate") is not None,
+            "specialist temporal advisory contains no proof",
+        )
+    else:
+        _require(
+            mechanism_id.startswith("profile_preference"),
+            "specialist advisory has no recognized proof",
+        )
+        expected_keys = common_keys
+    _require(set(advisory) == expected_keys, "specialist v2 advisory schema changed")
+
+    handles = _ordered_unique(
+        _exact_list(advisory["handle_ids"], "specialist advisory handles"),
+        "specialist advisory handles",
+    )
+    _require(bool(handles), "specialist advisory handles are empty")
+    for handle_id in handles:
+        _handle(handle_id, "specialist advisory handle changed")
+    _require(
+        set(handles) <= terminal_handles,
+        "specialist advisory handle escaped terminal evidence",
+    )
+    candidate_by_handle = {
+        handle_id: identity_sha256(
+            {
+                "format": "specialist-proof-local-handle-alias-v1",
+                "handle_id": handle_id,
+            }
+        )
+        for handle_id in handles
+    }
+    candidate_map = {
+        candidate_by_handle[handle_id]: handle_id for handle_id in handles
+    }
+    normalized = {
+        key: value
+        for key, value in advisory.items()
+        if key not in {"format", "handle_ids"}
+    }
+    normalized["candidate_handle_map"] = candidate_map
+
+    if advisory.get("operand_groups") is not None:
+        groups: list[dict[str, Any]] = []
+        for raw in _exact_list(
+            advisory["operand_groups"], "numeric operand groups"
+        ):
+            group = _exact_dict(raw, "numeric operand group")
+            _require(
+                set(group)
+                == {
+                    "action_class",
+                    "entity_key",
+                    "handle_ids",
+                    "operand_values",
+                    "operation_mode",
+                    "source_group_handles",
+                    "value_basis",
+                },
+                "numeric v2 operand group schema changed",
+            )
+            group_handles = _ordered_unique(
+                _exact_list(group["handle_ids"], "numeric group handles"),
+                "numeric group handles",
+            )
+            _require(
+                bool(group_handles) and set(group_handles) <= set(handles),
+                "numeric group handle escaped advisory",
+            )
+            groups.append(
+                {
+                    **group,
+                    "candidate_ids": [
+                        candidate_by_handle[handle_id]
+                        for handle_id in group_handles
+                    ],
+                }
+            )
+            groups[-1].pop("handle_ids")
+        normalized["operand_groups"] = groups
+
+    raw_bundle = advisory.get("temporal_bundle")
+    if raw_bundle is not None:
+        bundle = _exact_dict(raw_bundle, "temporal bundle")
+        _require(
+            set(bundle)
+            == {
+                "ordered_handle_ids",
+                "original_population_count",
+                "predecessor_handle_id",
+                "query_time",
+                "requested_cardinality",
+                "route",
+                "target_date",
+                "terminal_selection_truncated",
+                "winner_handle_id",
+            },
+            "temporal v2 bundle schema changed",
+        )
+        ordered_handles = _ordered_unique(
+            _exact_list(bundle["ordered_handle_ids"], "temporal handles"),
+            "temporal handles",
+        )
+        _require(
+            bool(ordered_handles) and set(ordered_handles) <= set(handles),
+            "temporal handle escaped advisory",
+        )
+        for role in ("winner_handle_id", "predecessor_handle_id"):
+            role_handle = bundle.get(role)
+            _require(
+                role_handle is None or role_handle in ordered_handles,
+                f"temporal {role} escaped ordered handles",
+            )
+        normalized["temporal_bundle"] = {
+            **bundle,
+            "ordered_candidate_ids": [
+                candidate_by_handle[handle_id] for handle_id in ordered_handles
+            ],
+            "predecessor_candidate_id": (
+                None
+                if bundle.get("predecessor_handle_id") is None
+                else candidate_by_handle[bundle["predecessor_handle_id"]]
+            ),
+            "winner_candidate_id": (
+                None
+                if bundle.get("winner_handle_id") is None
+                else candidate_by_handle[bundle["winner_handle_id"]]
+            ),
+        }
+
+    raw_certificate = advisory.get("absence_certificate")
+    if raw_certificate is not None:
+        certificate = _exact_dict(raw_certificate, "absence certificate")
+        slot_rows: list[dict[str, Any]] = []
+        for ordinal, raw in enumerate(
+            _exact_list(certificate.get("slot_coverage"), "absence slot coverage"),
+            start=1,
+        ):
+            slot = _exact_dict(raw, "absence slot")
+            _require("slot_id" not in slot, "absence v2 slot exposed a stable ID")
+            slot_rows.append(
+                {
+                    **slot,
+                    "slot_id": identity_sha256(
+                        {
+                            "advisory_receipt_sha256": advisory_receipt_sha256,
+                            "format": "specialist-proof-local-slot-alias-v1",
+                            "slot_ordinal": ordinal,
+                        }
+                    ),
+                }
+            )
+        normalized["absence_certificate"] = {
+            **certificate,
+            "slot_coverage": slot_rows,
+        }
+    return normalized, candidate_map
+
+
 def compile_specialist_validation_scope(
     *,
     specialist_advisories: Sequence[Mapping[str, Any]],
@@ -1231,28 +1412,46 @@ def compile_specialist_validation_scope(
     declared_handles: list[str] = []
     mechanism_ids: list[str] = []
     for advisory in advisories:
+        advisory_receipt = identity_sha256(advisory)
         mechanism_id = require_text(
             advisory.get("mechanism_id"), "specialist advisory mechanism"
         )
         _require(mechanism_id not in mechanism_ids, "specialist mechanisms repeat")
         mechanism_ids.append(mechanism_id)
-        raw_map = _exact_dict(
-            advisory.get("candidate_handle_map"), "specialist candidate handle map"
-        )
-        _require(bool(raw_map), "specialist candidate handle map is empty")
-        candidate_map: dict[str, str] = {}
-        for candidate_id, raw_handle in raw_map.items():
-            require_sha256(candidate_id, "specialist candidate")
-            handle_id = _handle(raw_handle, "specialist candidate handle changed")
-            _require(
-                handle_id in terminal and handle_id not in candidate_map.values(),
-                "specialist candidate handle escaped or repeats",
+        if advisory.get("format") is None:
+            normalized = advisory
+            raw_map = _exact_dict(
+                advisory.get("candidate_handle_map"),
+                "specialist candidate handle map",
             )
-            candidate_map[candidate_id] = handle_id
+            _require(bool(raw_map), "specialist candidate handle map is empty")
+            candidate_map: dict[str, str] = {}
+            for candidate_id, raw_handle in raw_map.items():
+                require_sha256(candidate_id, "specialist candidate")
+                handle_id = _handle(
+                    raw_handle, "specialist candidate handle changed"
+                )
+                _require(
+                    handle_id in terminal
+                    and handle_id not in candidate_map.values(),
+                    "specialist candidate handle escaped or repeats",
+                )
+                candidate_map[candidate_id] = handle_id
+        else:
+            _require(
+                advisory.get("format") == SPECIALIST_ADVISORY_FORMAT,
+                "specialist advisory format changed",
+            )
+            normalized, candidate_map = _normalize_v2_specialist_advisory(
+                advisory,
+                terminal_handles=set(terminal),
+                advisory_receipt_sha256=advisory_receipt,
+            )
+        for handle_id in candidate_map.values():
             if handle_id not in declared_handles:
                 declared_handles.append(handle_id)
         parsed_advisories.append(
-            (advisory, candidate_map, identity_sha256(advisory))
+            (normalized, candidate_map, advisory_receipt)
         )
 
     evidence = tuple(

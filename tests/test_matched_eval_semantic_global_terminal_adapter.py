@@ -172,6 +172,7 @@ def _pipeline(
     global_policy: SemanticGlobalCompletionPolicy | None = None,
     terminal_policy: SemanticGlobalTerminalPolicy | None = None,
     enable_selected_evidence_discourse_links: bool = False,
+    enable_post_dedup_backfill: bool = False,
 ):
     residual = search_semantic_residual(
         index,
@@ -241,6 +242,7 @@ def _pipeline(
         enable_selected_evidence_discourse_links=(
             enable_selected_evidence_discourse_links
         ),
+        enable_post_dedup_backfill=enable_post_dedup_backfill,
     )
     return residual, local, global_result, sources, selected_owners, compiled
 
@@ -456,10 +458,32 @@ def test_linked_successor_projects_selected_revision_without_relabeling_v2(
         query,
         enable_selected_evidence_discourse_links=True,
     )
+    residual, local_result, global_result, sources, owners, backfilled = _pipeline(
+        index,
+        query,
+        enable_post_dedup_backfill=True,
+    )
 
     assert legacy.format_id == terminal_adapter.FORMAT
     assert "typed_links" not in legacy.fitted.story_coherence
     assert linked.format_id == terminal_adapter.LINKED_FORMAT
+    assert backfilled.format_id == terminal_adapter.BACKFILL_FORMAT
+    assert backfilled.post_dedup_backfill is not None
+    assert "post_dedup_backfill" in backfilled.projection()
+    replayed = replay_semantic_global_terminal(
+        dated_question=query.dated_question,
+        parent_prediction="The prior answer remains available only as fallback.",
+        residual_index=index,
+        query=query,
+        protected_owner_universe_bindings=(),
+        selected_protected_owner_evidence=owners,
+        residual_result=residual,
+        local_result=local_result,
+        global_result=global_result,
+        sealed_sources=sources,
+        sealed_compilation=backfilled,
+    )
+    assert replayed.receipt_sha256 == backfilled.receipt_sha256
     typed_links = linked.fitted.story_coherence["typed_links"]
     revision = next(row for row in typed_links if row["relation"] == "revises")
     assert [member["role"] for member in revision["members"]] == [
@@ -1572,6 +1596,50 @@ def test_exact_span_dedup_transfers_l_and_g_retention_authority_without_rewritin
     )[r_target.receipt_sha256]
     assert l_overlay["authority_source_planes"] == ("L",)
     assert l_overlay["effective_hard_protection"] is True
+
+    # Successor mode reconsiders the authenticated skipped order only after
+    # independent selection and exact-span dedup free G-plane capacity.
+    candidate_planes = {
+        "P": (),
+        "R": (r_target,),
+        "L": (),
+        "G": (g_target, g_noise[0]),
+    }
+    budgets = {
+        plane: terminal_adapter.PlaneBudget(plane, 1, 10_000, 0)
+        for plane in "PRLG"
+    }
+    independently_selected = {}
+    selections = []
+    for plane in "PRLG":
+        chosen, selection = terminal_adapter._select_plane(  # noqa: SLF001
+            candidate_planes[plane], budgets[plane]
+        )
+        independently_selected[plane] = chosen
+        selections.append(selection)
+    initially_retained, initial_dedup = terminal_adapter._post_selection_dedup(  # noqa: SLF001
+        independently_selected, by_receipt={}
+    )
+    backfilled, backfill = terminal_adapter._post_dedup_backfill(  # noqa: SLF001
+        retained=initially_retained,
+        dedup_receipt=initial_dedup,
+        candidates_by_plane=candidate_planes,
+        selections=tuple(selections),
+        budgets=budgets,
+    )
+
+    assert tuple(row.receipt_sha256 for row in initially_retained) == (
+        r_target.receipt_sha256,
+    )
+    assert tuple(row.receipt_sha256 for row in backfilled) == (
+        r_target.receipt_sha256,
+        g_noise[0].receipt_sha256,
+    )
+    assert backfill.admitted_candidate_receipt_sha256s_by_plane[-1] == (
+        "G",
+        (g_noise[0].receipt_sha256,),
+    )
+    assert backfill.projection() == json.loads(json.dumps(backfill.projection()))
 
 
 def test_strict_owner_loader_accepts_historical_sealed_r7_provider_rows() -> None:

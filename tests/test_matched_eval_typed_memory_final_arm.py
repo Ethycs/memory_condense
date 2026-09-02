@@ -68,6 +68,7 @@ def _packet(
     *,
     output_reserve: int = OUTPUT_TOKEN_RESERVE,
     question: str = QUESTION,
+    frontier_mode: FrontierMode = FrontierMode.BOUNDED,
 ):
     spec = compile_typed_operator_spec(question)
     indices = sorted(
@@ -85,7 +86,7 @@ def _packet(
         bindings,
         parsed,
         sealed_input_artifact_sha256s=(_sha("sealed-map"),),
-        frontier_mode=FrontierMode.BOUNDED,
+        frontier_mode=frontier_mode,
         output_token_reserve=output_reserve,
     )
 
@@ -153,6 +154,47 @@ def test_final_fit_retains_active_reconstruction_above_passive_full_store() -> N
     assert _mechanism_priority("active_reconstruction_v1") > _mechanism_priority(
         "full_store_slot_closure_v1"
     )
+
+
+def test_identity_final_fit_preserves_exhaustive_closed_frontier() -> None:
+    packet = _packet(
+        [
+            {
+                "handle_ids": ["H001"],
+                "kind": "operand",
+                "numeric_role": "operand",
+                "numeric_value": 6,
+                "summary": "I initially planted 6 tomato plants.",
+            },
+            {
+                "handle_ids": ["H002"],
+                "kind": "operand",
+                "numeric_role": "operand",
+                "numeric_value": 4,
+                "summary": "I initially planted 4 chili pepper plants.",
+            },
+        ],
+        frontier_mode=FrontierMode.EXHAUSTIVE,
+    )
+    assert packet.frontier.truncated is False
+    assert packet.frontier.closed is True
+
+    fitted = fit_typed_final_prompt(
+        dated_question=QUESTION,
+        parent_prediction="10",
+        packet=packet,
+        mechanism_by_handle={
+            "H001": "parent_map",
+            "H002": "parent_map",
+        },
+    )
+
+    assert fitted.dropped_item_receipt_sha256s == ()
+    assert fitted.dropped_binding_receipt_sha256s == ()
+    assert fitted.packet.frontier.mode is FrontierMode.EXHAUSTIVE
+    assert fitted.packet.frontier.truncated is False
+    assert fitted.packet.frontier.closed is True
+    assert fitted.packet.frontier.receipt_sha256 == packet.frontier.receipt_sha256
 
 
 def test_final_fit_preserves_high_cue_active_connector_before_shallow_slots() -> None:

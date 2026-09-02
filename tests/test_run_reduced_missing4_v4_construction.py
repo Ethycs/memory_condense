@@ -20,7 +20,10 @@ from tools.run_reduced_missing4_v4_construction import (
     _terminal_projection,
     validate_construction,
 )
-from tools.run_reduced_specialist_answer_v2 import _prompt_plan_row
+from tools.run_reduced_specialist_answer_v2 import (
+    ReducedSpecialistAnswerV2Error,
+    _prompt_plan_row,
+)
 
 
 EXPECTED_CONSTRUCTION_SHA256 = (
@@ -121,10 +124,40 @@ def test_all_rows_use_the_generic_answer_v2_prompt_contract() -> None:
     plan = _prompt_plan_row(row, 42)
 
     assert plan["allowed_handle_ids"] == ["H500001"]
+    assert plan["messages_sha256"] == row["terminal_prompt"]["messages_sha256"]
     assert plan["prompt_token_proxy"] + 768 <= HARD_COMPLETE_CHAT_TOKEN_CAP
     assert plan["terminal_prompt_receipt_sha256"] == row["terminal_prompt"][
         "terminal_prompt_receipt_sha256"
     ]
+
+
+def test_generic_answer_v2_rejects_an_unrecognized_prompt_version() -> None:
+    row = _generic_question_row()
+    row["terminal_prompt"]["messages_sha256"] = "0" * 64
+    unsigned = dict(row)
+    unsigned.pop("question_receipt_sha256")
+    row["question_receipt_sha256"] = identity_sha256(unsigned)
+
+    with pytest.raises(
+        ReducedSpecialistAnswerV2Error,
+        match="does not bind one supported renderer",
+    ):
+        _prompt_plan_row(row, 42)
+
+
+def test_generic_answer_v2_rejects_non_integer_sealed_token_count() -> None:
+    row = _generic_question_row()
+    token_count = row["terminal_prompt"]["prompt_token_proxy"]
+    row["terminal_prompt"]["prompt_token_proxy"] = float(token_count)
+    unsigned = dict(row)
+    unsigned.pop("question_receipt_sha256")
+    row["question_receipt_sha256"] = identity_sha256(unsigned)
+
+    with pytest.raises(
+        ReducedSpecialistAnswerV2Error,
+        match="token proxy changed type",
+    ):
+        _prompt_plan_row(row, 42)
 
 
 def test_target_sources_freezes_the_six_source_target_population() -> None:

@@ -102,7 +102,8 @@ def test_v3_terminal_binds_the_specialist_prompt_envelope() -> None:
     provider_input = {"dated_question": "What happened?"}
     advisories = [
         {
-            "candidate_handle_map": {_sha("candidate"): "H700001"},
+            "format": base.SPECIALIST_ADVISORY_FORMAT,
+            "handle_ids": ["H700001"],
             "mechanism_id": "synthetic_specialist",
         }
     ]

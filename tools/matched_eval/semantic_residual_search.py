@@ -1263,7 +1263,7 @@ def _node_manifest(
     node: SemanticSearchNode,
     by_cell_id: Mapping[str, SemanticResidualCell],
 ) -> SemanticNodeManifest:
-    cells = tuple(by_cell_id[row.cell_id] for row in node.cells)
+    cells = tuple(by_cell_id[row.cell_id] for row in node.iter_cells())
     vectors = tuple(row.normalized_source_centroid for row in cells)
     complete = bool(vectors) and all(row is not None for row in vectors)
     centroid: tuple[float, ...] | None = None
@@ -1811,24 +1811,35 @@ class _ConservativeResidualClassifier:
         self.query = query
         query_surface = tuple(sorted(set(query.query_terms) | set(query.slot_terms)))
         query_actions = tuple(sorted(set(query.action_concepts)))
+        self._query_surface = frozenset(query_surface)
+        self._query_actions = frozenset(query_actions)
+        self._manifest_by_node_receipt = index.manifest_by_node_receipt
+        cell_surface_terms = tuple(
+            frozenset(cell.surface_terms) for cell in index.cells
+        )
+        cell_action_concepts = tuple(
+            frozenset(cell.action_concepts) for cell in index.cells
+        )
         leaf_count = len(index.cells)
+        term_document_frequency = {
+            term: sum(term in terms for terms in cell_surface_terms)
+            for term in query_surface
+        }
+        action_document_frequency = {
+            action: sum(action in actions for actions in cell_action_concepts)
+            for action in query_actions
+        }
         self.term_specificity = {
             term: math.log(
                 (leaf_count + 1)
-                / (
-                    sum(term in set(cell.surface_terms) for cell in index.cells)
-                    + 1
-                )
+                / (term_document_frequency[term] + 1)
             )
             for term in query_surface
         }
         self.action_specificity = {
             action: math.log(
                 (leaf_count + 1)
-                / (
-                    sum(action in set(cell.action_concepts) for cell in index.cells)
-                    + 1
-                )
+                / (action_document_frequency[action] + 1)
             )
             for action in query_actions
         }
@@ -1838,16 +1849,18 @@ class _ConservativeResidualClassifier:
                     *(
                         weight
                         for term, weight in self.term_specificity.items()
-                        if term in set(cell.surface_terms)
+                        if term in surface_terms
                     ),
                     *(
                         weight
                         for action, weight in self.action_specificity.items()
-                        if action in set(cell.action_concepts)
+                        if action in action_concepts
                     ),
                 )
             )
-            for cell in index.cells
+            for surface_terms, action_concepts in zip(
+                cell_surface_terms, cell_action_concepts, strict=True
+            )
         )
         self.max_leaf_specificity = max(leaf_scores, default=0.0)
         self.specificity_threshold = (
@@ -1864,9 +1877,7 @@ class _ConservativeResidualClassifier:
                 {
                     "idf": weight,
                     "kind": "surface_term",
-                    "leaf_cell_df": sum(
-                        term in set(cell.surface_terms) for cell in index.cells
-                    ),
+                    "leaf_cell_df": term_document_frequency[term],
                     "signal": term,
                 }
                 for term, weight in self.term_specificity.items()
@@ -1875,9 +1886,7 @@ class _ConservativeResidualClassifier:
                 {
                     "idf": weight,
                     "kind": "action_concept",
-                    "leaf_cell_df": sum(
-                        action in set(cell.action_concepts) for cell in index.cells
-                    ),
+                    "leaf_cell_df": action_document_frequency[action],
                     "signal": action,
                 }
                 for action, weight in self.action_specificity.items()
@@ -1902,7 +1911,12 @@ class _ConservativeResidualClassifier:
         call_ordinal: int,
     ) -> SemanticBranchDecision:
         _require(question == self.query.dated_question, "classifier question changed")
-        manifest = self.index.manifest_by_node_receipt[node.receipt_sha256]
+        node_receipt = node.receipt_sha256
+        manifest = self._manifest_by_node_receipt[node_receipt]
+        # Full descent classifies every node exactly once, so retaining a
+        # node-keyed conversion cache has no reuse and only extends lifetimes.
+        manifest_surface = frozenset(manifest.surface_terms)
+        manifest_actions = frozenset(manifest.action_concepts)
         required_role = self.query.operator_spec.required_evidence_role
         missing_role = (
             required_role
@@ -1910,16 +1924,25 @@ class _ConservativeResidualClassifier:
             else None
         )
         if self.query.exact_literals:
-            node_text = "\n".join(cell.text for cell in node.cells).casefold()
+            node_text = "\n".join(
+                cell.text for cell in node.iter_cells()
+            ).casefold()
             absent_literals = tuple(
                 literal for literal in self.query.exact_literals if literal not in node_text
             )
         else:
             absent_literals = ()
-        query_surface = set(self.query.query_terms) | set(self.query.slot_terms)
-        term_overlap = tuple(sorted(query_surface & set(manifest.surface_terms)))
+        term_overlap = tuple(
+            sorted(
+                self._query_surface
+                & manifest_surface
+            )
+        )
         action_overlap = tuple(
-            sorted(set(self.query.action_concepts) & set(manifest.action_concepts))
+            sorted(
+                self._query_actions
+                & manifest_actions
+            )
         )
         upper = manifest.cosine_upper_bound(self.query.present_query_vectors)
         vector_available = bool(
@@ -1949,11 +1972,13 @@ class _ConservativeResidualClassifier:
             and (self.term_specificity or self.action_specificity)
             and specificity_upper is not None
         )
+        # These signals are useful ranking/audit evidence, but none is an
+        # authenticated proof that a branch cannot contain support for a
+        # different obligation.  Keep them fail-open until such a proof exists.
+        classification: Literal["definitely_no", "may_answer"] = "may_answer"
         if missing_role is not None:
-            classification: Literal["definitely_no", "may_answer"] = "definitely_no"
             reason = "required_role_absent"
         elif absent_literals:
-            classification = "definitely_no"
             reason = "exact_literal_absent"
         elif (
             self.index.policy.dual_gate_enabled
@@ -1965,10 +1990,8 @@ class _ConservativeResidualClassifier:
             and specificity_upper is not None
             and specificity_upper < self.specificity_threshold
         ):
-            classification = "definitely_no"
             reason = "dual_gate"
         else:
-            classification = "may_answer"
             reason = "may_answer"
         decision = make_branch_decision(
             classifier_id=self.classifier_id,

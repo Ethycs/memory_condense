@@ -17,6 +17,8 @@ from tools.matched_eval.query_evidence_map_solver_v2_live import (
 )
 from tools.matched_eval.query_payload_live import PayloadEvidenceAlias
 from tools.matched_eval.typed_operator_adapter import (
+    COMPACT_FINAL_PROVIDER_FORMAT,
+    COMPACT_FINAL_PROVIDER_FORMAT_V2,
     ContentCoherence,
     EvidenceHandleBinding,
     EvidenceOrigin,
@@ -264,7 +266,7 @@ def test_541_character_citation_is_local_and_one_bad_item_is_salvaged() -> None:
     assert packet.local_bindings[0].citation_char_count == 541
 
 
-def test_overlong_item_is_rejected_without_invalidating_small_sibling() -> None:
+def test_overlong_shared_handle_item_opens_frontier_for_small_sibling() -> None:
     spec = compile_typed_operator_spec(Q28)
     bindings = (_binding(1),)
     parsed = parse_typed_items(
@@ -295,7 +297,12 @@ def test_overlong_item_is_rejected_without_invalidating_small_sibling() -> None:
     assert len(packet.items) == 1
     assert packet.items[0].summary == "One bike service in March"
     assert any(row.reason == "hard_8k_item_overflow" for row in packet.rejected_items)
-    assert packet.frontier.closed is True
+    assert packet.frontier.available_handle_ids == ("H001",)
+    assert packet.frontier.represented_handle_ids == ("H001",)
+    assert packet.frontier.omitted_handle_ids == ()
+    assert packet.frontier.mode is FrontierMode.EXHAUSTIVE
+    assert packet.frontier.truncated is True
+    assert packet.frontier.closed is False
 
 
 def test_budget_salvage_accounts_for_late_frontier_growth_and_keeps_fair_prefix() -> None:
@@ -390,6 +397,9 @@ def test_compact_final_mode_prevents_canonical_projection_tax() -> None:
     assert compact.provider_projection() == compact_typed_evidence_projection(
         compact
     )
+    assert compact.provider_projection()["format"] == COMPACT_FINAL_PROVIDER_FORMAT
+    assert "available_handle_ids" in compact.provider_projection()["frontier"]
+    assert "represented_handle_ids" in compact.provider_projection()["frontier"]
     rendered = json.dumps(
         compact.provider_projection(),
         ensure_ascii=False,
@@ -403,6 +413,112 @@ def test_compact_final_mode_prevents_canonical_projection_tax() -> None:
     assert compact.projection()["provider_payload_mode"] == "compact_final"
     assert "local_source_locator" not in rendered
     assert "sealed_artifact_sha256" not in rendered
+
+
+def test_compact_final_v2_aliases_stable_ids_and_preserves_local_receipts() -> None:
+    spec = compile_typed_operator_spec(
+        "[Question asked at 2023/05/30 (Tue) 14:24]\n"
+        "How many plants did I initially plant for tomatoes and chili peppers?"
+    )
+    binding = _binding(1)
+    stable_group_key = _sha("local numeric group")
+    parsed = parse_typed_items(
+        [
+            {
+                "group_key": stable_group_key,
+                "handle_ids": [binding.handle_id],
+                "numeric_role": "operand",
+                "numeric_value": 6,
+                "summary": "I initially planted 6 tomato plants.",
+            }
+        ],
+        operator_spec=spec,
+        bindings=(binding,),
+    )
+    packet = build_typed_evidence_packet(
+        spec,
+        (binding,),
+        parsed,
+        sealed_input_artifact_sha256s=(_sha("map-artifact"),),
+        provider_payload_mode=ProviderPayloadMode.COMPACT_FINAL_V2,
+    )
+    local_receipts = (
+        spec.receipt_sha256,
+        binding.receipt_sha256,
+        packet.items[0].receipt_sha256,
+    )
+
+    projection = packet.provider_projection()
+    rendered = json.dumps(projection, sort_keys=True, separators=(",", ":"))
+
+    assert projection["format"] == COMPACT_FINAL_PROVIDER_FORMAT_V2
+    assert "available_handle_ids" not in projection["frontier"]
+    assert "represented_handle_ids" not in projection["frontier"]
+    assert projection["operator_spec"]["required_slots"]
+    assert all(
+        row["slot_id"] == f"S{index:03d}"
+        for index, row in enumerate(
+            projection["operator_spec"]["required_slots"], start=1
+        )
+    )
+    assert projection["items"][0]["group_key"] == "K001"
+    assert "included" not in projection["items"][0]
+    assert "content_coherence" not in projection["items"][0]
+    assert "status" not in projection["items"][0]
+    assert "numeric_qualifier" not in projection["items"][0]
+    assert stable_group_key not in rendered
+    assert all(slot.slot_id not in rendered for slot in spec.required_slots)
+    assert (
+        spec.receipt_sha256,
+        binding.receipt_sha256,
+        packet.items[0].receipt_sha256,
+    ) == local_receipts
+
+
+def test_compact_final_v2_group_aliases_are_injective_with_literal_alias() -> None:
+    spec = compile_typed_operator_spec(
+        "[Question asked at 2023/05/30 (Tue) 14:24]\n"
+        "How many plants did I initially plant for tomatoes and chili peppers?"
+    )
+    bindings = (_binding(1), _binding(2))
+    stable_group_key = _sha("local numeric group")
+    parsed = parse_typed_items(
+        [
+            {
+                "group_key": stable_group_key,
+                "handle_ids": ["H001"],
+                "numeric_role": "operand",
+                "numeric_value": 6,
+                "summary": "I initially planted 6 tomato plants.",
+            },
+            {
+                "group_key": "K001",
+                "handle_ids": ["H002"],
+                "numeric_role": "operand",
+                "numeric_value": 4,
+                "summary": "I initially planted 4 chili pepper plants.",
+            },
+        ],
+        operator_spec=spec,
+        bindings=bindings,
+    )
+    packet = build_typed_evidence_packet(
+        spec,
+        bindings,
+        parsed,
+        sealed_input_artifact_sha256s=(_sha("map-artifact"),),
+        provider_payload_mode=ProviderPayloadMode.COMPACT_FINAL_V2,
+    )
+
+    assert [item.group_key for item in packet.items] == [
+        stable_group_key,
+        "K001",
+    ]
+    provider_group_keys = [
+        item["group_key"] for item in packet.provider_projection()["items"]
+    ]
+    assert provider_group_keys == ["K001", "K002"]
+    assert len(set(provider_group_keys)) == len(provider_group_keys)
 
 
 def test_unknown_gold_bearing_schema_key_is_rejected_per_item() -> None:

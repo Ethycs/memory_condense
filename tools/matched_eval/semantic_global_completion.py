@@ -278,6 +278,9 @@ class SemanticGlobalCompletionPolicy:
     max_retained_leaf_cells: int = 192
     source_neighbor_radius: int = 1
     max_hydrated_segments: int = 768
+    # Bound the primary entity-priority prefix only.  Additional entities are
+    # conserved after structural obligations so closure can never silently
+    # forget a query target merely because the question named more than four.
     max_entity_obligations: int = 4
     lane_budgets: tuple[GlobalLaneBudget, ...] = _default_lane_budgets()
     receipt_sha256: str = ""
@@ -638,14 +641,21 @@ def _compile_obligations(
         and not term.isdigit()
     )
     seen_entities: set[tuple[str, ...]] = set()
+    entity_rows: list[GlobalEvidenceObligation] = []
     for terms in entity_candidates:
         terms = tuple(value for value in terms if value not in _ENTITY_STOP)
         if not terms or terms in seen_entities:
             continue
         seen_entities.add(terms)
-        rows.append(_obligation("entity", " ".join(terms), match_terms=terms))
-        if len(seen_entities) >= policy.max_entity_obligations:
-            break
+        entity_rows.append(
+            _obligation("entity", " ".join(terms), match_terms=terms)
+        )
+    # Preserve the historical high-priority entity prefix, but never discard
+    # overflow.  Appending overflow after date/role/numeric obligations keeps
+    # those structural witnesses ahead of combinatorial query-term expansion
+    # while retaining a receipt-bound unresolved obligation for every entity.
+    rows.extend(entity_rows[: policy.max_entity_obligations])
+    overflow_entity_rows = entity_rows[policy.max_entity_obligations :]
     interval = _temporal_interval(query.dated_question)
     if interval is not None:
         start, end, derivation = interval
@@ -672,6 +682,7 @@ def _compile_obligations(
         AnswerShape.DURATION,
     }:
         rows.append(_obligation("numeric", "numeric operand", requires_numeric=True))
+    rows.extend(overflow_entity_rows)
     unique: dict[str, GlobalEvidenceObligation] = {}
     for row in rows:
         unique.setdefault(row.obligation_id, row)
@@ -1091,7 +1102,10 @@ def _node_lane_bounds(
     return tuple(
         (
             lane_id,
-            max(signals[cell.cell_id].lane_value(lane_id) for cell in node.cells),
+            max(
+                signals[cell.cell_id].lane_value(lane_id)
+                for cell in node.iter_cells()
+            ),
         )
         for lane_id in LANE_IDS
     )
@@ -1100,8 +1114,12 @@ def _node_lane_bounds(
 def _priority_key(
     node: SemanticSearchNode,
     signals: Mapping[str, _CellSignals],
+    *,
+    lane_bounds: tuple[tuple[str, float], ...] | None = None,
 ) -> tuple[object, ...]:
-    bounds = dict(_node_lane_bounds(node, signals))
+    bounds = dict(
+        _node_lane_bounds(node, signals) if lane_bounds is None else lane_bounds
+    )
     # Normalize only for cross-lane queueing; exact lane scores remain sealed
     # separately.  Node size is deliberately not a pruning authority.
     combined = max(
@@ -1126,28 +1144,19 @@ def _definite_no_reason(
     query: SemanticResidualQuery,
     node: SemanticSearchNode,
 ) -> str | None:
-    if query.exact_literals:
-        node_text = "\n".join(cell.text for cell in node.cells).casefold()
-        # Independent literals may live in different branches.  A branch is
-        # impossible only when it contains none of them; absence of one member
-        # can never erase another member's witness.
-        if all(literal not in node_text for literal in query.exact_literals):
-            return "explicit_exact_literal_absent"
+    # Literal absence is not a no-support proof: another obligation's operand
+    # may live in a branch that does not repeat the literal.
     return None
 
 
 def _manifest_definite_no_reason(
-    index: SemanticResidualIndex,
+    manifests: Mapping[str, SemanticNodeManifest],
     query: SemanticResidualQuery,
     node: SemanticSearchNode,
     obligations: Sequence[GlobalEvidenceObligation],
 ) -> str | None:
-    manifest = index.manifest_by_node_receipt[node.receipt_sha256]
-    required_roles = {
-        row.required_role for row in obligations if row.required_role is not None
-    }
-    if required_roles and not (required_roles & set(manifest.roles)):
-        return "required_role_absent"
+    # Role absence is likewise not compositional across obligations.  A user
+    # witness and an assistant-authored factual expansion may be separate.
     return _definite_no_reason(query, node)
 
 
@@ -1159,8 +1168,23 @@ def _search_tree_best_first(
     obligations: Sequence[GlobalEvidenceObligation],
 ) -> GlobalTreeFrontier:
     root = index.core_tree.root
+    manifests = index.manifest_by_node_receipt
+    bounds_by_node_receipt: dict[str, tuple[tuple[str, float], ...]] = {}
+
+    def bounds_for(node: SemanticSearchNode) -> tuple[tuple[str, float], ...]:
+        existing = bounds_by_node_receipt.get(node.receipt_sha256)
+        if existing is not None:
+            return existing
+        computed = _node_lane_bounds(node, signals)
+        bounds_by_node_receipt[node.receipt_sha256] = computed
+        return computed
+
     heap: list[tuple[tuple[object, ...], SemanticSearchNode]] = []
-    heapq.heappush(heap, (_priority_key(root, signals), root))
+    root_bounds = bounds_for(root)
+    heapq.heappush(
+        heap,
+        (_priority_key(root, signals, lane_bounds=root_bounds), root),
+    )
     visits: list[GlobalTreeVisit] = []
     retained: list[str] = []
     pruned: list[str] = []
@@ -1170,8 +1194,8 @@ def _search_tree_best_first(
         and len(retained) < policy.max_retained_leaf_cells
     ):
         _key, node = heapq.heappop(heap)
-        reason = _manifest_definite_no_reason(index, query, node, obligations)
-        bounds = _node_lane_bounds(node, signals)
+        reason = _manifest_definite_no_reason(manifests, query, node, obligations)
+        bounds = bounds_for(node)
         if reason is not None:
             action: Literal["expanded", "retained_leaf", "definitely_no"] = "definitely_no"
             pruned.extend(node.cell_ids)
@@ -1181,7 +1205,18 @@ def _search_tree_best_first(
         else:
             action = "expanded"
             for child in node.children:
-                heapq.heappush(heap, (_priority_key(child, signals), child))
+                child_bounds = bounds_for(child)
+                heapq.heappush(
+                    heap,
+                    (
+                        _priority_key(
+                            child,
+                            signals,
+                            lane_bounds=child_bounds,
+                        ),
+                        child,
+                    ),
+                )
         visits.append(
             GlobalTreeVisit(
                 visit_ordinal=len(visits),
@@ -1198,8 +1233,10 @@ def _search_tree_best_first(
         cell_id for node in unexpanded for cell_id in node.cell_ids
     }
     all_ids = tuple(row.cell_id for row in index.cells)
-    retained_ids = tuple(cell_id for cell_id in all_ids if cell_id in set(retained))
-    pruned_ids = tuple(cell_id for cell_id in all_ids if cell_id in set(pruned))
+    retained_set = set(retained)
+    pruned_set = set(pruned)
+    retained_ids = tuple(cell_id for cell_id in all_ids if cell_id in retained_set)
+    pruned_ids = tuple(cell_id for cell_id in all_ids if cell_id in pruned_set)
     unresolved_ids = tuple(cell_id for cell_id in all_ids if cell_id in unresolved_set)
     _require(
         len(unresolved_set) == sum(len(node.cell_ids) for node in unexpanded),
@@ -1475,14 +1512,12 @@ def _hydrate_candidates(
         for cell in history[start:end]:
             offset = cell.source_cell_ordinal - origin.source_cell_ordinal
             for segment in cell.segments:
-                # Neighbour hydration is deliberately factual/user-first.  A
-                # globally selected cell itself remains byte-complete.
-                if offset and segment.role != "user":
-                    continue
+                # Preserve the complete local discourse neighborhood.  Role
+                # is a ranking signal, not authority to discard linked facts.
                 route = (
                     "selected_global_cell"
                     if offset == 0
-                    else f"source_local_user_neighbor:offset={offset:+d}"
+                    else f"source_local_neighbor:offset={offset:+d}"
                 )
                 existing = raw.get(segment.receipt_sha256)
                 if existing is None:
@@ -1564,14 +1599,32 @@ def _hydrate_candidates(
             row.segment_receipt_sha256,
         )
     )
-    admitted = tuple(candidates[: policy.max_hydrated_segments])
+    protected: list[GlobalCompletionCandidate] = []
+    for obligation in obligations:
+        witness = next(
+            (
+                row
+                for row in candidates
+                if obligation.obligation_id in row.supported_obligation_ids
+            ),
+            None,
+        )
+        if witness is not None and witness not in protected:
+            protected.append(witness)
+    ordered = tuple((*protected, *(row for row in candidates if row not in protected)))
+    # Obligation witnesses receive the front of the fixed hydration budget,
+    # but they do not silently turn a named maximum into a soft limit.  When
+    # distinct witnesses outnumber the cap, the remainder stay in the sealed
+    # omitted partition so closure remains open for a successor search.
+    admitted_count = policy.max_hydrated_segments
+    admitted = ordered[:admitted_count]
     omitted = tuple(
         row.segment_receipt_sha256
-        for row in candidates[policy.max_hydrated_segments :]
+        for row in ordered[admitted_count:]
     )
     return (
         admitted,
-        tuple(row.receipt_sha256 for row in candidates),
+        tuple(row.receipt_sha256 for row in ordered),
         omitted,
     )
 
@@ -2156,6 +2209,7 @@ class GlobalCompletionClosure:
             self.unresolved_obligation_ids
             or not self.tree_search_closed
             or not self.hydration_complete
+            or not self.independent_lane_selection_complete
             or not self.packing_closed
             or (
                 self.operand_closure_required
@@ -2419,6 +2473,7 @@ def _make_closure(
         unresolved_ids
         or not tree_frontier.search_closed
         or not hydration_complete
+        or not lanes_complete
         or not packing_closed
         or (operand_required and not compiled)
     )

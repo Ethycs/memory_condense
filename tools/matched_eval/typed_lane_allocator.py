@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from memory_condense.domain._tokenizer import count_tokens
 
@@ -259,6 +259,7 @@ def _round_robin_items(
     *,
     operator_spec: TypedOperatorSpec | None,
     local_selection_priority_by_handle: Mapping[str, tuple[int, ...]],
+    admit_item: Callable[[TypedEvidenceContribution, TypedEvidenceItem], bool],
 ) -> tuple[tuple[TypedEvidenceContribution, TypedEvidenceItem], ...]:
     ordinal: dict[str, int] = {}
     owner: dict[str, TypedEvidenceContribution] = {}
@@ -320,32 +321,49 @@ def _round_robin_items(
     result: list[tuple[TypedEvidenceContribution, TypedEvidenceItem]] = []
     represented_groups: set[str] = set()
     remaining = list(flattened)
+
+    def consider(
+        contribution: TypedEvidenceContribution,
+        item: TypedEvidenceItem,
+    ) -> bool:
+        result.append((contribution, item))
+        remaining.remove(item)
+        admitted = admit_item(contribution, item)
+        if admitted:
+            represented_groups.update(
+                group_by_handle[handle] for handle in item.handle_ids
+            )
+        return admitted
+
     # Preserve one strongest candidate per nonempty mechanism before any lane
-    # fill, then favor new source groups and question-derived slot gain.
+    # fill, then favor new source groups and question-derived slot gain.  A
+    # mechanism keeps trying candidates until one is actually admitted; an
+    # unusable or oversized candidate cannot claim phantom group coverage.
     for contribution in contributions:
-        candidates = [
-            item
-            for item in remaining
-            if owner[item.receipt_sha256] is contribution
-        ]
-        if not candidates:
-            continue
-        selected = max(
-            candidates,
-            key=lambda item: strength(item, represented_groups=represented_groups),
-        )
-        result.append((contribution, selected))
-        remaining.remove(selected)
-        represented_groups.update(group_by_handle[row] for row in selected.handle_ids)
+        while True:
+            candidates = [
+                item
+                for item in remaining
+                if owner[item.receipt_sha256] is contribution
+            ]
+            if not candidates:
+                break
+            selected = max(
+                candidates,
+                key=lambda item: strength(
+                    item,
+                    represented_groups=represented_groups,
+                ),
+            )
+            if consider(contribution, selected):
+                break
     while remaining:
         selected = max(
             remaining,
             key=lambda item: strength(item, represented_groups=represented_groups),
         )
         contribution = owner[selected.receipt_sha256]
-        result.append((contribution, selected))
-        remaining.remove(selected)
-        represented_groups.update(group_by_handle[row] for row in selected.handle_ids)
+        consider(contribution, selected)
     return tuple(result)
 
 
@@ -431,20 +449,31 @@ def allocate_typed_contribution_lanes(
         )
         accepted: list[TypedEvidenceItem] = []
         omitted: list[TypedEvidenceItem] = []
-        for contribution, item in _round_robin_items(
+
+        def admit_item(
+            contribution: TypedEvidenceContribution,
+            item: TypedEvidenceItem,
+        ) -> bool:
+            if not _usable_item(item, operator_spec):
+                omitted.append(item)
+                return False
+            trial = tuple((*accepted, item))
+            if (
+                lane_content_token_proxy(trial, all_bindings)
+                > lane_budget.final_content_token_cap
+            ):
+                omitted.append(item)
+                return False
+            accepted.append(item)
+            selected_by_mechanism[contribution.mechanism_id].append(item)
+            return True
+
+        _round_robin_items(
             lane_contributions,
             operator_spec=operator_spec,
             local_selection_priority_by_handle=priorities,
-        ):
-            if not _usable_item(item, operator_spec):
-                omitted.append(item)
-                continue
-            trial = tuple((*accepted, item))
-            if lane_content_token_proxy(trial, all_bindings) <= lane_budget.final_content_token_cap:
-                accepted.append(item)
-                selected_by_mechanism[contribution.mechanism_id].append(item)
-            else:
-                omitted.append(item)
+            admit_item=admit_item,
+        )
         used_handles = {handle for item in accepted for handle in item.handle_ids}
         selected_bindings = tuple(
             row for row in all_bindings if row.handle_id in used_handles

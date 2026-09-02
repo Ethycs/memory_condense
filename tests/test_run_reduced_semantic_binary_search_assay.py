@@ -198,7 +198,9 @@ def _closure_fixture(*, duplicate: bool):
             {
                 "duplicate_item_receipt_sha256": residual_item_receipt,
                 "duplicate_mechanism_id": arm.residual.TYPED_ADAPTER_MECHANISM_ID,
-                "operation_position": "after_all_mechanism_selection",
+                "operation_position": (
+                    "after_independent_lane_admission_and_shared_surplus_fill"
+                ),
                 "owner_item_receipt_sha256": owner_item_receipt,
             }
         ]

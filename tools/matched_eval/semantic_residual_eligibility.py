@@ -526,8 +526,8 @@ def _reconciliation_unresolved(row: Mapping[str, Any] | None) -> bool:
 
 def _combined_resolution_state(
     answer_row: Mapping[str, Any],
-) -> tuple[str, bool, bool]:
-    """Return lane, V3-schema flag, and whether a combined repair won.
+) -> tuple[str, bool, bool, bool]:
+    """Return lane, V3 flag, attempted flag, and whether a repair won.
 
     Missing V2 fields must not be interpreted as weak merely because V3 has a
     different schema.  A non-fallback V3 decision is a completed combined
@@ -544,8 +544,16 @@ def _combined_resolution_state(
         type(source_value) is str and source_value.startswith("locked_v3_")
     )
     lane = lane_value.casefold() if type(lane_value) is str else ""
-    applied = is_v3 and lane not in {"", "fallback", "none", "v2_fallback"}
-    return lane, is_v3, applied
+    attempted = is_v3 and lane not in {"", "fallback", "none", "v2_fallback"}
+    parse_error = answer_row.get("parse_error_code")
+    parse_clean = parse_error in {None, "", "none"}
+    prediction = answer_row.get("prediction")
+    non_abstaining = (
+        type(prediction) is str and _ABSTENTION_RE.search(prediction) is None
+    )
+    valid = answer_row.get("solver_valid") is not False
+    applied = attempted and valid and parse_clean and non_abstaining
+    return lane, is_v3, attempted, applied
 
 
 def evaluate_semantic_residual_eligibility(
@@ -592,7 +600,9 @@ def evaluate_semantic_residual_eligibility(
 
     prediction = require_text(answer_row.get("prediction"), "residual answer prediction")
     construction_mode = str(construction_row.get("mode") or "").casefold()
-    combined_lane, is_v3, combined_applied = _combined_resolution_state(answer_row)
+    combined_lane, is_v3, combined_attempted, combined_applied = (
+        _combined_resolution_state(answer_row)
+    )
     answer_basis = (
         prior_answer_row
         if is_v3 and not combined_applied and prior_answer_row is not None
@@ -608,7 +618,12 @@ def evaluate_semantic_residual_eligibility(
     used_handle_count = len(tuple(used_handles))
     answer_invalid = not combined_applied and (
         answer_basis.get("solver_valid") is False
+        or (combined_attempted and answer_row.get("solver_valid") is False)
         or answer_basis.get("parse_error_code") not in {None, "", "none"}
+        or (
+            combined_attempted
+            and answer_row.get("parse_error_code") not in {None, "", "none"}
+        )
         or decision in {"invalid", "invalid_keep_parent"}
     )
     answer_abstained = _ABSTENTION_RE.search(prediction) is not None

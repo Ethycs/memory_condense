@@ -241,6 +241,59 @@ def test_v3_combined_resolution_is_terminal_even_when_v2_route_was_weak() -> Non
     assert decision.signals.specialist_route_gap is False
 
 
+@pytest.mark.parametrize(
+    "answer_update, expected_reason",
+    (
+        (
+            {
+                "solver_valid": False,
+                "parse_error_code": "specialist_temporal_interval_disagreement",
+            },
+            "answer_invalid",
+        ),
+        (
+            {
+                "solver_valid": False,
+                "prediction": "Unable to determine from memory.",
+            },
+            "answer_abstained",
+        ),
+    ),
+)
+def test_v3_attempt_is_not_terminal_when_invalid_or_abstaining(
+    answer_update: dict[str, object], expected_reason: str
+) -> None:
+    answer = {
+        "decision_lane": "question_bound_temporal",
+        "format": (
+            "memory-condense-locked-specialist-final-reconciliation-v3-"
+            "result-row-v1"
+        ),
+        "gold_loaded": False,
+        "prediction": "3 months",
+        "prediction_source": "locked_v3_temporal_computed",
+        "reconciliation": {"operation": "direct_duration"},
+        **answer_update,
+    }
+    construction = _construction(
+        style="temporal_timeline",
+        mode="parent_passthrough",
+        unresolved=("event_end",),
+    )
+    construction["methods"] = []
+
+    decision = evaluate_semantic_residual_eligibility(
+        answer,
+        construction,
+        prior_answer_row=_answer(decision="keep_parent", used=()),
+    )
+
+    assert decision.eligible is True
+    assert expected_reason in decision.reasons
+    assert decision.signals.combined_resolution_applied is False
+    assert decision.signals.specialist_route_gap is True
+
+
 def test_v3_fallback_missing_v2_fields_is_not_weak_numeric_evidence() -> None:
     answer = {
         "decision_lane": "v2_fallback",

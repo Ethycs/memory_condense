@@ -17,6 +17,7 @@ from tools.matched_eval.full_store_slot_closure import build_full_store_window_i
 from tools.matched_eval.query_expansion import FrozenSourceNamespace
 from tools.matched_eval.query_guided_scan import cache_namespace_partitions
 from tools.matched_eval.semantic_global_completion import (
+    GlobalLaneBudget,
     SemanticGlobalCompletionError,
     SemanticGlobalCompletionPolicy,
     compile_semantic_global_completion_request,
@@ -689,3 +690,129 @@ def test_request_is_generic_and_rejects_unknown_slot() -> None:
     assert "ordinal" not in json.dumps(
         compile_semantic_global_completion_request.__annotations__, default=str
     ).casefold()
+
+
+def test_required_user_role_keeps_assistant_answer_branch(tmp_path: Path) -> None:
+    user = "I visited the camera shop on Saturday."
+    answer = "You bought the Lumina camera during that visit."
+    index = _build(
+        tmp_path,
+        "global-role-bridge",
+        [("user", user, BASE, "user"), ("assistant", answer, BASE, "assistant")],
+        {"user": [1.0, 0.0], "assistant": [1.0, 0.0]},
+    )
+    query = _query(index, "What did I buy when I visited the camera shop?", [1.0, 0.0])
+    result = _search(index, query)
+
+    assert result.tree_frontier.definitely_no_leaf_cell_ids == ()
+    assert answer in {row.quote for row in result.evidence}
+
+
+def test_non_user_source_neighbor_is_hydrated(tmp_path: Path) -> None:
+    origin = "I visited the Orion exhibit."
+    neighbor = "The nearby museums were Atlas and Nova."
+    index = _build(
+        tmp_path,
+        "assistant-neighbor",
+        [("history", origin, BASE, "user"), ("history", neighbor, BASE, "assistant")],
+        {"history": [1.0, 0.0]},
+        max_cell_tokens=8,
+    )
+    query = _query(index, "Which museums were near the Orion exhibit?", [1.0, 0.0])
+    result = _search(
+        index,
+        query,
+        policy=SemanticGlobalCompletionPolicy(max_retained_leaf_cells=1),
+    )
+
+    candidate = next(row for row in result.candidates if row.quote == neighbor)
+    assert any(route.startswith("source_local_neighbor") for route in candidate.hydration_routes)
+
+
+def test_obligation_witness_precedes_hydration_slice(tmp_path: Path) -> None:
+    witness = "The heliotrope code is LIME-42."
+    index = _build(
+        tmp_path,
+        "hydration-witness",
+        [("noise", "Unrelated highly similar note.", BASE, "user"), ("answer", witness, BASE, "user")],
+        {"noise": [1.0, 0.0], "answer": [-1.0, 0.0]},
+    )
+    query = _query(index, "What was the heliotrope code?", [1.0, 0.0])
+    result = _search(
+        index,
+        query,
+        policy=SemanticGlobalCompletionPolicy(max_hydrated_segments=1),
+    )
+
+    assert witness in {row.quote for row in result.candidates}
+
+
+def test_entity_obligation_cap_defers_but_conserves_fifth_target(
+    tmp_path: Path,
+) -> None:
+    names = ("Amber", "Birch", "Cedar", "Dahlia", "Equinox")
+    rows = [
+        (
+            name.casefold(),
+            f"The {name} marker was recorded in my notebook.",
+            BASE + timedelta(days=index),
+            "user",
+        )
+        for index, name in enumerate(names)
+    ]
+    index = _build(
+        tmp_path,
+        "entity-obligation-overflow",
+        rows,
+        {source_id: [1.0, 0.0] for source_id, *_rest in rows},
+    )
+    query = _query(
+        index,
+        "Which markers mentioned Amber, Birch, Cedar, Dahlia, or Equinox?",
+        [1.0, 0.0],
+    )
+    result = _search(
+        index,
+        query,
+        policy=SemanticGlobalCompletionPolicy(
+            max_entity_obligations=4,
+            max_hydrated_segments=1,
+        ),
+    )
+
+    entity_obligations = tuple(
+        row for row in result.obligations if row.kind == "entity"
+    )
+    by_label = {row.label: row for row in entity_obligations}
+    assert {name.casefold() for name in names} <= set(by_label)
+    equinox = by_label["equinox"]
+    assert entity_obligations.index(equinox) >= result.policy.max_entity_obligations
+    equinox_segment = next(
+        segment
+        for cell in index.cells
+        for segment in cell.segments
+        if "Equinox" in segment.quote
+    )
+    assert len(result.candidates) == result.policy.max_hydrated_segments
+    assert (
+        equinox_segment.receipt_sha256
+        in result.omitted_hydrated_segment_receipt_sha256s
+    )
+    assert equinox.obligation_id in result.closure.required_obligation_ids
+    assert equinox.obligation_id in result.closure.unresolved_obligation_ids
+    assert result.closure.hydration_complete is False
+    assert result.closure.needs_further_global_search is True
+
+
+def test_lane_exhaustion_keeps_global_routing_open(tmp_path: Path) -> None:
+    rows = [
+        (f"source-{index}", f"Heliotrope code candidate {index} is K-{index}.", BASE, "user")
+        for index in range(4)
+    ]
+    index = _build(tmp_path, "lane-open", rows, {source: [1.0, 0.0] for source, *_ in rows})
+    query = _query(index, "What was the heliotrope code?", [1.0, 0.0])
+    budgets = tuple(GlobalLaneBudget(lane, 1, 100) for lane in ("dense", "sparse", "personal_temporal", "source_date_diversity"))
+    result = _search(index, query, policy=SemanticGlobalCompletionPolicy(lane_budgets=budgets))
+
+    assert any(row.budget_exhausted for row in result.lane_receipts)
+    assert result.closure.needs_further_global_search is True

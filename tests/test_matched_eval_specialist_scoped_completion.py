@@ -10,6 +10,7 @@ from tools.matched_eval.contracts import identity_sha256
 from tools.matched_eval.specialist_scoped_completion import (
     HARD_COMPLETE_CHAT_TOKEN_CAP,
     OUTPUT_TOKEN_RESERVE,
+    SPECIALIST_ADVISORY_FORMAT,
     SPECIALIST_SYSTEM_PROMPT,
     SpecialistProofKind,
     SpecialistScopedCompletionError,
@@ -123,13 +124,14 @@ def _completion(prediction: str, handles: list[str]) -> str:
 
 def test_renderer_declares_closed_specialist_scope_and_recounts_hard_budget() -> None:
     advisory = {
-        "candidate_handle_map": {_sha("candidate"): "H700001"},
+        "format": SPECIALIST_ADVISORY_FORMAT,
+        "handle_ids": ["H700001"],
         "mechanism_id": "numeric_specialist",
         "operand_groups": [
             {
                 "action_class": "buy",
-                "candidate_ids": [_sha("candidate")],
                 "entity_key": "feed",
+                "handle_ids": ["H700001"],
                 "operand_values": [50.0],
                 "operation_mode": "sum",
                 "source_group_handles": ["G700001"],
@@ -270,21 +272,19 @@ def test_temporal_order_and_relative_roles_are_advisory_local() -> None:
     groups = {handle: f"G90000{index + 1}" for index, handle in enumerate(rows)}
     order_advisory = {
         "absence_certificate": None,
-        "candidate_handle_map": candidate_map,
+        "format": SPECIALIST_ADVISORY_FORMAT,
+        "handle_ids": list(rows),
         "mechanism_id": "temporal_specialist",
         "purpose": "order selected events",
         "temporal_bundle": {
-            "ordered_candidate_ids": list(candidates),
             "ordered_handle_ids": list(rows),
             "original_population_count": 80,
-            "predecessor_candidate_id": candidates[1],
             "predecessor_handle_id": "H900002",
             "query_time": "2023-06-01T03:56:00",
             "requested_cardinality": 3,
             "route": "temporal_order",
             "target_date": None,
             "terminal_selection_truncated": True,
-            "winner_candidate_id": candidates[2],
             "winner_handle_id": "H900003",
         },
     }
@@ -632,7 +632,6 @@ def test_absence_certificate_allows_only_scoped_insufficiency() -> None:
                     "explicit_numeric_operand_missing": False,
                     "scope_has_grounded_predicate_assertion": True,
                     "selected_supporting_handle_ids": ["H900001"],
-                    "slot_id": _sha("tomato slot"),
                     "slot_label": "tomatoes",
                 },
                 {
@@ -644,12 +643,12 @@ def test_absence_certificate_allows_only_scoped_insufficiency() -> None:
                     "explicit_numeric_operand_missing": True,
                     "scope_has_grounded_predicate_assertion": True,
                     "selected_supporting_handle_ids": [],
-                    "slot_id": _sha("chili slot"),
                     "slot_label": "chili peppers",
                 },
             ],
         },
-        "candidate_handle_map": {support_candidate: "H900001"},
+        "format": SPECIALIST_ADVISORY_FORMAT,
+        "handle_ids": ["H900001"],
         "mechanism_id": "temporal_insufficiency_specialist",
         "purpose": "certify scoped missing operand",
         "temporal_bundle": None,
@@ -801,10 +800,8 @@ def test_profile_preference_is_grounded_in_one_specialist_cluster() -> None:
     first = _sha("profile first")
     second = _sha("profile second")
     advisory = {
-        "candidate_handle_map": {
-            first: "H800001",
-            second: "H800002",
-        },
+        "format": SPECIALIST_ADVISORY_FORMAT,
+        "handle_ids": ["H800001", "H800002"],
         "mechanism_id": "profile_preference_specialist_v1",
         "purpose": "personalize from one coherent first-person cluster",
     }

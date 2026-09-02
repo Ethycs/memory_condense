@@ -10,8 +10,8 @@ recurses into both children.  Thus uncertainty is represented by
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import InitVar, dataclass
 from typing import Literal, Protocol, runtime_checkable
 
 from memory_condense.domain._tokenizer import count_tokens
@@ -149,34 +149,75 @@ class SemanticCell:
         return value
 
 
-@dataclass(frozen=True, slots=True)
-class SemanticSearchNode:
+class _SemanticSearchNodeCache:
+    __slots__ = (
+        "_cell_population",
+        "_cell_population_start",
+        "_token_count_cache",
+    )
+
+    _cell_population: tuple[SemanticCell, ...]
+    _cell_population_start: int
+    _token_count_cache: int
+
+
+class _SharedSemanticCells:
+    """Private construction carrier for one already validated leaf tuple."""
+
+    __slots__ = ("cells",)
+
+    def __init__(self, cells: tuple[SemanticCell, ...]) -> None:
+        self.cells = cells
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SemanticSearchNode(_SemanticSearchNodeCache):
     """One immutable contiguous node in the balanced pair tree."""
 
     span_start: int
     span_end: int
-    cells: tuple[SemanticCell, ...]
+    cells: InitVar[tuple[SemanticCell, ...]]
     left: "SemanticSearchNode | None" = None
     right: "SemanticSearchNode | None" = None
     receipt_sha256: str = ""
 
-    def __post_init__(self) -> None:
-        cells = _exact_tuple(self.cells, "semantic node cells")
+    def __post_init__(
+        self,
+        cells: tuple[SemanticCell, ...] | _SharedSemanticCells,
+    ) -> None:
+        span_size = self.span_end - self.span_start
+        shared = type(cells) is _SharedSemanticCells
+        population = cells.cells if shared else _exact_tuple(
+            cells, "semantic node cells"
+        )
+        population_start = 0 if shared else self.span_start
+        population_end = population_start + len(population)
         _require(
             type(self.span_start) is int
             and type(self.span_end) is int
             and 0 <= self.span_start < self.span_end
-            and len(cells) == self.span_end - self.span_start
-            and all(type(row) is SemanticCell for row in cells)
-            and len({row.cell_id for row in cells}) == len(cells),
+            and population_start <= self.span_start
+            and self.span_end <= population_end
+            and (
+                shared
+                or (
+                    len(population) == span_size
+                    and all(type(row) is SemanticCell for row in population)
+                    and len({row.cell_id for row in population})
+                    == len(population)
+                )
+            ),
             "semantic node span/cell population changed",
         )
-        leaf = len(cells) == 1
+        object.__setattr__(self, "_cell_population", population)
+        object.__setattr__(self, "_cell_population_start", population_start)
+        leaf = span_size == 1
         if leaf:
             _require(
                 self.left is None and self.right is None,
                 "semantic leaf cannot have children",
             )
+            token_count = population[self.span_start - population_start].token_count
         else:
             _require(
                 type(self.left) is SemanticSearchNode
@@ -188,10 +229,30 @@ class SemanticSearchNode:
                 self.left.span_start == self.span_start
                 and self.left.span_end == self.right.span_start
                 and self.right.span_end == self.span_end
-                and self.left.cells + self.right.cells == cells
-                and abs(len(self.left.cells) - len(self.right.cells)) <= 1,
+                and (
+                    (
+                        shared
+                        and self.left._cell_population is population
+                        and self.right._cell_population is population
+                        and self.left._cell_population_start == population_start
+                        and self.right._cell_population_start == population_start
+                    )
+                    or (
+                        not shared
+                        and tuple(self.left.iter_cells())
+                        + tuple(self.right.iter_cells())
+                        == population
+                    )
+                )
+                and abs(
+                    (self.left.span_end - self.left.span_start)
+                    - (self.right.span_end - self.right.span_start)
+                )
+                <= 1,
                 "semantic node children changed balanced contiguous coverage",
             )
+            token_count = self.left.token_count + self.right.token_count
+        object.__setattr__(self, "_token_count_cache", token_count)
         object.__setattr__(
             self,
             "receipt_sha256",
@@ -208,15 +269,21 @@ class SemanticSearchNode:
 
     @property
     def token_count(self) -> int:
-        return sum(row.token_count for row in self.cells)
+        return self._token_count_cache
+
+    def iter_cells(self) -> Iterator[SemanticCell]:
+        start = self.span_start - self._cell_population_start
+        end = self.span_end - self._cell_population_start
+        for index in range(start, end):
+            yield self._cell_population[index]
 
     @property
     def cell_ids(self) -> tuple[str, ...]:
-        return tuple(row.cell_id for row in self.cells)
+        return tuple(row.cell_id for row in self.iter_cells())
 
     @property
     def is_leaf(self) -> bool:
-        return len(self.cells) == 1
+        return self.span_end - self.span_start == 1
 
     @property
     def children(self) -> tuple["SemanticSearchNode", ...]:
@@ -225,10 +292,57 @@ class SemanticSearchNode:
         assert self.left is not None and self.right is not None
         return (self.left, self.right)
 
+    def __copy__(self) -> "SemanticSearchNode":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "SemanticSearchNode":
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (
+            type(self),
+            (
+                self.span_start,
+                self.span_end,
+                self.cells,
+                self.left,
+                self.right,
+                self.receipt_sha256,
+            ),
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not SemanticSearchNode:
+            return NotImplemented
+        assert type(other) is SemanticSearchNode
+        return (
+            self.span_start == other.span_start
+            and self.span_end == other.span_end
+            and self.cells == other.cells
+            and self.left == other.left
+            and self.right == other.right
+            and self.receipt_sha256 == other.receipt_sha256
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.span_start,
+                self.span_end,
+                self.cells,
+                self.left,
+                self.right,
+                self.receipt_sha256,
+            )
+        )
+
     def projection(self, *, include_receipt: bool = True) -> dict[str, object]:
         value: dict[str, object] = {
             "cell_ids": list(self.cell_ids),
-            "cell_receipt_sha256s": [row.receipt_sha256 for row in self.cells],
+            "cell_receipt_sha256s": [
+                row.receipt_sha256 for row in self.iter_cells()
+            ],
             "child_node_receipt_sha256s": [
                 row.receipt_sha256 for row in self.children
             ],
@@ -244,12 +358,26 @@ class SemanticSearchNode:
         return value
 
 
+def _node_cells(node: SemanticSearchNode) -> tuple[SemanticCell, ...]:
+    return tuple(node.iter_cells())
+
+
+SemanticSearchNode.cells = property(_node_cells)  # type: ignore[attr-defined]
+
+
 def _preorder_nodes(node: SemanticSearchNode) -> tuple[SemanticSearchNode, ...]:
     return (node, *(child for row in node.children for child in _preorder_nodes(row)))
 
 
+class _SemanticSearchTreeCache:
+    __slots__ = ("_nodes_cache", "_token_count_cache")
+
+    _nodes_cache: tuple[SemanticSearchNode, ...]
+    _token_count_cache: int
+
+
 @dataclass(frozen=True, slots=True)
-class SemanticSearchTree:
+class SemanticSearchTree(_SemanticSearchTreeCache):
     """The complete deterministic tree and exact ordered leaf population."""
 
     cells: tuple[SemanticCell, ...]
@@ -271,10 +399,13 @@ class SemanticSearchTree:
         nodes = _preorder_nodes(self.root)
         _require(
             len(nodes) == 2 * len(cells) - 1
-            and tuple(row.cells[0] for row in nodes if row.is_leaf) == cells
+            and tuple(next(row.iter_cells()) for row in nodes if row.is_leaf)
+            == cells
             and len({row.receipt_sha256 for row in nodes}) == len(nodes),
             "semantic tree lost exact ordered binary leaf coverage",
         )
+        object.__setattr__(self, "_nodes_cache", nodes)
+        object.__setattr__(self, "_token_count_cache", self.root.token_count)
         object.__setattr__(
             self,
             "receipt_sha256",
@@ -287,11 +418,24 @@ class SemanticSearchTree:
 
     @property
     def nodes(self) -> tuple[SemanticSearchNode, ...]:
-        return _preorder_nodes(self.root)
+        return self._nodes_cache
 
     @property
     def token_count(self) -> int:
-        return sum(row.token_count for row in self.cells)
+        return self._token_count_cache
+
+    def __copy__(self) -> "SemanticSearchTree":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "SemanticSearchTree":
+        memo[id(self)] = self
+        return self
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (
+            _restore_semantic_search_tree,
+            (self.cells, self.receipt_sha256),
+        )
 
     def projection(self, *, include_receipt: bool = True) -> dict[str, object]:
         value: dict[str, object] = {
@@ -311,16 +455,23 @@ class SemanticSearchTree:
 def _build_node(
     cells: tuple[SemanticCell, ...], start: int, end: int
 ) -> SemanticSearchNode:
-    selected = cells[start:end]
+    return _build_shared_node(_SharedSemanticCells(cells), start, end)
+
+
+def _build_shared_node(
+    cells: _SharedSemanticCells,
+    start: int,
+    end: int,
+) -> SemanticSearchNode:
     if end - start == 1:
-        return SemanticSearchNode(start, end, selected)
+        return SemanticSearchNode(start, end, cells)
     midpoint = start + (end - start) // 2
     return SemanticSearchNode(
         start,
         end,
-        selected,
-        _build_node(cells, start, midpoint),
-        _build_node(cells, midpoint, end),
+        cells,
+        _build_shared_node(cells, start, midpoint),
+        _build_shared_node(cells, midpoint, end),
     )
 
 
@@ -335,6 +486,17 @@ def build_semantic_search_tree(
         "semantic search requires at least one exact cell",
     )
     return SemanticSearchTree(values, _build_node(values, 0, len(values)))
+
+
+def _restore_semantic_search_tree(
+    cells: tuple[SemanticCell, ...],
+    receipt_sha256: str,
+) -> SemanticSearchTree:
+    return SemanticSearchTree(
+        cells,
+        _build_node(cells, 0, len(cells)),
+        receipt_sha256,
+    )
 
 
 def validate_semantic_search_tree(tree: SemanticSearchTree) -> None:
@@ -726,7 +888,9 @@ def semantic_binary_search(
                     decision.receipt_sha256,
                 )
                 for cell_ordinal, cell in zip(
-                    range(node.span_start, node.span_end), node.cells, strict=True
+                    range(node.span_start, node.span_end),
+                    node.iter_cells(),
+                    strict=True,
                 )
             )
         elif node.is_leaf:
@@ -737,7 +901,7 @@ def semantic_binary_search(
             outcomes = (
                 LeafOutcome(
                     node.span_start,
-                    node.cells[0].cell_id,
+                    next(node.iter_cells()).cell_id,
                     "retained",
                     node.receipt_sha256,
                     decision.receipt_sha256,
@@ -761,7 +925,9 @@ def semantic_binary_search(
                         decision.receipt_sha256,
                     )
                     for cell_ordinal, cell in zip(
-                        range(node.span_start, node.span_end), node.cells, strict=True
+                        range(node.span_start, node.span_end),
+                        node.iter_cells(),
+                        strict=True,
                     )
                 )
             else:
@@ -894,7 +1060,9 @@ def validate_semantic_binary_search_result(
                     decision.receipt_sha256,
                 )
                 for ordinal, cell in zip(
-                    range(node.span_start, node.span_end), node.cells, strict=True
+                    range(node.span_start, node.span_end),
+                    node.iter_cells(),
+                    strict=True,
                 )
             )
             return visit
@@ -910,7 +1078,7 @@ def validate_semantic_binary_search_result(
             generated.append(
                 LeafOutcome(
                     node.span_start,
-                    node.cells[0].cell_id,
+                    next(node.iter_cells()).cell_id,
                     "retained",
                     node.receipt_sha256,
                     decision.receipt_sha256,
@@ -940,7 +1108,9 @@ def validate_semantic_binary_search_result(
                     decision.receipt_sha256,
                 )
                 for ordinal, cell in zip(
-                    range(node.span_start, node.span_end), node.cells, strict=True
+                    range(node.span_start, node.span_end),
+                    node.iter_cells(),
+                    strict=True,
                 )
             )
             return visit

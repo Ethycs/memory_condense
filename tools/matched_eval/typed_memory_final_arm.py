@@ -93,7 +93,7 @@ STORY_LINK_TOKEN_CAP = 256
 LOCAL_RETENTION_PRIORITY_WIDTH = 24
 VALIDATION_CONTRACT_FORMAT = f"{FORMAT}-completion-validation-contract-v3"
 
-SYSTEM_PROMPT = (
+RESOURCE_PRESERVING_SYSTEM_PROMPT_V2 = (
     "Answer one dated long-memory question from the supplied typed evidence. "
     "The protected parent prediction is fallback-not-evidence. Evidence is "
     "identified only by opaque H handles; opaque G handles express story or "
@@ -122,6 +122,7 @@ SYSTEM_PROMPT = (
     "and an empty handle list. replace requires a nonempty concise prediction "
     "and one or more supplied usable handles."
 )
+SYSTEM_PROMPT = RESOURCE_PRESERVING_SYSTEM_PROMPT_V2
 
 # Sealed terminal artifacts created before exact resource preservation was
 # added must continue to reconstruct their original provider messages.  Keep
@@ -130,7 +131,7 @@ _RESOURCE_PRESERVATION_INSTRUCTION = (
     "When the answering evidence supplies an exact resource title or URL, "
     "preserve both exactly in the replacement. "
 )
-LEGACY_SYSTEM_PROMPT_V1 = SYSTEM_PROMPT.replace(
+LEGACY_SYSTEM_PROMPT_V1 = RESOURCE_PRESERVING_SYSTEM_PROMPT_V2.replace(
     _RESOURCE_PRESERVATION_INSTRUCTION,
     "",
 )
@@ -276,11 +277,18 @@ def _packet_subset(
     packet: TypedEvidencePacket,
     items: tuple[TypedEvidenceItem, ...],
 ) -> TypedEvidencePacket:
+    identity_subset = tuple(
+        item.receipt_sha256 for item in items
+    ) == tuple(item.receipt_sha256 for item in packet.items)
     used_handles = {handle for item in items for handle in item.handle_ids}
-    bindings = tuple(
-        binding
-        for binding in packet.local_bindings
-        if binding.handle_id in used_handles
+    bindings = (
+        packet.local_bindings
+        if identity_subset
+        else tuple(
+            binding
+            for binding in packet.local_bindings
+            if binding.handle_id in used_handles
+        )
     )
     parsed = ParsedTypedItems(
         items,
@@ -312,7 +320,7 @@ def _packet_subset(
         # prevents the packet builder's first-fit salvage from silently
         # dropping later mechanisms before weakest-item fitting can see them.
         output_token_reserve=PACKET_CONSTRUCTION_OUTPUT_TOKEN_RESERVE,
-        truncated=True,
+        truncated=bool(packet.frontier.truncated or not identity_subset),
         provider_payload_mode=packet.provider_payload_mode,
     )
 
@@ -2709,6 +2717,7 @@ __all__ = [
     "PACKET_CONSTRUCTION_OUTPUT_TOKEN_RESERVE",
     "PROMPT_ROW_FORMAT",
     "ParsedTypedFinalDecision",
+    "RESOURCE_PRESERVING_SYSTEM_PROMPT_V2",
     "RESULT_ROW_FORMAT",
     "STORY_LINK_TOKEN_CAP",
     "SYSTEM_PROMPT",

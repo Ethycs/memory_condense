@@ -49,6 +49,9 @@ FORMAT = "memory-condense-typed-evidence-packet-v2"
 COMPACT_FINAL_PROVIDER_FORMAT = (
     "memory-condense-typed-memory-final-arm-v1-compact-provider-evidence-v1"
 )
+COMPACT_FINAL_PROVIDER_FORMAT_V2 = (
+    "memory-condense-typed-memory-final-arm-v1-compact-provider-evidence-v2"
+)
 HANDLE_FORMAT = "memory-condense-opaque-evidence-handle-v1"
 BINDING_FORMAT = "memory-condense-local-evidence-binding-v1"
 ITEM_FORMAT = "memory-condense-typed-evidence-item-v2"
@@ -126,6 +129,7 @@ class ProviderPayloadMode(str, Enum):
 
     CANONICAL = "canonical"
     COMPACT_FINAL = "compact_final"
+    COMPACT_FINAL_V2 = "compact_final_v2"
 
 
 def _text_sha256(value: str) -> str:
@@ -628,6 +632,124 @@ def compact_evidence_content_projection(
     return result
 
 
+def _compact_final_evidence_content_projection_v2(
+    items: Sequence[TypedEvidenceItem],
+    bindings: Sequence[EvidenceHandleBinding],
+    *,
+    slot_alias_by_id: dict[str, str],
+) -> dict[str, Any]:
+    """Version-two provider content without stable local identity fields."""
+
+    exact_items = tuple(items)
+    exact_bindings = tuple(bindings)
+    if not (
+        all(type(row) is TypedEvidenceItem for row in exact_items)
+        and all(type(row) is EvidenceHandleBinding for row in exact_bindings)
+    ):
+        raise MatchedEvalContractError("compact evidence content changed type")
+    represented = {handle for item in exact_items for handle in item.handle_ids}
+    retained_bindings = tuple(
+        row for row in exact_bindings if row.handle_id in represented
+    )
+    if {row.handle_id for row in retained_bindings} != represented:
+        raise MatchedEvalContractError(
+            "compact evidence content escaped its opaque bindings"
+        )
+
+    grade_by_origin = {
+        EvidenceOrigin.DIRECT_POINTER: ProvenanceGrade.DIRECT_POINTER,
+        EvidenceOrigin.MAP: ProvenanceGrade.EXACT_CITATION,
+        EvidenceOrigin.SOURCE_FACT: ProvenanceGrade.EXACT_FACT_UNION,
+    }
+    handles: list[dict[str, Any]] = []
+    for row in retained_bindings:
+        handle: dict[str, Any] = {
+            "group_handle": row.source_group_handle,
+            "handle_id": row.handle_id,
+            "origin": row.origin.value,
+        }
+        if grade_by_origin.get(row.origin) is not row.provenance_grade:
+            handle["provenance_grade"] = row.provenance_grade.value
+        handles.append(handle)
+
+    group_keys = tuple(
+        dict.fromkeys(
+            item.group_key
+            for item in exact_items
+            if item.group_key is not None
+        )
+    )
+    group_alias_by_id = {
+        group_key: f"K{index:03d}"
+        for index, group_key in enumerate(group_keys, start=1)
+    }
+    compact_items: list[dict[str, Any]] = []
+    for item in exact_items:
+        try:
+            supported_slot_ids = [
+                slot_alias_by_id[slot_id] for slot_id in item.supported_slot_ids
+            ]
+        except KeyError as exc:
+            raise MatchedEvalContractError(
+                "compact evidence item escaped provider slot aliases"
+            ) from exc
+        value: dict[str, Any] = {
+            "handle_ids": list(item.handle_ids),
+            "kind": item.kind.value,
+            "summary": item.summary,
+            "value_authority": item.value_authority.value,
+        }
+        if item.content_coherence is not ContentCoherence.MATCH:
+            value["content_coherence"] = item.content_coherence.value
+        if not item.included:
+            value["included"] = False
+        if item.status is not EvidenceStatus.UNKNOWN:
+            value["status"] = item.status.value
+        if supported_slot_ids:
+            value["supported_slot_ids"] = supported_slot_ids
+        optional = {
+            "date": item.date,
+            "entity_key": item.entity_key,
+            "group_key": (
+                None
+                if item.group_key is None
+                else group_alias_by_id.get(item.group_key, item.group_key)
+            ),
+            "numeric_role": (
+                None
+                if item.numeric_role is NumericRole.NONE
+                else item.numeric_role.value
+            ),
+            "numeric_qualifier": (
+                item.numeric_qualifier.value
+                if item.numeric_value is not None
+                and item.numeric_qualifier is not NumericQualifier.EXACT
+                else None
+            ),
+            "numeric_value": item.numeric_value,
+            "participant_count": item.participant_count,
+            "personalization_anchors": (
+                list(item.personalization_anchors)
+                if item.personalization_anchors
+                else None
+            ),
+            "relation": item.relation,
+            "specificity_terms": (
+                list(item.specificity_terms)
+                if item.specificity_terms
+                else None
+            ),
+            "unit": item.unit,
+        }
+        value.update(
+            {key: child for key, child in optional.items() if child is not None}
+        )
+        compact_items.append(value)
+    result = {"handles": handles, "items": compact_items}
+    assert_gold_blind(result, path="compact_typed_evidence_content_v2")
+    return result
+
+
 def _compact_provider_projection(
     *,
     operator_spec: TypedOperatorSpec,
@@ -636,6 +758,8 @@ def _compact_provider_projection(
     items: Sequence[TypedEvidenceItem],
     bindings: Sequence[EvidenceHandleBinding],
 ) -> dict[str, Any]:
+    """Historical compact-final v1 projection; keep byte-identical."""
+
     spec = operator_spec
     operator = {
         "absence_decision_requires_closed_frontier": (
@@ -684,6 +808,105 @@ def _compact_provider_projection(
         "format": COMPACT_FINAL_PROVIDER_FORMAT,
         "frontier": compact_frontier,
         **compact_evidence_content_projection(items, bindings),
+        "operator_spec": operator,
+    }
+    assert_gold_blind(value, path="compact_typed_evidence")
+    return value
+
+
+def _compact_provider_projection_v2(
+    *,
+    operator_spec: TypedOperatorSpec,
+    frontier: EvidenceFrontierReceipt,
+    conflict_policy: ConflictPolicy,
+    items: Sequence[TypedEvidenceItem],
+    bindings: Sequence[EvidenceHandleBinding],
+) -> dict[str, Any]:
+    spec = operator_spec
+    slot_alias_by_id = {
+        slot.slot_id: f"S{index:03d}"
+        for index, slot in enumerate(spec.required_slots, start=1)
+    }
+    operator = {
+        "absence_decision_requires_closed_frontier": (
+            spec.absence_decision_requires_closed_frontier
+        ),
+        "answer_shape": spec.answer_shape.value,
+        "cardinality": spec.cardinality,
+        "comparison_mode": spec.comparison_mode.value,
+        "include_proposed": spec.include_proposed,
+        "operation": spec.operation,
+        "ordering": spec.ordering,
+        "personalization_required": spec.personalization_required,
+        "query_timestamp": spec.query_timestamp,
+        "required_evidence_role": spec.required_evidence_role,
+        "required_slots": [
+            {
+                "kind": slot.kind.value,
+                "label": slot.label,
+                "match_terms": list(slot.match_terms),
+                "minimum_match_term_count": slot.minimum_match_term_count,
+                "relation_constraint": slot.relation_constraint,
+                "requires_numeric": slot.requires_numeric,
+                "slot_id": slot_alias_by_id[slot.slot_id],
+            }
+            for slot in spec.required_slots
+        ],
+        "requires_all_slots": spec.requires_all_slots,
+        "requires_complete_frontier": spec.requires_complete_frontier,
+        "specificity_required": spec.specificity_required,
+        "style": spec.style.value,
+        "temporal_mode": spec.temporal_mode.value,
+        "temporal_window_days": spec.temporal_window_days,
+    }
+    try:
+        unresolved_slot_ids = [
+            slot_alias_by_id[slot_id] for slot_id in frontier.unresolved_slot_ids
+        ]
+    except KeyError as exc:
+        raise MatchedEvalContractError(
+            "compact frontier escaped provider slot aliases"
+        ) from exc
+    compact_frontier = {
+        "closed": frontier.closed,
+        "mode": frontier.mode.value,
+        "omitted_handle_ids": list(frontier.omitted_handle_ids),
+        "rejected_item_count": len(frontier.rejected_item_receipt_sha256s),
+        "truncated": frontier.truncated,
+        "unresolved_slot_ids": unresolved_slot_ids,
+    }
+    value = {
+        "conflict_policy": conflict_policy.value,
+        "defaults": {
+            "item": {
+                "content_coherence": ContentCoherence.MATCH.value,
+                "included": True,
+                "numeric_qualifier_when_numeric": NumericQualifier.EXACT.value,
+                "status": EvidenceStatus.UNKNOWN.value,
+                "supported_slot_ids": [],
+            },
+            "provenance_grade_by_origin": {
+                origin.value: grade.value
+                for origin, grade in (
+                    (
+                        EvidenceOrigin.DIRECT_POINTER,
+                        ProvenanceGrade.DIRECT_POINTER,
+                    ),
+                    (EvidenceOrigin.MAP, ProvenanceGrade.EXACT_CITATION),
+                    (
+                        EvidenceOrigin.SOURCE_FACT,
+                        ProvenanceGrade.EXACT_FACT_UNION,
+                    ),
+                )
+            },
+        },
+        "format": COMPACT_FINAL_PROVIDER_FORMAT_V2,
+        "frontier": compact_frontier,
+        **_compact_final_evidence_content_projection_v2(
+            items,
+            bindings,
+            slot_alias_by_id=slot_alias_by_id,
+        ),
         "operator_spec": operator,
     }
     assert_gold_blind(value, path="compact_typed_evidence")
@@ -760,8 +983,16 @@ class TypedEvidencePacket:
         assert_gold_blind(self.projection(), path="typed_evidence_packet")
 
     def provider_projection(self) -> dict[str, Any]:
-        if self.provider_payload_mode is ProviderPayloadMode.COMPACT_FINAL:
-            return _compact_provider_projection(
+        if self.provider_payload_mode in {
+            ProviderPayloadMode.COMPACT_FINAL,
+            ProviderPayloadMode.COMPACT_FINAL_V2,
+        }:
+            projector = (
+                _compact_provider_projection_v2
+                if self.provider_payload_mode is ProviderPayloadMode.COMPACT_FINAL_V2
+                else _compact_provider_projection
+            )
+            return projector(
                 operator_spec=self.operator_spec,
                 frontier=self.frontier,
                 conflict_policy=self.conflict_policy,
@@ -821,7 +1052,12 @@ def compact_typed_evidence_projection(
 ) -> dict[str, Any]:
     if type(packet) is not TypedEvidencePacket:
         raise TypeError("packet must be an exact TypedEvidencePacket")
-    return _compact_provider_projection(
+    projector = (
+        _compact_provider_projection_v2
+        if packet.provider_payload_mode is ProviderPayloadMode.COMPACT_FINAL_V2
+        else _compact_provider_projection
+    )
+    return projector(
         operator_spec=packet.operator_spec,
         frontier=packet.frontier,
         conflict_policy=packet.conflict_policy,
@@ -1131,11 +1367,18 @@ def build_frontier_receipt(
     )
     supported = {slot_id for row in usable for slot_id in row.supported_slot_ids}
     unresolved = tuple(row.slot_id for row in spec.required_slots if row.slot_id not in supported)
-    closed = bool(mode is FrontierMode.EXHAUSTIVE and not truncated and not omitted and not unresolved)
+    capacity_rejected = any(row.reason.startswith("hard_8k_") for row in rejected)
+    effective_truncated = bool(truncated or capacity_rejected)
+    closed = bool(
+        mode is FrontierMode.EXHAUSTIVE
+        and not effective_truncated
+        and not omitted
+        and not unresolved
+    )
     return EvidenceFrontierReceipt(
         mode, available, represented, omitted,
         tuple(row.rejection_sha256 for row in rejected), unresolved,
-        truncated, closed,
+        effective_truncated, closed,
     )
 
 
@@ -1272,8 +1515,16 @@ def _packet_with_budget_salvage(
             conflict_policy=conflict_policy,
         )
         handles = tuple(row.opaque() for row in bindings)
-        if provider_payload_mode is ProviderPayloadMode.COMPACT_FINAL:
-            projection = _compact_provider_projection(
+        if provider_payload_mode in {
+            ProviderPayloadMode.COMPACT_FINAL,
+            ProviderPayloadMode.COMPACT_FINAL_V2,
+        }:
+            projector = (
+                _compact_provider_projection_v2
+                if provider_payload_mode is ProviderPayloadMode.COMPACT_FINAL_V2
+                else _compact_provider_projection
+            )
+            projection = projector(
                 operator_spec=spec,
                 frontier=frontier,
                 conflict_policy=conflict_policy,
@@ -1294,10 +1545,20 @@ def _packet_with_budget_salvage(
             }
         return frontier, handles, projection
 
+    fit_cache: dict[tuple[tuple[str, ...], tuple[str, ...]], bool] = {}
+
     def fits(
         items: tuple[TypedEvidenceItem, ...],
         rejected_items: tuple[RejectedTypedItem, ...],
+        *,
+        memoize: bool = True,
     ) -> bool:
+        cache_key = (
+            tuple(row.receipt_sha256 for row in items),
+            tuple(row.rejection_sha256 for row in rejected_items),
+        )
+        if memoize and cache_key in fit_cache:
+            return fit_cache[cache_key]
         _frontier, _handles, projection = projection_for(items, rejected_items)
         rendered = json.dumps(
             projection,
@@ -1306,7 +1567,13 @@ def _packet_with_budget_salvage(
             sort_keys=True,
             separators=(",", ":"),
         )
-        return count_tokens(rendered) + output_token_reserve <= HARD_PROMPT_TOKEN_CAP
+        result = (
+            count_tokens(rendered) + output_token_reserve
+            <= HARD_PROMPT_TOKEN_CAP
+        )
+        if memoize:
+            fit_cache[cache_key] = result
+        return result
 
     kept: list[TypedEvidenceItem] = []
     rejected = list(parsed.rejected_items)
@@ -1338,7 +1605,10 @@ def _packet_with_budget_salvage(
             )
 
     final_items = tuple(kept)
-    if not fits(final_items, tuple(rejected)):
+    # Rebuild and retokenize the final population even if it was probed during
+    # salvage.  The cache removes only redundant exploratory work; this exact
+    # verification remains the authoritative hard-cap check.
+    if not fits(final_items, tuple(rejected), memoize=False):
         raise MatchedEvalContractError(
             "typed packet metadata exceeds the hard 8k envelope"
         )
@@ -1669,7 +1939,8 @@ def typed_packet_from_adaptive_plan_row(
 
 
 __all__ = [
-    "COMPACT_FINAL_PROVIDER_FORMAT", "ConflictPolicy", "ContentCoherence",
+    "COMPACT_FINAL_PROVIDER_FORMAT", "COMPACT_FINAL_PROVIDER_FORMAT_V2",
+    "ConflictPolicy", "ContentCoherence",
     "DEFAULT_OUTPUT_TOKEN_RESERVE",
     "EvidenceFrontierReceipt", "EvidenceHandleBinding", "EvidenceOrigin",
     "EvidenceStatus", "FrontierMode", "HARD_PROMPT_TOKEN_CAP",

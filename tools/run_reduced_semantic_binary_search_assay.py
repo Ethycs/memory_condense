@@ -1002,7 +1002,7 @@ def _closure_plan(
                 exclusion.get("duplicate_mechanism_id")
                 == residual.TYPED_ADAPTER_MECHANISM_ID
                 and exclusion.get("operation_position")
-                == "after_all_mechanism_selection"
+                == "after_independent_lane_admission_and_shared_surplus_fill"
                 and quote_sha256(visible_item.summary)
                 == quote_sha256(typed_item.summary),
                 "semantic duplicate owner changed provider-visible semantics",

@@ -141,33 +141,26 @@ def test_advisories_close_over_only_fitted_handles_groups_and_bundle_members() -
     )
     by_mechanism = {row["mechanism_id"]: row for row in advisories}
 
-    numeric = by_mechanism[NUMERIC_MECHANISM_ID]
-    assert numeric["candidate_handle_map"] == {"numeric-keep": "H700001"}
-    assert numeric["operand_groups"]
-    assert all(
-        group["candidate_ids"]
-        and set(group["candidate_ids"]) <= set(numeric["candidate_handle_map"])
-        and set(group.get("source_group_handles", ())) <= {"G700001"}
-        for group in numeric["operand_groups"]
-    )
+    # Numeric reduction is all-or-nothing: fitting removed the only witness
+    # for one of the two sealed operand groups, so publishing the surviving
+    # value 5 as a complete reduction would be unsound.
+    assert NUMERIC_MECHANISM_ID not in by_mechanism
 
     temporal = by_mechanism[TEMPORAL_MECHANISM_ID]
-    assert temporal["candidate_handle_map"] == {"temporal-keep": "H900001"}
+    assert temporal["format"] == assay.SPECIALIST_ADVISORY_FORMAT
+    assert temporal["handle_ids"] == ["H900001"]
     bundle = temporal["temporal_bundle"]
     assert type(bundle) is dict
-    assert set(bundle.get("ordered_candidate_ids", ())) <= {
-        "temporal-keep"
-    }
     assert set(bundle.get("ordered_handle_ids", ())) <= {"H900001"}
-    for key in (
-        "winner_candidate_id",
-        "predecessor_candidate_id",
-    ):
-        assert bundle.get(key) in {None, "temporal-keep"}
     for key in ("winner_handle_id", "predecessor_handle_id"):
         assert bundle.get(key) in {None, "H900001"}
 
     rendered = json.dumps(advisories, sort_keys=True)
+    assert "candidate" not in rendered
+    assert "numeric-keep" not in rendered
+    assert "temporal-keep" not in rendered
+    assert numeric_run.local_bindings[0].candidate_id == "numeric-keep"
+    assert temporal_run.local_bindings[0].candidate_id == "temporal-keep"
     for dangling in (
         "numeric-drop",
         "temporal-drop",
@@ -311,7 +304,8 @@ def test_terminal_receipt_chains_fitter_advisories_and_exact_final_chat() -> Non
     }
     advisories = [
         {
-            "candidate_handle_map": {"candidate-a": "H800001"},
+            "format": assay.SPECIALIST_ADVISORY_FORMAT,
+            "handle_ids": ["H800001"],
             "mechanism_id": PROFILE_MECHANISM_ID,
             "purpose": "synthetic contract fixture",
         }

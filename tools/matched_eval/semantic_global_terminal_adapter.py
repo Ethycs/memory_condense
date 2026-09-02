@@ -96,11 +96,14 @@ from .typed_operator_spec import AnswerShape, TypedOperatorSpec, normalized_term
 
 FORMAT = "memory-condense-semantic-global-terminal-compilation-v2"
 LINKED_FORMAT = "memory-condense-semantic-global-terminal-compilation-v3"
+BACKFILL_FORMAT = "memory-condense-semantic-global-terminal-compilation-v4"
+LINKED_BACKFILL_FORMAT = "memory-condense-semantic-global-terminal-compilation-v5"
 POLICY_FORMAT = f"{FORMAT}-policy-v1"
 SOURCE_FORMAT = f"{FORMAT}-sealed-sources-v1"
 OWNER_FORMAT = f"{FORMAT}-protected-owner-v1"
 SELECTION_FORMAT = f"{FORMAT}-plane-selection-v1"
 DEDUP_FORMAT = f"{FORMAT}-post-selection-dedup-v2"
+BACKFILL_AUDIT_FORMAT = f"{FORMAT}-post-dedup-freed-capacity-backfill-v1"
 ROW_FORMAT = f"{FORMAT}-selected-row-v1"
 REPLAY_FORMAT = f"{FORMAT}-replay-v1"
 EXACT_SPAN_SUPPORT_FORMAT = f"{FORMAT}-exact-span-support-authority-v1"
@@ -852,6 +855,98 @@ class DeduplicationReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class PostDedupBackfillReceipt:
+    """Sealed reconsideration of each plane's original skipped order."""
+
+    initial_dedup_receipt_sha256: str
+    plane_selection_receipt_sha256s: tuple[str, ...]
+    considered_candidate_receipt_sha256s_by_plane: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ]
+    admitted_candidate_receipt_sha256s_by_plane: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ]
+    final_retained_candidate_receipt_sha256s: tuple[str, ...]
+    receipt_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        require_sha256(self.initial_dedup_receipt_sha256, "backfill initial dedup")
+        _require(
+            len(self.plane_selection_receipt_sha256s) == len(PLANE_ORDER),
+            "backfill lost plane selections",
+        )
+        for value in self.plane_selection_receipt_sha256s:
+            require_sha256(value, "backfill plane selection")
+        for rows, label in (
+            (self.considered_candidate_receipt_sha256s_by_plane, "considered"),
+            (self.admitted_candidate_receipt_sha256s_by_plane, "admitted"),
+        ):
+            _require(
+                tuple(plane for plane, _values in rows) == PLANE_ORDER,
+                f"backfill {label} plane order changed",
+            )
+            for _plane, values in rows:
+                _ordered_unique(values, f"backfill {label} candidates")
+        considered = {
+            plane: values
+            for plane, values in self.considered_candidate_receipt_sha256s_by_plane
+        }
+        admitted = {
+            plane: values
+            for plane, values in self.admitted_candidate_receipt_sha256s_by_plane
+        }
+        _require(
+            all(set(admitted[plane]) <= set(considered[plane]) for plane in PLANE_ORDER),
+            "backfill admitted a candidate outside consideration",
+        )
+        _ordered_unique(
+            tuple(
+                value
+                for plane in PLANE_ORDER
+                for value in considered[plane]
+            ),
+            "backfill cross-plane considered candidates",
+        )
+        _ordered_unique(
+            tuple(value for plane in PLANE_ORDER for value in admitted[plane]),
+            "backfill cross-plane admitted candidates",
+        )
+        _ordered_unique(
+            self.final_retained_candidate_receipt_sha256s,
+            "backfill final retained",
+        )
+        expected = identity_sha256(self.projection(include_receipt=False))
+        if self.receipt_sha256:
+            _require(self.receipt_sha256 == expected, "post-dedup backfill changed")
+        object.__setattr__(self, "receipt_sha256", expected)
+
+    def projection(self, *, include_receipt: bool = True) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "format": BACKFILL_AUDIT_FORMAT,
+            "initial_dedup_receipt_sha256": self.initial_dedup_receipt_sha256,
+            "plane_selection_receipt_sha256s": list(
+                self.plane_selection_receipt_sha256s
+            ),
+            "considered_candidate_receipt_sha256s_by_plane": [
+                {"plane": plane, "candidate_receipt_sha256s": list(values)}
+                for plane, values in self.considered_candidate_receipt_sha256s_by_plane
+            ],
+            "admitted_candidate_receipt_sha256s_by_plane": [
+                {"plane": plane, "candidate_receipt_sha256s": list(values)}
+                for plane, values in self.admitted_candidate_receipt_sha256s_by_plane
+            ],
+            "final_retained_candidate_receipt_sha256s": list(
+                self.final_retained_candidate_receipt_sha256s
+            ),
+            "globally_novel_exact_spans_only": True,
+            "original_plane_budgets_reused": True,
+        }
+        if include_receipt:
+            value["receipt_sha256"] = self.receipt_sha256
+        return value
+
+
+@dataclass(frozen=True, slots=True)
 class _Candidate:
     plane: Plane
     candidate_id: str
@@ -1462,13 +1557,24 @@ class SemanticGlobalTerminalCompilation:
     mechanism_by_handle: Mapping[str, str]
     retained_row_receipt_sha256s: tuple[str, ...]
     local_rows: tuple[Mapping[str, Any], ...]
+    post_dedup_backfill: PostDedupBackfillReceipt | None = None
     format_id: str = FORMAT
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
         _require(
-            self.format_id in {FORMAT, LINKED_FORMAT},
+            self.format_id
+            in {FORMAT, LINKED_FORMAT, BACKFILL_FORMAT, LINKED_BACKFILL_FORMAT},
             "terminal compilation format changed",
+        )
+        _require(
+            (self.post_dedup_backfill is not None)
+            == (self.format_id in {BACKFILL_FORMAT, LINKED_BACKFILL_FORMAT})
+            and (
+                self.post_dedup_backfill is None
+                or type(self.post_dedup_backfill) is PostDedupBackfillReceipt
+            ),
+            "terminal backfill format binding changed",
         )
         _require(type(self.policy) is SemanticGlobalTerminalPolicy, "terminal policy type changed")
         _require(type(self.sealed_sources) is TerminalSealedSources, "terminal sources type changed")
@@ -1510,6 +1616,42 @@ class SemanticGlobalTerminalCompilation:
             and self.fitted.packet.receipt_sha256 == self.packet.receipt_sha256,
             "terminal packet/fitted proof changed",
         )
+        if self.post_dedup_backfill is not None:
+            backfill = self.post_dedup_backfill
+            considered_by_plane = dict(
+                backfill.considered_candidate_receipt_sha256s_by_plane
+            )
+            admitted_by_plane = dict(
+                backfill.admitted_candidate_receipt_sha256s_by_plane
+            )
+            expected_considered = {
+                selection.plane: tuple(
+                    receipt
+                    for receipt in selection.consideration_candidate_receipt_sha256s
+                    if receipt in set(
+                        selection.skipped_candidate_receipt_sha256s
+                    )
+                )
+                for selection in self.plane_selections
+            }
+            expected_final = (
+                *self.post_selection_dedup.retained_after_dedup_receipt_sha256s,
+                *(
+                    receipt
+                    for plane in PLANE_ORDER
+                    for receipt in admitted_by_plane[plane]
+                ),
+            )
+            _require(
+                backfill.initial_dedup_receipt_sha256
+                == self.post_selection_dedup.receipt_sha256
+                and backfill.plane_selection_receipt_sha256s
+                == tuple(row.receipt_sha256 for row in self.plane_selections)
+                and considered_by_plane == expected_considered
+                and backfill.final_retained_candidate_receipt_sha256s
+                == expected_final,
+                "terminal backfill escaped dedup or plane consideration",
+            )
         _require(
             self.packet.frontier.mode is FrontierMode.OPEN
             and self.packet.frontier.closed is False
@@ -1584,6 +1726,8 @@ class SemanticGlobalTerminalCompilation:
             "sealed_sources": self.sealed_sources.projection(),
             "terminal_prompt": self.fitted.projection(include_local=False),
         }
+        if self.post_dedup_backfill is not None:
+            value["post_dedup_backfill"] = self.post_dedup_backfill.projection()
         if include_local:
             value["local_audit"] = {
                 "exact_span_support_population": (
@@ -3765,6 +3909,62 @@ def _post_selection_dedup(
     return tuple(retained), receipt
 
 
+def _post_dedup_backfill(
+    *,
+    retained: Sequence[_Candidate],
+    dedup_receipt: DeduplicationReceipt,
+    candidates_by_plane: Mapping[Plane, tuple[_Candidate, ...]],
+    selections: Sequence[PlaneSelectionReceipt],
+    budgets: Mapping[Plane, PlaneBudget],
+) -> tuple[tuple[_Candidate, ...], PostDedupBackfillReceipt]:
+    """Fill only capacity freed by dedup, in authenticated plane order."""
+
+    output = list(retained)
+    seen_spans = {
+        identity_sha256(row.binding.span.identity_payload()) for row in output
+    }
+    considered_rows: list[tuple[str, tuple[str, ...]]] = []
+    admitted_rows: list[tuple[str, tuple[str, ...]]] = []
+    selection_by_plane = {row.plane: row for row in selections}
+    for plane in PLANE_ORDER:
+        selection = selection_by_plane[plane]
+        budget = budgets[plane]
+        by_receipt = {row.receipt_sha256: row for row in candidates_by_plane[plane]}
+        retained_plane = [row for row in output if row.plane == plane]
+        used_items = len(retained_plane)
+        used_tokens = sum(count_tokens(row.selection_quote) for row in retained_plane)
+        skipped = set(selection.skipped_candidate_receipt_sha256s)
+        consideration = tuple(
+            receipt
+            for receipt in selection.consideration_candidate_receipt_sha256s
+            if receipt in skipped
+        )
+        admitted: list[str] = []
+        for receipt in consideration:
+            candidate = by_receipt[receipt]
+            span_sha = identity_sha256(candidate.binding.span.identity_payload())
+            tokens = count_tokens(candidate.selection_quote)
+            if span_sha in seen_spans:
+                continue
+            if used_items >= budget.max_items or used_tokens + tokens > budget.evidence_token_cap:
+                continue
+            output.append(candidate)
+            seen_spans.add(span_sha)
+            admitted.append(receipt)
+            used_items += 1
+            used_tokens += tokens
+        considered_rows.append((plane, consideration))
+        admitted_rows.append((plane, tuple(admitted)))
+    receipt = PostDedupBackfillReceipt(
+        initial_dedup_receipt_sha256=dedup_receipt.receipt_sha256,
+        plane_selection_receipt_sha256s=tuple(row.receipt_sha256 for row in selections),
+        considered_candidate_receipt_sha256s_by_plane=tuple(considered_rows),
+        admitted_candidate_receipt_sha256s_by_plane=tuple(admitted_rows),
+        final_retained_candidate_receipt_sha256s=tuple(row.receipt_sha256 for row in output),
+    )
+    return tuple(output), receipt
+
+
 def _typed_kind(
     spec: TypedOperatorSpec,
     quote: str,
@@ -4599,6 +4799,7 @@ def compile_semantic_global_terminal(
     sealed_sources: TerminalSealedSources,
     policy: SemanticGlobalTerminalPolicy | None = None,
     enable_selected_evidence_discourse_links: bool = False,
+    enable_post_dedup_backfill: bool = False,
 ) -> SemanticGlobalTerminalCompilation:
     """Compile one cumulative, bounded, provider-free terminal prompt.
 
@@ -4610,8 +4811,9 @@ def compile_semantic_global_terminal(
     require_text(dated_question, "terminal dated question")
     require_text(parent_prediction, "terminal parent prediction")
     _require(
-        type(enable_selected_evidence_discourse_links) is bool,
-        "terminal selected-evidence discourse-link feature flag changed type",
+        type(enable_selected_evidence_discourse_links) is bool
+        and type(enable_post_dedup_backfill) is bool,
+        "terminal feature flag changed type",
     )
     _require(
         type(residual_index) is SemanticResidualIndex
@@ -4754,6 +4956,15 @@ def compile_semantic_global_terminal(
     post_dedup_rows, dedup_receipt = _post_selection_dedup(
         MappingProxyType(selected_by_plane), by_receipt=by_receipt
     )
+    backfill_receipt: PostDedupBackfillReceipt | None = None
+    if enable_post_dedup_backfill:
+        post_dedup_rows, backfill_receipt = _post_dedup_backfill(
+            retained=post_dedup_rows,
+            dedup_receipt=dedup_receipt,
+            candidates_by_plane=MappingProxyType(candidates_by_plane),
+            selections=selection_receipt_tuple,
+            budgets=active_policy.budget_by_plane,
+        )
     protected_population_receipt = identity_sha256(
         {
             "format": f"{OWNER_FORMAT}-selected-population-v1",
@@ -4837,8 +5048,13 @@ def compile_semantic_global_terminal(
         mechanism_by_handle=mechanism,
         retained_row_receipt_sha256s=retained_receipts,
         local_rows=local_rows,
+        post_dedup_backfill=backfill_receipt,
         format_id=(
-            LINKED_FORMAT
+            LINKED_BACKFILL_FORMAT
+            if enable_selected_evidence_discourse_links and enable_post_dedup_backfill
+            else BACKFILL_FORMAT
+            if enable_post_dedup_backfill
+            else LINKED_FORMAT
             if enable_selected_evidence_discourse_links
             else FORMAT
         ),
@@ -4889,7 +5105,10 @@ def replay_semantic_global_terminal(
         sealed_sources=sealed_sources,
         policy=policy or sealed_compilation.policy,
         enable_selected_evidence_discourse_links=(
-            sealed_compilation.format_id == LINKED_FORMAT
+            sealed_compilation.format_id in {LINKED_FORMAT, LINKED_BACKFILL_FORMAT}
+        ),
+        enable_post_dedup_backfill=(
+            sealed_compilation.format_id in {BACKFILL_FORMAT, LINKED_BACKFILL_FORMAT}
         ),
     )
     _require(
@@ -4903,6 +5122,7 @@ def replay_semantic_global_terminal(
 
 __all__ = [
     "DeduplicationReceipt",
+    "PostDedupBackfillReceipt",
     "PlaneBudget",
     "PlaneSelectionReceipt",
     "ProtectedOwnerEvidence",
@@ -4910,6 +5130,8 @@ __all__ = [
     "SemanticGlobalTerminalError",
     "SemanticGlobalTerminalPolicy",
     "LINKED_FORMAT",
+    "BACKFILL_FORMAT",
+    "LINKED_BACKFILL_FORMAT",
     "TerminalSealedSources",
     "compile_semantic_global_terminal",
     "load_selected_protected_owner_evidence",

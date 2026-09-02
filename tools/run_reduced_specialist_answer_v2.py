@@ -50,6 +50,7 @@ from tools.matched_eval.contracts import (  # noqa: E402
 )
 from tools.matched_eval.typed_memory_final_arm import (  # noqa: E402
     LEGACY_SYSTEM_PROMPT_V1,
+    RESOURCE_PRESERVING_SYSTEM_PROMPT_V2,
     VALIDATOR_POLICY_FORMAT,
     parse_typed_final_completion,
     render_final_messages,
@@ -109,6 +110,40 @@ def _plain_messages(
         "terminal prompt message schema changed",
     )
     return rows
+
+
+def _messages_bound_to_terminal(
+    provider_input: Mapping[str, Any],
+    terminal: Mapping[str, Any],
+) -> tuple[tuple[dict[str, str], ...], str, int]:
+    """Reconstruct the one supported prompt version sealed by ``terminal``."""
+
+    expected_sha256 = require_sha256(
+        terminal.get("messages_sha256"), "specialist terminal messages"
+    )
+    expected_tokens = terminal.get("prompt_token_proxy")
+    _require(
+        type(expected_tokens) is int and expected_tokens >= 0,
+        "sealed specialist prompt token proxy changed type",
+    )
+    matches: list[tuple[tuple[dict[str, str], ...], str, int]] = []
+    for system_prompt in dict.fromkeys(
+        (LEGACY_SYSTEM_PROMPT_V1, RESOURCE_PRESERVING_SYSTEM_PROMPT_V2)
+    ):
+        messages = _plain_messages(
+            render_final_messages(provider_input, system_prompt=system_prompt)
+        )
+        messages_sha256 = identity_sha256(list(messages))
+        if messages_sha256 != expected_sha256:
+            continue
+        prompt_tokens = count_chat_prompt_token_proxy(messages)
+        if prompt_tokens == expected_tokens:
+            matches.append((messages, messages_sha256, prompt_tokens))
+    _require(
+        len(matches) == 1,
+        "sealed specialist terminal prompt does not bind one supported renderer",
+    )
+    return matches[0]
 
 
 def _handle_groups(
@@ -175,14 +210,10 @@ def _prompt_plan_row(raw: Mapping[str, Any], expected_ordinal: int) -> dict[str,
         == {**dict(fitted_input), "specialist_advisories": advisories},
         "terminal provider input is not the fitted prompt plus sealed advisories",
     )
-    messages = _plain_messages(
-        render_final_messages(
-            provider_input,
-            system_prompt=LEGACY_SYSTEM_PROMPT_V1,
-        )
+    messages, messages_sha, prompt_tokens = _messages_bound_to_terminal(
+        provider_input,
+        terminal,
     )
-    messages_sha = identity_sha256(list(messages))
-    prompt_tokens = count_chat_prompt_token_proxy(messages)
     fitted_receipt = require_sha256(
         fitted.get("receipt_sha256"), "fitted specialist prompt"
     )

@@ -11,7 +11,10 @@ from tools.matched_eval.typed_additive_composer import (
     deduplicate_selected_contributions,
 )
 from tools.matched_eval.typed_lane_allocator import lane_content_token_proxy
-from tools.matched_eval.typed_memory_final_arm import fit_typed_final_prompt
+from tools.matched_eval.typed_memory_final_arm import (
+    LOCAL_RETENTION_PRIORITY_WIDTH,
+    fit_typed_final_prompt,
+)
 from tools.matched_eval.typed_operator_adapter import (
     EvidenceHandleBinding,
     EvidenceOrigin,
@@ -206,6 +209,176 @@ def test_compose_preserves_each_nonempty_lane_minimum_and_is_fit_ready() -> None
     )
     assert protected <= {row.receipt_sha256 for row in fitted.packet.items}
     assert fitted.protection_source_receipt_sha256 == result.receipt_sha256
+
+
+def test_lane_admission_precedes_dedup_so_a_later_omitted_owner_cannot_erase_class() -> None:
+    duplicate = (
+        "I selected cobalt paper for the cedar lantern. "
+        + "exact supporting detail " * 12
+    )
+    preferred_parent_item = (
+        "The parent map retained the cedar lantern workshop decision. "
+        + "protected context " * 8
+    )
+    parent = _contribution(
+        "protected_parent",
+        1,
+        (preferred_parent_item, duplicate),
+    )
+    specialist = _contribution(
+        "episodic_specialist",
+        100_001,
+        (duplicate,),
+    )
+    parent_cap = lane_content_token_proxy(
+        (parent.parsed.accepted_items[0],), parent.bindings
+    )
+    specialist_cap = lane_content_token_proxy(
+        specialist.parsed.accepted_items, specialist.bindings
+    )
+    priority = (1, *((0,) * (LOCAL_RETENTION_PRIORITY_WIDTH - 1)))
+    shared_span = _sha("dedup-owner-can-be-lane-omitted")
+
+    result = compose_additive_typed_evidence(
+        compile_typed_operator_spec(QUESTION),
+        (parent, specialist),
+        lane_budgets=(
+            _budget("parent", parent_cap),
+            _budget("specialist", specialist_cap),
+        ),
+        lane_by_mechanism={
+            "protected_parent": "parent",
+            "episodic_specialist": "specialist",
+        },
+        dedup_owner_priority_by_mechanism={
+            "protected_parent": 100,
+            "episodic_specialist": 10,
+        },
+        exact_span_keys_by_handle={
+            parent.bindings[1].handle_id: (shared_span,),
+            specialist.bindings[0].handle_id: (shared_span,),
+        },
+        local_selection_priority_by_handle={
+            parent.bindings[0].handle_id: priority,
+        },
+    )
+
+    retained_summaries = {item.summary for item in result.packet.items}
+    assert preferred_parent_item.strip() in retained_summaries
+    assert duplicate.strip() in retained_summaries
+    assert specialist.bindings[0].handle_id in result.mechanism_by_handle
+    assert result.post_selection_dedup_audit["exclusions"] == []
+    assert result.post_selection_dedup_audit["operation_position"] == (
+        "after_independent_lane_admission_and_shared_surplus_fill_"
+        "then_dedup_and_freed_capacity_backfill"
+    )
+
+
+def test_exact_dedup_frees_shared_capacity_for_next_unique_item() -> None:
+    duplicate = "I selected cobalt paper for the cedar lantern."
+    unique = "The lantern frame used ash wood."
+    parent = _contribution("protected_parent", 1, (duplicate,))
+    specialist = _contribution(
+        "episodic_specialist",
+        100_001,
+        (duplicate, unique),
+    )
+    parent_cap = lane_content_token_proxy(
+        parent.parsed.accepted_items,
+        parent.bindings,
+    )
+    specialist_cap = lane_content_token_proxy(
+        (specialist.parsed.accepted_items[0],),
+        specialist.bindings,
+    )
+    shared_span = _sha("dedup-releases-capacity-for-unique-backfill")
+    priority = (1, *((0,) * (LOCAL_RETENTION_PRIORITY_WIDTH - 1)))
+
+    result = compose_additive_typed_evidence(
+        compile_typed_operator_spec(QUESTION),
+        (parent, specialist),
+        lane_budgets=(
+            _budget("parent", parent_cap),
+            _budget("specialist", specialist_cap),
+        ),
+        lane_by_mechanism={
+            "protected_parent": "parent",
+            "episodic_specialist": "specialist",
+        },
+        dedup_owner_priority_by_mechanism={
+            "protected_parent": 100,
+            "episodic_specialist": 10,
+        },
+        exact_span_keys_by_handle={
+            parent.bindings[0].handle_id: (shared_span,),
+            specialist.bindings[0].handle_id: (shared_span,),
+        },
+        local_selection_priority_by_handle={
+            specialist.bindings[0].handle_id: priority,
+        },
+    )
+
+    assert {item.summary for item in result.packet.items} == {
+        duplicate,
+        unique,
+    }
+    assert result.post_selection_dedup_audit[
+        "backfilled_item_receipt_sha256s"
+    ] == [specialist.parsed.accepted_items[1].receipt_sha256]
+    backfill = result.post_selection_dedup_audit["backfill_rows"]
+    assert [row["disposition"] for row in backfill] == ["admitted_unique"]
+    assert (
+        result.post_selection_dedup_audit["final_content_token_proxy"]
+        <= result.post_selection_dedup_audit["shared_final_content_token_cap"]
+    )
+
+
+def test_selected_duplicate_minima_transfer_protection_to_one_surviving_owner() -> None:
+    summary = "I selected cobalt paper for the cedar lantern."
+    parent = _contribution("protected_parent", 1, (summary,))
+    specialist = _contribution("episodic_specialist", 100_001, (summary,))
+    parent_cap = lane_content_token_proxy(
+        parent.parsed.accepted_items, parent.bindings
+    )
+    specialist_cap = lane_content_token_proxy(
+        specialist.parsed.accepted_items, specialist.bindings
+    )
+    shared_span = _sha("both-lane-minima-same-span")
+
+    result = compose_additive_typed_evidence(
+        compile_typed_operator_spec(QUESTION),
+        (parent, specialist),
+        lane_budgets=(
+            _budget("parent", parent_cap),
+            _budget("specialist", specialist_cap),
+        ),
+        lane_by_mechanism={
+            "protected_parent": "parent",
+            "episodic_specialist": "specialist",
+        },
+        dedup_owner_priority_by_mechanism={
+            "protected_parent": 100,
+            "episodic_specialist": 10,
+        },
+        exact_span_keys_by_handle={
+            parent.bindings[0].handle_id: (shared_span,),
+            specialist.bindings[0].handle_id: (shared_span,),
+        },
+    )
+
+    assert len(result.packet.items) == 1
+    assert result.packet.items[0].summary == summary
+    assert result.protected_item_receipt_sha256s == (
+        parent.parsed.accepted_items[0].receipt_sha256,
+    )
+    assert len(result.post_selection_dedup_audit["exclusions"]) == 1
+    assert result.fair_merge_audit[
+        "original_protected_minimum_item_receipt_sha256s"
+    ] == [
+        parent.parsed.accepted_items[0].receipt_sha256,
+        specialist.parsed.accepted_items[0].receipt_sha256,
+    ]
+    assert result.fair_merge_audit["protected_minimum_item_transfer_rows"]
 
 
 def test_compose_fails_if_a_hard_lane_cap_starves_a_nonempty_mechanism() -> None:

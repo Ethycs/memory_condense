@@ -106,6 +106,8 @@ def _norm(value: str) -> str:
 
 
 class _SealedRecord:
+    __slots__ = ()
+
     _kind = ""
 
     def _body(self) -> dict[str, Any]:
@@ -116,7 +118,12 @@ class _SealedRecord:
         return _seal(self._kind, self._body())
 
     def projection(self) -> dict[str, Any]:
-        return _record(self._kind, self._body(), receipt_sha256=self.receipt_sha256)
+        body = self._body()
+        return _record(
+            self._kind,
+            body,
+            receipt_sha256=_seal(self._kind, body),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1086,46 +1093,53 @@ def advance_source_gate(plan: SourceGatePlan, rounds: tuple[SourceGateRound, ...
         return _stop(plan, current, observed, GateStopReason.PHYSICAL_CALL_CAP)
     if len(rounds) >= plan.policy.max_rounds:
         return _stop(plan, current, observed, GateStopReason.ROUND_CAP)
-    if current.cumulative_unique_source_count >= plan.policy.global_unique_source_cap:
-        return _stop(plan, current, observed, GateStopReason.UNIQUE_SOURCE_CAP)
     selected_ids = set(current.cumulative_selected_candidate_ids)
     available = {lane: _next(plan, lane, selected_ids) for lane in SOURCE_GATE_LANES}
     if not any(available.values()):
         return _stop(plan, current, observed, GateStopReason.CANDIDATES_EXHAUSTED)
     order = _TAIL_ORDER[plan.route.style]
     tail = tuple((row, result) for row, result in zip(rounds, coverage, strict=True) if row.kind is GateRoundKind.TAIL)
-    tried: set[FactLane] = set()
-    for row, result in reversed(tail):
-        if result.made_progress:
-            break
-        assert row.tail_lane is not None
-        tried.add(row.tail_lane)
     if tail:
         last = tail[-1][0].tail_lane
         assert last is not None
-        start = order.index(last) if tail[-1][1].made_progress else (order.index(last) + 1) % len(order)
+        start = (order.index(last) + 1) % len(order)
         lane_order = order[start:] + order[:start]
     else:
         lane_order = order
-    lanes = tuple(lane for lane in lane_order if available[lane] and lane not in tried)
+    # A no-progress prefix does not exhaust its lane.  Rotate fairly, then
+    # revisit the lane while later candidates remain inside its hard cap.
+    lanes = tuple(lane for lane in lane_order if available[lane])
     if not lanes:
-        return _stop(plan, current, observed, GateStopReason.NO_PROGRESS)
-    lane, known = lanes[0], {plan.candidate_by_id(value).source_key for value in current.cumulative_selected_candidate_ids}
-    remaining = plan.policy.global_unique_source_cap - len(known)
-    chosen: list[SourceGateCandidate] = []
-    for candidate in available[lane]:
-        new = candidate.source_key not in known
-        if new and remaining == 0:
-            break
-        chosen.append(candidate)
-        if new:
-            known.add(candidate.source_key)
-            remaining -= 1
-        if len(chosen) == plan.policy.budget_for(lane).tail_step_source_cap:
-            break
-    if not chosen:
-        return _stop(plan, current, observed, GateStopReason.UNIQUE_SOURCE_CAP)
-    return _make_round(plan, current, GateRoundKind.TAIL, lane, tuple(chosen))
+        return _stop(plan, current, observed, GateStopReason.CANDIDATES_EXHAUSTED)
+    initial_known = {
+        plan.candidate_by_id(value).source_key
+        for value in current.cumulative_selected_candidate_ids
+    }
+    for lane in lanes:
+        known = set(initial_known)
+        remaining = plan.policy.global_unique_source_cap - len(known)
+        chosen: list[SourceGateCandidate] = []
+        for candidate in available[lane]:
+            new = candidate.source_key not in known
+            if new and remaining == 0:
+                # A later candidate in this lane, or a later lane in the fair
+                # rotation, may already be known and cost no unique capacity.
+                continue
+            chosen.append(candidate)
+            if new:
+                known.add(candidate.source_key)
+                remaining -= 1
+            if len(chosen) == plan.policy.budget_for(lane).tail_step_source_cap:
+                break
+        if chosen:
+            return _make_round(
+                plan,
+                current,
+                GateRoundKind.TAIL,
+                lane,
+                tuple(chosen),
+            )
+    return _stop(plan, current, observed, GateStopReason.UNIQUE_SOURCE_CAP)
 
 
 @dataclass(frozen=True, slots=True)

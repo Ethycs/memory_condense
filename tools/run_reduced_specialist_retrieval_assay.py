@@ -69,6 +69,9 @@ from tools.matched_eval.prompt_tick_contracts import (  # noqa: E402
     CallBudget,
     LaneBudget,
 )
+from tools.matched_eval.specialist_scoped_completion import (  # noqa: E402
+    SPECIALIST_ADVISORY_FORMAT,
+)
 from tools.matched_eval.temporal_insufficiency_specialist import (  # noqa: E402
     BundleRole,
     MECHANISM_ID as TEMPORAL_MECHANISM_ID,
@@ -90,6 +93,7 @@ from tools.matched_eval.typed_memory_final_arm import (  # noqa: E402
 )
 from tools.matched_eval.typed_operator_adapter import (  # noqa: E402
     EvidenceStatus,
+    ProviderPayloadMode,
     TypedEvidenceContribution,
 )
 from tools.matched_eval.typed_operator_spec import (  # noqa: E402
@@ -603,7 +607,6 @@ def _compact_absence_advisory(
                     for candidate_id in row.selected_supporting_candidate_ids
                     if candidate_id in candidate_handle_map
                 ],
-                "slot_id": row.slot_id,
                 "slot_label": row.slot_label,
             }
             for row in certificate.slot_coverage
@@ -649,6 +652,7 @@ def _specialist_advisories(
                 )
                 if binding.handle_id in allowed
             }
+            all_operand_groups_represented = True
             for group in run.result.operand_groups:
                 candidate_ids = tuple(
                     candidate_id
@@ -656,7 +660,13 @@ def _specialist_advisories(
                     if candidate_id in handles
                 )
                 if not candidate_ids:
-                    continue
+                    # A deterministic reduction is valid only over the exact
+                    # operand-group population sealed by the specialist.  If
+                    # fitting removes every witness for even one group, a
+                    # surviving subset must not be re-described as the whole
+                    # reduction universe.
+                    all_operand_groups_represented = False
+                    break
                 # The scoped completion proof cites each opaque evidence
                 # handle at most once.  A source window can contain several
                 # numeric mentions and therefore appear in several closure
@@ -671,8 +681,10 @@ def _specialist_advisories(
                 owned_candidates.update(candidate_ids)
                 projection = {
                     "action_class": group.action_class,
-                    "candidate_ids": list(candidate_ids),
                     "entity_key": group.entity_key,
+                    "handle_ids": [
+                        handles[candidate_id] for candidate_id in candidate_ids
+                    ],
                     "operand_values": list(group.operand_values),
                     "operation_mode": group.operation_mode,
                     "source_group_handles": list(
@@ -684,11 +696,17 @@ def _specialist_advisories(
                     "value_basis": group.value_basis,
                 }
                 groups.append(projection)
-            if candidate_ownership_repeats or not handles or not groups:
+            if (
+                candidate_ownership_repeats
+                or not all_operand_groups_represented
+                or not handles
+                or len(groups) != len(run.result.operand_groups)
+            ):
                 continue
             rows.append(
                 {
-                    "candidate_handle_map": handles,
+                    "format": SPECIALIST_ADVISORY_FORMAT,
+                    "handle_ids": list(handles.values()),
                     "mechanism_id": run.mechanism_id,
                     "operand_groups": groups,
                     "purpose": "group distinct numeric event operands before reduction",
@@ -721,10 +739,8 @@ def _specialist_advisories(
                         else None
                     )
                     bundle = {
-                        "ordered_candidate_ids": list(ordered),
                         "ordered_handle_ids": [handles[value] for value in ordered],
                         "original_population_count": source_bundle.population_count,
-                        "predecessor_candidate_id": predecessor,
                         "predecessor_handle_id": (
                             None if predecessor is None else handles[predecessor]
                         ),
@@ -736,16 +752,18 @@ def _specialist_advisories(
                             len(ordered) < len(source_bundle.ordered_candidate_ids)
                             or source_bundle.truncated
                         ),
-                        "winner_candidate_id": winner,
                         "winner_handle_id": (
                             None if winner is None else handles[winner]
                         ),
                     }
             absence = _compact_absence_advisory(run.result, handles)
+            if bundle is None and absence is None:
+                continue
             rows.append(
                 {
                     "absence_certificate": absence,
-                    "candidate_handle_map": handles,
+                    "format": SPECIALIST_ADVISORY_FORMAT,
+                    "handle_ids": list(handles.values()),
                     "mechanism_id": run.mechanism_id,
                     "purpose": "apply participant/entity constraints before temporal selection",
                     "temporal_bundle": bundle,
@@ -756,7 +774,8 @@ def _specialist_advisories(
                 continue
             rows.append(
                 {
-                    "candidate_handle_map": handles,
+                    "format": SPECIALIST_ADVISORY_FORMAT,
+                    "handle_ids": list(handles.values()),
                     "mechanism_id": run.mechanism_id,
                     "purpose": "personalize from one coherent first-person preference cluster",
                 }
@@ -963,6 +982,7 @@ def _composed_question(
         exact_span_keys_by_handle=exact_span_keys,
         local_selection_priority_by_handle=local_priorities,
         fair_merge_priority_by_mechanism=fair_priorities,
+        provider_payload_mode=ProviderPayloadMode.COMPACT_FINAL_V2,
     )
     fitted = fit_typed_final_prompt(
         dated_question=dated_question,
@@ -1446,6 +1466,7 @@ __all__ = [
     "CONSTRUCTION_FORMAT",
     "CONSTRUCTION_NAME",
     "ReducedSpecialistAssayError",
+    "SPECIALIST_ADVISORY_FORMAT",
     "applicable_specialist_ids",
     "build_target_audit",
     "main",

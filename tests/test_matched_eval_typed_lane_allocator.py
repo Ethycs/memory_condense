@@ -281,6 +281,53 @@ def test_late_third_source_group_survives_three_item_lane_with_local_priority() 
     )
 
 
+def test_oversized_candidate_cannot_claim_phantom_group_coverage() -> None:
+    contribution = _contribution(
+        "full_store",
+        500_001,
+        (
+            "HelloFresh first order was 40 percent. " + "oversized " * 300,
+            "HelloFresh first order was 40 percent, concise evidence.",
+            "UberEats first order was 20 percent. " + "other detail " * 20,
+        ),
+        groups=(501, 501, 502),
+    )
+    oversized, same_group_fit, other_group_fit = (
+        contribution.parsed.accepted_items
+    )
+    cap = max(
+        lane_content_token_proxy((same_group_fit,), contribution.bindings),
+        lane_content_token_proxy((other_group_fit,), contribution.bindings),
+    )
+    assert lane_content_token_proxy((oversized,), contribution.bindings) > cap
+    assert (
+        lane_content_token_proxy(
+            (same_group_fit, other_group_fit),
+            contribution.bindings,
+        )
+        > cap
+    )
+
+    allocation = allocate_typed_contribution_lanes(
+        (contribution,),
+        lane_budgets=(_budget("full_store", cap),),
+        lane_by_mechanism={"full_store": "full_store"},
+        operator_spec=compile_typed_operator_spec(QUESTION),
+        local_selection_priority_by_handle={
+            contribution.bindings[0].handle_id: (2, 0),
+            contribution.bindings[1].handle_id: (1, 0),
+            contribution.bindings[2].handle_id: (0, 0),
+        },
+    )
+
+    retained = allocation.contributions[0].parsed.accepted_items
+    assert retained == (same_group_fit,)
+    assert set(allocation.receipts[0].omitted_item_receipt_sha256s) == {
+        oversized.receipt_sha256,
+        other_group_fit.receipt_sha256,
+    }
+
+
 def test_shared_surplus_preserves_minima_and_uses_only_aggregate_slack() -> None:
     empty = _contribution("empty_parent", 1, ())
     specialist = _contribution(

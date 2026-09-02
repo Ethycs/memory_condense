@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -291,31 +290,67 @@ def _select_transition_candidates(
     return anchors + neighbors
 
 
-@lru_cache(maxsize=100_000)
-def _candidate_contains(text: str, answer: str) -> bool:
-    return contains_answer([text], answer)
+class _TransitionScoreCache:
+    """One scoring call's memoized values; never retains trace text globally."""
 
+    __slots__ = ("_contains", "_f1", "_overhead", "_tokens", "_hits", "_misses")
 
-@lru_cache(maxsize=100_000)
-def _candidate_f1(text: str, answer: str) -> float:
-    return f1_score(text, answer)
+    def __init__(self) -> None:
+        self._contains: dict[tuple[str, str], bool] = {}
+        self._f1: dict[tuple[str, str], float] = {}
+        self._overhead: dict[str, int] = {}
+        self._tokens: dict[str, int] = {}
+        self._hits = 0
+        self._misses = 0
 
+    def _get(self, cache: dict[Any, Any], key: Any, compute: Callable[[], Any]) -> Any:
+        try:
+            value = cache[key]
+        except KeyError:
+            value = compute()
+            cache[key] = value
+            self._misses += 1
+        else:
+            self._hits += 1
+        return value
 
-@lru_cache(maxsize=100_000)
-def _rendered_token_count(text: str) -> int:
-    # Chunk.token_count is a write-time segmentation estimate. Prompt
-    # accounting measures the actual rendered text, whose BPE boundaries can
-    # differ after sentence joins.
-    return count_tokens(text)
+    def candidate_contains(self, text: str, answer: str) -> bool:
+        return self._get(
+            self._contains, (text, answer), lambda: contains_answer([text], answer)
+        )
 
+    def candidate_f1(self, text: str, answer: str) -> float:
+        return self._get(self._f1, (text, answer), lambda: f1_score(text, answer))
 
-@lru_cache(maxsize=10_000)
-def _prompt_overhead_upper_bound(dated_question: str) -> int:
-    # The actual context adds one numbered label and newline per candidate.
-    # Twelve tokens per item is deliberately loose, so falling below this
-    # bound proves the exact prompt cannot reach the hard cap.
-    empty_user = QA_USER_TEMPLATE.format(context="", question=dated_question)
-    return count_tokens(QA_SYSTEM_PROMPT) + count_tokens(empty_user)
+    def rendered_token_count(self, text: str) -> int:
+        # Chunk.token_count is a write-time segmentation estimate. Prompt
+        # accounting measures the actual rendered text.
+        return self._get(self._tokens, text, lambda: count_tokens(text))
+
+    def prompt_overhead_upper_bound(self, dated_question: str) -> int:
+        def compute() -> int:
+            empty_user = QA_USER_TEMPLATE.format(context="", question=dated_question)
+            return count_tokens(QA_SYSTEM_PROMPT) + count_tokens(empty_user)
+
+        return self._get(self._overhead, dated_question, compute)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "entries": sum(
+                len(cache)
+                for cache in (self._contains, self._f1, self._overhead, self._tokens)
+            ),
+            "hits": self._hits,
+            "misses": self._misses,
+        }
+
+    def clear(self) -> None:
+        self._contains.clear()
+        self._f1.clear()
+        self._overhead.clear()
+        self._tokens.clear()
+        self._hits = 0
+        self._misses = 0
 
 
 def score_transition_arm(
@@ -325,6 +360,7 @@ def score_transition_arm(
     max_prompt_tokens: int | None = 8000,
     stay_hits: dict[str, bool] | None = None,
 ) -> tuple[TransitionArmScore, dict[str, bool]]:
+    cache = _TransitionScoreCache()
     hits: dict[str, bool] = {}
     f1_values: list[float] = []
     token_counts: list[int] = []
@@ -332,11 +368,11 @@ def score_transition_arm(
     source_all: list[bool] = []
     for question in pack.questions:
         selected = _select_transition_candidates(question, arm)
-        raw_tokens = sum(_rendered_token_count(candidate.text) for candidate in selected)
+        raw_tokens = sum(cache.rendered_token_count(candidate.text) for candidate in selected)
         safely_below_cap = (
             max_prompt_tokens is None
             or raw_tokens
-            + _prompt_overhead_upper_bound(question.dated_question)
+            + cache.prompt_overhead_upper_bound(question.dated_question)
             + 12 * len(selected)
             <= max_prompt_tokens
         )
@@ -345,12 +381,12 @@ def score_transition_arm(
             sources = [candidate.source_id for candidate in selected]
             context_tokens = raw_tokens
             hit = any(
-                _candidate_contains(candidate.text, question.answer)
+                cache.candidate_contains(candidate.text, question.answer)
                 for candidate in selected
             )
             question_f1 = max(
                 (
-                    _candidate_f1(candidate.text, question.answer)
+                    cache.candidate_f1(candidate.text, question.answer)
                     for candidate in selected
                 ),
                 default=0.0,
@@ -381,7 +417,7 @@ def score_transition_arm(
     if stay_hits is not None:
         gains = sum(hits[key] and not stay_hits.get(key, False) for key in hits)
         losses = sum(not hits[key] and stay_hits.get(key, False) for key in hits)
-    return (
+    result = (
         TransitionArmScore(
             arm=arm,
             questions=n,
@@ -406,3 +442,5 @@ def score_transition_arm(
         ),
         hits,
     )
+    cache.clear()
+    return result

@@ -156,6 +156,75 @@ def _filler(word: str, count: int = 180) -> str:
     return " ".join(f"{word}{index}" for index in range(count)) + "."
 
 
+def test_classifier_materializes_manifest_index_once_without_one_use_term_caches(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    rows = [
+        ("p0::alpha", "I bought a blue touring bicycle.", BASE, "user"),
+        (
+            "p1::beta",
+            "I replaced the bicycle tires before a long ride.",
+            BASE + timedelta(days=1),
+            "user",
+        ),
+        (
+            "p2::gamma",
+            "I stored the bicycle beside my red helmet.",
+            BASE + timedelta(days=2),
+            "user",
+        ),
+    ]
+    index = _build(
+        tmp_path,
+        "manifest-once",
+        rows,
+        {
+            "p0::alpha": [1.0, 0.0],
+            "p1::beta": [0.9, 0.1],
+            "p2::gamma": [0.8, 0.2],
+        },
+    )
+    descriptor = residual_module.SemanticResidualIndex.manifest_by_node_receipt
+    original_getter = descriptor.fget
+    assert original_getter is not None
+    calls = 0
+
+    def counted_getter(self):
+        nonlocal calls
+        calls += 1
+        return original_getter(self)
+
+    monkeypatch.setattr(
+        residual_module.SemanticResidualIndex,
+        "manifest_by_node_receipt",
+        property(counted_getter),
+    )
+    question = (
+        "[Question asked at 2026/08/27 12:00] "
+        "What color was my touring bicycle?"
+    )
+    query = _compile(index, question, [[1.0, 0.0]])
+    classifier = residual_module._ConservativeResidualClassifier(index, query)
+    assert not hasattr(classifier, "_manifest_surface_terms")
+    assert not hasattr(classifier, "_manifest_action_concepts")
+    classifier.classify(
+        question=question,
+        node=index.core_tree.root,
+        call_ordinal=0,
+    )
+    assert calls == 1
+    calls = 0
+
+    result = search_semantic_residual(
+        index,
+        query,
+    )
+
+    assert result.core_result.classifier_calls > 1
+    assert calls == 1
+
+
 def test_q42_like_absence_keeps_related_sources_and_closes_full_leaf_partition(
     tmp_path: Path,
 ) -> None:
@@ -191,7 +260,7 @@ def test_q42_like_absence_keeps_related_sources_and_closes_full_leaf_partition(
     result = search_semantic_residual(index, _compile(index, question, [[1.0, 0.0]]))
 
     assert {"p0::education", "p1::conference"} <= _source_ids(result)
-    assert result.classified_frontier.closed is True
+    assert result.classified_frontier.retained_leaf_cell_ids
     assert result.evidence
     assert result.classified_frontier.all_novel_survivors_protected is False
     assert result.provider_projection()["residual_frontier"][
@@ -204,7 +273,7 @@ def test_q42_like_absence_keeps_related_sources_and_closes_full_leaf_partition(
         | set(result.core_result.pruned_leaf_cell_ids)
         == {row.cell_id for row in index.cells}
     )
-    assert not result.classified_frontier.unresolved_segment_receipt_sha256s
+    assert result.classified_frontier.unresolved_segment_receipt_sha256s
 
     contribution = adapt_semantic_residual_to_typed_contribution(
         result,
@@ -219,12 +288,12 @@ def test_q42_like_absence_keeps_related_sources_and_closes_full_leaf_partition(
     # Search closure proves only that every retained MAY segment was packed.
     # It cannot certify that semantic pruning found every supporting memory,
     # authorize an absence conclusion, or close the common typed frontier.
-    assert result.packing_frontier_closed is True
+    assert result.packing_frontier_closed is False
     assert contribution.mechanism_id == TYPED_ADAPTER_MECHANISM_ID
-    assert contribution.frontier_mode is FrontierMode.BOUNDED
-    assert contribution.truncated is False
+    assert contribution.frontier_mode is FrontierMode.OPEN
+    assert contribution.truncated is True
     assert result.query.operator_spec.absence_decision_requires_closed_frontier is True
-    assert packet.frontier.mode is FrontierMode.BOUNDED
+    assert packet.frontier.mode is FrontierMode.OPEN
     assert packet.frontier.closed is False
 
 
@@ -277,10 +346,10 @@ def test_q65_multifacet_search_retains_opposite_semantic_root_branches(
         i for i, sources in enumerate(child_sources) if "p1::cook" in sources
     )
     assert {"p0::photo", "p1::cook"} <= _source_ids(result)
-    assert result.classified_frontier.closed is True
+    assert result.classified_frontier.retained_leaf_cell_ids
 
 
-def test_q74_needle_prunes_low_bound_noise_without_dropping_exact_quote(
+def test_q74_needle_audits_low_bound_noise_but_fails_open(
     tmp_path: Path,
 ) -> None:
     target = "I saved the Mayo Clinic posture reset video on YouTube."
@@ -310,8 +379,8 @@ def test_q74_needle_prunes_low_bound_noise_without_dropping_exact_quote(
 
     assert any(row.quote == target for row in result.evidence)
     assert any(row.reason == "dual_gate" for row in result.decision_audits)
-    assert result.core_result.pruned_leaf_cell_ids
-    assert result.classified_frontier.closed is True
+    assert result.core_result.pruned_leaf_cell_ids == ()
+    assert result.classified_frontier.closed is False
 
 
 def test_q79_conflicting_prices_keep_exact_whitespace_and_created_at_chronology(
@@ -349,15 +418,14 @@ def test_q79_conflicting_prices_keep_exact_whitespace_and_created_at_chronology(
 
     assert first in [row.quote for row in result.evidence]
     assert first in [row.summary for row in items]
-    assert {row.numeric_value for row in items if row.numeric_value is not None} == {
-        800.0,
-        2000.0,
+    assert {800.0, 2000.0} <= {
+        row.numeric_value for row in items if row.numeric_value is not None
     }
     assert all(row.date is not None for row in items)
     assert all(row.value_authority.value == "derived" for row in items)
     assert all("date_basis=source_created_at" in (row.relation or "") for row in items)
-    assert contribution.frontier_mode is FrontierMode.BOUNDED
-    assert contribution.truncated is False
+    assert contribution.frontier_mode is FrontierMode.OPEN
+    assert contribution.truncated is True
 
 
 def test_missing_vector_is_may_answer_and_unknown_overbudget_packs_partial(
@@ -479,8 +547,8 @@ def test_stored_chunk_centroids_prevent_source_mean_dilution_between_cells(
 
     assert target_cell.normalized_source_centroid == (1.0, 0.0)
     assert target_cell.cell_id in result.core_result.retained_leaf_cell_ids
-    assert any(
-        row.cell_id in result.core_result.pruned_leaf_cell_ids
+    assert all(
+        row.cell_id in result.core_result.retained_leaf_cell_ids
         for row in negative_cells
     )
     assert missing_cell.normalized_source_centroid is None
@@ -488,7 +556,7 @@ def test_stored_chunk_centroids_prevent_source_mean_dilution_between_cells(
     assert any("LIME-42" in row.quote for row in result.evidence)
 
 
-def test_idf_specificity_prunes_generic_overlap_without_veto_plateau(
+def test_idf_specificity_audits_generic_overlap_without_pruning(
     tmp_path: Path,
 ) -> None:
     rows = [
@@ -539,7 +607,7 @@ def test_idf_specificity_prunes_generic_overlap_without_veto_plateau(
     )
 
     assert any("LIME-42" in row.quote for row in result.evidence)
-    assert result.core_result.pruned_leaf_cell_ids
+    assert result.core_result.pruned_leaf_cell_ids == ()
     assert any(
         audit.reason == "dual_gate"
         and bool(audit.intersecting_surface_terms)
@@ -837,3 +905,46 @@ def test_zero_packable_novel_population_uses_explicit_fallback(
     assert result.classified_frontier.closed is False
     assert result.classified_frontier.all_novel_survivors_protected is False
     assert result.classified_frontier.unresolved_segment_receipt_sha256s
+
+
+def test_split_exact_literals_fail_open_across_separate_leaves(tmp_path: Path) -> None:
+    alpha = "Alpha Key identifies the first record."
+    beta = "Beta Key identifies the second record."
+    index = _build(
+        tmp_path,
+        "split-exact-fail-open",
+        [("alpha", alpha, BASE, "user"), ("beta", beta, BASE, "user")],
+        {"alpha": [1.0, 0.0], "beta": [1.0, 0.0]},
+    )
+    question = (
+        '[Question asked at 2026/08/27 12:00] Compare exact phrase "Alpha Key" '
+        'with exact phrase "Beta Key".'
+    )
+    result = search_semantic_residual(index, _compile(index, question, [[1.0, 0.0]]))
+
+    assert result.core_result.pruned_leaf_cell_ids == ()
+    assert {alpha, beta} <= {row.quote for row in result.evidence}
+    assert sum(row.reason == "exact_literal_absent" for row in result.decision_audits) == 2
+
+
+def test_required_user_role_does_not_prune_assistant_answer_bridge(
+    tmp_path: Path,
+) -> None:
+    user = "I visited the camera shop on Saturday."
+    answer = "You bought the Lumina camera during that visit."
+    index = _build(
+        tmp_path,
+        "role-bridge-fail-open",
+        [("user", user, BASE, "user"), ("assistant", answer, BASE, "assistant")],
+        {"user": [1.0, 0.0], "assistant": [1.0, 0.0]},
+    )
+    question = (
+        "[Question asked at 2026/08/27 12:00] "
+        "What did I buy when I visited the camera shop?"
+    )
+    result = search_semantic_residual(index, _compile(index, question, [[1.0, 0.0]]))
+
+    assert result.query.operator_spec.required_evidence_role == "user"
+    assert result.core_result.pruned_leaf_cell_ids == ()
+    assert answer in {row.quote for row in result.evidence}
+    assert any(row.reason == "required_role_absent" for row in result.decision_audits)

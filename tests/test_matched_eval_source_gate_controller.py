@@ -411,11 +411,14 @@ def test_temporal_and_numeric_routes_slew_to_their_specialized_tail_lane() -> No
     assert tuple(row.rank for row in numeric_tail.selections) == (0,)
 
 
-def test_no_progress_pass_stops_after_direct_guided_partition_and_replays() -> None:
+def test_no_progress_rotates_through_later_batches_before_exhaustion() -> None:
     plan = _plan()
     rounds: list[SourceGateRound] = [start_source_gate(plan)]
     coverages = [_empty_coverage(plan, rounds[0])]
     expected_lanes = (
+        FactLane.DIRECT,
+        FactLane.GUIDED,
+        FactLane.PARTITION,
         FactLane.DIRECT,
         FactLane.GUIDED,
         FactLane.PARTITION,
@@ -434,7 +437,10 @@ def test_no_progress_pass_stops_after_direct_guided_partition_and_replays() -> N
         )
     stop = advance_source_gate(plan, tuple(rounds), tuple(coverages))
     assert type(stop) is SourceGateStopReceipt
-    assert stop.reason is GateStopReason.NO_PROGRESS
+    assert stop.reason is GateStopReason.CANDIDATES_EXHAUSTED
+    assert set(stop.cumulative_selected_candidate_ids) == {
+        row.candidate_id for row in plan.candidates
+    }
     assert stop.unresolved_obligation_ids == (plan.obligations[0].obligation_id,)
     replay = replay_source_gate(
         plan,
@@ -444,6 +450,107 @@ def test_no_progress_pass_stops_after_direct_guided_partition_and_replays() -> N
     )
     assert replay.byte_identical is True
     assert replay.round_receipt_sha256s == tuple(row.receipt_sha256 for row in rounds)
+
+
+def test_progress_does_not_grant_a_lane_a_second_turn_before_others() -> None:
+    obligation = replace(_obligation_for("What color did Alpha choose?"), minimum_fact_count=99)
+    plan = _plan(obligation=obligation)
+    base = start_source_gate(plan)
+
+    def fact(index: int) -> CoverageFact:
+        return CoverageFact(
+            fact_id=_sha(f"round-robin-fact:{index}"),
+            fact_variants=(f"Alpha chose blue in observation {index}.",),
+            source_keys=(NamespacedSourceKey(_NAMESPACE, f"fact-source-{index}"),),
+            event_tuple=None,
+            provenance_receipt_sha256=_sha(f"round-robin-provenance:{index}"),
+        )
+
+    facts = (fact(0),)
+    base_coverage = assess_obligation_coverage(plan, base, facts)
+    direct = advance_source_gate(plan, (base,), (base_coverage,))
+    assert type(direct) is SourceGateRound
+    assert direct.tail_lane is FactLane.DIRECT
+
+    facts = (*facts, fact(1))
+    direct_coverage = assess_obligation_coverage(
+        plan, direct, facts, previous=base_coverage
+    )
+    assert direct_coverage.made_progress is True
+    guided = advance_source_gate(
+        plan,
+        (base, direct),
+        (base_coverage, direct_coverage),
+    )
+    assert type(guided) is SourceGateRound
+    assert guided.tail_lane is FactLane.GUIDED
+
+    facts = (*facts, fact(2))
+    guided_coverage = assess_obligation_coverage(
+        plan, guided, facts, previous=direct_coverage
+    )
+    assert guided_coverage.made_progress is True
+    partition = advance_source_gate(
+        plan,
+        (base, direct, guided),
+        (base_coverage, direct_coverage, guided_coverage),
+    )
+    assert type(partition) is SourceGateRound
+    assert partition.tail_lane is FactLane.PARTITION
+
+
+def test_unique_source_cap_skips_new_source_to_select_later_known_alias() -> None:
+    candidates = (
+        _candidate(FactLane.DIRECT, "known-a", 0),
+        _candidate(FactLane.PARTITION, "known-b", 0),
+        _candidate(FactLane.GUIDED, "new-c", 0),
+        _candidate(FactLane.GUIDED, "known-a", 1),
+    )
+    plan = _plan(
+        candidates=candidates,
+        policy=_policy(
+            direct=(1, 1, 1),
+            partition=(1, 1, 1),
+            guided=(0, 2, 1),
+            unique_cap=2,
+        ),
+    )
+    base = start_source_gate(plan)
+    assert base.cumulative_unique_source_count == 2
+
+    tail = advance_source_gate(plan, (base,), (_empty_coverage(plan, base),))
+
+    assert type(tail) is SourceGateRound
+    assert tail.tail_lane is FactLane.GUIDED
+    assert tuple(row.source_id for row in tail.selected_candidates) == ("known-a",)
+    assert tail.cumulative_unique_source_count == 2
+
+
+def test_unique_source_cap_skips_unaffordable_lane_for_known_alias_lane() -> None:
+    candidates = (
+        _candidate(FactLane.DIRECT, "known-a", 0),
+        _candidate(FactLane.PARTITION, "known-b", 0),
+        _candidate(FactLane.PARTITION, "known-a", 1),
+        _candidate(FactLane.GUIDED, "new-c", 0),
+    )
+    plan = _plan(
+        candidates=candidates,
+        policy=_policy(
+            direct=(1, 1, 1),
+            guided=(0, 1, 1),
+            partition=(1, 2, 1),
+            unique_cap=2,
+        ),
+    )
+    base = start_source_gate(plan)
+    assert base.cumulative_unique_source_count == 2
+
+    tail = advance_source_gate(plan, (base,), (_empty_coverage(plan, base),))
+
+    assert type(tail) is SourceGateRound
+    assert tail.tail_lane is FactLane.PARTITION
+    assert tuple(row.source_id for row in tail.selected_candidates) == ("known-a",)
+    assert tail.cumulative_unique_source_count == 2
 
 
 def test_grounded_thresholds_conflicts_frontier_and_call_cap_are_fail_closed() -> None:

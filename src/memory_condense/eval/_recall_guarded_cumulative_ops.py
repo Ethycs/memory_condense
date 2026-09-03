@@ -50,10 +50,10 @@ from memory_condense.eval.answer_value_coverage import (
     best_f1,
     contains_answer,
 )
-from memory_condense.eval.benchmark import (
-    BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
+from memory_condense.eval._retrieval_qa_prompt import (
     QA_NO_CONTEXT,
     QA_SYSTEM_PROMPT,
+    RESPONDER_OUTPUT_TOKEN_RESERVE as BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
     build_qa_prompt,
     cap_context_to_prompt_budget,
 )

@@ -20,7 +20,7 @@ import json
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,13 +29,13 @@ if __package__ in {None, ""}:
     repository = Path(__file__).resolve().parents[1]
     sys.path[:0] = [str(repository / "src"), str(repository)]
 
-from tools.v4_population_firebreak.canonical import (  # noqa: E402
+from tools.confirmation_canonical import (  # noqa: E402
     canonical_json_bytes,
     canonical_sha256,
     parse_json_bytes,
     publish_no_clobber,
 )
-from tools.v4_population_firebreak.treatment import (  # noqa: E402
+from tools.confirmation_treatment import (  # noqa: E402
     ConfirmationTreatmentInput,
     TreatmentQuestion,
     TreatmentSample,
@@ -52,6 +52,25 @@ POLICY_FORMAT = f"{FORMAT}-population-neutral-policy-v1"
 INPUT_BINDING_FORMAT = f"{FORMAT}-input-binding-v1"
 
 DEFAULT_QUESTIONS_PER_NAMESPACE = 10
+
+_TREATMENT_FIELDS = (
+    "file_sha256",
+    "sanitized_projection_sha256",
+    "dataset_sha256",
+    "split_manifest_sha256",
+    "ordered_question_ids_sha256",
+    "ordered_normalized_sample_bindings_sha256",
+    "ordered_raw_record_bindings_sha256",
+    "samples",
+)
+_SAMPLE_FIELDS = (
+    "sample_id",
+    "turns",
+    "turn_source_ids",
+    "turn_created_at",
+    "questions",
+)
+_QUESTION_FIELDS = ("question_id", "question", "question_date")
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -264,10 +283,32 @@ def _canonical_timestamp(value: datetime | None) -> str | None:
     return normalized.isoformat().replace("+00:00", "Z")
 
 
+def _require_carrier_shape(
+    value: object,
+    expected_fields: tuple[str, ...],
+    label: str,
+) -> None:
+    """Accept either firebreak carrier without importing the evaluator package.
+
+    The prediction-only loader and the post-prediction evaluator intentionally
+    define separate frozen dataclasses so importing one cannot expose the
+    other's dependency graph.  Their wire schema is identical.  Validate that
+    exact immutable record schema here instead of relying on Python class
+    identity across the process boundary.
+    """
+
+    _require(
+        is_dataclass(value)
+        and not isinstance(value, type)
+        and tuple(field.name for field in fields(value)) == expected_fields,
+        f"{label} must be an exact immutable carrier record",
+    )
+
+
 def _sample_projection(sample: TreatmentSample) -> dict[str, Any]:
     """Recreate the exact sanitized firebreak projection from decoded values."""
 
-    _require(type(sample) is TreatmentSample, "treatment sample changed type")
+    _require_carrier_shape(sample, _SAMPLE_FIELDS, "treatment sample")
     _require(
         type(sample.turns) is tuple
         and type(sample.turn_source_ids) is tuple
@@ -302,7 +343,7 @@ def _sample_projection(sample: TreatmentSample) -> dict[str, Any]:
         "treatment sample must contain one immutable question",
     )
     question = sample.questions[0]
-    _require(type(question) is TreatmentQuestion, "treatment question changed type")
+    _require_carrier_shape(question, _QUESTION_FIELDS, "treatment question")
     sample_id = _exact_text(sample.sample_id, "treatment sample ID")
     question_id = _exact_text(question.question_id, "treatment question ID")
     _require(question_id == sample_id, "treatment question and sample IDs differ")
@@ -332,10 +373,7 @@ def _sample_projection(sample: TreatmentSample) -> dict[str, Any]:
 def _validate_treatment(
     treatment: ConfirmationTreatmentInput,
 ) -> tuple[dict[str, Any], ...]:
-    _require(
-        type(treatment) is ConfirmationTreatmentInput,
-        "pipeline input must be a ConfirmationTreatmentInput",
-    )
+    _require_carrier_shape(treatment, _TREATMENT_FIELDS, "pipeline input")
     for value, label in (
         (treatment.file_sha256, "treatment file"),
         (treatment.sanitized_projection_sha256, "treatment projection"),

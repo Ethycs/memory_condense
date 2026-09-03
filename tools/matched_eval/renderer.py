@@ -12,7 +12,6 @@ from memory_condense.domain._tokenizer import (
     count_chat_prompt_token_proxy,
     count_tokens,
 )
-from memory_condense.eval.benchmark import QA_SYSTEM_PROMPT
 from tools.matched_eval.contracts import (
     MemoryPacket,
     MatchedEvalContractError,
@@ -21,6 +20,7 @@ from tools.matched_eval.contracts import (
     identity_sha256,
     require_text,
 )
+from tools.matched_eval.qa_prompt_policy import QA_SYSTEM_PROMPT
 
 
 RENDERER_ID = "matched_typed_slots_v2"

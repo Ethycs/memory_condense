@@ -594,13 +594,17 @@ def build_query_payload_answer_plan(
         "delta tier must be exact non-empty text",
     )
     source = adapter_population.source_population
+    supported_parent_renderers = frozenset(
+        {live.RENDERER_ID, live.V3_RENDERER_ID, live.V4_RENDERER_ID}
+    )
     _require(
         parent_plane.matched_population_id == source.population_id
         and parent_plane.population_identity_sha256
         == source.snapshot.population_identity_sha256
         and parent_plane.snapshot_id == source.snapshot.snapshot_id
-        and parent_plane.renderer_id == source.renderer_id == live.RENDERER_ID,
-        "query-payload parent plane changed its matched S0-v2 binding",
+        and parent_plane.renderer_id == source.renderer_id
+        and source.renderer_id in supported_parent_renderers,
+        "query-payload parent plane changed its registered matched S0 binding",
     )
     _require(
         len(adapter_population.rows) == len(parent_plane.rows),

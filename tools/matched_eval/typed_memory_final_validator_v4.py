@@ -44,10 +44,16 @@ from .typed_memory_final_arm import (
     _rows_in_complete_proof_scope,
     _rows_relevant_to_question,
     _validated_semantic_rows,
-    judge_row_projection,
     parse_typed_final_completion,
 )
+from .prediction_row_projection import prediction_row_projection
 from .typed_operator_spec import AnswerShape, TemporalMode, normalized_terms
+
+
+# Historical validation tools import this public compatibility name.  The
+# implementation is prediction-only and lives in a module whose dependency
+# surface accurately reflects that fact.
+judge_row_projection = prediction_row_projection
 
 
 FORMAT = "memory-condense-typed-memory-final-validator-v4"

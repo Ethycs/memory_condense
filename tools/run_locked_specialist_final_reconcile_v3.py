@@ -427,8 +427,10 @@ def _audit_temporal(bundle: _SourceBundle) -> _LaneAudit:
             if route_eligible:
                 resolutions[ordinal] = result
         statuses.append(status)
-    _require(len(statuses) == EXPECTED_PHYSICAL_PROMPT_COUNT,
-             "temporal audit population changed")
+    _require(
+        len(statuses) == len(bundle.providers_by_ordinal),
+        "temporal audit population changed",
+    )
     return _LaneAudit("temporal", tuple(statuses), tuple(resolved), resolutions)
 
 
@@ -486,8 +488,10 @@ def _audit_numeric(bundle: _SourceBundle) -> _LaneAudit:
             if route_eligible:
                 resolutions[ordinal] = receipt
         statuses.append(status)
-    _require(len(statuses) == EXPECTED_PHYSICAL_PROMPT_COUNT,
-             "numeric audit population changed")
+    _require(
+        len(statuses) == len(bundle.providers_by_ordinal),
+        "numeric audit population changed",
+    )
     return _LaneAudit("numeric", tuple(statuses), tuple(resolved), resolutions)
 
 
@@ -628,8 +632,10 @@ def _audit_authority(bundle: _SourceBundle) -> _LaneAudit:
             if eligible:
                 resolutions[ordinal] = result
         statuses.append(status)
-    _require(len(statuses) == EXPECTED_PHYSICAL_PROMPT_COUNT,
-             "authority audit population changed")
+    _require(
+        len(statuses) == len(bundle.providers_by_ordinal),
+        "authority audit population changed",
+    )
     return _LaneAudit("authority", tuple(statuses), tuple(resolved), resolutions)
 
 
@@ -844,7 +850,7 @@ def _compose_rows(
         results.append(result)
     _require(
         tuple(row["ordinal"] for row in results)
-        == tuple(range(EXPECTED_QUESTION_COUNT))
+        == tuple(range(len(bundle.rows)))
         and all(_question_row_is_self_hashed(row) for row in results),
         "V3 result population changed",
     )

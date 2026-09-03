@@ -31,10 +31,13 @@ from memory_condense.eval.recall_guarded_cumulative_fast_artifact import (
 )
 
 from tools._routed_repair_routing import RoutedRepairReceipt, RoutedRepairStyle
+from tools.routed_repair_contracts import (
+    MAX_ROUTED_PROMPT_TOKENS,
+    ROUTED_REPAIR_PROMPT_FORMAT,
+    RoutedRepairPromptError,
+)
 
 
-ROUTED_REPAIR_PROMPT_FORMAT = "memory-condense-routed-repair-prompt-v1"
-MAX_ROUTED_PROMPT_TOKENS = 8_000
 DEFAULT_RESPONDER_OUTPUT_TOKEN_RESERVE = 256
 DEFAULT_MEASURED_ARM: EMFactArm = "facts"
 _GOLD_BLIND_SUFFIX = (
@@ -42,10 +45,6 @@ _GOLD_BLIND_SUFFIX = (
     "reference answer, benchmark label, source-completeness label, prior "
     "prediction, or scorer feedback."
 )
-class RoutedRepairPromptError(ValueError):
-    """Raised when a routed request loses identity or budget integrity."""
-
-
 def _bound_route(
     question: FastRetrievalQuestion,
     value: object,

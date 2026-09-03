@@ -28,8 +28,7 @@ from memory_condense.domain._discourse_identity import (
 from memory_condense.domain.discourse import canonical_json, identity_sha256, quote_sha256
 from memory_condense.domain.sealed import SealedIdentity
 from memory_condense.domain.schemas import RetrievalResult
-from memory_condense.eval.diffuse_longmemeval_analysis import (
-    DiffuseLongMemEvalRetrievalPhase,
+from memory_condense.eval.diffuse_longmemeval_inputs import (
     GoldBlindLongMemEvalQuestion,
     GoldBlindLongMemEvalSample,
     LegacyDiffuseCandidates,
@@ -99,6 +98,12 @@ class TreatmentSampleLike(Protocol):
     turn_source_ids: Sequence[str | None]
     turn_created_at: Sequence[datetime | None]
     questions: Sequence[TreatmentQuestionLike]
+
+
+class RetrievalPhaseLike(Protocol):
+    """Only the sealed phase receipt is observable in a runtime result."""
+
+    receipt_sha256: str
 
 
 def _callable_identity(value: object) -> dict[str, str | None]:
@@ -1136,7 +1141,7 @@ def build_diffuse_longmemeval_execution_binding(
 class DiffuseLongMemEvalRuntimeResult(SealedIdentity):
     _SEAL_MISMATCH = "runtime result receipt does not match"
 
-    phase: DiffuseLongMemEvalRetrievalPhase
+    phase: RetrievalPhaseLike
     runtime_binding_sha256: str
     runtime_binding_certified: bool
     residency_preflight: ResidencyPreflightObservation

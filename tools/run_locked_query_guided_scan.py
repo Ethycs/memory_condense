@@ -36,10 +36,10 @@ from tools.matched_eval.query_guided_scan import (  # noqa: E402
     materialize_query_guided_scan,
     replay_query_guided_scan,
 )
-from tools.run_locked_query_expansion import (  # noqa: E402
-    DEFAULT_RETRIEVAL,
-    DEFAULT_STORE_ROOT,
+DEFAULT_STORE_ROOT = Path(
+    "eval_results/longmemeval-1m-recall-guarded-cumulative-validation-20260822"
 )
+DEFAULT_RETRIEVAL = DEFAULT_STORE_ROOT / "retrieval.json"
 
 
 DEFAULT_PARENT_OUTPUT = Path(

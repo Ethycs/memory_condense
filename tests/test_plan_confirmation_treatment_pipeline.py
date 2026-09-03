@@ -11,7 +11,7 @@ import pytest
 
 from tools import plan_confirmation_treatment_pipeline as planner
 from tools.v4_population_firebreak.canonical import canonical_sha256
-from tools.v4_population_firebreak.treatment import (
+from tools.confirmation_treatment import (
     ConfirmationTreatmentInput,
     TreatmentQuestion,
     TreatmentSample,

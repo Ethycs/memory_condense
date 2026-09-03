@@ -27,13 +27,13 @@ from memory_condense.domain.integrity import file_sha256
 from memory_condense.eval.fast_completion_runtime import (
     preflight_fast_completion_prompts,
 )
-from memory_condense.eval.fast_em_fact_memory import episodic_neighborhood
 from memory_condense.eval.recall_guarded_cumulative_fast_artifact import (
     FastEvidence,
 )
 
-from tools._locked_em_repair_adapter import LockedEMQuestionView, LockedEMStageView
-from tools._routed_repair_prompts import build_routed_fact_compression_prompt
+from tools.matched_eval.routed_compression import (
+    build_routed_fact_compression_prompt,
+)
 from tools._routed_repair_routing import route_question
 
 from .artifacts import SealedArtifact, read_sealed_json
@@ -44,6 +44,8 @@ from .contracts import (
     identity_sha256,
     require_sha256,
 )
+from .em_question_view import LockedEMQuestionView, LockedEMStageView
+from .em_fact_projection import episodic_neighborhood
 from .ledger import (
     RuntimeLedgerEntry,
     _validated_runtime_ledger,

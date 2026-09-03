@@ -45,7 +45,7 @@ from memory_condense.eval.diffuse_compilation import (
     DiffuseSourceCompilationReceipt,
     compile_diffuse_artifact,
 )
-from memory_condense.eval.recall_guarded_cumulative import (
+from memory_condense.eval._recall_guarded_cumulative_contracts import (
     causal_graph_context_budget,
 )
 from memory_condense.eval.schemas import EvalConfig

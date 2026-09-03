@@ -41,6 +41,13 @@ from .population import (
     load_s0_population,
     select_s0_population,
 )
+from .provider_runtime import (
+    DEFAULT_API_KEY_ENV,
+    DEFAULT_GATEWAY_URL,
+    DEFAULT_TERRA_CALLER_MODEL,
+    DEFAULT_TERRA_GATEWAY_MODEL,
+    make_provider_client,
+)
 from .renderer import RENDERER_ID, V3_RENDERER_ID, V4_RENDERER_ID
 
 
@@ -53,11 +60,7 @@ V3_ARM_LABEL = "S0_CONTROL_V3"
 V4_ANSWER_RUN_FORMAT = "memory-condense-matched-s0-v4-answer-run-v1"
 V4_ANSWER_PLAN_ID = "matched_s0_control_v4_terra_answer_v1"
 V4_ARM_LABEL = "S0_CONTROL_V4"
-DEFAULT_GATEWAY_URL = "https://central-dev.zt:4000/v1"
-DEFAULT_TERRA_GATEWAY_MODEL = "codex_sdk/gpt-5.6-terra"
-DEFAULT_TERRA_CALLER_MODEL = "openai/codex_sdk/gpt-5.6-terra"
 DEFAULT_MAX_NEW_TOKENS = 256
-DEFAULT_API_KEY_ENV = "LITELLM_KEY"
 
 PREFLIGHT_NAME = "s0-v2-preflight.json"
 V3_PREFLIGHT_NAME = "s0-v3-preflight.json"
@@ -150,11 +153,7 @@ def _thaw_json(value: Any) -> Any:
 
 
 def _make_provider_client(api_key: str, gateway_url: str) -> Any:
-    # Keep provider imports behind the live boundary.  The proven repository
-    # client binds truststore TLS and max_retries=0.
-    from memory_condense.eval.run_fast_1m_em_facts import _make_provider_client
-
-    return _make_provider_client(api_key, gateway_url)
+    return make_provider_client(api_key, gateway_url)
 
 
 def _stable_batch(batch: FastCompletionBatch) -> dict[str, Any]:

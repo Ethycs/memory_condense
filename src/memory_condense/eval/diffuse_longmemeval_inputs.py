@@ -6,6 +6,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Protocol
 
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.domain._discourse_identity import _nonempty, normalize_fields
@@ -14,7 +15,6 @@ from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.domain.sealed import SealedIdentity
 from memory_condense.eval._identity import sha256_digest
 from memory_condense.eval.schemas import RetrievalConfig
-from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 from memory_condense.search.episodes import (
     EpisodeSourceCandidate,
     EpisodeSourceCandidateScope,
@@ -26,6 +26,24 @@ DETERMINISTIC_DIFFUSE_INGEST_FORMAT = (
     "memory-condense-longmemeval-diffuse-ingest-v1"
 )
 _MISSING_TIMESTAMP_SENTINEL = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class BenchmarkQuestionLike(Protocol):
+    """Structural benchmark projection accepted only by the legacy adapter."""
+
+    question_id: str
+    question: str
+    dated_question: str
+
+
+class BenchmarkSampleLike(Protocol):
+    """Structural sample view; importing the raw benchmark loader is unnecessary."""
+
+    sample_id: str
+    turns: Sequence[tuple[str, str]]
+    turn_source_ids: Sequence[str | None]
+    turn_created_at: Sequence[datetime | None]
+    questions: Sequence[BenchmarkQuestionLike]
 
 
 def _embedding_sha256(values: Sequence[float] | None) -> str | None:
@@ -288,7 +306,7 @@ def _corpus_sha256(
     )
 
 
-def _question_probe(question: BenchmarkQuestion) -> GoldBlindLongMemEvalQuestion:
+def _question_probe(question: BenchmarkQuestionLike) -> GoldBlindLongMemEvalQuestion:
     """Project one benchmark question into its gold-blind probe."""
 
     return GoldBlindLongMemEvalQuestion(
@@ -299,7 +317,7 @@ def _question_probe(question: BenchmarkQuestion) -> GoldBlindLongMemEvalQuestion
 
 
 def gold_blind_longmemeval_sample(
-    sample: BenchmarkSample,
+    sample: BenchmarkSampleLike,
 ) -> GoldBlindLongMemEvalSample:
     """Project a benchmark sample into the only view retrieval may receive."""
 

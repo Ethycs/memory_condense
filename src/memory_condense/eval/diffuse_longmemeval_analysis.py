@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,8 +31,8 @@ from memory_condense.domain.discourse import (
     identity_sha256,
     quote_sha256,
 )
-from memory_condense.eval.benchmark import (
-    BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
+from memory_condense.eval._retrieval_qa_prompt import (
+    RESPONDER_OUTPUT_TOKEN_RESERVE as BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
 )
 from memory_condense.eval._diffuse_replay_provider_identity import (
     _OPERATIONAL_PROVIDER_IDENTITY_V2_MARKER,
@@ -77,7 +77,6 @@ from memory_condense.eval.diffuse_longmemeval_inputs import (
 from memory_condense.domain.sealed import SealedIdentity
 from memory_condense.eval._identity import exact_int, sha256_digest
 from memory_condense.eval.schemas import EvalConfig, RetrievalConfig
-from memory_condense.ingest.loader import BenchmarkSample
 from memory_condense.search.episodes import (
     EpisodeRepresentativeRetrievalPolicy,
     EpisodeRetrievalPolicy,
@@ -96,6 +95,26 @@ DIFFUSE_ANALYSIS_PHASE_FORMAT = (
     "memory-condense-longmemeval-diffuse-analysis-phase-v1"
 )
 DIFFUSE_ANALYSIS_FORMAT = "memory-condense-longmemeval-diffuse-analysis-v1"
+
+
+class MeasurementQuestionLike(Protocol):
+    """Structural post-retrieval question view used only by measurement APIs."""
+
+    question_id: str
+    question: str
+    dated_question: str
+    answer: str
+    evidence_sources: Sequence[str]
+
+
+class MeasurementSampleLike(Protocol):
+    """Structural post-retrieval sample view; no raw loader is imported."""
+
+    sample_id: str
+    turns: Sequence[tuple[str, str]]
+    turn_source_ids: Sequence[str | None]
+    turn_created_at: Sequence[Any]
+    questions: Sequence[MeasurementQuestionLike]
 
 
 class LegacyDiffuseInputProvider(Protocol):
@@ -927,7 +946,7 @@ def retrieve_diffuse_longmemeval_sample(
 
 def measure_diffuse_longmemeval_sample(
     retrieval_phase: DiffuseLongMemEvalRetrievalPhase,
-    sample: BenchmarkSample,
+    sample: MeasurementSampleLike,
     *,
     hydrate_span: Callable[[EvidenceSpan], str],
 ) -> DiffuseLongMemEvalAnalysis:
@@ -976,7 +995,7 @@ def measure_diffuse_longmemeval_sample(
 
 
 def run_diffuse_longmemeval_analysis(
-    sample: BenchmarkSample,
+    sample: MeasurementSampleLike,
     *,
     config: EvalConfig,
     arm: DiffuseLongMemEvalArm,

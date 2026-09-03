@@ -47,6 +47,10 @@ from memory_condense.eval.recall_guarded_cumulative_final_answer import (
 from memory_condense.eval.recall_guarded_cumulative_validation_retrieval import (
     VALIDATION_MERGED_RETRIEVAL_FORMAT,
 )
+from tools.matched_eval.em_question_view import (
+    LockedEMQuestionView,
+    LockedEMStageView,
+)
 
 
 ADAPTER_FORMAT = "memory-condense-locked-fixed-s1-em-repair-adapter-v1"
@@ -162,43 +166,6 @@ def _read_canonical_artifact(
             f"artifact digest sidecar is invalid: {sidecar}"
         )
     return value, digest
-
-
-@dataclass(frozen=True, slots=True)
-class LockedEMStageView:
-    """Minimal cumulative stage surface consumed by EM v2."""
-
-    stage_id: str
-    stage_receipt_sha256: str
-    evidence_projection_sha256: str
-    evidence: tuple[FastEvidence, ...]
-
-    @property
-    def evidence_ids(self) -> tuple[str, ...]:
-        return tuple(row.evidence_id for row in self.evidence)
-
-
-@dataclass(frozen=True, slots=True)
-class LockedEMQuestionView:
-    """Minimal ``FastRetrievalQuestion``-compatible S0/S1 projection."""
-
-    ordinal: int
-    question_id: str
-    question_sha256: str
-    dated_question_sha256: str
-    retrieval_question_part_sha256: str
-    dated_question: str
-    stages: tuple[LockedEMStageView, LockedEMStageView]
-
-    @property
-    def stage_ids(self) -> tuple[str, ...]:
-        return tuple(stage.stage_id for stage in self.stages)
-
-    def stage(self, stage_id: str) -> LockedEMStageView:
-        for stage in self.stages:
-            if stage.stage_id == stage_id:
-                return stage
-        raise KeyError(stage_id)
 
 
 @dataclass(frozen=True, slots=True)

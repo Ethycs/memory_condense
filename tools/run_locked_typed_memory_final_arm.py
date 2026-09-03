@@ -49,7 +49,7 @@ from tools import run_locked_adaptive_evidence_solver_v3 as adaptive_cli  # noqa
 from tools import run_locked_adaptive_source_map as source_cli  # noqa: E402
 from tools import run_locked_adaptive_source_tail_wave as tail_cli  # noqa: E402
 from tools import run_locked_query_guided_scan as guided_scan_cli  # noqa: E402
-from tools.matched_eval import live  # noqa: E402
+from tools.matched_eval import provider_runtime  # noqa: E402
 from tools.matched_eval import adaptive_evidence_solver_live as adaptive_live  # noqa: E402
 from tools.matched_eval.adaptive_source_tail_typed import (  # noqa: E402
     TailFactUnionRow,
@@ -122,9 +122,11 @@ from tools.matched_eval.typed_memory_final_arm import (  # noqa: E402
     OUTPUT_TOKEN_RESERVE,
     VALIDATOR_POLICY_FORMAT,
     fit_typed_final_prompt,
-    judge_row_projection,
     materialize_typed_final_result_row,
     render_final_messages,
+)
+from tools.matched_eval.prediction_row_projection import (  # noqa: E402
+    prediction_row_projection,
 )
 from tools.matched_eval.typed_operator_adapter import (  # noqa: E402
     ConflictPolicy,
@@ -3242,7 +3244,7 @@ def _provider(args: argparse.Namespace) -> dict[str, Any]:
     load_dotenv()
     api_key = os.environ.get(str(args.api_key_env), "").strip()
     _require(bool(api_key), f"provider API key is empty: {args.api_key_env}")
-    client = live._make_provider_client(api_key, str(args.gateway_url))  # noqa: SLF001
+    client = provider_runtime.make_provider_client(api_key, str(args.gateway_url))
     try:
         batch = _checkpoint_batch(
             artifact,
@@ -3315,7 +3317,7 @@ def _materialization_projection(
                 response_journal_sha256=record.response_journal_sha256,
             )
         )
-    judge_rows = [judge_row_projection(row) for row in results]
+    judge_rows = [prediction_row_projection(row) for row in results]
     _require(
         len(results) == len(judge_rows) == EXPECTED_QUESTION_COUNT
         and tuple(row["question_id"] for row in results)
@@ -3428,8 +3430,8 @@ def _replay(args: argparse.Namespace) -> dict[str, Any]:
 
 def _add_runtime_settings(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--model", default=live.DEFAULT_TERRA_GATEWAY_MODEL)
-    parser.add_argument("--gateway-url", default=live.DEFAULT_GATEWAY_URL)
+    parser.add_argument("--model", default=provider_runtime.DEFAULT_TERRA_GATEWAY_MODEL)
+    parser.add_argument("--gateway-url", default=provider_runtime.DEFAULT_GATEWAY_URL)
     parser.add_argument("--max-concurrency", type=int, default=4)
 
 
@@ -3509,7 +3511,7 @@ def _parser() -> argparse.ArgumentParser:
     provider.add_argument("--expected-preflight-sha256", required=True)
     provider.add_argument("--enable-provider", action="store_true")
     provider.add_argument("--authorized-provider-calls", type=int, default=0)
-    provider.add_argument("--api-key-env", default=live.DEFAULT_API_KEY_ENV)
+    provider.add_argument("--api-key-env", default=provider_runtime.DEFAULT_API_KEY_ENV)
 
     materialize = commands.add_parser(
         "materialize", help="consume immutable completion checkpoints only"

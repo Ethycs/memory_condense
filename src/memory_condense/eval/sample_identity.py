@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Protocol
 
-from memory_condense.ingest.loader import BenchmarkSample
+
+class ModelDumpLike(Protocol):
+    """Structural Pydantic projection needed for stable content identity."""
+
+    def model_dump(self, *, mode: str) -> Any: ...
 
 
 def canonical_sha256(value: Any) -> str:
@@ -25,7 +29,7 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def sample_sha256(sample: BenchmarkSample) -> str:
+def sample_sha256(sample: ModelDumpLike) -> str:
     """Hash all haystack, source, question, answer, and date fields."""
 
     return canonical_sha256(sample.model_dump(mode="json"))

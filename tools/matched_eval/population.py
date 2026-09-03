@@ -18,13 +18,11 @@ from memory_condense.domain.discourse import (
     identity_sha256 as legacy_identity_sha256,
     quote_sha256,
 )
-from memory_condense.eval._recall_guarded_cumulative_synthesis_contracts import (
-    extract_stage_question,
-)
 from memory_condense.eval.fast_completion_runtime import (
     FastPromptPopulation,
     preflight_fast_completion_prompts,
 )
+from tools.confirmation_prompt_extract import extract_stage_question
 
 from .artifacts import read_sealed_json
 from .contracts import (

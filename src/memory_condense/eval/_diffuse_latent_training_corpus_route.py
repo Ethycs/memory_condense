@@ -31,7 +31,7 @@ from memory_condense.eval._diffuse_route_v2_validation import (
     validate_closure_stopping_state,
     validate_compilation_receipt,
 )
-from memory_condense.eval.benchmark import QA_SYSTEM_PROMPT, build_qa_prompt
+from memory_condense.eval._retrieval_qa_prompt import QA_SYSTEM_PROMPT, build_qa_prompt
 from memory_condense.eval.diffuse_compilation import (
     DiffuseCompilationPolicy,
     DiffuseCompilationReceipt,

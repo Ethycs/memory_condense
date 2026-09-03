@@ -76,7 +76,7 @@ from memory_condense.eval.diffuse_longmemeval_analysis import (
 )
 from memory_condense.eval.diffuse_longmemeval import LongMemEvalDiffuseQueryReceipt
 from memory_condense.eval.diffuse_longmemeval_inputs import LegacyDiffuseInputReceipt
-from memory_condense.eval.benchmark import build_qa_prompt
+from memory_condense.eval._retrieval_qa_prompt import build_qa_prompt
 from memory_condense.search.fusion.models import FusionCaps
 from memory_condense.search.fusion.planner import (
     _atom_refs,

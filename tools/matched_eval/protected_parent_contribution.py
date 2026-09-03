@@ -27,7 +27,9 @@ from .contracts import (
 )
 from .typed_operator_adapter import (
     EvidenceHandleBinding,
+    EvidenceOrigin,
     FrontierMode,
+    ProvenanceGrade,
     TypedEvidenceContribution,
     compact_evidence_content_projection,
     parse_typed_items,
@@ -80,6 +82,46 @@ def _ordered_text(value: object, label: str) -> tuple[str, ...]:
 
 def _ordered_unique(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _rehydrate_handle_binding(raw: object) -> EvidenceHandleBinding:
+    """Rebuild one exact typed binding without importing an assay runner."""
+
+    row = _exact_dict(raw, "retained evidence binding")
+    binding = EvidenceHandleBinding(
+        handle_id=require_text(row.get("handle_id"), "retained handle"),
+        origin=EvidenceOrigin(require_text(row.get("origin"), "retained origin")),
+        provenance_grade=ProvenanceGrade(
+            require_text(row.get("provenance_grade"), "retained provenance")
+        ),
+        source_group_handle=require_text(
+            row.get("source_group_handle"), "retained group"
+        ),
+        sealed_artifact_sha256=require_sha256(
+            row.get("sealed_artifact_sha256"), "retained artifact"
+        ),
+        parent_receipt_sha256=require_sha256(
+            row.get("parent_receipt_sha256"), "retained parent"
+        ),
+        evidence_receipt_sha256=require_sha256(
+            row.get("evidence_receipt_sha256"), "retained evidence"
+        ),
+        payload_sha256=require_sha256(
+            row.get("payload_sha256"), "retained payload"
+        ),
+        citation_sha256=require_sha256(
+            row.get("citation_sha256"), "retained citation"
+        ),
+        citation_char_count=row.get("citation_char_count"),
+        local_source_locator_sha256=require_sha256(
+            row.get("local_source_locator_sha256"), "retained locator"
+        ),
+        receipt_sha256=require_sha256(
+            row.get("receipt_sha256"), "retained receipt"
+        ),
+    )
+    _require(binding.projection() == row, "retained evidence binding changed")
+    return binding
 
 
 def _compact_operator_projection(spec: TypedOperatorSpec) -> dict[str, Any]:
@@ -784,12 +826,8 @@ def rehydrate_protected_parent_contributions(
         local_audit.get("retained_fitted_bindings"),
         "retained fitted bindings",
     )
-    # Required private helpers are intentionally imported lazily so this
-    # reusable adapter cannot create an import cycle in the assay CLI.
-    from tools import run_reduced_second_read_retrieval_assay as reduced_cli
-
     original_bindings = tuple(
-        reduced_cli._rehydrate_handle_binding(value) for value in retained
+        _rehydrate_handle_binding(value) for value in retained
     )
     _require(
         tuple(row.handle_id for row in original_bindings) == handle_ids,

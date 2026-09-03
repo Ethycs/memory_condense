@@ -33,7 +33,7 @@ from memory_condense.eval._recall_guarded_cumulative_contracts import (
     ProtectedExcerpt,
     RecallGuardedCumulativeReceipt,
 )
-from memory_condense.eval.benchmark import (
+from memory_condense.eval._retrieval_qa_prompt import (
     QA_NO_CONTEXT,
     QA_SYSTEM_PROMPT,
     QA_USER_TEMPLATE,

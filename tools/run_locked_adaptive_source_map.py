@@ -35,7 +35,7 @@ from memory_condense.eval.fast_completion_runtime import (  # noqa: E402
 )
 from tools import run_locked_query_evidence_map_solver_v2 as map_cli  # noqa: E402
 from tools import run_locked_query_payload_answers as payload_cli  # noqa: E402
-from tools.matched_eval import live  # noqa: E402
+from tools.matched_eval import provider_runtime  # noqa: E402
 from tools.matched_eval.artifacts import (  # noqa: E402
     SealedArtifact,
     publish_sealed_json,
@@ -126,6 +126,19 @@ PARETO_COVERAGE_NAME = "adaptive-source-map-pareto-posthoc-coverage-v2.json"
 WORK_MANIFEST_NAME = "adaptive-source-map-base-work-manifest-v1.json"
 WORK_MANIFEST_FORMAT = f"{FORMAT}-work-manifest-v1"
 CHECKPOINT_DIR_NAME = "terra-source-history-map-calls"
+
+# The optional post-hoc coverage command historically imported the whole
+# joint-failure analysis CLI merely to obtain these two immutable pins.  That
+# CLI opens the locked validation split and benchmark, which made the pure
+# source-map implementation import-reachable from prediction code.  Keep the
+# frozen values beside the legacy command that consumes them instead.
+DEFAULT_POSTHOC_TARGET_PLAN = Path(
+    "eval_results/longmemeval-1m-locked-retrieval-mechanism-arms-20260826/"
+    "target-owner-plan-v1/target-plan.json"
+)
+EXPECTED_POSTHOC_TARGET_PLAN_SHA256 = (
+    "b96786a4ef87a2958e385939b31857e06a33a1bd1577eb693e6a4a409f8356ff"
+)
 
 DEFAULT_OUTPUT = (
     payload_cli.DEFAULT_CAMPAIGN_ROOT
@@ -2142,11 +2155,6 @@ def _pareto_preflight(args: argparse.Namespace) -> dict[str, Any]:
 def _pareto_posthoc_coverage(args: argparse.Namespace) -> dict[str, Any]:
     """Attach registered source-target coverage after structural seals exist."""
 
-    from tools.analyze_locked_query_answer_joint_failures import (  # noqa: PLC0415
-        DEFAULT_TARGET_PLAN,
-        EXPECTED_TARGET_PLAN_SHA256,
-    )
-
     root = Path(args.output_root)
     expected_pareto = require_sha256(
         args.expected_pareto_sha256, "expected source-map Pareto manifest"
@@ -2163,11 +2171,13 @@ def _pareto_posthoc_coverage(args: argparse.Namespace) -> dict[str, Any]:
         "posthoc coverage requires a sealed provider-free Pareto manifest",
     )
     target_path = (
-        DEFAULT_TARGET_PLAN if args.target_plan is None else Path(args.target_plan)
+        DEFAULT_POSTHOC_TARGET_PLAN
+        if args.target_plan is None
+        else Path(args.target_plan)
     )
     target = read_sealed_json(target_path)
     expected_target = (
-        EXPECTED_TARGET_PLAN_SHA256
+        EXPECTED_POSTHOC_TARGET_PLAN_SHA256
         if args.expected_target_plan_sha256 is None
         else require_sha256(
             args.expected_target_plan_sha256, "expected target-plan artifact"
@@ -2431,7 +2441,7 @@ def _provider(args: argparse.Namespace) -> dict[str, Any]:
     load_dotenv()
     api_key = os.environ.get(args.api_key_env, "").strip()
     _require(bool(api_key), f"provider API key is empty: {args.api_key_env}")
-    client = live._make_provider_client(api_key, args.gateway_url)  # noqa: SLF001
+    client = provider_runtime.make_provider_client(api_key, args.gateway_url)
     runtime = _runtime(
         artifact=artifact,
         prompts=prompts,
@@ -2730,8 +2740,8 @@ def _replay(args: argparse.Namespace) -> dict[str, Any]:
 
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--gateway-url", default=live.DEFAULT_GATEWAY_URL)
-    parser.add_argument("--model", default=live.DEFAULT_TERRA_GATEWAY_MODEL)
+    parser.add_argument("--gateway-url", default=provider_runtime.DEFAULT_GATEWAY_URL)
+    parser.add_argument("--model", default=provider_runtime.DEFAULT_TERRA_GATEWAY_MODEL)
     parser.add_argument("--max-concurrency", type=int, default=4)
     parser.add_argument(
         "--direct-base-cap", type=int, default=DEFAULT_DIRECT_BASE_CAP
@@ -2781,14 +2791,14 @@ def _parser() -> argparse.ArgumentParser:
     coverage.add_argument("--expected-pareto-sha256", required=True)
     coverage.add_argument("--target-plan", type=Path)
     coverage.add_argument("--expected-target-plan-sha256")
-    coverage.add_argument("--gateway-url", default=live.DEFAULT_GATEWAY_URL)
+    coverage.add_argument("--gateway-url", default=provider_runtime.DEFAULT_GATEWAY_URL)
     coverage.add_argument("--max-concurrency", type=int, default=4)
     provider = commands.add_parser("provider-run")
     _common(provider)
     provider.add_argument("--expected-preflight-sha256", required=True)
     provider.add_argument("--enable-provider", action="store_true")
     provider.add_argument("--authorized-provider-calls", type=int, default=0)
-    provider.add_argument("--api-key-env", default=live.DEFAULT_API_KEY_ENV)
+    provider.add_argument("--api-key-env", default=provider_runtime.DEFAULT_API_KEY_ENV)
     materialize = commands.add_parser("materialize")
     _common(materialize)
     materialize.add_argument("--expected-preflight-sha256", required=True)

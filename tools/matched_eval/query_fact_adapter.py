@@ -23,11 +23,9 @@ from typing import Any, Mapping, Sequence
 from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.domain.discourse import quote_sha256
 from memory_condense.eval.fast_completion_runtime import FastPromptPopulation, preflight_fast_completion_prompts
-from memory_condense.eval.fast_em_fact_memory import EMFactCompression, episodic_neighborhood, parse_fact_compression
 from memory_condense.eval.recall_guarded_cumulative_fast_artifact import FastEvidence
 
-from tools._locked_em_repair_adapter import LockedEMQuestionView, LockedEMStageView
-from tools._routed_repair_prompts import (
+from tools.matched_eval.routed_compression import (
     MAX_ROUTED_PROMPT_TOKENS,
     RoutedCompressionPrompt,
     build_routed_fact_compression_prompt,
@@ -36,6 +34,12 @@ from tools._routed_repair_routing import RoutedRepairReceipt, route_question
 
 from .artifacts import SealedArtifact, read_sealed_json
 from .contracts import MatchedEvalContractError, StageDisposition, assert_gold_blind, identity_sha256, require_sha256, require_text
+from .em_question_view import LockedEMQuestionView, LockedEMStageView
+from .em_fact_projection import (
+    EMFactCompression,
+    episodic_neighborhood,
+    parse_fact_compression,
+)
 from .population import EXPECTED_QUESTION_COUNT, MatchedS0Population, MatchedS0Row, SOURCE_STAGE_ID, load_s0_population
 from .query_expansion import (
     ENTIRE_STORE_SCOPE,

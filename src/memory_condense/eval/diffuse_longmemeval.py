@@ -34,10 +34,10 @@ from memory_condense.domain.schemas import RetrievalResult
 from memory_condense.domain.sealed import SealedIdentity
 from memory_condense.eval._identity import exact_int, sha256_digest
 from memory_condense.eval.answer_value_coverage import best_f1, contains_answer
-from memory_condense.eval.benchmark import (
-    BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
+from memory_condense.eval._retrieval_qa_prompt import (
     QA_SYSTEM_PROMPT,
     QA_USER_TEMPLATE,
+    RESPONDER_OUTPUT_TOKEN_RESERVE as BENCHMARK_RESPONDER_OUTPUT_TOKEN_RESERVE,
     build_qa_prompt,
 )
 from memory_condense.search.episodes import (

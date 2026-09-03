@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from memory_condense.eval.benchmark import f1_score, normalize_answer
+from memory_condense.eval._answer_normalization import f1_score, normalize_answer
 from memory_condense.eval.recall_models import AnswerValueCoverage
 
 _NUMBERED_ANSWER_COMPONENT_RE = re.compile(

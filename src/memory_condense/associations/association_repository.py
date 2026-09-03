@@ -67,81 +67,110 @@ class AssociationStore(
         if max_neighbors < 0:
             raise ValueError("max_neighbors must be non-negative")
         self._require_artifact(artifact_id)
-        turn = self._db.current_turn() if now_turn is None else int(now_turn)
-        select_columns = f"SELECT {head_edge_columns()} FROM chunk_head_edges "
-        rows: list = []
-        if source_chunk_ids is None:
-            rows = self._db.execute(
-                select_columns + "WHERE artifact_id = ?",
-                (artifact_id,),
-            ).fetchall()
-        else:
-            # Keep below SQLite's conservative host-parameter limit while
-            # avoiding one SELECT per source.
-            sources = list(dict.fromkeys(source_chunk_ids))
-            for offset in range(0, len(sources), 500):
-                batch = sources[offset : offset + 500]
-                if not batch:
-                    continue
-                placeholders = ",".join("?" for _ in batch)
-                rows.extend(
-                    self._db.execute(
-                        select_columns
-                        + f"WHERE artifact_id = ? AND source_chunk_id IN ({placeholders})",
-                        (artifact_id, *batch),
-                    ).fetchall()
-                )
-
-        rows_by_source: dict[str, list] = defaultdict(list)
-        for row in rows:
-            rows_by_source[row[0]].append(row)
-        deletions: list[tuple[str, str, str]] = []
-        for source_id, source_rows in rows_by_source.items():
-            ranked: list[tuple[float, str]] = []
-            for row in source_rows:
-                edge = self._stored_edge(row, artifact_id)
-                ranked.append(
-                    (edge.utility(now_turn=turn), edge.destination_chunk_id)
-                )
-            ranked.sort(reverse=True)
-            for _, destination_id in ranked[max_neighbors:]:
-                deletions.append((source_id, destination_id, artifact_id))
+        connection = self._db.connection
         removed = 0
-        if deletions:
-            cur = self._db.executemany(
-                "DELETE FROM chunk_head_edges WHERE source_chunk_id = ? "
-                "AND destination_chunk_id = ? AND artifact_id = ?",
-                deletions,
-            )
-            removed = (
-                cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0
-                else len(deletions)
-            )
-        self._db.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            turn = self._db.current_turn() if now_turn is None else int(now_turn)
+            select_columns = f"SELECT {head_edge_columns()} FROM chunk_head_edges "
+            rows: list = []
+            if source_chunk_ids is None:
+                rows = self._db.execute(
+                    select_columns + "WHERE artifact_id = ?",
+                    (artifact_id,),
+                ).fetchall()
+            else:
+                # Keep below SQLite's conservative host-parameter limit while
+                # avoiding one SELECT per source.
+                sources = list(dict.fromkeys(source_chunk_ids))
+                for offset in range(0, len(sources), 500):
+                    batch = sources[offset : offset + 500]
+                    if not batch:
+                        continue
+                    placeholders = ",".join("?" for _ in batch)
+                    rows.extend(
+                        self._db.execute(
+                            select_columns
+                            + "WHERE artifact_id = ? AND source_chunk_id IN "
+                            + f"({placeholders})",
+                            (artifact_id, *batch),
+                        ).fetchall()
+                    )
+
+            rows_by_source: dict[str, list] = defaultdict(list)
+            for row in rows:
+                rows_by_source[row[0]].append(row)
+            deletions: list[tuple[str, str, str]] = []
+            for source_id, source_rows in rows_by_source.items():
+                ranked: list[tuple[float, str]] = []
+                for row in source_rows:
+                    edge = self._stored_edge(row, artifact_id)
+                    ranked.append(
+                        (edge.utility(now_turn=turn), edge.destination_chunk_id)
+                    )
+                ranked.sort(reverse=True)
+                for _, destination_id in ranked[max_neighbors:]:
+                    deletions.append((source_id, destination_id, artifact_id))
+            if deletions:
+                cur = self._db.executemany(
+                    "DELETE FROM chunk_head_edges WHERE source_chunk_id = ? "
+                    "AND destination_chunk_id = ? AND artifact_id = ?",
+                    deletions,
+                )
+                removed = (
+                    cur.rowcount
+                    if cur.rowcount is not None and cur.rowcount >= 0
+                    else len(deletions)
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         if removed:
             self._edge_neighbor_cache.clear()
         return removed
 
-    def remove_chunk_artifacts(self, chunk_id: str) -> int:
-        """Remove a chunk from the live graph while preserving its source row."""
-        hebbian_edge_cur = self._db.execute(
-            "DELETE FROM hebbian_chunk_edges WHERE chunk_low = ? OR chunk_high = ?",
-            (chunk_id, chunk_id),
-        )
-        hebbian_node_cur = self._db.execute(
-            "DELETE FROM hebbian_chunk_nodes WHERE chunk_id = ?",
-            (chunk_id,),
-        )
-        edge_cur = self._db.execute(
-            "DELETE FROM chunk_head_edges WHERE source_chunk_id = ? "
-            "OR destination_chunk_id = ?",
-            (chunk_id, chunk_id),
-        )
-        signature_cur = self._db.execute(
-            "DELETE FROM chunk_cav_signatures WHERE chunk_id = ?",
-            (chunk_id,),
-        )
-        self._db.commit()
+    def remove_chunk_artifacts(
+        self, chunk_id: str, *, commit: bool = True
+    ) -> int:
+        """Remove a chunk from the live graph while preserving its source row.
+
+        ``commit=False`` is the transaction-composition seam used by chunk
+        retirement; caches are invalidated immediately and are safe even if
+        the caller subsequently rolls the transaction back.
+        """
+        connection = self._db.connection
+        try:
+            if commit and not connection.in_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            if not commit and not connection.in_transaction:
+                raise RuntimeError(
+                    "commit=False requires an owning SQLite transaction"
+                )
+            hebbian_edge_cur = self._db.execute(
+                "DELETE FROM hebbian_chunk_edges "
+                "WHERE chunk_low = ? OR chunk_high = ?",
+                (chunk_id, chunk_id),
+            )
+            hebbian_node_cur = self._db.execute(
+                "DELETE FROM hebbian_chunk_nodes WHERE chunk_id = ?",
+                (chunk_id,),
+            )
+            edge_cur = self._db.execute(
+                "DELETE FROM chunk_head_edges WHERE source_chunk_id = ? "
+                "OR destination_chunk_id = ?",
+                (chunk_id, chunk_id),
+            )
+            signature_cur = self._db.execute(
+                "DELETE FROM chunk_cav_signatures WHERE chunk_id = ?",
+                (chunk_id,),
+            )
+            if commit:
+                connection.commit()
+        except BaseException:
+            if commit:
+                connection.rollback()
+            raise
         if edge_cur.rowcount:
             self._edge_neighbor_cache.clear()
         if signature_cur.rowcount:

@@ -1208,7 +1208,8 @@ def test_exact_span_dedup_transfers_l_and_g_retention_authority_without_rewritin
         return candidates
 
     monkeypatch.setattr(terminal_adapter, "_global_candidates", capture)
-    *_unused, sources, _owners, _compiled = _pipeline(index, query)
+    *upstream_results, sources, selected_owners, _compiled = _pipeline(index, query)
+    residual_result, local_result, global_result = upstream_results
     unique_bases = []
     seen_spans: set[str] = set()
     for candidate in captured:
@@ -1640,6 +1641,155 @@ def test_exact_span_dedup_transfers_l_and_g_retention_authority_without_rewritin
         (g_noise[0].receipt_sha256,),
     )
     assert backfill.projection() == json.loads(json.dumps(backfill.projection()))
+
+    backfill_support = terminal_adapter._exact_span_support_population(  # noqa: SLF001
+        candidates_by_plane=candidate_planes,
+        plane_selections=tuple(selections),
+    )
+    _, _, _, backfilled_local_rows, _ = terminal_adapter._compile_typed_prompt(  # noqa: SLF001
+        rows=backfilled,
+        spec=query.operator_spec,
+        dated_question=query.dated_question,
+        parent_prediction="Fallback.",
+        sealed_sources=sources,
+        parent_receipt_by_plane={
+            plane: _sha(f"backfill-parent:{plane}") for plane in "PRLG"
+        },
+        policy=policy,
+        dedup_receipt=initial_dedup,
+        post_dedup_backfill=backfill,
+        exact_span_support_population=backfill_support,
+    )
+    assert g_noise[0].receipt_sha256 in {
+        row["candidate"]["receipt_sha256"] for row in backfilled_local_rows
+    }
+
+    with pytest.raises(
+        SemanticGlobalTerminalError,
+        match="outside its authenticated backfill population",
+    ):
+        terminal_adapter._retention_authority_overlay(  # noqa: SLF001
+            rows=initially_retained,
+            dedup_receipt=initial_dedup,
+            post_dedup_backfill=backfill,
+            exact_span_support_population=backfill_support,
+        )
+    tampered_final = replace(
+        backfill,
+        final_retained_candidate_receipt_sha256s=(r_target.receipt_sha256,),
+        receipt_sha256="",
+    )
+    with pytest.raises(
+        SemanticGlobalTerminalError,
+        match="outside its authenticated backfill population",
+    ):
+        terminal_adapter._retention_authority_overlay(  # noqa: SLF001
+            rows=initially_retained,
+            dedup_receipt=initial_dedup,
+            post_dedup_backfill=tampered_final,
+            exact_span_support_population=backfill_support,
+        )
+    mismatched_initial = replace(
+        backfill,
+        initial_dedup_receipt_sha256=_sha("foreign-initial-dedup"),
+        receipt_sha256="",
+    )
+    with pytest.raises(
+        SemanticGlobalTerminalError,
+        match="outside its authenticated backfill population",
+    ):
+        terminal_adapter._retention_authority_overlay(  # noqa: SLF001
+            rows=backfilled,
+            dedup_receipt=initial_dedup,
+            post_dedup_backfill=mismatched_initial,
+            exact_span_support_population=backfill_support,
+        )
+
+    legacy_overlay = terminal_adapter._retention_authority_overlay(  # noqa: SLF001
+        rows=initially_retained,
+        dedup_receipt=initial_dedup,
+        exact_span_support_population=backfill_support,
+    )
+    assert set(legacy_overlay) == {r_target.receipt_sha256}
+    with pytest.raises(
+        SemanticGlobalTerminalError,
+        match="outside its authenticated dedup population",
+    ):
+        terminal_adapter._retention_authority_overlay(  # noqa: SLF001
+            rows=backfilled,
+            dedup_receipt=initial_dedup,
+            exact_span_support_population=backfill_support,
+        )
+
+    # Exercise the public compiler in both backfill successor modes.  The
+    # retained R copy inherits the hard G authority while the freed G slot is
+    # filled only through the sealed post-dedup receipt.
+    monkeypatch.setattr(
+        terminal_adapter,
+        "_selected_protected_owner_candidates",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        terminal_adapter,
+        "_residual_candidates",
+        lambda **_kwargs: (r_target,),
+    )
+    monkeypatch.setattr(
+        terminal_adapter,
+        "_local_candidates",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        terminal_adapter,
+        "_global_candidates",
+        lambda **_kwargs: (g_target, g_noise[0]),
+    )
+    monkeypatch.setattr(
+        terminal_adapter,
+        "_direct_operand_lane",
+        lambda *_args, **_kwargs: ((), ()),
+    )
+    backfill_policy = SemanticGlobalTerminalPolicy(
+        plane_budgets=tuple(
+            PlaneBudget(plane, 1, 10_000, 0) for plane in "PRLG"
+        )
+    )
+    for enable_links, expected_format in (
+        (False, terminal_adapter.BACKFILL_FORMAT),
+        (True, terminal_adapter.LINKED_BACKFILL_FORMAT),
+    ):
+        successor = compile_semantic_global_terminal(
+            dated_question=query.dated_question,
+            parent_prediction="Fallback.",
+            residual_index=index,
+            query=query,
+            protected_owner_universe_bindings=(),
+            selected_protected_owner_evidence=selected_owners,
+            residual_result=residual_result,
+            local_result=local_result,
+            global_result=global_result,
+            sealed_sources=sources,
+            policy=backfill_policy,
+            enable_selected_evidence_discourse_links=enable_links,
+            enable_post_dedup_backfill=True,
+        )
+        assert successor.format_id == expected_format
+        assert successor.post_dedup_backfill is not None
+        assert successor.post_dedup_backfill.admitted_candidate_receipt_sha256s_by_plane[-1] == (
+            "G",
+            (g_noise[0].receipt_sha256,),
+        )
+        retained_target = next(
+            row["typed_terminal"]
+            for row in successor.local_rows
+            if row["candidate"]["receipt_sha256"] == r_target.receipt_sha256
+        )
+        assert retained_target["retention_authority"]["authority_source_planes"] == (
+            "G",
+        )
+        assert retained_target["retention_authority"][
+            "effective_hard_protection"
+        ] is True
 
 
 def test_strict_owner_loader_accepts_historical_sealed_r7_provider_rows() -> None:

@@ -40,6 +40,38 @@ def published() -> tuple[
     return artifact, rows, base_rows, v4_rows
 
 
+@pytest.fixture(scope="module")
+def routing_population() -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+]:
+    composition = read_sealed_json(
+        arm.DEFAULT_PARENT_ROOT / arm.typed_cli.COMPOSITION_NAME
+    )
+    assert composition.sha256 == arm.v1.EXPECTED_PARENT_COMPOSITION_SHA256
+    composition_rows = tuple(composition.payload["questions"])
+    _base_artifact, base_rows = arm._load_v1(  # noqa: SLF001
+        arm.DEFAULT_V1_CONSTRUCTION
+    )
+    _v4_artifact, v4_rows = arm._load_v4(arm.DEFAULT_V4_CONSTRUCTION)  # noqa: SLF001
+    return composition_rows, base_rows, v4_rows
+
+
+def _dated_question(composition_row: dict[str, Any]) -> str:
+    return composition_row["provider_projection"]["provider_input"][
+        "dated_question"
+    ]
+
+
+def _reseal_question_row(row: dict[str, Any]) -> dict[str, Any]:
+    resealed = copy.deepcopy(row)
+    body = dict(resealed)
+    body.pop("question_receipt_sha256")
+    resealed["question_receipt_sha256"] = identity_sha256(body)
+    return resealed
+
+
 def test_replacement_partition_is_exact_and_disjoint() -> None:
     assert len(arm.LATEST_STATE_ORDINALS) == 10
     assert len(arm.REPAIRED_OPERATOR_ORDINALS) == 3
@@ -49,6 +81,104 @@ def test_replacement_partition_is_exact_and_disjoint() -> None:
     assert set(arm.REPLACED_ORDINALS) | set(arm.PRESERVED_ORDINALS) == set(
         range(100)
     )
+
+
+def test_question_local_predicate_reproduces_the_13_row_partition(
+    routing_population: tuple[
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+    ],
+) -> None:
+    composition_rows, base_rows, v4_rows = routing_population
+
+    plan = arm._validation_independent_replacement_plan(  # noqa: SLF001
+        base_rows=base_rows,
+        composition_rows=composition_rows,
+        repaired_operator_rows=v4_rows,
+    )
+
+    assert tuple(plan) == arm.REPLACED_ORDINALS
+    assert tuple(
+        coordinate
+        for coordinate, (route, _candidate) in plan.items()
+        if route is arm.SuccessorRouteKind.LATEST_STATE
+    ) == arm.LATEST_STATE_ORDINALS
+    assert tuple(
+        coordinate
+        for coordinate, (route, _candidate) in plan.items()
+        if route is arm.SuccessorRouteKind.REPAIRED_OPERATOR
+    ) == arm.REPAIRED_OPERATOR_ORDINALS
+
+
+def test_question_local_predicate_is_invariant_to_ids_and_coordinates(
+    routing_population: tuple[
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+    ],
+) -> None:
+    composition_rows, base_rows, v4_rows = routing_population
+    v4_by_ordinal = {row["ordinal"]: row for row in v4_rows}
+
+    latest_base = copy.deepcopy(base_rows[19])
+    latest_base["ordinal"] = 901
+    latest_base["question_id"] = "renumbered-latest-state"
+    latest_base = _reseal_question_row(latest_base)
+    assert arm.validation_independent_successor_route(
+        dated_question=_dated_question(composition_rows[19]),
+        base_row=latest_base,
+    ) is arm.SuccessorRouteKind.LATEST_STATE
+
+    operator_base = copy.deepcopy(base_rows[42])
+    operator_base["ordinal"] = 902
+    operator_base["question_id"] = "renumbered-operator-base"
+    operator_base = _reseal_question_row(operator_base)
+    operator_candidate = copy.deepcopy(v4_by_ordinal[42])
+    operator_candidate["ordinal"] = 903
+    operator_candidate["question_id"] = "renumbered-operator-candidate"
+    operator_candidate = _reseal_question_row(operator_candidate)
+    assert arm.validation_independent_successor_route(
+        dated_question=_dated_question(composition_rows[42]),
+        base_row=operator_base,
+        repaired_operator_candidate=operator_candidate,
+    ) is arm.SuccessorRouteKind.REPAIRED_OPERATOR
+
+
+def test_target_coordinates_do_not_admit_foreign_or_unsealed_rows(
+    routing_population: tuple[
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+    ],
+) -> None:
+    composition_rows, base_rows, v4_rows = routing_population
+    v4_by_ordinal = {row["ordinal"]: row for row in v4_rows}
+
+    foreign_base = copy.deepcopy(base_rows[0])
+    foreign_base["ordinal"] = 42
+    foreign_base["question_id"] = v4_by_ordinal[42]["question_id"]
+    foreign_base = _reseal_question_row(foreign_base)
+    assert arm.validation_independent_successor_route(
+        dated_question=_dated_question(composition_rows[0]),
+        base_row=foreign_base,
+        repaired_operator_candidate=v4_by_ordinal[42],
+    ) is arm.SuccessorRouteKind.PRESERVE
+
+    unsealed_latest = copy.deepcopy(base_rows[19])
+    unsealed_latest["question_id"] = "unsealed-latest-state"
+    assert arm.validation_independent_successor_route(
+        dated_question=_dated_question(composition_rows[19]),
+        base_row=unsealed_latest,
+    ) is arm.SuccessorRouteKind.PRESERVE
+
+    unsealed = copy.deepcopy(v4_by_ordinal[65])
+    unsealed["operator"]["selected_scope_only"] = False
+    assert arm.validation_independent_successor_route(
+        dated_question=_dated_question(composition_rows[65]),
+        base_row=base_rows[65],
+        repaired_operator_candidate=unsealed,
+    ) is arm.SuccessorRouteKind.PRESERVE
 
 
 def test_typed_latest_state_route_overrides_but_seals_legacy_routing() -> None:

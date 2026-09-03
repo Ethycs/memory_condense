@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import numpy as np
 import pytest
@@ -394,6 +395,419 @@ def test_save_and_rebuild(db, tmp_dir):
     assert results[0].chunk.chunk_id == chunk.chunk_id
 
 
+def test_startup_rebuilds_corrupt_index_image_from_read_only_sqlite(tmp_path):
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "corrupt-index.db"
+    index_path = tmp_path / "corrupt-index.bin"
+    with Database(db_path) as writable:
+        retriever = SimilarityRetriever(
+            db=writable,
+            dim=8,
+            index_path=index_path,
+            max_elements=100,
+        )
+        chunk_id = _seed(retriever, writable, "corrupt-recovery", 1)[0]
+        retriever.save()
+
+    index_path.write_bytes(b"torn hnsw image")
+
+    with Database(db_path, read_only=True) as read_only:
+        recovered = SimilarityRetriever(
+            db=read_only,
+            dim=8,
+            index_path=index_path,
+            max_elements=100,
+        )
+        probe = np.asarray(_vector({0: 1.0}, dim=8), dtype=np.float32)
+
+        assert [
+            row.chunk.chunk_id for row in recovered.query(probe, k=10)
+        ] == [chunk_id]
+        assert recovered._observed_index_revision >= 0
+
+
+def test_failed_private_index_save_keeps_published_image_and_cleans_temp(
+    db, tmp_path, monkeypatch
+):
+    from memory_condense.search.indexes import index_lifecycle
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    index_path = tmp_path / "atomic-index.bin"
+    retriever = SimilarityRetriever(
+        db=db,
+        dim=16,
+        index_path=index_path,
+        max_elements=100,
+    )
+    turn = TranscriptStore(db).append("user", "atomic index owner")
+    retriever.add_chunks([_make_chunk(turn.turn_id, "published vector", dim=16)])
+    retriever.save()
+    published = index_path.read_bytes()
+
+    retriever.add_chunks([_make_chunk(turn.turn_id, "newer vector", dim=16)])
+
+    def fail_private_save(_index, temporary_path):
+        temporary_path.write_bytes(b"partial private image")
+        raise OSError("synthetic private image failure")
+
+    monkeypatch.setattr(
+        index_lifecycle,
+        "_save_hnsw_index",
+        fail_private_save,
+    )
+
+    with pytest.raises(OSError, match="synthetic private image failure"):
+        retriever.save()
+
+    assert index_path.read_bytes() == published
+    assert list(tmp_path.glob(f".{index_path.name}.*.tmp")) == []
+
+
+def test_read_only_retriever_cannot_publish_index_image(tmp_path):
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "read-only-save.db"
+    index_path = tmp_path / "read-only-save.bin"
+    with Database(db_path) as writable:
+        retriever = SimilarityRetriever(
+            db=writable, dim=8, index_path=index_path, max_elements=100
+        )
+        _seed(retriever, writable, "read-only-save", 1)
+        retriever.save()
+    published = index_path.read_bytes()
+
+    with Database(db_path, read_only=True) as read_only:
+        retriever = SimilarityRetriever(
+            db=read_only, dim=8, index_path=index_path, max_elements=100
+        )
+        with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+            retriever.save()
+
+    assert index_path.read_bytes() == published
+    assert list(tmp_path.glob(f".{index_path.name}.*.tmp")) == []
+
+
+@pytest.mark.parametrize("lexical_only", [False, True])
+def test_persistent_chunk_id_conflict_fails_closed(
+    db, retriever, turn_id, lexical_only
+):
+    original = _chunk_with(
+        turn_id,
+        "the durable identity keeps its original text",
+        _vector({0: 1.0}),
+    ).model_copy(update={"chunk_id": "durable-chunk-id"})
+    if lexical_only:
+        retriever.lexical.add_chunks([original])
+    else:
+        retriever.add_chunks([original])
+    conflict = original.model_copy(
+        update={
+            "text": "conflicting text must not replace postings",
+            "end_char": len("conflicting text must not replace postings"),
+            "token_count": 6,
+            "embedding": _vector({1: 1.0}),
+        }
+    )
+
+    with pytest.raises(ValueError, match="already exists with different content"):
+        retriever.add_chunks([conflict])
+
+    row = db.execute(
+        "SELECT turn_id, text, start_char, end_char, token_count "
+        "FROM chunks WHERE chunk_id = ?",
+        (original.chunk_id,),
+    ).fetchone()
+    assert row == (
+        original.turn_id,
+        original.text,
+        original.start_char,
+        original.end_char,
+        original.token_count,
+    )
+    assert retriever.lexical.search("conflicting") == []
+
+
+def test_chunk_id_conflict_is_rechecked_under_write_lock(tmp_path, monkeypatch):
+    from memory_condense.persistence.db import Database
+
+    db_path = tmp_path / "chunk-identity-race.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    turn = TranscriptStore(db_a).append("user", "shared source turn")
+    a = SimilarityRetriever(db=db_a, dim=16, max_elements=100)
+    b = SimilarityRetriever(db=db_b, dim=16, max_elements=100)
+    candidate = _chunk_with(
+        turn.turn_id, "writer A identity", _vector({0: 1.0})
+    ).model_copy(update={"chunk_id": "raced-chunk-id"})
+    conflict = _chunk_with(
+        turn.turn_id, "writer B conflicting identity", _vector({1: 1.0})
+    ).model_copy(update={"chunk_id": candidate.chunk_id})
+    original_validate = a._lexical.validate_chunk_identities
+    calls = 0
+
+    def publish_conflict_after_fast_check(chunks):
+        nonlocal calls
+        calls += 1
+        existing = original_validate(chunks)
+        if calls == 1:
+            b.lexical.add_chunks([conflict])
+        return existing
+
+    monkeypatch.setattr(
+        a._lexical,
+        "validate_chunk_identities",
+        publish_conflict_after_fast_check,
+    )
+    with pytest.raises(ValueError, match="already exists with different content"):
+        a.add_chunks([candidate])
+
+    assert calls == 2
+    assert db_a.execute(
+        "SELECT text FROM chunks WHERE chunk_id = ?", (candidate.chunk_id,)
+    ).fetchone()[0] == conflict.text
+    assert candidate.chunk_id not in a._chunk_id_to_label
+    db_a.close()
+    db_b.close()
+
+
+def test_dense_promotion_invalidates_older_lexical_span_row(db, retriever, turn_id):
+    promoted = _chunk_with(
+        turn_id,
+        "older lexical row promoted later",
+        _vector({0: 1.0}),
+    )
+    retriever.lexical.add_chunks([promoted])
+    appended = _chunk_with(
+        turn_id,
+        "newer dense row sets the high water",
+        _vector({1: 1.0}),
+    )
+    retriever.add_chunks([appended])
+
+    _vectors, before = retriever._span_vectors(100)
+    assert before == [[appended.chunk_id]]
+
+    retriever.add_chunks([promoted])
+    _vectors, after = retriever._span_vectors(100)
+    assert after == [[promoted.chunk_id, appended.chunk_id]]
+
+
+def test_failed_rebuild_keeps_revision_sync_armed(db, tmp_dir, monkeypatch):
+    from memory_condense.search.indexes import index_lifecycle
+
+    store = TranscriptStore(db)
+    turn = store.append("user", "failed rebuild recovery")
+    retriever = SimilarityRetriever(
+        db=db, dim=16, index_path=tmp_dir / "failed-rebuild.bin", max_elements=100
+    )
+    chunk = _make_chunk(turn.turn_id, "recover this durable vector", dim=16)
+    retriever.add_chunks([chunk])
+
+    def fail_stack(_vectors):
+        raise RuntimeError("synthetic rebuild failure")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(index_lifecycle.np, "stack", fail_stack)
+        with pytest.raises(RuntimeError, match="synthetic rebuild failure"):
+            retriever.rebuild_index()
+
+    assert retriever._chunk_id_to_label == {}
+    assert retriever._index.get_current_count() == 0
+    assert retriever._observed_index_revision == -1
+
+    query_vec = np.array(chunk.embedding, dtype=np.float32)
+    results = retriever.query(query_vec, k=1)
+    assert [result.chunk.chunk_id for result in results] == [chunk.chunk_id]
+
+
+def test_rebuild_vector_failure_cannot_publish_unlabelled_row(
+    db, tmp_dir, monkeypatch
+):
+    from memory_condense.search.indexes import index_lifecycle
+
+    turn = TranscriptStore(db).append("user", "unlabelled rebuild owner")
+    chunk = _make_chunk(turn.turn_id, "decode before label publication", dim=16)
+    db.execute(
+        "INSERT INTO chunks "
+        "(chunk_id, turn_id, text, start_char, end_char, token_count, embedding) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            chunk.chunk_id,
+            chunk.turn_id,
+            chunk.text,
+            chunk.start_char,
+            chunk.end_char,
+            chunk.token_count,
+            np.asarray(chunk.embedding, dtype=np.float32).tobytes(),
+        ),
+    )
+    db.commit()
+    retriever = SimilarityRetriever(
+        db=db, dim=16, index_path=tmp_dir / "decode-failure.bin", max_elements=100
+    )
+
+    def fail_frombuffer(_blob, *, dtype):
+        del dtype
+        raise KeyboardInterrupt("synthetic vector decode failure")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(index_lifecycle.np, "frombuffer", fail_frombuffer)
+        with pytest.raises(KeyboardInterrupt, match="vector decode failure"):
+            retriever.rebuild_index()
+
+    assert not db.connection.in_transaction
+    assert db.execute(
+        "SELECT hnsw_label FROM chunks WHERE chunk_id = ?", (chunk.chunk_id,)
+    ).fetchone()[0] is None
+
+
+def test_partial_ann_add_failure_discards_unmapped_labels(db, tmp_dir):
+    turn = TranscriptStore(db).append("user", "partial graph owner")
+    retriever = SimilarityRetriever(
+        db=db, dim=16, index_path=tmp_dir / "partial-add.bin", max_elements=100
+    )
+    durable = _make_chunk(turn.turn_id, "durable graph member", dim=16)
+    retriever.add_chunks([durable])
+
+    class PartialFailingIndex:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def add_items(self, vectors, labels):
+            self._inner.add_items(vectors[:1], labels[:1])
+            raise RuntimeError("synthetic partial ANN failure")
+
+    retriever._index = PartialFailingIndex(retriever._index)
+    additions = [
+        _make_chunk(turn.turn_id, "first rejected graph member", dim=16),
+        _make_chunk(turn.turn_id, "second rejected graph member", dim=16),
+    ]
+    with pytest.raises(RuntimeError, match="partial ANN failure"):
+        retriever.add_chunks(additions)
+
+    assert retriever._index.get_current_count() == 0
+    assert retriever._chunk_id_to_label == {}
+    assert db.execute(
+        "SELECT COUNT(*) FROM chunks WHERE chunk_id IN (?, ?)",
+        tuple(chunk.chunk_id for chunk in additions),
+    ).fetchone()[0] == 0
+    probe = np.asarray(durable.embedding, dtype=np.float32)
+    assert [row.chunk.chunk_id for row in retriever.query(probe, k=10)] == [
+        durable.chunk_id
+    ]
+
+
+def test_ambiguous_ann_retirement_discards_graph_and_recovers(db, tmp_dir):
+    turn = TranscriptStore(db).append("user", "retirement graph owner")
+    retriever = SimilarityRetriever(
+        db=db,
+        dim=16,
+        index_path=tmp_dir / "retirement-failure.bin",
+        max_elements=100,
+    )
+    keep = _make_chunk(turn.turn_id, "keep this graph member", dim=16)
+    retire = _make_chunk(turn.turn_id, "retire this graph member", dim=16)
+    retriever.add_chunks([keep, retire])
+
+    class RetirementFailingIndex:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def mark_deleted(self, _label):
+            raise RuntimeError("synthetic ambiguous retirement")
+
+    retriever._index = RetirementFailingIndex(retriever._index)
+    assert retriever.delete_chunk(retire.chunk_id) is True
+    assert retriever._index.get_current_count() == 0
+    assert retriever._observed_index_revision == -1
+
+    probe = np.asarray(keep.embedding, dtype=np.float32)
+    assert [row.chunk.chunk_id for row in retriever.query(probe, k=10)] == [
+        keep.chunk_id
+    ]
+    assert retire.chunk_id not in retriever._chunk_id_to_label
+
+
+def test_interrupted_ann_retirement_discards_graph_before_reraising(db, tmp_dir):
+    turn = TranscriptStore(db).append("user", "interrupted retirement owner")
+    retriever = SimilarityRetriever(
+        db=db,
+        dim=16,
+        index_path=tmp_dir / "interrupted-retirement.bin",
+        max_elements=100,
+    )
+    keep = _make_chunk(turn.turn_id, "keep after interrupted retirement", dim=16)
+    retire = _make_chunk(
+        turn.turn_id, "retire despite interrupted retirement", dim=16
+    )
+    retriever.add_chunks([keep, retire])
+
+    class InterruptingRetirementIndex:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def mark_deleted(self, label):
+            self._inner.mark_deleted(label)
+            raise KeyboardInterrupt("synthetic post-retirement interruption")
+
+    retriever._index = InterruptingRetirementIndex(retriever._index)
+    with pytest.raises(KeyboardInterrupt, match="post-retirement interruption"):
+        retriever.delete_chunk(retire.chunk_id)
+
+    assert retriever._index.get_current_count() == 0
+    assert retriever._chunk_id_to_label == {}
+    assert retriever._observed_index_revision == -1
+    probe = np.asarray(keep.embedding, dtype=np.float32)
+    assert [row.chunk.chunk_id for row in retriever.query(probe, k=10)] == [
+        keep.chunk_id
+    ]
+
+
+def test_rebuild_does_not_acknowledge_concurrent_delete(tmp_path, monkeypatch):
+    from memory_condense.persistence.db import Database
+
+    db_path = tmp_path / "concurrent-rebuild.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    a = SimilarityRetriever(
+        db=db_a, dim=16, index_path=tmp_path / "rebuild-a.bin", max_elements=100
+    )
+    b = SimilarityRetriever(
+        db=db_b, dim=16, index_path=tmp_path / "rebuild-b.bin", max_elements=100
+    )
+    turn = TranscriptStore(db_a).append("user", "concurrent rebuild owner")
+    chunk = _make_chunk(turn.turn_id, "retire during rebuild", dim=16)
+    a.add_chunks([chunk])
+    snapshot_revision = a._read_index_revision()
+    original_allocate = a._allocate_labels
+
+    def delete_after_row_snapshot(count):
+        assert b.delete_chunk(chunk.chunk_id) is True
+        return original_allocate(count)
+
+    monkeypatch.setattr(a, "_allocate_labels", delete_after_row_snapshot)
+    a.rebuild_index()
+
+    assert a._observed_index_revision == snapshot_revision
+    assert a._read_index_revision() > a._observed_index_revision
+    query_vec = np.array(chunk.embedding, dtype=np.float32)
+    assert a.query(query_vec, k=1) == []
+    assert chunk.chunk_id not in a._chunk_id_to_label
+
+    db_a.close()
+    db_b.close()
+
+
 # ---------------------------------------------------------------------------
 # Hybrid retrieval
 # ---------------------------------------------------------------------------
@@ -449,6 +863,28 @@ def test_add_chunks_persists_lexical_weights_and_terms(db, retriever, turn_id):
         "broker": 1.0,
         "retention": 1.0,
     }
+
+
+def test_default_lexical_rebuild_does_not_resurrect_retired_chunk(
+    db, retriever, turn_id
+):
+    chunk = _make_chunk(turn_id, "retired saffron evidence stays absent")
+    retriever.add_chunks([chunk])
+    assert retriever.delete_chunk(chunk.chunk_id) is True
+
+    retriever.lexical.rebuild()
+
+    assert retriever.lexical.search("saffron") == []
+    assert db.execute(
+        "SELECT embedding, hnsw_label, term_count FROM chunks "
+        "WHERE chunk_id = ?",
+        (chunk.chunk_id,),
+    ).fetchone() == (None, None, None)
+    assert retriever.hybrid_query(
+        "saffron",
+        np.asarray(chunk.embedding, dtype=np.float32),
+        k=10,
+    ) == []
 
 
 def test_readd_does_not_duplicate_chunk_terms(db, retriever, turn_id):
@@ -675,6 +1111,156 @@ def test_a_session_adopts_another_sessions_writes(tmp_path):
 
     db_a.close()
     db_b.close()
+
+
+def test_partial_cross_process_sync_discards_unmapped_native_labels(tmp_path):
+    """A failed native sync must leave no searchable label without an owner."""
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "partial-shared-sync.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    writer = SimilarityRetriever(db=db_a, dim=8, index_path=tmp_path / "writer.bin")
+    reader = SimilarityRetriever(db=db_b, dim=8, index_path=tmp_path / "reader.bin")
+    durable_ids = _seed(writer, db_a, "partial-sync", 2)
+
+    class PartialFailingIndex:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def add_items(self, vectors, labels):
+            self._inner.add_items(vectors[:1], labels[:1])
+            raise RuntimeError("synthetic partial sync failure")
+
+    reader._index = PartialFailingIndex(reader._index)
+    with pytest.raises(RuntimeError, match="partial sync failure"):
+        reader._sync_from_db()
+
+    assert reader._index.get_current_count() == 0
+    assert reader._chunk_id_to_label == {}
+    assert reader._label_to_chunk_id == {}
+    assert reader._observed_index_revision == -1
+
+    probe = np.asarray(_vector({0: 1.0}, dim=8), dtype=np.float32)
+    assert {
+        row.chunk.chunk_id for row in reader.query(probe, k=10)
+    } == set(durable_ids)
+    db_a.close()
+    db_b.close()
+
+
+def test_a_session_retires_another_sessions_deleted_chunk(tmp_path):
+    """A durable delete must invalidate every live reader, not only its writer."""
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "shared-delete.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    a = SimilarityRetriever(db=db_a, dim=8, index_path=tmp_path / "a-delete.bin")
+    b = SimilarityRetriever(db=db_b, dim=8, index_path=tmp_path / "b-delete.bin")
+
+    chunk_id = _seed(a, db_a, "retire", 1)[0]
+    probe = np.asarray(_vector({0: 1.0}, dim=8), dtype=np.float32)
+    assert [row.chunk.chunk_id for row in b.query(probe, k=10)] == [chunk_id]
+
+    assert a.delete_chunk(chunk_id) is True
+    assert b.query(probe, k=10) == []
+    assert chunk_id not in b._chunk_id_to_label
+
+    db_a.close()
+    db_b.close()
+
+
+def test_span_cache_retires_another_sessions_deleted_chunk(tmp_path):
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "shared-span-delete.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    a = SimilarityRetriever(db=db_a, dim=8, index_path=tmp_path / "a-span.bin")
+    b = SimilarityRetriever(db=db_b, dim=8, index_path=tmp_path / "b-span.bin")
+
+    chunk_id = _seed(a, db_a, "span-retire", 1)[0]
+    probe = np.asarray(_vector({0: 1.0}, dim=8), dtype=np.float32)
+    assert [row.chunk.chunk_id for row in b.span_query(probe, levels=(3,))] == [
+        chunk_id
+    ]
+
+    assert a.delete_chunk(chunk_id) is True
+    assert b.span_query(probe, levels=(3,)) == []
+
+    db_a.close()
+    db_b.close()
+
+
+def test_stale_session_cannot_overwrite_newer_shared_index(tmp_path):
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "shared-save.db"
+    index_path = tmp_path / "shared.bin"
+    db_a, db_b = Database(db_path), Database(db_path)
+    a = SimilarityRetriever(db=db_a, dim=8, index_path=index_path)
+    stale = SimilarityRetriever(db=db_b, dim=8, index_path=index_path)
+
+    chunk_id = _seed(a, db_a, "persist", 1)[0]
+    a.save()
+    stale.save()
+    db_a.close()
+    db_b.close()
+
+    with Database(db_path) as db_c:
+        reopened = SimilarityRetriever(db=db_c, dim=8, index_path=index_path)
+        probe = np.asarray(_vector({0: 1.0}, dim=8), dtype=np.float32)
+        assert [row.chunk.chunk_id for row in reopened.query(probe, k=10)] == [
+            chunk_id
+        ]
+
+
+def test_startup_recovers_live_vector_missing_from_index_image(tmp_path):
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "missing-image-vector.db"
+    index_path = tmp_path / "missing-vector.bin"
+    db_a, db_stale = Database(db_path), Database(db_path)
+    writer = SimilarityRetriever(db=db_a, dim=8, index_path=tmp_path / "writer.bin")
+    stale_image = SimilarityRetriever(db=db_stale, dim=8, index_path=index_path)
+    stale_image.save()
+    chunk_id = _seed(writer, db_a, "missing", 1)[0]
+    db_a.close()
+    db_stale.close()
+
+    with Database(db_path) as db_c:
+        reopened = SimilarityRetriever(db=db_c, dim=8, index_path=index_path)
+        probe = np.asarray(_vector({0: 1.0}, dim=8), dtype=np.float32)
+        assert [row.chunk.chunk_id for row in reopened.query(probe, k=10)] == [
+            chunk_id
+        ]
+
+
+def test_reopen_counts_persisted_deleted_label_as_deleted(tmp_path):
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "persisted-delete.db"
+    index_path = tmp_path / "persisted-delete.bin"
+    with Database(db_path) as first_db:
+        first = SimilarityRetriever(db=first_db, dim=8, index_path=index_path)
+        chunk_id = _seed(first, first_db, "deleted", 1)[0]
+        assert first.delete_chunk(chunk_id) is True
+        first.save()
+
+    with Database(db_path) as reopened_db:
+        reopened = SimilarityRetriever(
+            db=reopened_db, dim=8, index_path=index_path
+        )
+        probe = np.asarray(_vector({0: 1.0}, dim=8), dtype=np.float32)
+        assert reopened.query(probe, k=10) == []
+        assert reopened._live_count() == 0
 
 
 def test_label_counter_repairs_a_store_written_before_it_existed(tmp_path):

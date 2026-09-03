@@ -96,6 +96,48 @@ def _with_receipt(
     return {**dict(body), key: identity_sha256(body)}
 
 
+def _sealed_r7_semantic_policy(
+    r7_payload: Mapping[str, Any],
+    args: argparse.Namespace,
+    *,
+    payload_token_cap: int,
+) -> residual.SemanticResidualPolicy:
+    """Reconstruct classifier semantics from the authenticated R7 policy."""
+
+    try:
+        policy = residual.semantic_residual_policy_from_projection(
+            r7_payload.get("residual_search_policy")
+        )
+    except residual.SemanticResidualSearchError as exc:
+        raise ReducedSemanticGlobalCompletionAssayError(
+            "R7 semantic policy authentication failed"
+        ) from exc
+    _require(
+        policy.max_cell_tokens == int(args.max_cell_tokens)
+        and policy.payload_token_cap == payload_token_cap
+        and policy.cosine_upper_bound_floor
+        == float(args.cosine_upper_bound_floor)
+        and policy.specificity_upper_bound_ratio
+        == float(args.specificity_upper_bound_ratio)
+        and policy.dual_gate_enabled is bool(args.dual_gate_enabled),
+        "R7 semantic policy parameters changed",
+    )
+    return policy
+
+
+def _require_r7_replay_component(
+    *,
+    ordinal: int,
+    component: str,
+    actual: object,
+    expected: object,
+) -> None:
+    _require(
+        actual == expected,
+        f"R7 question {ordinal} {component} replay changed",
+    )
+
+
 def _ordered_protected_union(
     r7_protected: Sequence[LocalCitationBinding],
     r7_global: Sequence[LocalCitationBinding],
@@ -167,16 +209,34 @@ def run_global_completion_question_adapter(
         protected_owner_token_cap=protected_owner_token_cap,
     )
     _require(
-        terminal_reason == "none"
-        and terminal is not None
-        and terminal == r7_question.get("terminal_prompt")
-        and r7_cli._compact_query_commitment(query)  # noqa: SLF001
-        == r7_question.get("semantic_query_commitment")
-        and r7_cli._compact_search_commitment(r7_search)  # noqa: SLF001
-        == r7_question.get("semantic_search_commitment")
-        and r7_cli._selected_provenance(semantic_index, r7_search)  # noqa: SLF001
-        == r7_question.get("selected_exact_provenance"),
-        f"R7 question {ordinal} differs from exact store/search replay",
+        terminal_reason == "none" and terminal is not None,
+        f"R7 question {ordinal} terminal reconstruction was unavailable",
+    )
+    _require_r7_replay_component(
+        ordinal=ordinal,
+        component="terminal prompt",
+        actual=terminal,
+        expected=r7_question.get("terminal_prompt"),
+    )
+    _require_r7_replay_component(
+        ordinal=ordinal,
+        component="semantic query",
+        actual=r7_cli._compact_query_commitment(query),  # noqa: SLF001
+        expected=r7_question.get("semantic_query_commitment"),
+    )
+    _require_r7_replay_component(
+        ordinal=ordinal,
+        component="semantic search",
+        actual=r7_cli._compact_search_commitment(r7_search),  # noqa: SLF001
+        expected=r7_question.get("semantic_search_commitment"),
+    )
+    _require_r7_replay_component(
+        ordinal=ordinal,
+        component="selected provenance",
+        actual=r7_cli._selected_provenance(  # noqa: SLF001
+            semantic_index, r7_search
+        ),
+        expected=r7_question.get("selected_exact_provenance"),
     )
     handle_bindings, handle_groups, retained_sources = (
         v6_cli._selected_handle_bindings(  # noqa: SLF001
@@ -421,16 +481,13 @@ def build_assay(
             "R7 lifecycle rows",
         )
     }
-    semantic_policy = residual.SemanticResidualPolicy(
-        max_cell_tokens=int(args.max_cell_tokens),
+    semantic_policy = _sealed_r7_semantic_policy(
+        r7_payload,
+        args,
         payload_token_cap=sources[8].residual_payload_token_cap,
-        cosine_upper_bound_floor=float(args.cosine_upper_bound_floor),
-        specificity_upper_bound_ratio=float(args.specificity_upper_bound_ratio),
-        dual_gate_enabled=bool(args.dual_gate_enabled),
     )
     _require(
-        semantic_policy.projection() == r7_payload.get("residual_search_policy")
-        and query_preflight.sha256
+        query_preflight.sha256
         == _exact_dict(
             r7_payload.get("resident_index_lifecycle"), "R7 lifecycle"
         ).get("query_parent_preflight_sha256"),

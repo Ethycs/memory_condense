@@ -34,11 +34,14 @@ from tools.matched_eval.contracts import (  # noqa: E402
     require_text,
 )
 from tools.matched_eval.semantic_global_terminal_adapter import (  # noqa: E402
+    BACKFILL_FORMAT,
     EXACT_SPAN_SUPPORT_FORMAT,
     EXACT_SPAN_SUPPORT_POPULATION_FORMAT,
     EXACT_SPAN_SUPPORT_RANKING_POLICY,
     FORMAT as TERMINAL_COMPILATION_FORMAT,
     HARD_PROMPT_TOKEN_CAP,
+    LINKED_BACKFILL_FORMAT,
+    LINKED_FORMAT,
     OUTPUT_TOKEN_RESERVE,
     PLANE_ORDER,
     ExactSpanSupportAuthority,
@@ -62,6 +65,34 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = REPOSITORY_ROOT / (
     "eval_results/matched_eval_100/locked-semantic-global-terminal-v2-r1"
 )
+TERMINAL_COMPILATION_MODE_V2 = "v2"
+TERMINAL_COMPILATION_MODE_V3 = "v3-linked"
+TERMINAL_COMPILATION_MODE_V4 = "v4-backfill"
+TERMINAL_COMPILATION_MODE_V5 = "v5-linked-backfill"
+TERMINAL_COMPILATION_MODES = (
+    TERMINAL_COMPILATION_MODE_V2,
+    TERMINAL_COMPILATION_MODE_V3,
+    TERMINAL_COMPILATION_MODE_V4,
+    TERMINAL_COMPILATION_MODE_V5,
+)
+TERMINAL_COMPILATION_FORMAT_BY_MODE = {
+    TERMINAL_COMPILATION_MODE_V2: TERMINAL_COMPILATION_FORMAT,
+    TERMINAL_COMPILATION_MODE_V3: LINKED_FORMAT,
+    TERMINAL_COMPILATION_MODE_V4: BACKFILL_FORMAT,
+    TERMINAL_COMPILATION_MODE_V5: LINKED_BACKFILL_FORMAT,
+}
+TERMINAL_COMPILATION_MODE_BY_FORMAT = {
+    value: key for key, value in TERMINAL_COMPILATION_FORMAT_BY_MODE.items()
+}
+DEFAULT_OUTPUT_ROOT_BY_MODE = {
+    TERMINAL_COMPILATION_MODE_V2: DEFAULT_OUTPUT_ROOT,
+    TERMINAL_COMPILATION_MODE_V3: REPOSITORY_ROOT
+    / "eval_results/matched_eval_100/locked-semantic-global-terminal-v3-r1",
+    TERMINAL_COMPILATION_MODE_V4: REPOSITORY_ROOT
+    / "eval_results/matched_eval_100/locked-semantic-global-terminal-v4-r1",
+    TERMINAL_COMPILATION_MODE_V5: REPOSITORY_ROOT
+    / "eval_results/matched_eval_100/locked-semantic-global-terminal-v5-r1",
+}
 DEFAULT_V7_SOURCE_ROOT = REPOSITORY_ROOT / (
     "eval_results/matched_eval_100/locked-semantic-global-completion-v7-r2"
 )
@@ -77,6 +108,7 @@ TERMINAL_TOP_LEVEL_KEYS = frozenset(
         "base_v7_replay_sha256",
         "exact_terminal_ordinals",
         "terminal_answer_plan_count",
+        "terminal_compilation_format",
         "terminal_policy",
         "terminal_source_artifact_bindings",
         "terminalized_resident_pass_identity_sha256",
@@ -152,6 +184,46 @@ def _require(ok: object, message: str) -> None:
         raise ReducedSemanticGlobalTerminalAssayError(message)
 
 
+def terminal_compilation_mode(args: argparse.Namespace) -> str:
+    """Return the explicit sealed-compilation mode, defaulting to frozen v2."""
+
+    value = getattr(args, "terminal_compilation_mode", TERMINAL_COMPILATION_MODE_V2)
+    _require(value in TERMINAL_COMPILATION_MODES, "unsupported terminal mode")
+    return str(value)
+
+
+def terminal_compilation_format(args: argparse.Namespace) -> str:
+    return TERMINAL_COMPILATION_FORMAT_BY_MODE[terminal_compilation_mode(args)]
+
+
+def terminal_compilation_features(
+    mode: str,
+) -> tuple[bool, bool]:
+    _require(mode in TERMINAL_COMPILATION_MODES, "unsupported terminal mode")
+    return (
+        mode in {TERMINAL_COMPILATION_MODE_V3, TERMINAL_COMPILATION_MODE_V5},
+        mode in {TERMINAL_COMPILATION_MODE_V4, TERMINAL_COMPILATION_MODE_V5},
+    )
+
+
+def terminal_compilation_mode_for_format(format_id: str) -> str:
+    _require(
+        format_id in TERMINAL_COMPILATION_MODE_BY_FORMAT,
+        "unsupported terminal compilation format",
+    )
+    return TERMINAL_COMPILATION_MODE_BY_FORMAT[format_id]
+
+
+def output_root_for_args(args: argparse.Namespace) -> Path:
+    """Keep frozen v2 at its old root and isolate successor defaults."""
+
+    mode = terminal_compilation_mode(args)
+    configured = Path(args.output_root)
+    if configured == DEFAULT_OUTPUT_ROOT:
+        return DEFAULT_OUTPUT_ROOT_BY_MODE[mode]
+    return configured
+
+
 def _exact_dict(value: object, label: str) -> dict[str, Any]:
     _require(type(value) is dict, f"{label} must be an exact object")
     return value  # type: ignore[return-value]
@@ -186,9 +258,11 @@ def _compile_answer_plan_core(
     global_result: Any,
     sealed_sources: TerminalSealedSources,
     policy: SemanticGlobalTerminalPolicy,
+    terminal_mode: str = TERMINAL_COMPILATION_MODE_V2,
 ) -> dict[str, Any]:
     """Compile only gold-blind mechanism inputs; identity wrapping is external."""
 
+    enable_links, enable_backfill = terminal_compilation_features(terminal_mode)
     upstream_projection_sha256s = {
         "global": identity_sha256(global_result.projection()),
         "local": identity_sha256(local_result.projection()),
@@ -209,6 +283,12 @@ def _compile_answer_plan_core(
         global_result=global_result,
         sealed_sources=sealed_sources,
         policy=policy,
+        enable_selected_evidence_discourse_links=enable_links,
+        enable_post_dedup_backfill=enable_backfill,
+    )
+    _require(
+        compilation.format_id == TERMINAL_COMPILATION_FORMAT_BY_MODE[terminal_mode],
+        "terminal compiler emitted the wrong successor format",
     )
     replayed = replay_semantic_global_terminal(
         dated_question=dated_question,
@@ -469,12 +549,14 @@ def build_assay(args: argparse.Namespace) -> dict[str, Any]:
         parent_artifact_sha256=gate.sha256,
     )
     policy = SemanticGlobalTerminalPolicy()
+    terminal_mode = terminal_compilation_mode(args)
     terminalized = v7_cli.build_assay(
         args,
         terminal_compiler=partial(
             _compile_answer_plan_core,
             sealed_sources=sealed_sources,
             policy=policy,
+            terminal_mode=terminal_mode,
         ),
     )
     projected_v7 = _project_base_v7(terminalized)
@@ -589,6 +671,10 @@ def build_assay(args: argparse.Namespace) -> dict[str, Any]:
             ],
         }
     )
+    if terminal_mode != TERMINAL_COMPILATION_MODE_V2:
+        body["terminal_compilation_format"] = TERMINAL_COMPILATION_FORMAT_BY_MODE[
+            terminal_mode
+        ]
     assert_gold_blind(body, path="reduced_semantic_global_terminal_assay")
     return {**body, "construction_identity_sha256": identity_sha256(body)}
 
@@ -735,6 +821,24 @@ def _validate_answer_plan(
     compilation = _exact_dict(
         plan.get("terminal_compilation"), "terminal compilation"
     )
+    compilation_format = require_text(
+        compilation.get("format"), "terminal compilation format"
+    )
+    has_backfill = "post_dedup_backfill" in compilation
+    backfill_receipt_valid = True
+    if has_backfill:
+        backfill = _exact_dict(
+            compilation.get("post_dedup_backfill"), "terminal post-dedup backfill"
+        )
+        backfill_body = {
+            key: value for key, value in backfill.items() if key != "receipt_sha256"
+        }
+        backfill_receipt_valid = (
+            require_sha256(
+                backfill.get("receipt_sha256"), "terminal post-dedup backfill"
+            )
+            == identity_sha256(backfill_body)
+        )
     compilation_body = {
         key: value
         for key, value in compilation.items()
@@ -837,7 +941,10 @@ def _validate_answer_plan(
         == plan.get("terminal_compilation_receipt_sha256")
         and identity_sha256(compilation_body)
         == compilation.get("receipt_sha256")
-        and compilation.get("format") == TERMINAL_COMPILATION_FORMAT
+        and compilation_format in set(TERMINAL_COMPILATION_FORMAT_BY_MODE.values())
+        and has_backfill
+        == (compilation_format in {BACKFILL_FORMAT, LINKED_BACKFILL_FORMAT})
+        and backfill_receipt_valid
         and question.get("new_provider_calls") == 0
         and question.get("retained_transformer_token_state_bytes") == 0
         and compilation.get("new_provider_calls") == 0
@@ -1010,6 +1117,7 @@ def load_verified_terminal_assay(
         "terminal construction identity/population changed",
     )
     plans_list: list[dict[str, Any]] = []
+    compilation_formats: set[str] = set()
     question_receipt_by_ordinal: dict[int, str] = {}
     question_ordinals_by_namespace: dict[str, list[int]] = {}
     for raw in questions:
@@ -1037,6 +1145,9 @@ def load_verified_terminal_assay(
         compilation = _exact_dict(
             plan.get("terminal_compilation"), "terminal plan compilation"
         )
+        compilation_formats.add(
+            require_text(compilation.get("format"), "terminal compilation format")
+        )
         _require(
             plan.get("source_artifact_bindings") == terminal_sources
             and compilation.get("sealed_sources") == terminal_sources
@@ -1044,6 +1155,23 @@ def load_verified_terminal_assay(
             "terminal plan escaped top-level policy/source bindings",
         )
         plans_list.append(plan)
+    _require(
+        len(compilation_formats) == 1,
+        "terminal assay mixed sealed compilation versions",
+    )
+    only_compilation_format = next(iter(compilation_formats))
+    declared_compilation_format = payload.get("terminal_compilation_format")
+    _require(
+        (
+            only_compilation_format == TERMINAL_COMPILATION_FORMAT
+            and declared_compilation_format in {None, TERMINAL_COMPILATION_FORMAT}
+        )
+        or (
+            only_compilation_format != TERMINAL_COMPILATION_FORMAT
+            and declared_compilation_format == only_compilation_format
+        ),
+        "terminal assay does not bind its compilation successor",
+    )
     namespace_rows = _exact_list(
         payload.get("namespace_receipts"), "terminal namespace receipts"
     )
@@ -1089,7 +1217,7 @@ def load_verified_terminal_assay(
 def run_construct(args: argparse.Namespace) -> dict[str, Any]:
     payload = build_assay(args)
     artifact, created = publish_sealed_json(
-        Path(args.output_root) / CONSTRUCTION_NAME, payload
+        output_root_for_args(args) / CONSTRUCTION_NAME, payload
     )
     return {
         "assay_sha256": artifact.sha256,
@@ -1102,7 +1230,8 @@ def run_construct(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     rebuilt = build_assay(args)
-    artifact = read_sealed_json(Path(args.output_root) / CONSTRUCTION_NAME)
+    output_root = output_root_for_args(args)
+    artifact = read_sealed_json(output_root / CONSTRUCTION_NAME)
     replay_difference = _first_projection_difference(rebuilt, artifact.payload)
     _require(
         artifact.sha256
@@ -1112,7 +1241,7 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         f"first_difference={json.dumps(replay_difference, sort_keys=True)}",
     )
     replay, _created = publish_sealed_json(
-        Path(args.output_root) / REPLAY_NAME, rebuilt
+        output_root / REPLAY_NAME, rebuilt
     )
     _require(replay.sha256 == artifact.sha256, "terminal assay replay changed bytes")
     return {
@@ -1146,6 +1275,15 @@ def _add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--expected-v7-replay-sha256", default=DEFAULT_V7_ASSAY_SHA256
+    )
+    parser.add_argument(
+        "--terminal-compilation-mode",
+        choices=TERMINAL_COMPILATION_MODES,
+        default=TERMINAL_COMPILATION_MODE_V2,
+        help=(
+            "sealed compiler successor: v2 historical, v3 linked, "
+            "v4 post-dedup backfill, or v5 linked backfill"
+        ),
     )
 
 
@@ -1181,11 +1319,23 @@ __all__ = [
     "FORMAT",
     "REPLAY_NAME",
     "ROUTE_ID",
+    "TERMINAL_COMPILATION_FORMAT_BY_MODE",
+    "TERMINAL_COMPILATION_MODE_BY_FORMAT",
+    "TERMINAL_COMPILATION_MODES",
+    "TERMINAL_COMPILATION_MODE_V2",
+    "TERMINAL_COMPILATION_MODE_V3",
+    "TERMINAL_COMPILATION_MODE_V4",
+    "TERMINAL_COMPILATION_MODE_V5",
     "ReducedSemanticGlobalTerminalAssayError",
     "build_assay",
     "build_parser",
     "load_verified_terminal_assay",
     "main",
+    "output_root_for_args",
     "run_construct",
     "run_replay",
+    "terminal_compilation_features",
+    "terminal_compilation_format",
+    "terminal_compilation_mode",
+    "terminal_compilation_mode_for_format",
 ]

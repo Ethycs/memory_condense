@@ -59,6 +59,9 @@ from tools.matched_eval.contracts import (  # noqa: E402
     require_sha256,
     require_text,
 )
+from tools.matched_eval.semantic_residual_search import (  # noqa: E402
+    EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
+)
 from tools.matched_eval.typed_memory_final_arm import (  # noqa: E402
     HARD_PROMPT_TOKEN_CAP,
     MAX_CHAT_PROMPT_TOKENS,
@@ -320,6 +323,68 @@ class _VerifiedSources:
 
 
 def _load_verified_sources(args: argparse.Namespace) -> _VerifiedSources:
+    direct = bool(getattr(args, "promotion_from_full100", False))
+    r7_path = getattr(args, "r7_construction", None)
+    r7_sha = getattr(args, "expected_r7_construction_sha256", None)
+    if direct:
+        _require(
+            r7_path is not None and r7_sha is not None,
+            "direct full100 promotion requires explicit successor R7 path and SHA-256",
+        )
+        full_sha = require_sha256(
+            str(args.expected_full100_construction_sha256),
+            "full100 construction",
+        )
+        full_replay_sha = require_sha256(
+            str(args.expected_full100_replay_sha256), "full100 replay"
+        )
+        promotion_sha = require_sha256(
+            str(args.expected_promotion_terminal_construction_sha256),
+            "promotion construction",
+        )
+        promotion_replay_sha = require_sha256(
+            str(args.expected_promotion_terminal_replay_sha256),
+            "promotion replay",
+        )
+        _require(
+            _canonical_root(args.full100_terminal_root)
+            == _canonical_root(args.promotion_terminal_root)
+            and full_sha == promotion_sha
+            and full_replay_sha == promotion_replay_sha,
+            "direct full100 promotion requires canonical same-root/same-SHA sources",
+        )
+        detailed = full100_cli.load_verified_full100_construction_detailed(
+            args.full100_terminal_root,
+            full_sha,
+            full_replay_sha,
+            r7_path=r7_path,
+            expected_r7_sha256=str(r7_sha),
+        )
+        _require(
+            detailed.residual_policy.classifier_mode
+            == EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
+            "direct full100 promotion requires the evidence-conserving R7 successor",
+        )
+        promotion_audit = _read_promotion_audit(
+            args.postseal_audit,
+            str(args.expected_postseal_audit_sha256),
+            construction_sha256=detailed.construction.sha256,
+            replay_sha256=detailed.replay.sha256,
+        )
+        return _VerifiedSources(
+            full100_construction=detailed.construction,
+            full100_replay=detailed.replay,
+            provider_plans=detailed.provider_plans,
+            passthroughs=detailed.passthroughs,
+            promotion_construction=detailed.construction,
+            promotion_replay=detailed.replay,
+            promotion_plans=detailed.exact11_terminal_plans,
+            promotion_audit=promotion_audit,
+        )
+    _require(
+        r7_path is None and r7_sha is None,
+        "successor R7 arguments require --promotion-from-full100",
+    )
     construction, replay, provider_plans, passthroughs = (
         full100_cli.load_verified_full100_construction(
             args.full100_terminal_root,
@@ -2040,6 +2105,16 @@ def _add_sources(parser: argparse.ArgumentParser) -> None:
         "--expected-promotion-terminal-construction-sha256", required=True
     )
     parser.add_argument("--expected-promotion-terminal-replay-sha256", required=True)
+    parser.add_argument(
+        "--promotion-from-full100",
+        action="store_true",
+        help=(
+            "use exact11 full plans from the authenticated full100 sidecars; "
+            "requires the promotion root and SHA pair to equal full100"
+        ),
+    )
+    parser.add_argument("--r7-construction", type=Path)
+    parser.add_argument("--expected-r7-construction-sha256")
     _add_postseal(parser)
 
 

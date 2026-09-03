@@ -4,7 +4,11 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-CURRENT_SCHEMA_VERSION = 11
+from memory_condense.persistence.pending_ingest_schema import (
+    PENDING_INGEST_SCHEMA_V13,
+)
+
+CURRENT_SCHEMA_VERSION = 13
 
 #: A chunk's owning source: a turn falls back to its own ID when no source
 #: grouped it.  Expects the ``turns`` table aliased as ``t``.
@@ -663,6 +667,30 @@ BEGIN
 END;
 """ + _immutable_discourse_triggers() + _graph_content_revision_triggers()
 
+# v12 gives exact-duplicate coalescence an honest forward edge.  The scalar
+# ``memory_items.supersedes`` remains the canonical revision link from a fresh
+# replacement back to its primary predecessor.  When that replacement also
+# absorbs a different active row with identical content, one scalar cannot
+# name both predecessors without overwriting history.  This small supplemental
+# table records only that many-to-one redirect; it is additive and leaves all
+# legacy rows readable without trying to infer the direction of old cleanup
+# records.
+_V12_MEMORY_SUCCESSOR_REDIRECT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_successor_redirects (
+    predecessor_mem_id TEXT PRIMARY KEY
+                       REFERENCES memory_items(mem_id) ON DELETE CASCADE,
+    successor_mem_id   TEXT NOT NULL
+                       REFERENCES memory_items(mem_id) ON DELETE CASCADE,
+    reason             TEXT NOT NULL
+                       CHECK(reason IN ('exact_duplicate_merge')),
+    created_at         TEXT NOT NULL,
+    CHECK(predecessor_mem_id <> successor_mem_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_successor_redirects_successor
+ON memory_successor_redirects(successor_mem_id);
+"""
+
 #: Full schema for a freshly created database (already at CURRENT_SCHEMA_VERSION).
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS turns (
@@ -753,6 +781,8 @@ _SCHEMA_SQL = (
     + _V9_CAUSAL_BINDING_SCHEMA
     + _V10_DISCOURSE_SCHEMA
     + _V11_REVISION_SCHEMA
+    + _V12_MEMORY_SUCCESSOR_REDIRECT_SCHEMA
+    + PENDING_INGEST_SCHEMA_V13
 )
 
 #: Statements that upgrade a database *into* the keyed version.
@@ -832,6 +862,8 @@ CREATE INDEX IF NOT EXISTS idx_turns_source ON turns(source_id, ordinal);
     9: _V9_CAUSAL_BINDING_SCHEMA,
     10: _V10_DISCOURSE_SCHEMA,
     11: _V11_REVISION_SCHEMA,
+    12: _V12_MEMORY_SUCCESSOR_REDIRECT_SCHEMA,
+    13: PENDING_INGEST_SCHEMA_V13,
 }
 
 
@@ -1008,7 +1040,10 @@ def _backfill_discourse_snapshot_revisions(conn: sqlite3.Connection) -> None:
                 conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             ),
             graph_revision=legacy_max_revision + 1,
-            schema_version=CURRENT_SCHEMA_VERSION,
+            # This receipt is created by the v11 post-migration hook. It must
+            # describe the transaction that owns it, even when a later schema
+            # version exists and has not committed yet.
+            schema_version=11,
             artifact_ids=tuple(
                 row[0]
                 for row in conn.execute(
@@ -1041,6 +1076,15 @@ END;
     )
 
 
+def _backfill_pending_ingest_receipts(conn: sqlite3.Connection) -> None:
+    """Delegate v13 value ownership to the ingest-journal module."""
+    from memory_condense.persistence.pending_ingest_store import (
+        backfill_legacy_ingest_receipts,
+    )
+
+    backfill_legacy_ingest_receipts(conn)
+
+
 #: Work that must run *after* the SQL for a version, when SQL alone cannot
 #: express it. Keyed by target version, same as :data:`_MIGRATIONS`.
 #:
@@ -1054,6 +1098,7 @@ _POST_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     3: _backfill_content_hash,
     4: _backfill_turn_ordinals,
     11: _backfill_discourse_snapshot_revisions,
+    13: _backfill_pending_ingest_receipts,
 }
 
 
@@ -1094,6 +1139,10 @@ class Database:
             check_same_thread=False,
             uri=self._read_only,
         )
+        # BEFORE DELETE guards must also observe SQLite's implicit delete in
+        # INSERT OR REPLACE; otherwise durable ingest receipts can be replaced
+        # without firing their immutability triggers.
+        self._conn.execute("PRAGMA recursive_triggers=ON")
         self._conn.execute("PRAGMA foreign_keys=ON")
         if self._read_only:
             self._conn.execute("PRAGMA query_only=ON")
@@ -1139,6 +1188,7 @@ class Database:
         value._path = Path(path)
         value._read_only = bool(read_only)
         value._conn = connection
+        value._conn.execute("PRAGMA recursive_triggers=ON")
         return value
 
     def _read_version(self) -> int | None:

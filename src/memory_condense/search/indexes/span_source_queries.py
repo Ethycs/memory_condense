@@ -190,6 +190,7 @@ class SpanSourceQueryMixin:
         consumer keep working on chunks exactly as before. Nothing here invents
         a synthetic chunk.
         """
+        self._sync_from_db()
         query_vec = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
         norm = float(np.linalg.norm(query_vec))
         if norm > 1e-9:
@@ -231,6 +232,7 @@ class SpanSourceQueryMixin:
         continue to operate normally.
         """
 
+        self._sync_from_db()
         if k_sources <= 0:
             return []
         query_vec = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
@@ -346,6 +348,7 @@ class SpanSourceQueryMixin:
     ) -> list[tuple[str, float]]:
         """Return live source-level lexical activations without hydration."""
 
+        self._sync_from_db()
         return self._lexical.search_source_tfisf(query_text, limit=k_sources)
 
     def source_hsc_expand(
@@ -358,6 +361,7 @@ class SpanSourceQueryMixin:
     ) -> list[tuple[str, float]]:
         """Expand source seeds through the transient contraction hierarchy."""
 
+        self._sync_from_db()
         return self._source_hierarchy.expand(
             query_embedding,
             seed_source_ids,

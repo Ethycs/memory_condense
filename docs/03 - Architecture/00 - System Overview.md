@@ -61,10 +61,11 @@ provider-agnostic, while public common-benchmark validation remains open.
         │   └─────────────┬─────────────┘      │
         ▼                 ▼                    ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ SQLite — db.py: WAL, foreign_keys=ON, schema_version 11 (v1 migrates up)  │
+│ SQLite — db.py: WAL, foreign_keys=ON, schema_version 13 (v1 migrates up)  │
 │   turns(source_id) · chunks(text, embedding, lexical weights, hnsw label) │
+│   pending_ingests + reservations (sealed topology, pending→indexed)       │
 │   chunk_terms(term, chunk_id, tf)          ← BM25 inverted index          │
-│   memory_items(...) · memory_provenance(...) ← mandatory provenance rows  │
+│   memory_items · provenance · successor redirects                         │
 │   CAV/QK/OV + Hebbian + episodic discourse artifacts/coverage/receipts    │
 │   meta(schema_version)                                                    │
 │   + hnsw_index.bin  (cache only — rebuildable via rebuild_index())        │
@@ -80,8 +81,34 @@ provider-agnostic, while public common-benchmark validation remains open.
 
 ### TranscriptStore — `transcript_store.py`
 - **Domain**: durable raw history. **Runs at**: every `ingest`. **Inputs**: `(role, text, source_id?)`. **Outputs**: source-identified `Turn` rows.
-- **Structure**: append-only `turns` table; `append` / `get_turn` / `get_recent` / `get_all` / `count`.
-- **Hard constraint**: never mutated, never deleted. Every other table is derivable from it.
+- **Structure**: append-only `turns` table; `stage` builds without publication, while `publish_turn` / `append` / `get_turn` / `get_recent` / `get_all` / `count` own the durable surface.
+- **Hard constraint**: never mutated, never deleted. Every factual payload is
+  grounded in it; compact receipts preserve the exact derivation topology.
+
+### Ingest journal — `pending_ingest_store.py`, `ingest_workflow.py`
+
+- **Publication boundary**: a turn and its canonical text-free chunk manifest
+  commit together. The manifest seals IDs, spans, token counts, and text hashes;
+  normalized `ingest_chunk_reservations` claim each chunk ID globally before a
+  chunk row is materialized.
+- **Completion boundary**: status advances `pending -> indexed` only inside the
+  transaction that proves the exact dense/HNSW/BM25 population. A provider must
+  return a one-to-one derivative of an immutable deep pre-call source snapshot;
+  it receives separate deep copies, so mutation of a nested derived field cannot
+  rewrite the baseline used for validation.
+- **Database enforcement**: exact-manifest-member insertion, immutable/durable
+  reservations, durable receipts, and the single complete `pending -> indexed`
+  transition are SQLite-triggered contracts. Every connection enables recursive
+  triggers. Supported direct dense/lexical writes may complete only pending
+  members; terminal indexed receipts reject reactivation of a missing or retired
+  member rather than turning repair into resurrection.
+- **Recovery**: `pending_ingest_count()` exposes incomplete publications and
+  `recover_pending_ingests()` reconstructs exact chunks from the turn. Indexed
+  receipts remain durable; exact retries and stale concurrent workers cannot
+  resurrect intentionally retired evidence.
+- **Legacy rule**: v13 seals every pre-v13 chunked topology as historical
+  `indexed` state. Without an original pending claim, incomplete-looking rows
+  cannot safely be distinguished from legitimate lexical-only or retired rows.
 
 ### Chunker — `chunker.py`
 - **Domain**: span segmentation. **Inputs**: one turn. **Outputs**: `Chunk`s with char-span provenance into the turn.
@@ -96,6 +123,10 @@ provider-agnostic, while public common-benchmark validation remains open.
 - **Domain**: sparse candidate generation. **Inputs**: chunk text. **Outputs**: `(chunk_id, bm25_score)` pairs.
 - **Structure**: Okapi BM25, `k1=1.5`, `b=0.75`, over the `chunk_terms` inverted index with document length in `chunks.term_count`. Tokenizer = lowercase, maximal alphanumeric runs (`[^\W_]+`), drop tokens shorter than 2 chars, drop a deliberately small stopword list (`no`/`not` are **not** stopwords — they carry preference polarity).
 - **Hard constraints**: no in-memory state — `N`, `avgdl` and document frequencies are recomputed from SQLite on every read, so two processes on one database always agree. Scores are raw BM25; callers must normalize before blending. Ties break on `chunk_id`, so ordering is deterministic.
+- **Repair boundary**: a no-argument `rebuild()` derives its live input from
+  SQLite before clearing postings and may restore that exact indexed topology.
+  A caller-supplied iterable is an ordinary direct write and therefore cannot
+  reactivate a retired member of a terminal indexed receipt.
 
 ### SimilarityRetriever — `retrieval.py`
 - **Domain**: chunk candidate generation + ranking. **Outputs**: `RetrievalResult`.
@@ -129,9 +160,9 @@ provider-agnostic, while public common-benchmark validation remains open.
   transcript text or transformer state. Query-seeded reads ascend from active
   source leaves and inspect bounded siblings; writes invalidate the hierarchy
   and the next read reconstructs it from authoritative chunk embeddings.
-- **`add_chunks`** writes the dense index, persists the embedding, **populates `chunks.lexical_weights`** with the chunk's term-frequency map, and feeds the same chunks to the BM25 index. The column that was always NULL is now real.
+- **`add_chunks`** writes the dense index, persists the embedding, **populates `chunks.lexical_weights`** with the chunk's term-frequency map, and feeds the same chunks to the BM25 index. The column that was always NULL is now real. Manifest membership and terminal-receipt state are rechecked under the owning write lock.
 - **`delete_chunk(chunk_id)`** — clears embedding + `hnsw_label` in SQLite (authoritative), marks the label deleted in the live hnswlib graph best-effort, and drops the BM25 postings. The chunk **row** survives so memory provenance pointing at it cannot dangle.
-- **Structure**: hnswlib `space="cosine"`, `M=16`, `ef_construction=200`, `max_elements=100_000`; chunk↔label mapping lives in `chunks.hnsw_label` (single source of truth); `rebuild_index()` reconstructs the `.bin` from SQLite blobs.
+- **Structure**: hnswlib `space="cosine"`, `M=16`, `ef_construction=200`, `max_elements=100_000`; chunk↔label mapping lives in `chunks.hnsw_label` (single source of truth); `rebuild_index()` reconstructs the `.bin` from SQLite blobs. Any possibly partial native add or cross-process sync, and any ambiguous or interrupted native retirement, discards the whole process-local ANN graph; the next read rebuilds it from SQLite rather than exposing an unowned label.
 
 ### Compiled and live association plane — `association_store.py`, `associative_retrieval.py`, `heat_diffusion.py`, `hebbian_retrieval.py`, `consolidation.py`
 
@@ -337,7 +368,7 @@ provider-agnostic, while public common-benchmark validation remains open.
 1. **Local/API split.** Chunking, embedding, both indexes, the memory state machine, and context packing live locally; the API is generation-only. **No core module imports an LLM SDK at module scope.** `llm_provider.py` is the single seam that binds one, and it does `import litellm` *inside* the function that needs it, so `import memory_condense` still costs nothing and needs no credentials. Everything else takes **injected callables** — `extractor.LLMExtractor(complete=…)`, `benchmark.run_benchmark(answer_fn=…, judge_fn=…)` — so the LLM paths exist without a provider dependency reaching the core.
 
    This was previously stated as "validated by grep", which is validated exactly once, on the day someone runs it. It is now `tests/test_architecture.py`, checked over the AST (so a docstring mentioning litellm is not an offence) plus a subprocess assertion that importing the package pulls no SDK into `sys.modules`.
-2. **Transcript is append-only**; all derived state (chunks, terms, embeddings, memory) must be reconstructible from it + config.
+2. **Transcript is append-only**; derived state must be reconstructible from it plus sealed configuration/receipts. The v13 ingest manifest and globally unique chunk reservations are authoritative for exact historical chunk topology when ambient chunker settings change. Supported APIs and migrations fail closed at that boundary. Arbitrary raw SQL remains outside the supported trust boundary and can manufacture an initially `indexed` receipt because the completion trigger governs updates, not privileged initial inserts.
 3. **Provenance over trust.** Any LLM-written memory must quote real turn spans. This is now enforced code, not intent: `Validator` is the only path into `MemoryStore.apply` used by `MemoryCondenser.extract_memory`.
 4. **One tokenizer proxy**: cl100k_base (`_tokenizer.py`) for all budgeting, regardless of runtime LLM.
 5. **Baseline and treatment share one code path** in eval (`--k 0` vs `--k N`), never a forked harness. This is why `retrieval.query()` was left byte-for-byte alone when `hybrid_query` was added.
@@ -350,8 +381,8 @@ provider-agnostic, while public common-benchmark validation remains open.
 ```powershell
 pixi run --frozen -e dev pytest -q -m "not slow"
 pixi run python -c "from memory_condense.persistence.db import Database; import tempfile, pathlib; d=Database(pathlib.Path(tempfile.mkdtemp())/'v.db'); print('schema_version', d.schema_version)"
-git log --oneline -1                            # expect merge f3edc91 on main
+git log --oneline -1
 ```
 
-Expect `schema_version 11`. Canonical package ownership and import paths are
+Expect `schema_version 13`. Canonical package ownership and import paths are
 listed in [`03 - Code Package Layout.md`](03%20-%20Code%20Package%20Layout.md).

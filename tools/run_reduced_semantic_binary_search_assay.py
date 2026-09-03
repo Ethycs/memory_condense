@@ -80,6 +80,10 @@ from tools.matched_eval.query_guided_scan import (  # noqa: E402
     cache_namespace_partitions,
 )
 from tools.matched_eval.typed_additive_composer import (  # noqa: E402
+    FORMAT as LEGACY_TYPED_COMPOSITION_FORMAT,
+    LEGACY_COMPOSITION_MODE,
+    POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+    POST_DEDUP_BACKFILL_FORMAT as SUCCESSOR_TYPED_COMPOSITION_FORMAT,
     compose_additive_typed_evidence,
     deduplicate_selected_contributions,
 )
@@ -117,7 +121,16 @@ ATTEMPTED_SELECTION_FORMAT = f"{FORMAT}-attempted-selection-v1"
 CAPACITY_CERTIFICATE_FORMAT = f"{FORMAT}-capacity-certificate-v1"
 VECTOR_NAME = "reduced-semantic-binary-search-query-vectors-v1.json"
 CONSTRUCTION_NAME = "reduced-semantic-binary-search-construction-v3.json"
+SUCCESSOR_CONSTRUCTION_NAME = (
+    "reduced-semantic-binary-search-construction-v3-typed-composer-v2.json"
+)
 AUDIT_NAME = "reduced-semantic-binary-search-target-audit-v3.json"
+SUCCESSOR_AUDIT_FORMAT = (
+    f"{FORMAT}-posthoc-target-audit-v2-typed-composer-v2"
+)
+SUCCESSOR_AUDIT_NAME = (
+    "reduced-semantic-binary-search-target-audit-v3-typed-composer-v2.json"
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 TARGET_ORDINALS = (42, 65, 74, 79)
@@ -135,6 +148,10 @@ DEFAULT_VECTOR_OUTPUT_ROOT = REPOSITORY_ROOT / (
 )
 DEFAULT_OUTPUT_ROOT = REPOSITORY_ROOT / (
     "eval_results/matched_eval_100/reduced-semantic-binary-search-missing4-v3"
+)
+DEFAULT_SUCCESSOR_OUTPUT_ROOT = REPOSITORY_ROOT / (
+    "eval_results/matched_eval_100/"
+    "reduced-semantic-binary-search-missing4-v3-typed-composer-v2"
 )
 DEFAULT_VECTOR_ARTIFACT = DEFAULT_VECTOR_OUTPUT_ROOT / VECTOR_NAME
 DEFAULT_TARGET_PLAN = reduced_cli.DEFAULT_TARGET_PLAN
@@ -456,6 +473,13 @@ def _policy(args: argparse.Namespace) -> residual.SemanticResidualPolicy:
         cosine_upper_bound_floor=float(args.cosine_upper_bound_floor),
         specificity_upper_bound_ratio=float(args.specificity_upper_bound_ratio),
         dual_gate_enabled=bool(args.dual_gate_enabled),
+        classifier_mode=str(
+            getattr(
+                args,
+                "residual_classifier_mode",
+                residual.EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
+            )
+        ),
     )
 
 
@@ -1276,6 +1300,7 @@ def _semantic_question(
     vector_artifact_sha256: str,
     vector_row: Mapping[str, Any],
     vectors: Sequence[Sequence[float]],
+    typed_composition_mode: str = LEGACY_COMPOSITION_MODE,
 ) -> dict[str, Any]:
     dated_question, _old_prediction, _question_id = specialist_cli._question_inputs(  # noqa: SLF001
         composition_row
@@ -1460,6 +1485,7 @@ def _semantic_question(
                 )
                 for contribution in contributions
             },
+            composition_mode=typed_composition_mode,
         )
     except MatchedEvalContractError as exc:
         if not _capacity_failure(exc):
@@ -1468,11 +1494,18 @@ def _semantic_question(
             common,
             fallback_reason="protected_semantic_residual_exceeds_terminal_cap",
         )
-    _require(
-        composition.post_selection_dedup_audit["receipt_sha256"]
-        == preview_audit["receipt_sha256"],
-        "semantic post-selection dedup changed after its preview",
-    )
+    if typed_composition_mode == LEGACY_COMPOSITION_MODE:
+        _require(
+            composition.post_selection_dedup_audit["receipt_sha256"]
+            == preview_audit["receipt_sha256"],
+            "semantic post-selection dedup changed after its preview",
+        )
+    else:
+        _require(
+            typed_composition_mode == POST_DEDUP_BACKFILL_COMPOSITION_MODE
+            and composition.format_id == SUCCESSOR_TYPED_COMPOSITION_FORMAT,
+            "semantic typed-composition successor changed",
+        )
     plan = _closure_plan(
         search_result,
         residual_contribution,
@@ -1529,6 +1562,14 @@ def _semantic_question(
 
 
 def build_construction(args: argparse.Namespace) -> dict[str, Any]:
+    typed_composition_mode = getattr(
+        args, "typed_composition_mode", LEGACY_COMPOSITION_MODE
+    )
+    _require(
+        typed_composition_mode
+        in {LEGACY_COMPOSITION_MODE, POST_DEDUP_BACKFILL_COMPOSITION_MODE},
+        "semantic typed composition mode changed",
+    )
     (
         composition,
         closure,
@@ -1659,6 +1700,7 @@ def build_construction(args: argparse.Namespace) -> dict[str, Any]:
                 vector_artifact_sha256=vector_artifact.sha256,
                 vector_row=vector_row,
                 vectors=vectors,
+                typed_composition_mode=typed_composition_mode,
             )
         index_projection = semantic_index.projection()
         lifecycle_body = {
@@ -1753,6 +1795,8 @@ def build_construction(args: argparse.Namespace) -> dict[str, Any]:
         "target_labels_loaded": False,
         "target_plan_loaded": False,
     }
+    if typed_composition_mode != LEGACY_COMPOSITION_MODE:
+        payload["typed_composition_format"] = SUCCESSOR_TYPED_COMPOSITION_FORMAT
     assert_gold_blind(payload, path="reduced_semantic_binary_search_construction")
     payload["construction_identity_sha256"] = identity_sha256(payload)
     return payload
@@ -2407,6 +2451,12 @@ def validate_construction(
         _exact_dict(value, "semantic namespace lifecycle")
         for value in _exact_list(lifecycle.get("receipts"), "semantic lifecycle rows")
     )
+    declared_typed_format = payload.get("typed_composition_format")
+    expected_typed_format = (
+        LEGACY_TYPED_COMPOSITION_FORMAT
+        if declared_typed_format is None
+        else require_text(declared_typed_format, "semantic typed composition format")
+    )
     _require(
         payload.get("format") == CONSTRUCTION_FORMAT
         and payload.get("construction_is_posthoc_outcome_conditioned") is True
@@ -2455,6 +2505,15 @@ def validate_construction(
         and lifecycle.get("unique_namespace_count") == len(lifecycle_rows)
         and 1 <= len(lifecycle_rows) <= QUESTION_COUNT,
         "reduced semantic construction boundary changed",
+    )
+    _require(
+        expected_typed_format
+        in {LEGACY_TYPED_COMPOSITION_FORMAT, SUCCESSOR_TYPED_COMPOSITION_FORMAT}
+        and (
+            expected_typed_format == LEGACY_TYPED_COMPOSITION_FORMAT
+            or declared_typed_format == SUCCESSOR_TYPED_COMPOSITION_FORMAT
+        ),
+        "semantic construction typed-composition binding changed",
     )
     require_sha256(
         lifecycle.get("query_parent_preflight_sha256"),
@@ -2622,7 +2681,8 @@ def validate_construction(
         )
         fitted = _exact_dict(row.get("fitted_typed_prompt"), "semantic fitted prompt")
         _require(
-            fitted.get("hard_prompt_token_cap") == HARD_COMPLETE_CHAT_TOKEN_CAP
+            composition_projection.get("format") == expected_typed_format
+            and fitted.get("hard_prompt_token_cap") == HARD_COMPLETE_CHAT_TOKEN_CAP
             and fitted.get("output_token_reserve") == OUTPUT_TOKEN_RESERVE
             and fitted.get("retained_transformer_token_state_bytes") == 0
             and fitted.get("full_chat_plus_output_tokens")
@@ -2659,10 +2719,20 @@ def load_verified_construction(
     path: str | Path,
     *,
     expected_sha256: str,
+    typed_composition_mode: str = LEGACY_COMPOSITION_MODE,
 ) -> tuple[SealedArtifact, tuple[dict[str, Any], ...]]:
+    _require(
+        typed_composition_mode
+        in {LEGACY_COMPOSITION_MODE, POST_DEDUP_BACKFILL_COMPOSITION_MODE},
+        "semantic typed composition mode changed",
+    )
     resolved = Path(path)
     if resolved.is_dir():
-        resolved = resolved / CONSTRUCTION_NAME
+        resolved = resolved / (
+            SUCCESSOR_CONSTRUCTION_NAME
+            if typed_composition_mode == POST_DEDUP_BACKFILL_COMPOSITION_MODE
+            else CONSTRUCTION_NAME
+        )
     artifact = read_sealed_json(resolved)
     _require(
         artifact.sha256
@@ -2674,7 +2744,7 @@ def load_verified_construction(
 
 def run_construct(args: argparse.Namespace) -> dict[str, Any]:
     payload = build_construction(args)
-    target = Path(args.output_root) / CONSTRUCTION_NAME
+    target = construction_path_for_args(args)
     candidate = SealedArtifact(
         path=target,
         sha256=hashlib.sha256(canonical_json_bytes(payload)).hexdigest(),
@@ -2800,11 +2870,15 @@ def build_target_audit(
         selected_hits += len(selected_target_ids)
         terminal_hits += len(terminal_target_ids)
     _require(total_targets == 6, "semantic reduced audit target population changed")
+    successor_composition = (
+        construction.payload.get("typed_composition_format")
+        == SUCCESSOR_TYPED_COMPOSITION_FORMAT
+    )
     payload: dict[str, Any] = {
         "audit_is_posthoc_only": True,
         "construction_artifact_sha256": construction.sha256,
         "construction_verified_before_target_plan_load": True,
-        "format": AUDIT_FORMAT,
+        "format": SUCCESSOR_AUDIT_FORMAT if successor_composition else AUDIT_FORMAT,
         "gold_loaded": True,
         "new_provider_calls": 0,
         "ordinals": list(TARGET_ORDINALS),
@@ -2825,6 +2899,8 @@ def build_target_audit(
         "terminal_source_target_count": total_targets,
         "terminal_source_target_hits": terminal_hits,
     }
+    if successor_composition:
+        payload["typed_composition_format"] = SUCCESSOR_TYPED_COMPOSITION_FORMAT
     payload["audit_identity_sha256"] = identity_sha256(payload)
     return payload
 
@@ -2832,9 +2908,23 @@ def build_target_audit(
 def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     # Construction verification intentionally happens before the first target
     # plan read/import, preserving the runtime gold firewall.
+    composition_mode = typed_composition_mode(args)
     construction, _rows = load_verified_construction(
-        Path(args.construction),
+        audit_construction_path_for_args(args),
         expected_sha256=args.expected_construction_sha256,
+        typed_composition_mode=composition_mode,
+    )
+    expected_typed_format = (
+        SUCCESSOR_TYPED_COMPOSITION_FORMAT
+        if composition_mode == POST_DEDUP_BACKFILL_COMPOSITION_MODE
+        else LEGACY_TYPED_COMPOSITION_FORMAT
+    )
+    actual_typed_format = construction.payload.get(
+        "typed_composition_format", LEGACY_TYPED_COMPOSITION_FORMAT
+    )
+    _require(
+        actual_typed_format == expected_typed_format,
+        "semantic audit typed-composition mode does not match construction",
     )
     plan, plan_file_sha = reduced_cli._read_target_plan(  # noqa: SLF001
         Path(args.target_plan)
@@ -2844,7 +2934,7 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         plan,
         target_plan_file_sha256=plan_file_sha,
     )
-    artifact, created = publish_sealed_json(Path(args.output), payload)
+    artifact, created = publish_sealed_json(audit_output_path_for_args(args), payload)
     return {
         "audit_sha256": artifact.sha256,
         "created": created,
@@ -2894,6 +2984,58 @@ def _add_policy_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=defaults.dual_gate_enabled,
     )
+    parser.add_argument(
+        "--residual-classifier-mode",
+        choices=residual.RESIDUAL_CLASSIFIER_MODES,
+        default=defaults.classifier_mode,
+        help=(
+            "authenticated residual classifier semantics; new construction "
+            "defaults to evidence-conserving fail-open"
+        ),
+    )
+
+
+def typed_composition_mode(args: argparse.Namespace) -> str:
+    value = getattr(args, "typed_composition_mode", LEGACY_COMPOSITION_MODE)
+    _require(
+        value in {LEGACY_COMPOSITION_MODE, POST_DEDUP_BACKFILL_COMPOSITION_MODE},
+        "semantic typed composition mode changed",
+    )
+    return str(value)
+
+
+def construction_path_for_args(args: argparse.Namespace) -> Path:
+    mode = typed_composition_mode(args)
+    root = Path(args.output_root)
+    if mode == POST_DEDUP_BACKFILL_COMPOSITION_MODE:
+        if root == DEFAULT_OUTPUT_ROOT:
+            root = DEFAULT_SUCCESSOR_OUTPUT_ROOT
+        return root / SUCCESSOR_CONSTRUCTION_NAME
+    return root / CONSTRUCTION_NAME
+
+
+def audit_construction_path_for_args(args: argparse.Namespace) -> Path:
+    mode = typed_composition_mode(args)
+    raw = Path(args.construction)
+    if mode == POST_DEDUP_BACKFILL_COMPOSITION_MODE:
+        if raw == DEFAULT_OUTPUT_ROOT / CONSTRUCTION_NAME:
+            return DEFAULT_SUCCESSOR_OUTPUT_ROOT / SUCCESSOR_CONSTRUCTION_NAME
+        if raw.is_dir():
+            return raw / SUCCESSOR_CONSTRUCTION_NAME
+    elif raw.is_dir():
+        return raw / CONSTRUCTION_NAME
+    return raw
+
+
+def audit_output_path_for_args(args: argparse.Namespace) -> Path:
+    mode = typed_composition_mode(args)
+    raw = Path(args.output)
+    if (
+        mode == POST_DEDUP_BACKFILL_COMPOSITION_MODE
+        and raw == DEFAULT_OUTPUT_ROOT / AUDIT_NAME
+    ):
+        return DEFAULT_SUCCESSOR_OUTPUT_ROOT / SUCCESSOR_AUDIT_NAME
+    return raw
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2922,6 +3064,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--vector-artifact", type=Path, default=DEFAULT_VECTOR_ARTIFACT
     )
     construct.add_argument("--expected-vector-sha256", required=True)
+    construct.add_argument(
+        "--typed-composition-mode",
+        choices=(
+            LEGACY_COMPOSITION_MODE,
+            POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+        ),
+        default=LEGACY_COMPOSITION_MODE,
+    )
 
     audit = commands.add_parser(
         "audit", help="join sealed construction to post-hoc target aliases"
@@ -2934,6 +3084,14 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--expected-construction-sha256", required=True)
     audit.add_argument("--target-plan", type=Path, default=DEFAULT_TARGET_PLAN)
     audit.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_ROOT / AUDIT_NAME)
+    audit.add_argument(
+        "--typed-composition-mode",
+        choices=(
+            LEGACY_COMPOSITION_MODE,
+            POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+        ),
+        default=LEGACY_COMPOSITION_MODE,
+    )
     return parser
 
 

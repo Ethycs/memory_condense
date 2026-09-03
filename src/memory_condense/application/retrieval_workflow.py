@@ -201,7 +201,7 @@ class RetrievalWorkflowMixin:
             cav_candidates=cav_candidates,
             lexical_protection_threshold=lexical_protection_threshold,
             max_prompt_token_increase=max_prompt_token_increase,
-            touch=touch,
+            touch=touch and not self._db.read_only,
         )
 
     def expand_hebbian(

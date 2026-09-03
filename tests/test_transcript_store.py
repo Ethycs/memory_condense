@@ -35,6 +35,45 @@ def test_explicit_turn_id_round_trips_and_empty_id_is_rejected(db):
         store.append("user", "invalid", turn_id="   ")
 
 
+def test_exact_explicit_turn_retry_is_idempotent_and_conflicts_fail_closed(db):
+    store = TranscriptStore(db)
+    first = store.append(
+        "user", "stable source turn", source_id="session-2", turn_id="stable-turn"
+    )
+
+    assert store.append(
+        "user", "stable source turn", source_id="session-2", turn_id="stable-turn"
+    ) == first
+    assert store.count() == 1
+    with pytest.raises(ValueError, match="different content"):
+        store.append("user", "changed", source_id="session-2", turn_id="stable-turn")
+
+
+def test_direct_publish_commit_failure_rolls_back_owned_transaction(
+    db, monkeypatch
+):
+    store = TranscriptStore(db)
+
+    def fail_commit() -> None:
+        raise RuntimeError("synthetic turn commit failure")
+
+    monkeypatch.setattr(db, "commit", fail_commit)
+    with pytest.raises(RuntimeError, match="synthetic turn commit failure"):
+        store.append("user", "must not remain uncommitted", turn_id="failed-turn")
+
+    assert store.get_turn("failed-turn") is None
+
+
+def test_publish_without_commit_requires_an_outer_transaction(db):
+    store = TranscriptStore(db)
+    turn = store.stage("user", "caller must own publication", turn_id="outer-turn")
+
+    with pytest.raises(RuntimeError, match="requires an active caller transaction"):
+        store.publish_turn(turn, commit=False)
+
+    assert store.get_turn("outer-turn") is None
+
+
 def test_source_metadata_returns_first_system_turn_per_source(db):
     store = TranscriptStore(db)
     store.append(

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tools import run_reduced_specialist_retrieval_assay as base
 from tools import run_reduced_specialist_retrieval_assay_v3 as v3
+from tools import run_reduced_specialist_retrieval_assay_v4 as v4
 from tools.matched_eval.artifacts import SealedArtifact
 from tools.matched_eval.contracts import identity_sha256
 from tools.matched_eval.specialist_scoped_completion import (
@@ -76,6 +78,41 @@ def test_v3_protocol_and_default_paths_are_distinct_from_v2() -> None:
     assert v3.AUDIT_NAME != base.AUDIT_NAME
     parsed = v3.build_parser().parse_args(["construct"])
     assert parsed.output_root == v3.DEFAULT_OUTPUT_ROOT
+
+
+def test_v3_construction_explicitly_preserves_typed_composer_v1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_build(_args, **kwargs):
+        captured.update(kwargs)
+        return {"format": v3.CONSTRUCTION_FORMAT}
+
+    monkeypatch.setattr(base, "build_construction", fake_build)
+    v3.run_construct(SimpleNamespace(output_root=tmp_path))
+
+    assert captured["typed_composition_mode"] == base.LEGACY_COMPOSITION_MODE
+
+
+def test_v4_construction_isolates_and_selects_typed_composer_v2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_build(_args, **kwargs):
+        captured.update(kwargs)
+        return {"format": v4.CONSTRUCTION_FORMAT}
+
+    monkeypatch.setattr(base, "build_construction", fake_build)
+    v4.run_construct(SimpleNamespace(output_root=tmp_path))
+
+    assert captured["typed_composition_mode"] == (
+        base.POST_DEDUP_BACKFILL_COMPOSITION_MODE
+    )
+    assert v4.CONSTRUCTION_FORMAT != v3.CONSTRUCTION_FORMAT
+    assert v4.CONSTRUCTION_NAME != v3.CONSTRUCTION_NAME
+    assert v4.DEFAULT_OUTPUT_ROOT != v3.DEFAULT_OUTPUT_ROOT
 
 
 def test_v3_audit_uses_explicit_protocol_without_weakening_v2_validation() -> None:

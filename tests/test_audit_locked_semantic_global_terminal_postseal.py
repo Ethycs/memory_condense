@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,6 +48,91 @@ SOURCE_DATE_UTC = "2026-08-29T12:00:00+00:00"
 
 def _sha(label: str) -> str:
     return identity_sha256({"label": label})
+
+
+def test_backfill_retention_audit_authenticates_budget_and_novelty_flags() -> None:
+    candidates = {
+        plane: (_sha(f"{plane}:selected"), _sha(f"{plane}:skipped"))
+        for plane in audit.PLANE_ORDER
+    }
+    selections: list[dict] = []
+    for plane in audit.PLANE_ORDER:
+        selected, skipped = candidates[plane]
+        body = {
+            "candidate_receipt_sha256s": [selected, skipped],
+            "consideration_order": [
+                {"candidate_receipt_sha256": selected, "priority": [1]},
+                {"candidate_receipt_sha256": skipped, "priority": [0]},
+            ],
+            "plane": plane,
+            "selected_candidate_receipt_sha256s": [selected],
+            "skipped_candidate_receipt_sha256s": [skipped],
+        }
+        selections.append({**body, "receipt_sha256": identity_sha256(body)})
+    selected = tuple(candidates[plane][0] for plane in audit.PLANE_ORDER)
+    dedup_body = {
+        "retained_after_dedup_receipt_sha256s": list(selected),
+        "selected_before_dedup_receipt_sha256s": list(selected),
+    }
+    dedup = {**dedup_body, "receipt_sha256": identity_sha256(dedup_body)}
+    admitted = candidates["G"][1]
+    backfill_body = {
+        "admitted_candidate_receipt_sha256s_by_plane": [
+            {
+                "candidate_receipt_sha256s": [admitted] if plane == "G" else [],
+                "plane": plane,
+            }
+            for plane in audit.PLANE_ORDER
+        ],
+        "considered_candidate_receipt_sha256s_by_plane": [
+            {
+                "candidate_receipt_sha256s": [candidates[plane][1]],
+                "plane": plane,
+            }
+            for plane in audit.PLANE_ORDER
+        ],
+        "final_retained_candidate_receipt_sha256s": [*selected, admitted],
+        "format": audit.BACKFILL_AUDIT_FORMAT,
+        "globally_novel_exact_spans_only": True,
+        "initial_dedup_receipt_sha256": dedup["receipt_sha256"],
+        "original_plane_budgets_reused": True,
+        "plane_selection_receipt_sha256s": [
+            row["receipt_sha256"] for row in selections
+        ],
+    }
+    backfill = {
+        **backfill_body,
+        "receipt_sha256": identity_sha256(backfill_body),
+    }
+    compilation = {
+        "format": audit.LINKED_BACKFILL_FORMAT,
+        "plane_selections": selections,
+        "post_selection_dedup": dedup,
+        "post_dedup_backfill": backfill,
+    }
+
+    selected_set, retained_set, candidate_plane = (
+        audit._verified_retention_populations(compilation)  # noqa: SLF001
+    )
+    assert selected_set == set(selected)
+    assert retained_set == {*selected, admitted}
+    assert candidate_plane[admitted] == "G"
+
+    for field in ("globally_novel_exact_spans_only", "original_plane_budgets_reused"):
+        changed = deepcopy(compilation)
+        changed_backfill = changed["post_dedup_backfill"]
+        changed_backfill[field] = False
+        unsigned = {
+            key: value
+            for key, value in changed_backfill.items()
+            if key != "receipt_sha256"
+        }
+        changed_backfill["receipt_sha256"] = identity_sha256(unsigned)
+        with pytest.raises(
+            audit.SemanticGlobalTerminalPostSealAuditError,
+            match="backfill identity changed",
+        ):
+            audit._verified_retention_populations(changed)  # noqa: SLF001
 
 
 def _question_id(ordinal: int) -> str:
@@ -1068,6 +1154,117 @@ def test_target_plan_is_not_opened_before_terminal_seal_verification(
     ):
         audit.run_audit(args)
     assert opened is False
+
+
+def test_full100_promotion_authenticates_successor_before_target_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = False
+
+    def observe_plan(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+        raise AssertionError("target plan must remain unopened")
+
+    detailed = SimpleNamespace(
+        residual_policy=SimpleNamespace(classifier_mode="legacy-heuristic-pruning")
+    )
+    monkeypatch.setattr(
+        audit.full100_cli,
+        "load_verified_full100_construction_detailed",
+        lambda *_args, **_kwargs: detailed,
+    )
+    monkeypatch.setattr(audit, "_verified_target_plan", observe_plan)
+    args = argparse.Namespace(
+        expected_construction_sha256=_sha("construction"),
+        expected_replay_sha256=_sha("replay"),
+        expected_r7_construction_sha256=_sha("R7 construction"),
+        expected_semantic_atom_manifest_identity_sha256=None,
+        expected_semantic_atom_manifest_sha256=None,
+        expected_semantic_atom_population_sha256=None,
+        expected_target_plan_identity_sha256=_sha("plan identity"),
+        expected_target_plan_sha256=_sha("plan artifact"),
+        expected_witness_manifest_sha256=None,
+        output=tmp_path / "audit.json",
+        promotion_from_full100=True,
+        promotion_gate=False,
+        r7_construction=tmp_path / "r7.json",
+        semantic_atom_manifest=None,
+        target_plan=tmp_path / "target-plan.json",
+        terminal_root=tmp_path / "full100",
+        v7_source_root=tmp_path / "unused-v7",
+        witness_manifest=None,
+    )
+
+    with pytest.raises(
+        audit.SemanticGlobalTerminalPostSealAuditError,
+        match="evidence-conserving R7 successor",
+    ):
+        audit.run_audit(args)
+    assert opened is False
+
+
+def test_full100_promotion_audits_exact11_sidecar_plans_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    construction, replay, plans, target_plan, _targets = _fixture(tmp_path)
+    captured: dict[str, object] = {}
+    detailed = SimpleNamespace(
+        construction=construction,
+        replay=replay,
+        exact11_terminal_plans=plans,
+        residual_policy=SimpleNamespace(
+            classifier_mode=audit.EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE
+        ),
+    )
+
+    def load_detailed(root, construction_sha, replay_sha, **kwargs):
+        captured.update(
+            root=root,
+            construction_sha=construction_sha,
+            replay_sha=replay_sha,
+            **kwargs,
+        )
+        return detailed
+
+    monkeypatch.setattr(
+        audit.full100_cli,
+        "load_verified_full100_construction_detailed",
+        load_detailed,
+    )
+    monkeypatch.setattr(
+        audit.terminal_cli,
+        "load_verified_terminal_assay",
+        lambda *_args, **_kwargs: pytest.fail("direct mode opened a reduced assay"),
+    )
+    args = argparse.Namespace(
+        expected_construction_sha256=construction.sha256,
+        expected_replay_sha256=replay.sha256,
+        expected_r7_construction_sha256=_sha("successor R7"),
+        expected_semantic_atom_manifest_identity_sha256=None,
+        expected_semantic_atom_manifest_sha256=None,
+        expected_semantic_atom_population_sha256=None,
+        expected_target_plan_identity_sha256=target_plan.payload["plan_sha256"],
+        expected_target_plan_sha256=target_plan.sha256,
+        expected_witness_manifest_sha256=None,
+        output=tmp_path / "direct-source-audit.json",
+        promotion_from_full100=True,
+        promotion_gate=False,
+        r7_construction=tmp_path / "successor-r7.json",
+        semantic_atom_manifest=None,
+        target_plan=target_plan.path,
+        terminal_root=tmp_path / "full100",
+        v7_source_root=tmp_path / "unused-v7",
+        witness_manifest=None,
+    )
+
+    result = audit.run_audit(args)
+
+    assert result["source_target_count"] == audit.SOURCE_TARGET_COUNT
+    assert result["new_provider_calls"] == 0
+    assert captured["root"] == args.terminal_root
+    assert captured["r7_path"] == args.r7_construction
+    assert captured["expected_r7_sha256"] == args.expected_r7_construction_sha256
 
 
 def test_cli_promotion_mode_fails_closed_without_fact_manifest(

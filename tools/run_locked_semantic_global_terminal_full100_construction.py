@@ -47,6 +47,7 @@ from tools.matched_eval.contracts import (  # noqa: E402
 from tools.matched_eval.semantic_global_completion import (  # noqa: E402
     SemanticGlobalCompletionPolicy,
 )
+from tools.matched_eval import semantic_residual_search as residual  # noqa: E402
 from tools.matched_eval.semantic_global_terminal_adapter import (  # noqa: E402
     SemanticGlobalTerminalPolicy,
     TerminalSealedSources,
@@ -73,6 +74,15 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = REPOSITORY_ROOT / (
     "eval_results/matched_eval_100/locked-semantic-global-terminal-full100-v1"
 )
+DEFAULT_OUTPUT_ROOT_BY_MODE = {
+    terminal_cli.TERMINAL_COMPILATION_MODE_V2: DEFAULT_OUTPUT_ROOT,
+    terminal_cli.TERMINAL_COMPILATION_MODE_V3: REPOSITORY_ROOT
+    / "eval_results/matched_eval_100/locked-semantic-global-terminal-full100-v3-r1",
+    terminal_cli.TERMINAL_COMPILATION_MODE_V4: REPOSITORY_ROOT
+    / "eval_results/matched_eval_100/locked-semantic-global-terminal-full100-v4-r1",
+    terminal_cli.TERMINAL_COMPILATION_MODE_V5: REPOSITORY_ROOT
+    / "eval_results/matched_eval_100/locked-semantic-global-terminal-full100-v5-r1",
+}
 
 QUESTION_COUNT = 100
 ELIGIBLE_COUNT = 68
@@ -130,6 +140,7 @@ class _SourceArtifacts:
     gate_rows: tuple[dict[str, Any], ...]
     r7_rows: tuple[dict[str, Any], ...]
     parent_rows: tuple[dict[str, Any], ...]
+    residual_policy: residual.SemanticResidualPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +149,31 @@ class Full100ConstructionBundle:
 
     manifest: dict[str, Any]
     sidecars: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedFull100Construction:
+    """Strict authenticated view, including full exact11 sidecar plans."""
+
+    construction: SealedArtifact
+    replay: SealedArtifact
+    provider_plans: tuple[dict[str, Any], ...]
+    passthroughs: tuple[dict[str, Any], ...]
+    exact11_terminal_plans: tuple[dict[str, Any], ...]
+    residual_policy: residual.SemanticResidualPolicy
+
+    def legacy_tuple(self) -> tuple[
+        SealedArtifact,
+        SealedArtifact,
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+    ]:
+        return (
+            self.construction,
+            self.replay,
+            self.provider_plans,
+            self.passthroughs,
+        )
 
 
 def _artifact_identity(payload: Mapping[str, Any], key: str, label: str) -> None:
@@ -168,6 +204,14 @@ def _validate_source_artifacts(
     gate_bindings = _exact_dict(gate.payload.get("bindings"), "gate bindings")
     r7_bindings = _exact_dict(r7.payload.get("bindings"), "R7 bindings")
     vector_rows = _exact_list(vectors.payload.get("rows"), "query-vector rows")
+    try:
+        residual_policy = residual.semantic_residual_policy_from_projection(
+            r7.payload.get("residual_search_policy")
+        )
+    except residual.SemanticResidualSearchError as exc:
+        raise LockedSemanticGlobalTerminalFull100Error(
+            "R7 residual search policy authentication failed"
+        ) from exc
     _require(
         gate.payload.get("format") == r7_cli.GATE_FORMAT
         and r7.payload.get("format") == r7_cli.CONSTRUCTION_FORMAT
@@ -184,7 +228,9 @@ def _validate_source_artifacts(
         and len(vector_rows) == ELIGIBLE_COUNT
         and gate_bindings.get("answer_artifact_sha256") == parent.sha256
         and r7_bindings.get("gate_artifact_sha256") == gate.sha256
-        and r7_bindings.get("query_vector_artifact_sha256") == vectors.sha256,
+        and r7_bindings.get("query_vector_artifact_sha256") == vectors.sha256
+        and r7_bindings.get("query_vector_replay_artifact_sha256")
+        == vector_replay.sha256,
         "full100 source artifact roots or populations changed",
     )
     _artifact_identity(gate.payload, "gate_identity_sha256", "gate")
@@ -199,6 +245,7 @@ def _validate_source_artifacts(
         gate_rows=gate_rows,
         r7_rows=r7_rows,
         parent_rows=parent_rows,
+        residual_policy=residual_policy,
     )
 
 
@@ -248,22 +295,27 @@ def _derived_eligible_ordinals(sources: _SourceArtifacts) -> tuple[int, ...]:
             key="receipt_sha256",
             label=f"eligibility row {ordinal}",
         )
+        r7_receipt = _validate_receipt(
+            r7_row,
+            key="question_receipt_sha256",
+            label=f"R7 question {ordinal}",
+        )
         prediction = require_text(
             parent_row.get("prediction"), f"V3 prediction {ordinal}"
         )
         is_eligible = eligibility.get("eligible")
         _require(
             type(is_eligible) is bool
-            and gate_row.get("ordinal") == r7_row.get("ordinal") == ordinal
+            and gate_row.get("ordinal") == r7_receipt.get("ordinal") == ordinal
             and parent_row.get("ordinal") == ordinal
             and gate_row.get("question_id")
-            == r7_row.get("question_id")
+            == r7_receipt.get("question_id")
             == parent_row.get("question_id")
             and gate_row.get("question_sha256")
-            == r7_row.get("question_sha256")
+            == r7_receipt.get("question_sha256")
             == parent_row.get("question_sha256")
             and gate_row.get("dated_question_sha256")
-            == r7_row.get("dated_question_sha256")
+            == r7_receipt.get("dated_question_sha256")
             == parent_row.get("dated_question_sha256")
             and gate_row.get("current_prediction") == prediction
             and gate_row.get("current_prediction_sha256")
@@ -271,7 +323,7 @@ def _derived_eligible_ordinals(sources: _SourceArtifacts) -> tuple[int, ...]:
             == quote_sha256(prediction)
             and gate_row.get("source_answer_row_sha256")
             == identity_sha256(parent_row)
-            and r7_row.get("mode")
+            and r7_receipt.get("mode")
             == ("residual_synthesis" if is_eligible else "not_eligible")
             and ((ordinal in vector_ordinals) is is_eligible),
             f"gate/R7/V3 derivation changed at ordinal {ordinal}",
@@ -315,6 +367,7 @@ def _policy_bindings(
     sources: _SourceArtifacts,
     terminalized: Mapping[str, Any],
     terminal_policy: SemanticGlobalTerminalPolicy,
+    terminal_mode: str = terminal_cli.TERMINAL_COMPILATION_MODE_V2,
 ) -> dict[str, Any]:
     _require(
         terminalized.get("local_policy")
@@ -323,7 +376,7 @@ def _policy_bindings(
         == SemanticGlobalCompletionPolicy().projection(),
         "resident execution escaped the frozen V6/V7 policy",
     )
-    body = {
+    body: dict[str, Any] = {
         "eligibility_policy": sources.gate.payload["eligibility_policy"],
         "format": POLICY_BINDINGS_FORMAT,
         "global_policy": terminalized["global_policy"],
@@ -331,6 +384,10 @@ def _policy_bindings(
         "residual_search_policy": sources.r7.payload["residual_search_policy"],
         "terminal_policy": terminal_policy.projection(),
     }
+    if terminal_mode != terminal_cli.TERMINAL_COMPILATION_MODE_V2:
+        body["terminal_compilation_format"] = (
+            terminal_cli.TERMINAL_COMPILATION_FORMAT_BY_MODE[terminal_mode]
+        )
     return _with_receipt(body)
 
 
@@ -369,6 +426,25 @@ def _validate_resident_question(
         "terminal answer plan escaped the exact V3 parent",
     )
     return row
+
+
+def _require_r7_question_reexecution(
+    question: Mapping[str, Any],
+    r7_row: Mapping[str, Any],
+) -> None:
+    """Bind one resident V7 row to the exact authenticated R7 question row."""
+
+    ordinal = _exact_int(question.get("ordinal"), "resident terminal ordinal")
+    expected = require_sha256(
+        r7_row.get("question_receipt_sha256"),
+        f"R7 question {ordinal}",
+    )
+    _require(
+        r7_row.get("ordinal") == ordinal
+        and question.get("r7_exact_question_rebuilt") is True
+        and question.get("r7_question_receipt_sha256") == expected,
+        f"resident terminal question {ordinal} lost exact R7 reexecution binding",
+    )
 
 
 def _compact_answer_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -657,6 +733,7 @@ def _compose_payload(
     sources: _SourceArtifacts,
     terminalized: Mapping[str, Any],
     terminal_policy: SemanticGlobalTerminalPolicy,
+    terminal_mode: str = terminal_cli.TERMINAL_COMPILATION_MODE_V2,
 ) -> Full100ConstructionBundle:
     terminalized_body = {
         key: value
@@ -670,6 +747,31 @@ def _compose_payload(
             terminalized.get("questions"), "resident terminal questions"
         )
     )
+    for question in terminal_questions:
+        ordinal = _exact_int(
+            question.get("ordinal"), "resident terminal ordinal"
+        )
+        _require(
+            0 <= ordinal < len(sources.r7_rows),
+            "resident terminal ordinal escaped the R7 population",
+        )
+        _require_r7_question_reexecution(question, sources.r7_rows[ordinal])
+    expected_compilation_format = (
+        terminal_cli.TERMINAL_COMPILATION_FORMAT_BY_MODE[terminal_mode]
+    )
+    resident_compilation_formats = {
+        require_text(
+            _exact_dict(
+                _exact_dict(
+                    row.get("terminal_answer_plan"),
+                    "resident terminal answer plan",
+                ).get("terminal_compilation"),
+                "resident terminal compilation",
+            ).get("format"),
+            "resident terminal compilation format",
+        )
+        for row in terminal_questions
+    }
     _require(
         terminalized.get("format") == v7_cli.FORMAT
         and require_sha256(
@@ -690,7 +792,8 @@ def _compose_payload(
             "gate_artifact_sha256": sources.gate.sha256,
             "query_vector_artifact_sha256": sources.vectors.sha256,
             "query_vector_replay_artifact_sha256": sources.vector_replay.sha256,
-        },
+        }
+        and resident_compilation_formats == {expected_compilation_format},
         "resident terminal execution population changed",
     )
     terminal_by_ordinal = {
@@ -708,7 +811,9 @@ def _compose_payload(
         parent_artifact_sha256=sources.gate.sha256,
     )
     source_bindings = _source_bindings(sources, sealed_sources)
-    policy_bindings = _policy_bindings(sources, terminalized, terminal_policy)
+    policy_bindings = _policy_bindings(
+        sources, terminalized, terminal_policy, terminal_mode
+    )
     sidecars, sidecar_sha_by_namespace = _namespace_sidecars(
         terminal_questions=terminal_questions,
         resident_by_namespace=resident_namespaces,
@@ -763,6 +868,10 @@ def _compose_payload(
         ],
         "terminal_answer_plan_count": ELIGIBLE_COUNT,
     }
+    if terminal_mode != terminal_cli.TERMINAL_COMPILATION_MODE_V2:
+        body["terminal_compilation_format"] = (
+            terminal_cli.TERMINAL_COMPILATION_FORMAT_BY_MODE[terminal_mode]
+        )
     assert_gold_blind(body, path="semantic_global_terminal_full100_construction")
     manifest = {**body, "construction_identity_sha256": identity_sha256(body)}
     _require(
@@ -781,6 +890,7 @@ def build_construction_bundle(args: argparse.Namespace) -> Full100ConstructionBu
         parent_artifact_sha256=sources.gate.sha256,
     )
     terminal_policy = SemanticGlobalTerminalPolicy()
+    terminal_mode = terminal_cli.terminal_compilation_mode(args)
     resident_args = argparse.Namespace(**vars(args))
     # This is the sole ordinal handoff.  It is derived from the authenticated
     # gate above and is not caller- or CLI-controlled.
@@ -791,12 +901,14 @@ def build_construction_bundle(args: argparse.Namespace) -> Full100ConstructionBu
             terminal_cli._compile_answer_plan_core,  # noqa: SLF001
             sealed_sources=sealed_sources,
             policy=terminal_policy,
+            terminal_mode=terminal_mode,
         ),
     )
     return _compose_payload(
         sources=sources,
         terminalized=terminalized,
         terminal_policy=terminal_policy,
+        terminal_mode=terminal_mode,
     )
 
 
@@ -810,7 +922,11 @@ def _validate_bound_projection(
     payload: Mapping[str, Any],
     sources: _SourceArtifacts,
     sidecar_root: str | Path,
-) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+]:
     """Authenticate the compact manifest against exact full namespace sidecars."""
 
     body = {
@@ -830,17 +946,35 @@ def _validate_bound_projection(
         residual_artifact_sha256=sources.r7.sha256,
         parent_artifact_sha256=sources.gate.sha256,
     )
+    declared_compilation_format = payload.get("terminal_compilation_format")
+    if declared_compilation_format is None:
+        terminal_mode = terminal_cli.TERMINAL_COMPILATION_MODE_V2
+        expected_compilation_format = terminal_cli.TERMINAL_COMPILATION_FORMAT
+    else:
+        expected_compilation_format = require_text(
+            declared_compilation_format, "full100 terminal compilation format"
+        )
+        terminal_mode = terminal_cli.terminal_compilation_mode_for_format(
+            expected_compilation_format
+        )
+        _require(
+            terminal_mode != terminal_cli.TERMINAL_COMPILATION_MODE_V2,
+            "full100 frozen v2 must retain its historical projection",
+        )
     expected_source_bindings = _source_bindings(sources, expected_sealed_sources)
-    expected_policy_bindings = _with_receipt(
-        {
-            "eligibility_policy": sources.gate.payload["eligibility_policy"],
-            "format": POLICY_BINDINGS_FORMAT,
-            "global_policy": SemanticGlobalCompletionPolicy().projection(),
-            "local_policy": SourceGroupReinjectionPolicy().projection(),
-            "residual_search_policy": sources.r7.payload["residual_search_policy"],
-            "terminal_policy": SemanticGlobalTerminalPolicy().projection(),
-        }
-    )
+    expected_policy_body: dict[str, Any] = {
+        "eligibility_policy": sources.gate.payload["eligibility_policy"],
+        "format": POLICY_BINDINGS_FORMAT,
+        "global_policy": SemanticGlobalCompletionPolicy().projection(),
+        "local_policy": SourceGroupReinjectionPolicy().projection(),
+        "residual_search_policy": sources.r7.payload["residual_search_policy"],
+        "terminal_policy": SemanticGlobalTerminalPolicy().projection(),
+    }
+    if terminal_mode != terminal_cli.TERMINAL_COMPILATION_MODE_V2:
+        expected_policy_body["terminal_compilation_format"] = (
+            expected_compilation_format
+        )
+    expected_policy_bindings = _with_receipt(expected_policy_body)
     _require(
         payload.get("source_artifact_bindings") == expected_source_bindings
         and payload.get("policy_bindings") == expected_policy_bindings,
@@ -943,6 +1077,9 @@ def _validate_bound_projection(
             validated = _validate_resident_question(
                 raw_row, sources.gate_rows[ordinal]
             )
+            _require_r7_question_reexecution(
+                validated, sources.r7_rows[ordinal]
+            )
             _require(
                 validated.get("namespace_id") == namespace_id,
                 "terminal sidecar question escaped its namespace",
@@ -957,7 +1094,8 @@ def _validate_bound_projection(
                 plan.get("source_artifact_bindings")
                 == expected_sealed_sources.projection()
                 and compilation.get("policy")
-                == expected_policy_bindings["terminal_policy"],
+                == expected_policy_bindings["terminal_policy"]
+                and compilation.get("format") == expected_compilation_format,
                 "terminal sidecar plan escaped frozen source/policy bindings",
             )
             full_question_by_ordinal[ordinal] = validated
@@ -1117,6 +1255,10 @@ def _validate_bound_projection(
         ],
         "terminal_answer_plan_count": ELIGIBLE_COUNT,
     }
+    if terminal_mode != terminal_cli.TERMINAL_COMPILATION_MODE_V2:
+        expected_manifest_body["terminal_compilation_format"] = (
+            expected_compilation_format
+        )
     _require(
         payload
         == {
@@ -1128,10 +1270,30 @@ def _validate_bound_projection(
         "full100 manifest, population, sidecars, or resident replay changed",
     )
     assert_gold_blind(payload, path="verified_semantic_global_terminal_full100")
-    return tuple(provider_plans), tuple(passthroughs)
+    _require(
+        set(terminal_cli.EXACT_ORDINALS) <= set(full_question_by_ordinal),
+        "full100 exact11 terminal plan population is incomplete",
+    )
+    exact11_terminal_plans = tuple(
+        _exact_dict(
+            full_question_by_ordinal[ordinal].get("terminal_answer_plan"),
+            f"full100 exact11 terminal plan {ordinal}",
+        )
+        for ordinal in terminal_cli.EXACT_ORDINALS
+    )
+    _require(
+        tuple(plan.get("ordinal") for plan in exact11_terminal_plans)
+        == terminal_cli.EXACT_ORDINALS,
+        "full100 exact11 terminal plan projection changed",
+    )
+    return (
+        tuple(provider_plans),
+        tuple(passthroughs),
+        exact11_terminal_plans,
+    )
 
 
-def load_verified_full100_construction(
+def load_verified_full100_construction_detailed(
     output_root: str | Path,
     expected_construction_sha256: str,
     expected_replay_sha256: str,
@@ -1145,12 +1307,9 @@ def load_verified_full100_construction(
     expected_vector_sha256: str = v6_cli.EXPECTED_R7_VECTOR_SHA256,
     parent_path: str | Path = r7_cli.DEFAULT_ANSWER,
     expected_parent_sha256: str = r7_cli.EXPECTED_ANSWER_SHA256,
-) -> tuple[
-    SealedArtifact,
-    SealedArtifact,
-    tuple[dict[str, Any], ...],
-    tuple[dict[str, Any], ...],
-]:
+) -> VerifiedFull100Construction:
+    """Load every authenticated source and expose exact11 full sidecar plans."""
+
     root = Path(output_root)
     construction = _read_expected(
         root / CONSTRUCTION_NAME,
@@ -1175,20 +1334,66 @@ def load_verified_full100_construction(
     )
     parent = _read_expected(parent_path, expected_parent_sha256, "V3 parent")
     sources = _validate_source_artifacts(gate, r7, vectors, vector_replay, parent)
-    plans, passthroughs = _validate_bound_projection(
+    provider_plans, passthroughs, exact11_terminal_plans = _validate_bound_projection(
         construction.payload, sources, root
     )
-    return construction, replay, plans, passthroughs
+    return VerifiedFull100Construction(
+        construction=construction,
+        replay=replay,
+        provider_plans=provider_plans,
+        passthroughs=passthroughs,
+        exact11_terminal_plans=exact11_terminal_plans,
+        residual_policy=sources.residual_policy,
+    )
+
+
+def load_verified_full100_construction(
+    output_root: str | Path,
+    expected_construction_sha256: str,
+    expected_replay_sha256: str,
+    *,
+    gate_path: str | Path = r7_cli.DEFAULT_GATE,
+    expected_gate_sha256: str = v6_cli.EXPECTED_R7_GATE_SHA256,
+    r7_path: str | Path = v6_cli.DEFAULT_R7_CONSTRUCTION,
+    expected_r7_sha256: str = v6_cli.EXPECTED_R7_CONSTRUCTION_SHA256,
+    vectors_path: str | Path = r7_cli.DEFAULT_VECTORS,
+    vector_replay_path: str | Path = r7_cli.DEFAULT_VECTOR_REPLAY,
+    expected_vector_sha256: str = v6_cli.EXPECTED_R7_VECTOR_SHA256,
+    parent_path: str | Path = r7_cli.DEFAULT_ANSWER,
+    expected_parent_sha256: str = r7_cli.EXPECTED_ANSWER_SHA256,
+) -> tuple[
+    SealedArtifact,
+    SealedArtifact,
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+]:
+    """Preserve the original public four-tuple API."""
+
+    return load_verified_full100_construction_detailed(
+        output_root,
+        expected_construction_sha256,
+        expected_replay_sha256,
+        gate_path=gate_path,
+        expected_gate_sha256=expected_gate_sha256,
+        r7_path=r7_path,
+        expected_r7_sha256=expected_r7_sha256,
+        vectors_path=vectors_path,
+        vector_replay_path=vector_replay_path,
+        expected_vector_sha256=expected_vector_sha256,
+        parent_path=parent_path,
+        expected_parent_sha256=expected_parent_sha256,
+    ).legacy_tuple()
 
 
 def run_construct(args: argparse.Namespace) -> dict[str, Any]:
     bundle = build_construction_bundle(args)
     payload = bundle.manifest
+    output_root = output_root_for_args(args)
     sidecar_created_count = 0
     for sidecar_payload in bundle.sidecars:
         expected_sha256 = _sidecar_artifact_sha256(sidecar_payload)
         sidecar, created = publish_sealed_json(
-            Path(args.output_root)
+            output_root
             / SIDECAR_DIR_NAME
             / f"{expected_sha256}.json",
             sidecar_payload,
@@ -1199,7 +1404,7 @@ def run_construct(args: argparse.Namespace) -> dict[str, Any]:
         )
         sidecar_created_count += int(created)
     artifact, created = publish_sealed_json(
-        Path(args.output_root) / CONSTRUCTION_NAME, payload
+        output_root / CONSTRUCTION_NAME, payload
     )
     return {
         "construction_sha256": artifact.sha256,
@@ -1217,10 +1422,11 @@ def run_construct(args: argparse.Namespace) -> dict[str, Any]:
 def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     bundle = build_construction_bundle(args)
     rebuilt = bundle.manifest
+    output_root = output_root_for_args(args)
     for sidecar_payload in bundle.sidecars:
         expected_sha256 = _sidecar_artifact_sha256(sidecar_payload)
         sidecar = _read_expected(
-            Path(args.output_root)
+            output_root
             / SIDECAR_DIR_NAME
             / f"{expected_sha256}.json",
             expected_sha256,
@@ -1230,7 +1436,7 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
             sidecar.payload == sidecar_payload,
             "terminal namespace sidecar differs from exact resident replay",
         )
-    construction = read_sealed_json(Path(args.output_root) / CONSTRUCTION_NAME)
+    construction = read_sealed_json(output_root / CONSTRUCTION_NAME)
     _require(
         construction.sha256
         == require_sha256(
@@ -1240,7 +1446,7 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         "full100 construction differs from exact resident replay",
     )
     replay, _created = publish_sealed_json(
-        Path(args.output_root) / REPLAY_NAME, rebuilt
+        output_root / REPLAY_NAME, rebuilt
     )
     _require(
         replay.sha256 == construction.sha256,
@@ -1331,6 +1537,21 @@ def _add_resident_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--next-episodes", type=int, default=1)
     parser.add_argument("--max-episode-seeds", type=int, default=24)
     parser.add_argument("--max-episode-direct-fallbacks", type=int, default=16)
+    parser.add_argument(
+        "--terminal-compilation-mode",
+        choices=terminal_cli.TERMINAL_COMPILATION_MODES,
+        default=terminal_cli.TERMINAL_COMPILATION_MODE_V2,
+    )
+
+
+def output_root_for_args(args: argparse.Namespace) -> Path:
+    """Route successor modes away from the frozen full100 v2 default root."""
+
+    mode = terminal_cli.terminal_compilation_mode(args)
+    configured = Path(args.output_root)
+    if configured == DEFAULT_OUTPUT_ROOT:
+        return DEFAULT_OUTPUT_ROOT_BY_MODE[mode]
+    return configured
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1359,9 +1580,11 @@ __all__ = [
     "COMPACT_PLAN_FORMAT",
     "CONSTRUCTION_NAME",
     "DEFAULT_OUTPUT_ROOT",
+    "DEFAULT_OUTPUT_ROOT_BY_MODE",
     "ELIGIBLE_COUNT",
     "FORMAT",
     "Full100ConstructionBundle",
+    "VerifiedFull100Construction",
     "LockedSemanticGlobalTerminalFull100Error",
     "PASSTHROUGH_COUNT",
     "PASSTHROUGH_MODE",
@@ -1374,7 +1597,9 @@ __all__ = [
     "build_construction_bundle",
     "build_parser",
     "load_verified_full100_construction",
+    "load_verified_full100_construction_detailed",
     "main",
+    "output_root_for_args",
     "run_construct",
     "run_replay",
 ]

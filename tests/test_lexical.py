@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from memory_condense.search.indexes.lexical import (
@@ -119,6 +121,27 @@ def test_add_chunks_is_idempotent(db, index, turn_id):
     assert term_count == 3
 
 
+def test_add_chunks_rejects_persistent_id_content_conflict(db, index, turn_id):
+    original = _make_chunk(turn_id, "original kafka identity").model_copy(
+        update={"chunk_id": "fixed-lexical-id"}
+    )
+    conflict = _make_chunk(turn_id, "conflicting postgres identity").model_copy(
+        update={"chunk_id": original.chunk_id}
+    )
+    index.add_chunks([original])
+
+    with pytest.raises(ValueError, match="already exists with different content"):
+        index.add_chunks([conflict])
+
+    assert [chunk_id for chunk_id, _score in index.search("kafka")] == [
+        original.chunk_id
+    ]
+    assert index.search("postgres") == []
+    assert db.execute(
+        "SELECT text FROM chunks WHERE chunk_id = ?", (original.chunk_id,)
+    ).fetchone()[0] == original.text
+
+
 def test_add_chunks_empty_list_is_noop(db, index):
     index.add_chunks([])
     assert db.execute("SELECT COUNT(*) FROM chunk_terms").fetchone()[0] == 0
@@ -144,6 +167,27 @@ def test_delete_chunk_removes_postings(db, index, turn_id):
     assert index.search("kafka") == []
 
 
+def test_delete_chunk_update_failure_rolls_back_postings(db, index, turn_id):
+    chunk = _make_chunk(turn_id, "rollback-safe kafka posting")
+    index.add_chunks([chunk])
+    db.execute(
+        "CREATE TEMP TRIGGER fail_lexical_delete "
+        "BEFORE UPDATE OF term_count ON chunks "
+        "WHEN NEW.term_count IS NULL BEGIN "
+        "SELECT RAISE(ABORT, 'synthetic lexical delete failure'); END"
+    )
+    db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="lexical delete failure"):
+        index.delete_chunk(chunk.chunk_id)
+
+    db.execute("DROP TRIGGER fail_lexical_delete")
+    db.commit()
+    assert [chunk_id for chunk_id, _score in index.search("kafka")] == [
+        chunk.chunk_id
+    ]
+
+
 def test_rebuild_from_stored_text(db, index, turn_id):
     chunks = [
         _make_chunk(turn_id, "alpha beta"),
@@ -156,6 +200,54 @@ def test_rebuild_from_stored_text(db, index, turn_id):
     assert index.rebuild() == 2
     assert index.stats()["postings"] == 4
     assert [cid for cid, _ in index.search("alpha")] == [chunks[0].chunk_id]
+
+
+def test_rebuild_iterable_failure_preserves_existing_index(index, turn_id):
+    original = _make_chunk(turn_id, "durable alpha posting")
+    index.add_chunks([original])
+
+    def fail_during_materialization():
+        yield _make_chunk(turn_id, "replacement beta posting")
+        raise RuntimeError("synthetic rebuild iterable failure")
+
+    with pytest.raises(RuntimeError, match="iterable failure"):
+        index.rebuild(fail_during_materialization())
+
+    assert [chunk_id for chunk_id, _score in index.search("alpha")] == [
+        original.chunk_id
+    ]
+    assert index.search("beta") == []
+
+
+def test_direct_lexical_revision_invalidates_other_retriever_source_cache(
+    tmp_path,
+):
+    from memory_condense.persistence.db import Database
+    from memory_condense.search.indexes.retrieval import SimilarityRetriever
+
+    db_path = tmp_path / "shared-lexical-revision.db"
+    db_a, db_b = Database(db_path), Database(db_path)
+    writer = SimilarityRetriever(db=db_a, dim=8, max_elements=100)
+    reader = SimilarityRetriever(db=db_b, dim=8, max_elements=100)
+
+    first_turn = TranscriptStore(db_a).append(
+        "user", "first source", source_id="source-a"
+    )
+    writer.lexical.add_chunks([_make_chunk(first_turn.turn_id, "orchid alpha")])
+    assert [source for source, _score in reader.source_tfisf_query("orchid")] == [
+        "source-a"
+    ]
+
+    second_turn = TranscriptStore(db_a).append(
+        "user", "second source", source_id="source-b"
+    )
+    writer.lexical.add_chunks([_make_chunk(second_turn.turn_id, "orchid beta")])
+    assert {
+        source for source, _score in reader.source_tfisf_query("orchid")
+    } == {"source-a", "source-b"}
+
+    db_a.close()
+    db_b.close()
 
 
 def test_stats_reports_index_size(index, turn_id):

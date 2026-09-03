@@ -129,7 +129,11 @@ def _safe_output_root(args: argparse.Namespace) -> Path:
     _require(value is not None, "resumable construction requires --output-root")
     root = Path(value)
     _require(
-        _canonical_root(root) != _canonical_root(resident_cli.DEFAULT_OUTPUT_ROOT),
+        _canonical_root(root)
+        not in {
+            _canonical_root(value)
+            for value in resident_cli.DEFAULT_OUTPUT_ROOT_BY_MODE.values()
+        },
         "resumable construction refuses the legacy default output root",
     )
     if root.exists():
@@ -149,6 +153,8 @@ class _Context:
     r7_bindings: dict[str, str]
     namespace_population: tuple[dict[str, Any], ...]
     population: dict[str, Any]
+    terminal_compilation_format: str
+    terminal_mode: str
 
 
 def _namespace_key(namespace_id: str) -> str:
@@ -159,23 +165,35 @@ def _namespace_key(namespace_id: str) -> str:
 
 def _policy_bindings(
     sources: resident_cli._SourceArtifacts,
+    terminal_mode: str,
 ) -> dict[str, Any]:
-    return resident_cli._with_receipt(  # noqa: SLF001
-        {
-            "eligibility_policy": sources.gate.payload["eligibility_policy"],
-            "format": resident_cli.POLICY_BINDINGS_FORMAT,
-            "global_policy": SemanticGlobalCompletionPolicy().projection(),
-            "local_policy": SourceGroupReinjectionPolicy().projection(),
-            "residual_search_policy": sources.r7.payload[
-                "residual_search_policy"
-            ],
-            "terminal_policy": SemanticGlobalTerminalPolicy().projection(),
-        }
-    )
+    body: dict[str, Any] = {
+        "eligibility_policy": sources.gate.payload["eligibility_policy"],
+        "format": resident_cli.POLICY_BINDINGS_FORMAT,
+        "global_policy": SemanticGlobalCompletionPolicy().projection(),
+        "local_policy": SourceGroupReinjectionPolicy().projection(),
+        "residual_search_policy": sources.r7.payload[
+            "residual_search_policy"
+        ],
+        "terminal_policy": SemanticGlobalTerminalPolicy().projection(),
+    }
+    if terminal_mode != resident_cli.terminal_cli.TERMINAL_COMPILATION_MODE_V2:
+        body["terminal_compilation_format"] = (
+            resident_cli.terminal_cli.TERMINAL_COMPILATION_FORMAT_BY_MODE[
+                terminal_mode
+            ]
+        )
+    return resident_cli._with_receipt(body)  # noqa: SLF001
 
 
 def _build_context(args: argparse.Namespace) -> _Context:
     sources = resident_cli._load_build_sources(args)  # noqa: SLF001
+    terminal_mode = resident_cli.terminal_cli.terminal_compilation_mode(args)
+    compilation_format = (
+        resident_cli.terminal_cli.TERMINAL_COMPILATION_FORMAT_BY_MODE[
+            terminal_mode
+        ]
+    )
     derived = resident_cli._derived_eligible_ordinals(sources)  # noqa: SLF001
     by_namespace: dict[str, list[int]] = {}
     for ordinal in derived:
@@ -245,7 +263,7 @@ def _build_context(args: argparse.Namespace) -> _Context:
         source_bindings=resident_cli._source_bindings(  # noqa: SLF001
             sources, sealed_sources
         ),
-        policy_bindings=_policy_bindings(sources),
+        policy_bindings=_policy_bindings(sources, terminal_mode),
         r7_bindings={
             "construction_artifact_sha256": sources.r7.sha256,
             "gate_artifact_sha256": sources.gate.sha256,
@@ -254,6 +272,8 @@ def _build_context(args: argparse.Namespace) -> _Context:
         },
         namespace_population=tuple(rows),
         population=population,
+        terminal_compilation_format=compilation_format,
+        terminal_mode=terminal_mode,
     )
 
 
@@ -359,6 +379,10 @@ def _validate_namespace_execution(
             resident_cli._exact_dict(raw, "resumable resident question"),
             context.sources.gate_rows[ordinal],
         )
+        resident_cli._require_r7_question_reexecution(  # noqa: SLF001
+            question,
+            context.sources.r7_rows[ordinal],
+        )
         plan = resident_cli._exact_dict(  # noqa: SLF001
             question.get("terminal_answer_plan"), "terminal answer plan"
         )
@@ -370,7 +394,8 @@ def _validate_namespace_execution(
             and plan.get("source_artifact_bindings")
             == context.sealed_sources.projection()
             and compilation.get("policy")
-            == context.policy_bindings["terminal_policy"],
+            == context.policy_bindings["terminal_policy"]
+            and compilation.get("format") == context.terminal_compilation_format,
             f"resumable resident question {ordinal} escaped source/policy",
         )
         question_receipts.append(question["question_assay_receipt_sha256"])
@@ -540,6 +565,7 @@ def _build_namespace_checkpoint(
             resident_cli.terminal_cli._compile_answer_plan_core,  # noqa: SLF001
             sealed_sources=context.sealed_sources,
             policy=terminal_policy,
+            terminal_mode=context.terminal_mode,
         ),
     )
     payload = _checkpoint_payload(
@@ -627,6 +653,7 @@ def _bundle_from_checkpoints(
         sources=context.sources,
         terminalized=terminalized,
         terminal_policy=SemanticGlobalTerminalPolicy(),
+        terminal_mode=context.terminal_mode,
     )
 
 

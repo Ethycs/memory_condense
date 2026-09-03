@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import fields
+
 import hashlib
 
 import pytest
@@ -7,6 +9,11 @@ import pytest
 from tools.matched_eval.contracts import MatchedEvalContractError
 from tools.matched_eval.prompt_tick_contracts import CallBudget, LaneBudget
 from tools.matched_eval.typed_additive_composer import (
+    AdditiveTypedComposition,
+    FORMAT as LEGACY_COMPOSER_FORMAT,
+    LEGACY_COMPOSITION_MODE,
+    POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+    POST_DEDUP_BACKFILL_FORMAT,
     compose_additive_typed_evidence,
     deduplicate_selected_contributions,
 )
@@ -31,6 +38,12 @@ QUESTION = (
     "[Question asked at 2026/08/27 12:00] "
     "What paper did I select for the cedar lantern?"
 )
+
+
+def test_successor_format_field_preserves_legacy_positional_receipt_slot() -> None:
+    names = [field.name for field in fields(AdditiveTypedComposition)]
+
+    assert names[-2:] == ["receipt_sha256", "format_id"]
 
 
 def _sha(value: str) -> str:
@@ -178,8 +191,33 @@ def test_compose_preserves_each_nonempty_lane_minimum_and_is_fit_ready() -> None
             "episodic_specialist": 10,
         },
     )
+    explicit_legacy = compose_additive_typed_evidence(
+        compile_typed_operator_spec(QUESTION),
+        (parent, specialist),
+        lane_budgets=(
+            _budget("parent", parent_cap),
+            _budget("specialist", specialist_cap),
+        ),
+        lane_by_mechanism={
+            "protected_parent": "parent",
+            "episodic_specialist": "specialist",
+        },
+        dedup_owner_priority_by_mechanism={
+            "protected_parent": 100,
+            "episodic_specialist": 10,
+        },
+        composition_mode=LEGACY_COMPOSITION_MODE,
+    )
 
     protected = set(result.protected_item_receipt_sha256s)
+    assert result.projection() == explicit_legacy.projection()
+    assert result.projection()["format"] == LEGACY_COMPOSER_FORMAT
+    assert result.receipt_sha256 == (
+        "64404922f943965d40cebbfd59c8e81eab63b3e77172ca7ea53cf7fb0f10a7a3"
+    )
+    assert "initial_post_selection_dedup_audit" not in (
+        result.post_selection_dedup_audit
+    )
     assert len(protected) == 2
     assert protected <= {row.receipt_sha256 for row in result.packet.items}
     lane_rows = {
@@ -261,6 +299,7 @@ def test_lane_admission_precedes_dedup_so_a_later_omitted_owner_cannot_erase_cla
         local_selection_priority_by_handle={
             parent.bindings[0].handle_id: priority,
         },
+        composition_mode=POST_DEDUP_BACKFILL_COMPOSITION_MODE,
     )
 
     retained_summaries = {item.summary for item in result.packet.items}
@@ -316,6 +355,7 @@ def test_exact_dedup_frees_shared_capacity_for_next_unique_item() -> None:
         local_selection_priority_by_handle={
             specialist.bindings[0].handle_id: priority,
         },
+        composition_mode=POST_DEDUP_BACKFILL_COMPOSITION_MODE,
     )
 
     assert {item.summary for item in result.packet.items} == {
@@ -325,6 +365,7 @@ def test_exact_dedup_frees_shared_capacity_for_next_unique_item() -> None:
     assert result.post_selection_dedup_audit[
         "backfilled_item_receipt_sha256s"
     ] == [specialist.parsed.accepted_items[1].receipt_sha256]
+    assert result.projection()["format"] == POST_DEDUP_BACKFILL_FORMAT
     backfill = result.post_selection_dedup_audit["backfill_rows"]
     assert [row["disposition"] for row in backfill] == ["admitted_unique"]
     assert (
@@ -364,6 +405,7 @@ def test_selected_duplicate_minima_transfer_protection_to_one_surviving_owner() 
             parent.bindings[0].handle_id: (shared_span,),
             specialist.bindings[0].handle_id: (shared_span,),
         },
+        composition_mode=POST_DEDUP_BACKFILL_COMPOSITION_MODE,
     )
 
     assert len(result.packet.items) == 1

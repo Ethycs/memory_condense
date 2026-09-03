@@ -53,7 +53,7 @@ class TranscriptStore:
         """
         return self._db.current_turn()
 
-    def append(
+    def stage(
         self,
         role: str,
         text: str,
@@ -62,12 +62,7 @@ class TranscriptStore:
         created_at: datetime | None = None,
         turn_id: str | None = None,
     ) -> Turn:
-        """Create and persist a turn with a generated or explicit stable ID.
-
-        Advancing ``ordinal`` here is what makes decay happen: every item the
-        conversation did *not* reach for this turn falls one turn further
-        behind. Nothing else has to run — no sweep, no timer.
-        """
+        """Build a normalized turn without publishing it."""
         normalized_source = (
             source_id.strip() if source_id and source_id.strip() else None
         )
@@ -98,21 +93,106 @@ class TranscriptStore:
                 else {}
             ),
         )
-        ordinal = self.current_turn() + 1
-        self._db.execute(
-            "INSERT INTO turns (turn_id, role, text, source_id, created_at, ordinal)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                turn.turn_id,
-                turn.role,
-                turn.text,
-                turn.source_id,
-                turn.created_at.isoformat(),
-                ordinal,
-            ),
-        )
-        self._db.commit()
+        if normalized_turn_id is not None:
+            existing = self.get_turn(normalized_turn_id)
+            if existing is not None:
+                if (
+                    existing.role != turn.role
+                    or existing.text != turn.text
+                    or existing.source_id != turn.source_id
+                    or (
+                        normalized_created_at is not None
+                        and existing.created_at != turn.created_at
+                    )
+                ):
+                    raise ValueError(
+                        "explicit turn_id already exists with different content"
+                    )
+                return existing
         return turn
+
+    def publish_turn(
+        self,
+        turn: Turn,
+        *,
+        compare_created_at: bool = True,
+        commit: bool = True,
+    ) -> tuple[Turn, bool]:
+        """Publish ``turn`` and report whether this call inserted it.
+
+        ``commit=False`` is the ingest journal's transaction seam: the turn
+        and its replay manifest become visible together. Ordinary callers keep
+        the atomic one-row commit default.
+        """
+        if not commit and not self._db.connection.in_transaction:
+            raise RuntimeError(
+                "publish_turn(commit=False) requires an active caller transaction"
+            )
+        try:
+            inserted = self._db.execute(
+                "INSERT INTO turns "
+                "(turn_id, role, text, source_id, created_at, ordinal)"
+                " VALUES (?, ?, ?, ?, ?, "
+                "(SELECT COALESCE(MAX(ordinal), 0) + 1 FROM turns)) "
+                "ON CONFLICT(turn_id) DO NOTHING",
+                (
+                    turn.turn_id,
+                    turn.role,
+                    turn.text,
+                    turn.source_id,
+                    turn.created_at.isoformat(),
+                ),
+            ).rowcount == 1
+            if commit:
+                self._db.commit()
+        except BaseException:
+            if commit:
+                self._db.connection.rollback()
+            raise
+        if inserted:
+            return turn, True
+
+        existing = self.get_turn(turn.turn_id)
+        if existing is None or (
+            existing.role != turn.role
+            or existing.text != turn.text
+            or existing.source_id != turn.source_id
+            or (compare_created_at and existing.created_at != turn.created_at)
+        ):
+            raise ValueError("explicit turn_id already exists with different content")
+        return existing, False
+
+    def append_turn(self, turn: Turn) -> Turn:
+        """Publish a previously staged turn, idempotently by exact ID."""
+        stored, _inserted = self.publish_turn(turn)
+        return stored
+
+    def append(
+        self,
+        role: str,
+        text: str,
+        *,
+        source_id: str | None = None,
+        created_at: datetime | None = None,
+        turn_id: str | None = None,
+    ) -> Turn:
+        """Create and persist a turn with a generated or explicit stable ID.
+
+        Advancing ``ordinal`` here is what makes decay happen: every item the
+        conversation did *not* reach for this turn falls one turn further
+        behind. Nothing else has to run — no sweep, no timer.
+        """
+        stored, _inserted = self.publish_turn(
+            self.stage(
+                role,
+                text,
+                source_id=source_id,
+                created_at=created_at,
+                turn_id=turn_id,
+            ),
+            compare_created_at=created_at is not None,
+        )
+        return stored
 
     def get_turn(self, turn_id: str) -> Turn | None:
         """Retrieve a single turn by ID."""

@@ -4149,6 +4149,7 @@ def _retention_authority_overlay(
     *,
     rows: Sequence[_Candidate],
     dedup_receipt: DeduplicationReceipt | None,
+    post_dedup_backfill: PostDedupBackfillReceipt | None = None,
     exact_span_support_population: ExactSpanSupportPopulationReceipt | None = None,
 ) -> Mapping[str, Mapping[str, Any]]:
     """Bind dropped exact-span authority to the provider-first retained row.
@@ -4156,7 +4157,8 @@ def _retention_authority_overlay(
     The retained candidate is never rewritten: its plane, mechanism, citation,
     binding, and provider provenance remain byte-identical.  Only local final-fit
     priority/protection authority is inherited from independently selected exact
-    duplicates, and that overlay is authenticated by ``DeduplicationReceipt``.
+    duplicates.  The overlay is authenticated by ``DeduplicationReceipt`` and,
+    when present, its population-extending ``PostDedupBackfillReceipt``.
     """
 
     retained_receipts = tuple(row.receipt_sha256 for row in rows)
@@ -4175,7 +4177,37 @@ def _retention_authority_overlay(
         "terminal final fit received rows outside exact-span support population",
     )
     support_by_span = exact_span_support_population.authority_by_span
-    if dedup_receipt is not None:
+    if post_dedup_backfill is not None:
+        _require(
+            type(post_dedup_backfill) is PostDedupBackfillReceipt,
+            "terminal backfill receipt type changed",
+        )
+        admitted_receipts = tuple(
+            receipt
+            for _plane, receipts in (
+                post_dedup_backfill.admitted_candidate_receipt_sha256s_by_plane
+            )
+            for receipt in receipts
+        )
+        _require(
+            type(dedup_receipt) is DeduplicationReceipt
+            and post_dedup_backfill.initial_dedup_receipt_sha256
+            == dedup_receipt.receipt_sha256
+            and post_dedup_backfill.final_retained_candidate_receipt_sha256s
+            == (
+                *dedup_receipt.retained_after_dedup_receipt_sha256s,
+                *admitted_receipts,
+            )
+            and retained_receipts
+            == post_dedup_backfill.final_retained_candidate_receipt_sha256s
+            and (
+                not exact_span_support_population.plane_selection_receipt_sha256s
+                or post_dedup_backfill.plane_selection_receipt_sha256s
+                == exact_span_support_population.plane_selection_receipt_sha256s
+            ),
+            "terminal final fit received rows outside its authenticated backfill population",
+        )
+    elif dedup_receipt is not None:
         _require(
             type(dedup_receipt) is DeduplicationReceipt
             and retained_receipts
@@ -4465,6 +4497,7 @@ def _compile_typed_prompt(
     parent_receipt_by_plane: Mapping[Plane, str],
     policy: SemanticGlobalTerminalPolicy,
     dedup_receipt: DeduplicationReceipt | None = None,
+    post_dedup_backfill: PostDedupBackfillReceipt | None = None,
     exact_span_support_population: ExactSpanSupportPopulationReceipt | None = None,
     enable_selected_evidence_discourse_links: bool = False,
 ) -> tuple[
@@ -4502,6 +4535,7 @@ def _compile_typed_prompt(
     authority_by_candidate = _retention_authority_overlay(
         rows=rows,
         dedup_receipt=dedup_receipt,
+        post_dedup_backfill=post_dedup_backfill,
         exact_span_support_population=exact_span_support_population,
     )
     support_by_span = exact_span_support_population.authority_by_span
@@ -4993,6 +5027,7 @@ def compile_semantic_global_terminal(
             ),
             policy=active_policy,
             dedup_receipt=dedup_receipt,
+            post_dedup_backfill=backfill_receipt,
             exact_span_support_population=exact_span_support_population,
             enable_selected_evidence_discourse_links=(
                 enable_selected_evidence_discourse_links

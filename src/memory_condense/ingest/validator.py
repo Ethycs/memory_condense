@@ -37,8 +37,13 @@ from memory_condense.persistence.transcript_store import TranscriptStore
 #: Rejection reason slugs (stable strings — callers may switch on these).
 REASON_MISSING_PROVENANCE = "missing_provenance"
 REASON_UNKNOWN_TURN = "unknown_turn"
+REASON_UNKNOWN_CHUNK = "unknown_chunk"
+REASON_CHUNK_TURN_MISMATCH = "chunk_turn_mismatch"
+REASON_CHUNK_SPAN_MISMATCH = "chunk_span_mismatch"
+REASON_CHUNK_QUOTE_NOT_FOUND = "chunk_quote_not_found"
 REASON_QUOTE_NOT_FOUND = "quote_not_found"
 REASON_UNKNOWN_MEM_ID = "unknown_mem_id"
+REASON_INVALID_MEM_STATUS = "invalid_mem_status"
 REASON_EMPTY_CONTENT = "empty_content"
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -75,6 +80,7 @@ class Validator:
         rejected: list[ValidationError] = []
         # Per-call cache so a batch of ops over one turn hits SQLite once.
         turn_cache: dict[str, str | None] = {}
+        chunk_cache: dict[str, tuple[str, str, int, int] | None] = {}
 
         def admit(op, error: ValidationError | None, bucket: list) -> None:
             if error is None:
@@ -83,20 +89,35 @@ class Validator:
                 rejected.append(error)
 
         for op in ops.create:
-            admit(op, self._check_create(op, "create", turn_cache), accepted.create)
+            admit(
+                op,
+                self._check_create(op, "create", turn_cache, chunk_cache),
+                accepted.create,
+            )
 
         for update in ops.update:
             error = self._check_mem_id(update.mem_id, "update")
             if error is None:
                 error = self._check_provenance(
-                    update.provenance, "update", turn_cache, required=False
+                    update.provenance,
+                    "update",
+                    turn_cache,
+                    chunk_cache,
+                    required=False,
                 )
             admit(update, error, accepted.update)
 
         for sup in ops.supersede:
-            error = self._check_mem_id(sup.mem_id, "supersede")
+            error = self._check_mem_id(
+                sup.mem_id, "supersede", require_active=True
+            )
             if error is None:
-                error = self._check_create(sup.replacement, "supersede", turn_cache)
+                error = self._check_create(
+                    sup.replacement,
+                    "supersede",
+                    turn_cache,
+                    chunk_cache,
+                )
             admit(sup, error, accepted.supersede)
 
         for dele in ops.delete:
@@ -124,6 +145,7 @@ class Validator:
         op: CreateOp,
         op_kind: str,
         turn_cache: dict[str, str | None],
+        chunk_cache: dict[str, tuple[str, str, int, int] | None],
     ) -> ValidationError | None:
         """A create is only as trustworthy as its provenance."""
         if not op.content or not op.content.strip():
@@ -132,13 +154,20 @@ class Validator:
                 reason=REASON_EMPTY_CONTENT,
                 detail="content is empty or whitespace-only",
             )
-        return self._check_provenance(op.provenance, op_kind, turn_cache, required=True)
+        return self._check_provenance(
+            op.provenance,
+            op_kind,
+            turn_cache,
+            chunk_cache,
+            required=True,
+        )
 
     def _check_provenance(
         self,
         provenance: list[Provenance],
         op_kind: str,
         turn_cache: dict[str, str | None],
+        chunk_cache: dict[str, tuple[str, str, int, int] | None],
         required: bool,
     ) -> ValidationError | None:
         """Every entry must name a real turn and quote it verbatim.
@@ -182,16 +211,77 @@ class Validator:
                     ),
                 )
 
+            if entry.chunk_id is None:
+                continue
+            chunk = self._chunk(entry.chunk_id, chunk_cache)
+            if chunk is None:
+                return ValidationError(
+                    op_kind=op_kind,
+                    reason=REASON_UNKNOWN_CHUNK,
+                    detail=f"chunk_id {entry.chunk_id!r} is not in chunks",
+                )
+            chunk_turn_id, chunk_text, start_char, end_char = chunk
+            if chunk_turn_id != entry.turn_id:
+                return ValidationError(
+                    op_kind=op_kind,
+                    reason=REASON_CHUNK_TURN_MISMATCH,
+                    detail=(
+                        f"chunk_id {entry.chunk_id!r} belongs to turn "
+                        f"{chunk_turn_id!r}, not cited turn {entry.turn_id!r}"
+                    ),
+                )
+            if (
+                start_char < 0
+                or end_char <= start_char
+                or end_char > len(text)
+                or text[start_char:end_char] != chunk_text
+            ):
+                return ValidationError(
+                    op_kind=op_kind,
+                    reason=REASON_CHUNK_SPAN_MISMATCH,
+                    detail=(
+                        f"chunk_id {entry.chunk_id!r} does not match its "
+                        f"stored [{start_char}:{end_char}] span in turn "
+                        f"{entry.turn_id!r}"
+                    ),
+                )
+            if needle not in _normalize(chunk_text):
+                return ValidationError(
+                    op_kind=op_kind,
+                    reason=REASON_CHUNK_QUOTE_NOT_FOUND,
+                    detail=(
+                        f"quote {_truncate(entry.quote)!r} appears in turn "
+                        f"{entry.turn_id!r} but not in cited chunk "
+                        f"{entry.chunk_id!r}"
+                    ),
+                )
+
         return None
 
-    def _check_mem_id(self, mem_id: str, op_kind: str) -> ValidationError | None:
-        if self._mem_exists(mem_id):
-            return None
-        return ValidationError(
-            op_kind=op_kind,
-            reason=REASON_UNKNOWN_MEM_ID,
-            detail=f"mem_id {mem_id!r} is not in memory_items",
-        )
+    def _check_mem_id(
+        self,
+        mem_id: str,
+        op_kind: str,
+        *,
+        require_active: bool = False,
+    ) -> ValidationError | None:
+        status = self._mem_status(mem_id)
+        if status is None:
+            return ValidationError(
+                op_kind=op_kind,
+                reason=REASON_UNKNOWN_MEM_ID,
+                detail=f"mem_id {mem_id!r} is not in memory_items",
+            )
+        if require_active and status != "active":
+            return ValidationError(
+                op_kind=op_kind,
+                reason=REASON_INVALID_MEM_STATUS,
+                detail=(
+                    f"mem_id {mem_id!r} has status {status!r}; "
+                    "supersede requires an active predecessor"
+                ),
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Storage lookups
@@ -207,11 +297,32 @@ class Validator:
         turn_cache[turn_id] = text
         return text
 
-    def _mem_exists(self, mem_id: str) -> bool:
-        cur = self._db.execute(
-            "SELECT 1 FROM memory_items WHERE mem_id = ?", (mem_id,)
+    def _chunk(
+        self,
+        chunk_id: str,
+        chunk_cache: dict[str, tuple[str, str, int, int] | None],
+    ) -> tuple[str, str, int, int] | None:
+        if chunk_id in chunk_cache:
+            return chunk_cache[chunk_id]
+        row = self._db.execute(
+            "SELECT turn_id, text, start_char, end_char "
+            "FROM chunks WHERE chunk_id = ?",
+            (chunk_id,),
+        ).fetchone()
+        chunk = (
+            None
+            if row is None
+            else (str(row[0]), str(row[1]), int(row[2]), int(row[3]))
         )
-        return cur.fetchone() is not None
+        chunk_cache[chunk_id] = chunk
+        return chunk
+
+    def _mem_status(self, mem_id: str) -> str | None:
+        cur = self._db.execute(
+            "SELECT status FROM memory_items WHERE mem_id = ?", (mem_id,)
+        )
+        row = cur.fetchone()
+        return None if row is None else str(row[0])
 
 
 def _truncate(text: str, limit: int = 60) -> str:

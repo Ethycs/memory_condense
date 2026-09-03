@@ -8,6 +8,7 @@ The real-model path is covered by tests/test_integration.py behind `slow`.
 from __future__ import annotations
 
 import re
+import sqlite3
 import zlib
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -67,6 +68,64 @@ class FakeEmbedder:
         return [
             c.model_copy(update={"embedding": self._vec(c.text).tolist()})
             for c in chunks
+        ]
+
+
+class FailOnceEmbedder(FakeEmbedder):
+    def __init__(self, dim: int = 32) -> None:
+        super().__init__(dim)
+        self.failed = False
+
+    def embed_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("synthetic embedding failure")
+        return super().embed_chunks(chunks)
+
+
+class InvalidOutputEmbedder(FakeEmbedder):
+    """Inject one malformed provider result at the ingest boundary."""
+
+    def __init__(self, defect: str) -> None:
+        super().__init__()
+        self.defect = defect
+
+    def embed_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        if self.defect == "mutating-extra":
+            chunks.append(
+                chunks[0].model_copy(update={"chunk_id": "mutated-extra-chunk"})
+            )
+            return super().embed_chunks(chunks)
+        if self.defect == "mutating-source":
+            object.__setattr__(chunks[0], "text", "mutated provider source")
+            return super().embed_chunks(chunks)
+        embedded = super().embed_chunks(chunks)
+        if self.defect == "missing":
+            return embedded[:-1]
+        if self.defect == "extra":
+            return [
+                *embedded,
+                embedded[0].model_copy(update={"chunk_id": "unexpected-chunk"}),
+            ]
+        if self.defect == "duplicate":
+            return [*embedded, embedded[0]]
+        if self.defect == "replaced":
+            return [
+                embedded[0].model_copy(update={"text": "provider replacement"}),
+                *embedded[1:],
+            ]
+        if self.defect == "unembedded":
+            return chunks
+        raise AssertionError(f"unknown synthetic defect: {self.defect}")
+
+
+class LexicalOutputEmbedder(FakeEmbedder):
+    """A provider may add both dense and learned lexical representations."""
+
+    def embed_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        return [
+            chunk.model_copy(update={"lexical_weights": {"learned": 1.0}})
+            for chunk in super().embed_chunks(chunks)
         ]
 
 
@@ -1948,6 +2007,1442 @@ class TestIngest:
             chunk.chunk_id for chunk in changed[0][1]
         ]
 
+    def test_explicit_turn_retry_recovers_after_embedding_failure(self, tmp_path):
+        with MemoryCondenser(
+            data_dir=tmp_path / "retry-ingest",
+            embedder=FailOnceEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            with pytest.raises(RuntimeError, match="synthetic embedding failure"):
+                condenser.ingest(
+                    "user", "The amber badge is deployed.", turn_id="stable-turn"
+                )
+
+            turn, chunks = condenser.ingest(
+                "user", "The amber badge is deployed.", turn_id="stable-turn"
+            )
+
+            assert turn.turn_id == "stable-turn"
+            assert condenser.transcript.count() == 1
+            assert chunks
+            assert (
+                condenser.search_hybrid("amber badge", k=1)[0].chunk.chunk_id
+                == chunks[0].chunk_id
+            )
+
+    def test_generated_turn_embedding_failure_publishes_nothing(self, tmp_path):
+        with MemoryCondenser(
+            data_dir=tmp_path / "generated-failure",
+            embedder=FailOnceEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            with pytest.raises(RuntimeError, match="synthetic embedding failure"):
+                condenser.ingest("user", "A generated turn must remain staged.")
+
+            assert condenser.transcript.count() == 0
+
+    def test_batch_embedding_failure_publishes_no_turns(self, tmp_path):
+        with MemoryCondenser(
+            data_dir=tmp_path / "batch-failure",
+            embedder=FailOnceEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            with pytest.raises(RuntimeError, match="synthetic embedding failure"):
+                condenser.ingest_many(
+                    [
+                        ("user", "First staged batch turn.", "source-a"),
+                        ("assistant", "Second staged batch turn.", "source-a"),
+                    ]
+                )
+
+            assert condenser.transcript.count() == 0
+
+    @pytest.mark.parametrize(
+        "first_role,first_text,second_role,second_text",
+        [
+            ("user", "", "assistant", ""),
+            ("user", "First indexed text.", "user", "Second indexed text."),
+        ],
+    )
+    def test_batch_duplicate_turn_conflict_publishes_nothing(
+        self, tmp_path, first_role, first_text, second_role, second_text
+    ):
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        with MemoryCondenser(
+            data_dir=tmp_path / f"duplicate-{bool(first_text)}",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            with pytest.raises(ValueError, match="duplicate turn_id"):
+                condenser.ingest_many(
+                    [
+                        (first_role, first_text, "source", source_time, "duplicate"),
+                        (second_role, second_text, "source", source_time, "duplicate"),
+                    ]
+                )
+
+            assert condenser.transcript.count() == 0
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+
+    @pytest.mark.parametrize(
+        "source_time",
+        [datetime(2024, 5, 1, tzinfo=timezone.utc), None],
+        ids=["fixed-time", "generated-time"],
+    )
+    def test_exact_duplicate_batch_turn_indexes_each_chunk_once(
+        self, tmp_path, source_time
+    ):
+        record = (
+            "user",
+            "The exact repeated turn keeps one dense label.",
+            "source",
+            source_time,
+            "stable-duplicate",
+        )
+        with MemoryCondenser(
+            data_dir=tmp_path / "exact-duplicate",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            rows = condenser.ingest_many([record, record])
+
+            first_ids = [chunk.chunk_id for chunk in rows[0][1]]
+            second_ids = [chunk.chunk_id for chunk in rows[1][1]]
+            assert first_ids == second_ids
+            assert len(first_ids) == len(set(first_ids))
+            assert condenser.transcript.count() == 1
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == len(first_ids)
+            assert len(condenser.retriever._chunk_id_to_label) == len(first_ids)
+            assert condenser.retriever._index.get_current_count() == len(first_ids)
+
+    @pytest.mark.parametrize("explicit_first", [True, False])
+    def test_batch_omitted_timestamp_uses_duplicate_explicit_time(
+        self, tmp_path, explicit_first
+    ):
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        fixed = (
+            "user",
+            "The mixed-time duplicate has one canonical timestamp.",
+            "source",
+            source_time,
+            "mixed-time",
+        )
+        omitted = (*fixed[:3], None, fixed[4])
+        records = [fixed, omitted] if explicit_first else [omitted, fixed]
+
+        with MemoryCondenser(
+            data_dir=tmp_path / f"mixed-time-{explicit_first}",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            rows = condenser.ingest_many(records)
+
+            assert [turn.created_at for turn, _chunks in rows] == [
+                source_time,
+                source_time,
+            ]
+            assert condenser.transcript.count() == 1
+            indexed_ids = {
+                chunk.chunk_id for _turn, chunks in rows for chunk in chunks
+            }
+            assert len(indexed_ids) == len(rows[0][1])
+
+    @pytest.mark.parametrize("naive_first", [True, False])
+    def test_batch_duplicate_timestamps_normalize_before_comparison(
+        self, tmp_path, naive_first
+    ):
+        naive = datetime(2024, 5, 1, 12, 30)
+        aware = naive.replace(tzinfo=timezone.utc)
+        naive_record = (
+            "user",
+            "Equivalent timestamp forms share one turn.",
+            "source",
+            naive,
+            "normalized-time",
+        )
+        aware_record = (*naive_record[:3], aware, naive_record[4])
+        records = (
+            [naive_record, aware_record]
+            if naive_first
+            else [aware_record, naive_record]
+        )
+
+        with MemoryCondenser(
+            data_dir=tmp_path / f"normalized-time-{naive_first}",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            rows = condenser.ingest_many(records)
+
+            assert [turn.created_at for turn, _chunks in rows] == [aware, aware]
+            assert condenser.transcript.count() == 1
+
+    @pytest.mark.parametrize("texts", [("", ""), ("First indexed.", "Second indexed.")])
+    def test_batch_append_failure_compensates_earlier_publication(
+        self, tmp_path, monkeypatch, texts
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / f"append-failure-{bool(texts[0])}",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            original = condenser.transcript.publish_turn
+            calls = 0
+
+            def fail_second(turn, *, compare_created_at=True, commit=True):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("synthetic append failure")
+                return original(
+                    turn,
+                    compare_created_at=compare_created_at,
+                    commit=commit,
+                )
+
+            monkeypatch.setattr(condenser.transcript, "publish_turn", fail_second)
+            with pytest.raises(RuntimeError, match="synthetic append failure"):
+                condenser.ingest_many(
+                    [
+                        ("user", texts[0], "source"),
+                        ("assistant", texts[1], "source"),
+                    ]
+                )
+
+            assert condenser.transcript.count() == 0
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+
+    def test_failed_writer_cannot_delete_a_duplicate_writers_completed_ingest(
+        self, tmp_path, monkeypatch
+    ):
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        data_dir = tmp_path / "concurrent-completion"
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as failed, MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as completing:
+            completed_chunks: list[Chunk] = []
+
+            def complete_elsewhere_then_fail(_chunks, *, finalize=None):
+                _turn, concurrent_chunks = completing.ingest(
+                    "user",
+                    "The duplicate writer durably completes this amber turn.",
+                    source_id="source",
+                    created_at=source_time,
+                    turn_id="concurrent-turn",
+                )
+                completed_chunks.extend(concurrent_chunks)
+                raise RuntimeError("synthetic concurrent index failure")
+
+            monkeypatch.setattr(
+                failed.retriever,
+                "add_chunks",
+                complete_elsewhere_then_fail,
+            )
+            with pytest.raises(
+                RuntimeError, match="synthetic concurrent index failure"
+            ):
+                failed.ingest(
+                    "user",
+                    "The duplicate writer durably completes this amber turn.",
+                    source_id="source",
+                    created_at=source_time,
+                    turn_id="concurrent-turn",
+                )
+
+            assert completing.transcript.count() == 1
+            assert completing.pending_ingest_count() == 0
+            assert completed_chunks
+            assert completing._db.execute(
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL "
+                "AND hnsw_label IS NOT NULL AND term_count IS NOT NULL"
+            ).fetchone()[0] == len(completed_chunks)
+            assert completing.search_hybrid("amber turn", k=1)
+
+    def test_stale_ingest_cannot_resurrect_completed_then_retired_chunks(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "stale-complete-delete"
+        text = "The retired ochre evidence must defeat a stale helper."
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as stale, MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as completing:
+            original = stale.retriever.add_chunks
+            interleavings = 0
+
+            def complete_delete_then_resume(chunks, *, finalize=None):
+                nonlocal interleavings
+                interleavings += 1
+                _turn, completed = completing.ingest(
+                    "user",
+                    text,
+                    created_at=source_time,
+                    turn_id="stale-retired-turn",
+                )
+                for chunk in completed:
+                    assert completing.retriever.delete_chunk(chunk.chunk_id)
+                return original(chunks, finalize=finalize)
+
+            monkeypatch.setattr(
+                stale.retriever,
+                "add_chunks",
+                complete_delete_then_resume,
+            )
+            _turn, stale_chunks = stale.ingest(
+                "user",
+                text,
+                created_at=source_time,
+                turn_id="stale-retired-turn",
+            )
+
+            assert interleavings == 1
+            assert stale_chunks
+            assert stale.pending_ingest_count() == 0
+            assert stale._db.execute(
+                "SELECT embedding, hnsw_label, term_count FROM chunks "
+                "WHERE turn_id = 'stale-retired-turn'"
+            ).fetchall() == [(None, None, None)]
+            assert stale.search_hybrid("retired ochre", k=3) == []
+
+    def test_mixed_stale_batch_retries_only_receipts_still_pending(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "mixed-stale-completion"
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        retired_text = "The stale crimson batch evidence must stay retired."
+        live_text = "The fresh azure batch evidence must finish indexing."
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as stale, MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as completing:
+            original = stale.retriever.add_chunks
+            attempts = 0
+
+            def race_first_attempt(chunks, *, finalize=None):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    _turn, completed = completing.ingest(
+                        "user",
+                        retired_text,
+                        source_id="source",
+                        created_at=source_time,
+                        turn_id="mixed-retired-turn",
+                    )
+                    for chunk in completed:
+                        assert completing.retriever.delete_chunk(chunk.chunk_id)
+                return original(chunks, finalize=finalize)
+
+            monkeypatch.setattr(
+                stale.retriever,
+                "add_chunks",
+                race_first_attempt,
+            )
+            stale.ingest_many(
+                [
+                    (
+                        "user",
+                        retired_text,
+                        "source",
+                        source_time,
+                        "mixed-retired-turn",
+                    ),
+                    (
+                        "assistant",
+                        live_text,
+                        "source",
+                        source_time,
+                        "mixed-live-turn",
+                    ),
+                ]
+            )
+
+            assert attempts == 2
+            assert stale.pending_ingest_count() == 0
+            assert stale._db.execute(
+                "SELECT embedding, hnsw_label, term_count FROM chunks "
+                "WHERE turn_id = 'mixed-retired-turn'"
+            ).fetchall() == [(None, None, None)]
+            live_state = stale._db.execute(
+                "SELECT embedding, hnsw_label, term_count FROM chunks "
+                "WHERE turn_id = 'mixed-live-turn'"
+            ).fetchone()
+            assert all(value is not None for value in live_state)
+            assert stale.search_hybrid("fresh azure", k=1)[0].chunk.turn_id == (
+                "mixed-live-turn"
+            )
+
+    def test_direct_lexical_add_rejects_an_extra_manifest_chunk(self, tmp_path):
+        with MemoryCondenser(
+            data_dir=tmp_path / "direct-lexical-extra",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            _turn, chunks = condenser.ingest(
+                "user",
+                "The sealed silver topology admits no lexical extra.",
+                turn_id="sealed-lexical-turn",
+            )
+            extra = chunks[0].model_copy(
+                update={
+                    "chunk_id": "direct-lexical-extra",
+                    "embedding": None,
+                    "lexical_weights": None,
+                }
+            )
+            before_postings = condenser._db.execute(
+                "SELECT COUNT(*) FROM chunk_terms"
+            ).fetchone()[0]
+
+            with pytest.raises(ValueError, match="not a member"):
+                condenser.retriever._lexical.add_chunks([extra])
+            with pytest.raises(ValueError, match="not a member"):
+                condenser.retriever._lexical.rebuild([extra])
+
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == len(chunks)
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunk_terms"
+            ).fetchone()[0] == before_postings
+
+    def test_direct_dense_add_rejects_an_extra_manifest_chunk(self, tmp_path):
+        with MemoryCondenser(
+            data_dir=tmp_path / "direct-dense-extra",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            _turn, chunks = condenser.ingest(
+                "user",
+                "The sealed gold topology admits no dense extra.",
+                turn_id="sealed-dense-turn",
+            )
+            extra = chunks[0].model_copy(
+                update={"chunk_id": "direct-dense-extra"}
+            )
+            before_labels = dict(condenser.retriever._chunk_id_to_label)
+
+            with pytest.raises(ValueError, match="not a member"):
+                condenser.retriever.add_chunks([extra])
+
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == len(chunks)
+            assert condenser.retriever._chunk_id_to_label == before_labels
+
+    def test_direct_lexical_readd_cannot_reactivate_an_indexed_retirement(
+        self, tmp_path
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "direct-lexical-reactivation",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            _turn, chunks = condenser.ingest(
+                "user",
+                "The retired bronze member remains terminal for lexical writes.",
+                turn_id="retired-lexical-member",
+            )
+            for chunk in chunks:
+                assert condenser.retriever.delete_chunk(chunk.chunk_id)
+
+            with pytest.raises(RuntimeError, match="already indexed"):
+                condenser.retriever._lexical.add_chunks(chunks)
+            with pytest.raises(RuntimeError, match="already indexed"):
+                condenser.retriever._lexical.rebuild(chunks)
+
+            assert condenser._db.execute(
+                "SELECT embedding, hnsw_label, term_count FROM chunks"
+            ).fetchall() == [(None, None, None)]
+
+    def test_direct_dense_readd_cannot_reactivate_an_indexed_retirement(
+        self, tmp_path
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "direct-dense-reactivation",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            _turn, chunks = condenser.ingest(
+                "user",
+                "The retired copper member remains terminal for dense writes.",
+                turn_id="retired-dense-member",
+            )
+            for chunk in chunks:
+                assert condenser.retriever.delete_chunk(chunk.chunk_id)
+
+            with pytest.raises(RuntimeError, match="already indexed"):
+                condenser.retriever.add_chunks(chunks)
+
+            assert condenser._db.execute(
+                "SELECT embedding, hnsw_label, term_count FROM chunks"
+            ).fetchall() == [(None, None, None)]
+            assert condenser.retriever._chunk_id_to_label == {}
+
+    def test_default_lexical_rebuild_preserves_completed_receipt(self, tmp_path):
+        with MemoryCondenser(
+            data_dir=tmp_path / "completed-default-rebuild",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            _turn, chunks = condenser.ingest(
+                "user",
+                "The completed coral member survives a default lexical rebuild.",
+                turn_id="completed-rebuild-member",
+            )
+
+            assert condenser.retriever._lexical.rebuild(chunks) == len(chunks)
+            assert condenser.retriever._lexical.rebuild() == len(chunks)
+            assert condenser.pending_ingest_count() == 0
+            assert condenser.search_hybrid("completed coral", k=1)
+
+    def test_raw_turn_cannot_steal_pending_reservation_via_lexical_add(
+        self, tmp_path, monkeypatch
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "raw-lexical-reservation-steal",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            def fixed_chunk_id(turn_id, text):
+                return [
+                    Chunk(
+                        chunk_id="globally-reserved-lexical",
+                        turn_id=turn_id,
+                        text=text,
+                        start_char=0,
+                        end_char=len(text),
+                        token_count=len(text.split()),
+                    )
+                ]
+
+            def stop_before_index(_chunks, *, finalize=None):
+                raise RuntimeError("synthetic pending owner")
+
+            monkeypatch.setattr(condenser._chunker, "chunk_turn", fixed_chunk_id)
+            monkeypatch.setattr(
+                condenser.retriever,
+                "add_chunks",
+                stop_before_index,
+            )
+            with pytest.raises(RuntimeError, match="synthetic pending owner"):
+                condenser.ingest("user", "The first turn reserves lexical C.")
+
+            raw_turn = condenser.transcript.append(
+                "user", "The raw thief must not acquire lexical C."
+            )
+            stolen = fixed_chunk_id(raw_turn.turn_id, raw_turn.text)[0]
+            with pytest.raises(ValueError, match="global reservation"):
+                condenser.retriever._lexical.add_chunks([stolen])
+
+            assert condenser._db.execute(
+                "SELECT turn_id FROM ingest_chunk_reservations "
+                "WHERE chunk_id = 'globally-reserved-lexical'"
+            ).fetchone()[0] != raw_turn.turn_id
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+
+    def test_raw_turn_cannot_steal_pending_reservation_via_dense_add(
+        self, tmp_path, monkeypatch
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "raw-dense-reservation-steal",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            def fixed_chunk_id(turn_id, text):
+                return [
+                    Chunk(
+                        chunk_id="globally-reserved-dense",
+                        turn_id=turn_id,
+                        text=text,
+                        start_char=0,
+                        end_char=len(text),
+                        token_count=len(text.split()),
+                    )
+                ]
+
+            original_add = condenser.retriever.add_chunks
+
+            def stop_before_index(_chunks, *, finalize=None):
+                raise RuntimeError("synthetic pending owner")
+
+            monkeypatch.setattr(condenser._chunker, "chunk_turn", fixed_chunk_id)
+            monkeypatch.setattr(
+                condenser.retriever,
+                "add_chunks",
+                stop_before_index,
+            )
+            with pytest.raises(RuntimeError, match="synthetic pending owner"):
+                condenser.ingest("user", "The first turn reserves dense C.")
+
+            raw_turn = condenser.transcript.append(
+                "user", "The raw thief must not acquire dense C."
+            )
+            stolen = FakeEmbedder().embed_chunks(
+                fixed_chunk_id(raw_turn.turn_id, raw_turn.text)
+            )[0]
+            monkeypatch.setattr(condenser.retriever, "add_chunks", original_add)
+            with pytest.raises(ValueError, match="global reservation"):
+                condenser.retriever.add_chunks([stolen])
+
+            assert "globally-reserved-dense" not in (
+                condenser.retriever._chunk_id_to_label
+            )
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+
+    def test_high_level_pending_receipt_rejects_global_chunk_collision(
+        self, tmp_path, monkeypatch
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "pending-receipt-collision",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            def fixed_chunk_id(turn_id, text):
+                return [
+                    Chunk(
+                        chunk_id="high-level-pending-collision",
+                        turn_id=turn_id,
+                        text=text,
+                        start_char=0,
+                        end_char=len(text),
+                        token_count=len(text.split()),
+                    )
+                ]
+
+            original_add = condenser.retriever.add_chunks
+
+            def stop_before_index(_chunks, *, finalize=None):
+                raise RuntimeError("synthetic pending collision owner")
+
+            monkeypatch.setattr(condenser._chunker, "chunk_turn", fixed_chunk_id)
+            monkeypatch.setattr(
+                condenser.retriever,
+                "add_chunks",
+                stop_before_index,
+            )
+            with pytest.raises(
+                RuntimeError, match="synthetic pending collision owner"
+            ):
+                condenser.ingest("user", "The pending owner reserves C.")
+
+            monkeypatch.setattr(condenser.retriever, "add_chunks", original_add)
+            with pytest.raises(ValueError, match="reserved by a different"):
+                condenser.ingest("assistant", "A second receipt collides on C.")
+
+            assert condenser.transcript.count() == 1
+            assert condenser.pending_ingest_count() == 1
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM pending_ingests"
+            ).fetchone()[0] == 1
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM ingest_chunk_reservations"
+            ).fetchone()[0] == 1
+
+    def test_high_level_indexed_receipt_rejects_global_chunk_collision(
+        self, tmp_path, monkeypatch
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "indexed-receipt-collision",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            def fixed_chunk_id(turn_id, text):
+                return [
+                    Chunk(
+                        chunk_id="high-level-indexed-collision",
+                        turn_id=turn_id,
+                        text=text,
+                        start_char=0,
+                        end_char=len(text),
+                        token_count=len(text.split()),
+                    )
+                ]
+
+            monkeypatch.setattr(condenser._chunker, "chunk_turn", fixed_chunk_id)
+            condenser.ingest("user", "The indexed owner reserves C.")
+            with pytest.raises(ValueError, match="reserved by a different"):
+                condenser.ingest("assistant", "Another receipt collides on C.")
+
+            assert condenser.transcript.count() == 1
+            assert condenser.pending_ingest_count() == 0
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 1
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM ingest_chunk_reservations"
+            ).fetchone()[0] == 1
+
+    def test_indexed_nonempty_receipt_rejects_hard_missing_topology(
+        self, tmp_path
+    ):
+        text = "The sealed plum topology cannot silently disappear."
+        with MemoryCondenser(
+            data_dir=tmp_path / "hard-missing-topology",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            condenser.ingest("user", text, turn_id="hard-missing-turn")
+            condenser._db.execute(
+                "DELETE FROM chunk_terms WHERE chunk_id IN "
+                "(SELECT chunk_id FROM chunks WHERE turn_id = 'hard-missing-turn')"
+            )
+            condenser._db.execute(
+                "DELETE FROM chunks WHERE turn_id = 'hard-missing-turn'"
+            )
+            condenser._db.commit()
+
+            with pytest.raises(ValueError, match="no durable chunk topology"):
+                condenser.ingest("user", text, turn_id="hard-missing-turn")
+
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks WHERE turn_id = 'hard-missing-turn'"
+            ).fetchone()[0] == 0
+
+    @pytest.mark.parametrize(
+        "defect",
+        [
+            "missing",
+            "extra",
+            "mutating-extra",
+            "mutating-source",
+            "duplicate",
+            "replaced",
+            "unembedded",
+        ],
+    )
+    def test_ingest_rejects_invalid_embedder_output_before_publication(
+        self, tmp_path, defect
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / f"invalid-single-{defect}",
+            embedder=InvalidOutputEmbedder(defect),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            with pytest.raises(ValueError, match="embedder"):
+                condenser.ingest(
+                    "user",
+                    "No malformed provider result may publish this turn.",
+                    turn_id="invalid-single-turn",
+                )
+
+            assert condenser.transcript.count() == 0
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM pending_ingests"
+            ).fetchone()[0] == 0
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+
+    def test_ingest_many_rejects_invalid_embedder_output_before_publication(
+        self, tmp_path
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "invalid-batch-extra",
+            embedder=InvalidOutputEmbedder("extra"),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            with pytest.raises(ValueError, match="complete chunk identity set"):
+                condenser.ingest_many(
+                    [
+                        ("user", "First unpublished provider turn.", "source"),
+                        ("assistant", "Second unpublished provider turn.", "source"),
+                    ]
+                )
+
+            assert condenser.transcript.count() == 0
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM pending_ingests"
+            ).fetchone()[0] == 0
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+
+    def test_ingest_accepts_provider_derived_lexical_weights(self, tmp_path):
+        with MemoryCondenser(
+            data_dir=tmp_path / "provider-lexical-weights",
+            embedder=LexicalOutputEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            _turn, chunks = condenser.ingest(
+                "user",
+                "The provider adds a learned lexical representation.",
+            )
+
+            assert chunks
+            assert all(chunk.lexical_weights == {"learned": 1.0} for chunk in chunks)
+            assert condenser.pending_ingest_count() == 0
+
+    def test_recovery_rejects_invalid_embedder_output_and_keeps_receipt(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "invalid-recovery-output"
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as interrupted:
+            def fail_before_index(_chunks, *, finalize=None):
+                raise RuntimeError("synthetic interrupted index")
+
+            monkeypatch.setattr(
+                interrupted.retriever,
+                "add_chunks",
+                fail_before_index,
+            )
+            with pytest.raises(RuntimeError, match="synthetic interrupted index"):
+                interrupted.ingest(
+                    "user",
+                    "The pending orange turn must reject provider replacement.",
+                )
+            assert interrupted.pending_ingest_count() == 1
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=InvalidOutputEmbedder("replaced"),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as recovering:
+            with pytest.raises(ValueError, match="changed a chunk source field"):
+                recovering.recover_pending_ingests()
+
+            assert recovering.transcript.count() == 1
+            assert recovering.pending_ingest_count() == 1
+            assert recovering._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+
+    def test_index_transaction_failure_leaves_replayable_generated_turn(
+        self, tmp_path, monkeypatch
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "post-commit-failure",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            def fail_lexical(
+                _chunks, *, commit=True, validate_identity=True
+            ):
+                raise RuntimeError("synthetic post-commit failure")
+
+            with monkeypatch.context() as failure:
+                failure.setattr(
+                    condenser.retriever._lexical, "add_chunks", fail_lexical
+                )
+                with pytest.raises(
+                    RuntimeError, match="synthetic post-commit failure"
+                ):
+                    condenser.ingest(
+                        "user", "A generated staged row must remain replayable."
+                    )
+
+            assert condenser.transcript.count() == 1
+            assert condenser.pending_ingest_count() == 1
+            assert condenser._db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+            assert condenser.retriever._chunk_id_to_label == {}
+
+            recovered = condenser.recover_pending_ingests()
+            assert len(recovered) == 1
+            assert recovered[0][1]
+            assert condenser.pending_ingest_count() == 0
+            assert condenser.search_hybrid("remain replayable", k=1)
+
+    def test_pending_manifest_survives_close_and_recovers_exact_generated_ids(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "pending-process-death"
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as interrupted:
+            def fail_before_index(_chunks, *, finalize=None):
+                raise RuntimeError("synthetic process death boundary")
+
+            monkeypatch.setattr(
+                interrupted.retriever,
+                "add_chunks",
+                fail_before_index,
+            )
+            with pytest.raises(
+                RuntimeError, match="synthetic process death boundary"
+            ):
+                interrupted.ingest(
+                    "user",
+                    "The generated violet receipt must survive a restart.",
+                )
+            manifest = interrupted._pending_ingests.list_pending()[0]
+            expected_ids = [chunk.chunk_id for chunk in manifest.chunks]
+            assert expected_ids
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as recovered:
+            rows = recovered.recover_pending_ingests()
+            assert [chunk.chunk_id for chunk in rows[0][1]] == expected_ids
+            assert recovered.pending_ingest_count() == 0
+            assert recovered.search_hybrid("violet receipt", k=1)
+
+    def test_pending_finalizer_failure_rolls_back_chunks_and_keeps_manifest(
+        self, tmp_path
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "pending-finalizer-failure",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            condenser._db.execute(
+                "CREATE TRIGGER fail_pending_completion "
+                "BEFORE UPDATE OF status ON pending_ingests "
+                "WHEN OLD.status = 'pending' AND NEW.status = 'indexed' BEGIN "
+                "SELECT RAISE(ABORT, 'synthetic pending finalizer failure'); END"
+            )
+            condenser._db.commit()
+
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="synthetic pending finalizer failure",
+            ):
+                condenser.ingest(
+                    "user",
+                    "The finalizer transaction keeps this copper receipt.",
+                    turn_id="finalizer-turn",
+                )
+
+            assert condenser.transcript.count() == 1
+            assert condenser.pending_ingest_count() == 1
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+            assert condenser.retriever._chunk_id_to_label == {}
+
+            condenser._db.execute("DROP TRIGGER fail_pending_completion")
+            condenser._db.commit()
+            assert len(condenser.recover_pending_ingests()) == 1
+            assert condenser.pending_ingest_count() == 0
+            assert condenser.search_hybrid("copper receipt", k=1)
+
+    def test_empty_turn_is_complete_without_a_pending_manifest(self, tmp_path):
+        data_dir = tmp_path / "empty-complete"
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as first, MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as second:
+            left = first.ingest(
+                "user", "", created_at=source_time, turn_id="empty-turn"
+            )
+            right = second.ingest(
+                "user", "", created_at=source_time, turn_id="empty-turn"
+            )
+            assert left[0] == right[0]
+            assert left[1] == right[1] == []
+            assert first.transcript.count() == 1
+            assert first.pending_ingest_count() == 0
+            assert first._db.execute(
+                "SELECT status FROM pending_ingests WHERE turn_id = 'empty-turn'"
+            ).fetchone() == ("indexed",)
+            assert first._db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+
+    def test_mixed_batch_index_failure_preserves_complete_and_pending_turns(
+        self, tmp_path, monkeypatch
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "mixed-pending-batch",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            original = condenser.retriever.add_chunks
+
+            def fail_index(_chunks, *, finalize=None):
+                raise RuntimeError("synthetic mixed batch index failure")
+
+            monkeypatch.setattr(condenser.retriever, "add_chunks", fail_index)
+            with pytest.raises(
+                RuntimeError, match="synthetic mixed batch index failure"
+            ):
+                condenser.ingest_many(
+                    [
+                        ("user", "", "source", None, "empty-batch-turn"),
+                        (
+                            "assistant",
+                            "The nonempty silver batch turn remains pending.",
+                            "source",
+                            None,
+                            "indexed-batch-turn",
+                        ),
+                    ]
+                )
+
+            assert condenser.transcript.count() == 2
+            assert condenser.pending_ingest_count() == 1
+            assert condenser._db.execute(
+                "SELECT turn_id FROM pending_ingests WHERE status = 'pending'"
+            ).fetchall() == [("indexed-batch-turn",)]
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM pending_ingests"
+            ).fetchone()[0] == 2
+            assert condenser._db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+
+            monkeypatch.setattr(condenser.retriever, "add_chunks", original)
+            assert len(condenser.recover_pending_ingests()) == 1
+            assert condenser.pending_ingest_count() == 0
+            assert condenser.search_hybrid("silver batch", k=1)
+
+    def test_completed_manifest_rejects_a_different_chunk_topology(
+        self, tmp_path
+    ):
+        data_dir = tmp_path / "completed-topology"
+        text = (
+            "Alpha one two three. Beta four five six. "
+            "Gamma seven eight nine."
+        )
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+            chunker_max_tokens=5,
+        ) as narrow:
+            _turn, narrow_chunks = narrow.ingest(
+                "user",
+                text,
+                created_at=source_time,
+                turn_id="topology-turn",
+            )
+            assert len(narrow_chunks) > 1
+            receipt = narrow._pending_ingests.get("topology-turn")
+            assert receipt is not None
+            assert narrow.pending_ingest_count() == 0
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+            chunker_max_tokens=100,
+        ) as wide:
+            with pytest.raises(ValueError, match="different pending chunk manifest"):
+                wide.ingest(
+                    "user",
+                    text,
+                    created_at=source_time,
+                    turn_id="topology-turn",
+                )
+            assert wide._pending_ingests.get("topology-turn") == receipt
+            assert wide._db.execute("SELECT COUNT(*) FROM chunks").fetchone()[
+                0
+            ] == len(narrow_chunks)
+
+    def test_indexed_receipt_and_reservations_are_sqlite_durable(self, tmp_path):
+        with MemoryCondenser(
+            data_dir=tmp_path / "durable-ingest-receipt",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            _turn, chunks = condenser.ingest(
+                "user",
+                "The durable violet receipt cannot be rewritten or removed.",
+                turn_id="durable-receipt-turn",
+            )
+            assert chunks
+
+            forbidden = [
+                (
+                    "DELETE FROM pending_ingests "
+                    "WHERE turn_id = 'durable-receipt-turn'",
+                    "ingest receipts are durable",
+                ),
+                (
+                    "UPDATE pending_ingests SET manifest_sha256 = "
+                    f"'{('0' * 64)}' WHERE turn_id = 'durable-receipt-turn'",
+                    "allow only complete pending-to-indexed",
+                ),
+                (
+                    "UPDATE pending_ingests SET status = 'pending', "
+                    "indexed_at = NULL WHERE turn_id = 'durable-receipt-turn'",
+                    "allow only complete pending-to-indexed",
+                ),
+                (
+                    "DELETE FROM ingest_chunk_reservations "
+                    "WHERE turn_id = 'durable-receipt-turn'",
+                    "reservations are durable",
+                ),
+                (
+                    "UPDATE ingest_chunk_reservations SET token_count = 999 "
+                    "WHERE turn_id = 'durable-receipt-turn'",
+                    "reservations are immutable",
+                ),
+                (
+                    "INSERT INTO ingest_chunk_reservations "
+                    "(chunk_id, turn_id, start_char, end_char, token_count, "
+                    "text_sha256) VALUES ('undeclared-reservation', "
+                    "'durable-receipt-turn', 0, 1, 1, "
+                    f"'{('0' * 64)}')",
+                    "reservation is not declared by its manifest",
+                ),
+                (
+                    "INSERT OR REPLACE INTO pending_ingests "
+                    "(turn_id, manifest_sha256, manifest_json, status, "
+                    "created_at, indexed_at) SELECT turn_id, manifest_sha256, "
+                    "manifest_json, status, created_at, indexed_at FROM "
+                    "pending_ingests WHERE turn_id = 'durable-receipt-turn'",
+                    "ingest receipts are durable",
+                ),
+                (
+                    "INSERT OR REPLACE INTO ingest_chunk_reservations "
+                    "(chunk_id, turn_id, start_char, end_char, token_count, "
+                    "text_sha256) SELECT chunk_id, turn_id, start_char, "
+                    "end_char, token_count, text_sha256 FROM "
+                    "ingest_chunk_reservations WHERE "
+                    "turn_id = 'durable-receipt-turn' LIMIT 1",
+                    "reservations are durable",
+                ),
+            ]
+            for statement, message in forbidden:
+                with pytest.raises(sqlite3.IntegrityError, match=message):
+                    condenser._db.execute(statement)
+                condenser._db.connection.rollback()
+
+            assert condenser._db.execute(
+                "SELECT status FROM pending_ingests "
+                "WHERE turn_id = 'durable-receipt-turn'"
+            ).fetchone() == ("indexed",)
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM ingest_chunk_reservations "
+                "WHERE turn_id = 'durable-receipt-turn'"
+            ).fetchone()[0] == len(chunks)
+
+    def test_v12_migration_seals_chunks_but_leaves_raw_turn_claimable(
+        self, tmp_path
+    ):
+        data_dir = tmp_path / "v12-ingest-migration"
+        indexed_text = (
+            "Eta one two three. Theta four five six. "
+            "Iota seven eight nine."
+        )
+        raw_text = "The raw teal legacy turn has never been indexed."
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+            chunker_max_tokens=5,
+        ) as seeded:
+            _turn, indexed_chunks = seeded.ingest(
+                "user",
+                indexed_text,
+                created_at=source_time,
+                turn_id="migrated-indexed-turn",
+            )
+            seeded.transcript.append(
+                "user",
+                raw_text,
+                created_at=source_time,
+                turn_id="migrated-raw-turn",
+            )
+
+        raw = sqlite3.connect(data_dir / "memory.db")
+        raw.execute("DROP TABLE ingest_chunk_reservations")
+        raw.execute("DROP TABLE pending_ingests")
+        raw.execute(
+            "UPDATE meta SET value = '12' WHERE key = 'schema_version'"
+        )
+        raw.commit()
+        raw.close()
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+            chunker_max_tokens=100,
+        ) as migrated:
+            assert migrated._db.execute(
+                "SELECT status FROM pending_ingests "
+                "WHERE turn_id = 'migrated-indexed-turn'"
+            ).fetchone() == ("indexed",)
+            assert migrated._db.execute(
+                "SELECT COUNT(*) FROM ingest_chunk_reservations "
+                "WHERE turn_id = 'migrated-indexed-turn'"
+            ).fetchone()[0] == len(indexed_chunks)
+            assert migrated._pending_ingests.get("migrated-raw-turn") is None
+            with pytest.raises(ValueError, match="different pending chunk manifest"):
+                migrated.ingest(
+                    "user",
+                    indexed_text,
+                    created_at=source_time,
+                    turn_id="migrated-indexed-turn",
+                )
+
+            _raw_turn, raw_chunks = migrated.ingest(
+                "user",
+                raw_text,
+                created_at=source_time,
+                turn_id="migrated-raw-turn",
+            )
+            assert raw_chunks
+            assert migrated._db.execute(
+                "SELECT status FROM pending_ingests "
+                "WHERE turn_id = 'migrated-raw-turn'"
+            ).fetchone() == ("indexed",)
+            assert migrated._db.execute("SELECT COUNT(*) FROM chunks").fetchone()[
+                0
+            ] == len(indexed_chunks) + len(raw_chunks)
+
+    def test_v12_migration_never_replays_a_retired_chunk(self, tmp_path):
+        data_dir = tmp_path / "v12-retired-migration"
+        text = "The retired maroon evidence must stay absent after migration."
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as seeded:
+            _turn, chunks = seeded.ingest(
+                "user",
+                text,
+                created_at=source_time,
+                turn_id="legacy-retired-turn",
+            )
+            assert chunks
+            for chunk in chunks:
+                assert seeded.retriever.delete_chunk(chunk.chunk_id)
+
+        raw = sqlite3.connect(data_dir / "memory.db")
+        raw.execute("DROP TABLE ingest_chunk_reservations")
+        raw.execute("DROP TABLE pending_ingests")
+        raw.execute(
+            "UPDATE meta SET value = '12' WHERE key = 'schema_version'"
+        )
+        raw.commit()
+        raw.close()
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as migrated:
+            assert migrated._db.execute(
+                "SELECT status FROM pending_ingests "
+                "WHERE turn_id = 'legacy-retired-turn'"
+            ).fetchone() == ("indexed",)
+            assert migrated.pending_ingest_count() == 0
+            assert migrated.recover_pending_ingests() == []
+            assert migrated._db.execute(
+                "SELECT embedding, hnsw_label, term_count FROM chunks"
+            ).fetchall() == [(None, None, None)]
+            assert migrated.search_hybrid("retired maroon", k=3) == []
+
+    def test_indexed_receipt_prevents_exact_retry_from_resurrecting_retirement(
+        self, tmp_path
+    ):
+        text = "The retired indigo evidence must survive an exact live retry."
+        source_time = datetime(2024, 5, 1, tzinfo=timezone.utc)
+        with MemoryCondenser(
+            data_dir=tmp_path / "live-retired-retry",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            turn, chunks = condenser.ingest(
+                "user",
+                text,
+                created_at=source_time,
+                turn_id="live-retired-turn",
+            )
+            assert chunks
+            for chunk in chunks:
+                assert condenser.retriever.delete_chunk(chunk.chunk_id)
+
+            retried_turn, retried_chunks = condenser.ingest(
+                "user",
+                text,
+                created_at=source_time,
+                turn_id="live-retired-turn",
+            )
+
+            assert retried_turn == turn
+            assert [chunk.chunk_id for chunk in retried_chunks] == [
+                chunk.chunk_id for chunk in chunks
+            ]
+            assert condenser.pending_ingest_count() == 0
+            assert condenser._db.execute(
+                "SELECT embedding, hnsw_label, term_count FROM chunks"
+            ).fetchall() == [(None, None, None)]
+            assert condenser.search_hybrid("retired indigo", k=3) == []
+
+    def test_existing_turn_retry_heals_failed_index_publication(
+        self, tmp_path, monkeypatch
+    ):
+        with MemoryCondenser(
+            data_dir=tmp_path / "existing-turn-retry",
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as condenser:
+            condenser.transcript.append(
+                "user",
+                "The existing amber turn must become searchable.",
+                turn_id="old-turn",
+            )
+            original = condenser.retriever._lexical.add_chunks
+            calls = 0
+
+            def fail_once(chunks, *, commit=True, validate_identity=True):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("synthetic lexical failure")
+                return original(
+                    chunks,
+                    commit=commit,
+                    validate_identity=validate_identity,
+                )
+
+            monkeypatch.setattr(
+                condenser.retriever._lexical, "add_chunks", fail_once
+            )
+            with pytest.raises(RuntimeError, match="synthetic lexical failure"):
+                condenser.ingest(
+                    "user",
+                    "The existing amber turn must become searchable.",
+                    turn_id="old-turn",
+                )
+
+            assert condenser.transcript.count() == 1
+            assert condenser.pending_ingest_count() == 1
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
+            assert condenser.retriever._chunk_id_to_label == {}
+
+            _turn, chunks = condenser.ingest(
+                "user",
+                "The existing amber turn must become searchable.",
+                turn_id="old-turn",
+            )
+            row = condenser._db.execute(
+                "SELECT embedding, hnsw_label, term_count FROM chunks "
+                "WHERE chunk_id = ?",
+                (chunks[0].chunk_id,),
+            ).fetchone()
+            assert row[0] is not None and row[1] is not None and row[2] is not None
+            assert condenser.pending_ingest_count() == 0
+            assert condenser.search_hybrid("existing amber", k=1)
+
+    def test_default_rebuild_repairs_dense_live_chunk_after_restart(self, tmp_path):
+        data_dir = tmp_path / "legacy-dense-only"
+        text = "The legacy violet chunk needs its lexical owner repaired."
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as first:
+            _turn, chunks = first.ingest("user", text, turn_id="legacy-turn")
+            chunk_id = chunks[0].chunk_id
+            first._db.execute(
+                "DELETE FROM chunk_terms WHERE chunk_id = ?", (chunk_id,)
+            )
+            first._db.execute(
+                "UPDATE chunks SET term_count = NULL WHERE chunk_id = ?",
+                (chunk_id,),
+            )
+            first._db.commit()
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            auto_extract=False,
+            chunker_min_tokens=1,
+        ) as reopened:
+            assert reopened.retriever._lexical.rebuild() == 1
+            term_count = reopened._db.execute(
+                "SELECT term_count FROM chunks WHERE chunk_id = ?", (chunk_id,)
+            ).fetchone()[0]
+            postings = reopened._db.execute(
+                "SELECT COUNT(*) FROM chunk_terms WHERE chunk_id = ?", (chunk_id,)
+            ).fetchone()[0]
+
+            assert term_count is not None
+            assert postings > 0
+            assert reopened.search_hybrid("legacy violet", k=1)
+
     def test_ingest_many_keeps_auto_extraction_turn_causal(self, tmp_path):
         with MemoryCondenser(
             data_dir=tmp_path / "causal-batch",
@@ -2273,11 +3768,68 @@ class TestRetrieval:
                 linked.chunk.chunk_id: 1.0,
             },
         )
+        anchor_node = ConsolidationNode.chunk(first.chunk.chunk_id)
+        linked_node = ConsolidationNode.chunk(linked.chunk.chunk_id)
+        for repetition in range(2):
+            populated.consolidation.observe(
+                f"delete-consolidation-{repetition}",
+                {anchor_node: 1.0, linked_node: 0.9},
+                causal_targets=[linked_node],
+            )
+        assert [
+            neighbor.node for neighbor in populated.consolidation.neighbors(
+                {anchor_node: 1.0}, top_k=2
+            )
+        ] == [linked_node]
 
         assert populated.retriever.delete_chunk(linked.chunk.chunk_id) is True
         assert populated.associations.stats(artifact.artifact_id)["signatures"] == 0
         assert populated.associations.stats(artifact.artifact_id)["edges"] == 0
         assert populated.associations.hebbian_stats(artifact.artifact_id)["edges"] == 0
+        assert populated._db.execute(
+            "SELECT COUNT(*) FROM consolidation_nodes WHERE chunk_id = ?",
+            (linked.chunk.chunk_id,),
+        ).fetchone()[0] == 0
+        assert populated._db.execute(
+            "SELECT COUNT(*) FROM consolidation_edges "
+            "WHERE node_low = ? OR node_high = ?",
+            (linked_node.key, linked_node.key),
+        ).fetchone()[0] == 0
+        assert populated.consolidation.neighbors(
+            {anchor_node: 1.0}, top_k=2
+        ) == ()
+
+    def test_retriever_deletion_rolls_back_all_sqlite_state_on_cleanup_failure(
+        self, populated, monkeypatch
+    ):
+        linked = populated.search_hybrid("SQLite storage", k=1)[0]
+        chunk_id = linked.chunk.chunk_id
+        before = populated._db.execute(
+            "SELECT embedding, hnsw_label, term_count FROM chunks WHERE chunk_id = ?",
+            (chunk_id,),
+        ).fetchone()
+        postings = populated._db.execute(
+            "SELECT COUNT(*) FROM chunk_terms WHERE chunk_id = ?", (chunk_id,)
+        ).fetchone()[0]
+        original = populated.retriever._lexical.delete_chunk
+
+        def fail_after_lexical_sql(selected_id, *, commit=True):
+            original(selected_id, commit=False)
+            raise RuntimeError("synthetic cleanup failure")
+
+        monkeypatch.setattr(populated.retriever._lexical, "delete_chunk", fail_after_lexical_sql)
+        with pytest.raises(RuntimeError, match="synthetic cleanup failure"):
+            populated.retriever.delete_chunk(chunk_id)
+
+        after = populated._db.execute(
+            "SELECT embedding, hnsw_label, term_count FROM chunks WHERE chunk_id = ?",
+            (chunk_id,),
+        ).fetchone()
+        assert after == before
+        assert populated._db.execute(
+            "SELECT COUNT(*) FROM chunk_terms WHERE chunk_id = ?", (chunk_id,)
+        ).fetchone()[0] == postings
+        assert populated.search_hybrid("SQLite storage", k=3)
 
 
 class TestContextAssembly:
@@ -3138,6 +4690,189 @@ class TestContextAssembly:
             for i in populated.memory.list_items()
         }
         assert after == before
+
+    def test_read_only_default_build_preserves_packed_memory_without_feedback(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "read-only-packed-memory"
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+        ) as writable:
+            for role, text in CONVERSATION:
+                writable.ingest(role, text)
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            read_only=True,
+        ) as read_only:
+            kwargs = {
+                "recent_turns": 0,
+                "k_expansions": 0,
+                "use_consolidation": False,
+            }
+            expected = read_only.build_context(
+                "What storage decision did we make?",
+                reheat_memories=False,
+                learn_consolidation=False,
+                **kwargs,
+            )
+            assert expected.direct_memory_ids
+
+            monkeypatch.setattr(
+                read_only.memory,
+                "touch_many",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "read-only build attempted memory reheating"
+                ),
+            )
+            monkeypatch.setattr(
+                read_only.consolidation,
+                "observe",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "read-only build attempted consolidation learning"
+                ),
+            )
+
+            observed = read_only.build_context(
+                "What storage decision did we make?",
+                **kwargs,
+            )
+
+            assert observed == expected
+            assert observed.consolidation_learned is False
+
+    def test_read_only_default_build_preserves_direct_chunk_without_learning(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "read-only-direct-chunk"
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+        ) as writable:
+            _turn, chunks = writable.ingest(
+                "user",
+                "The cedar archive uses SQLite for its durable catalog.",
+            )
+            chunk_id = chunks[0].chunk_id
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            read_only=True,
+        ) as read_only:
+            direct = read_only.retriever.hydrate_chunk(
+                chunk_id,
+                score=1.0,
+                route="read_only_direct_fixture",
+            )
+            assert direct is not None
+            kwargs = {
+                "recent_turns": 0,
+                "k_memories": 0,
+                "k_expansions": 0,
+                "use_consolidation": False,
+                "expansion_results": [direct],
+            }
+            expected = read_only.build_context(
+                "Which database backs the cedar archive?",
+                reheat_memories=False,
+                learn_consolidation=False,
+                **kwargs,
+            )
+            assert expected.direct_expansion_chunk_ids == [chunk_id]
+
+            monkeypatch.setattr(
+                read_only.consolidation,
+                "observe",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "read-only build attempted direct-chunk learning"
+                ),
+            )
+
+            observed = read_only.build_context(
+                "Which database backs the cedar archive?",
+                **kwargs,
+            )
+
+            assert observed == expected
+            assert observed.consolidation_learned is False
+
+    def test_read_only_associative_default_suppresses_touch(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "read-only-associative"
+        artifact = association_artifact()
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+        ) as writable:
+            for role, text in CONVERSATION:
+                writable.ingest(role, text)
+            baseline = writable.search_hybrid("SQLite storage", k=3)
+            source = baseline[0].chunk.chunk_id
+            linked = baseline[2].chunk.chunk_id
+            writable.associations.register_artifact(artifact)
+            writable.associations.upsert_edge(
+                source,
+                linked,
+                artifact.artifact_id,
+                [0.9, 0.2, 0.1, 0.1],
+                qk_score=0.9,
+            )
+
+        with MemoryCondenser(
+            data_dir=data_dir,
+            embedder=FakeEmbedder(),
+            read_only=True,
+        ) as read_only:
+            kwargs = {
+                "k": 2,
+                "association_slots": 1,
+            }
+            expected = read_only.search_associative(
+                "SQLite storage",
+                artifact.artifact_id,
+                touch=False,
+                **kwargs,
+            )
+            assert expected[1].route == "qk"
+            anchors = read_only.search_hybrid("SQLite storage", k=2)
+            expected_direct = read_only.expand_associative(
+                anchors,
+                artifact.artifact_id,
+                touch=False,
+                **kwargs,
+            )
+
+            monkeypatch.setattr(
+                read_only.associations,
+                "touch_edges",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "read-only associative retrieval touched edges"
+                ),
+            )
+            monkeypatch.setattr(
+                read_only.associations,
+                "touch_signatures",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "read-only associative retrieval touched signatures"
+                ),
+            )
+            observed = read_only.search_associative(
+                "SQLite storage",
+                artifact.artifact_id,
+                **kwargs,
+            )
+            observed_direct = read_only.expand_associative(
+                anchors,
+                artifact.artifact_id,
+                **kwargs,
+            )
+
+            assert observed == expected
+            assert observed_direct == expected_direct
 
     def test_context_build_learns_only_the_items_that_reach_the_prompt(
         self, populated

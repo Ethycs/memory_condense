@@ -53,9 +53,62 @@ def test_terminal_defaults_to_frozen_authenticated_episode_resolution() -> None:
 
     assert args.auto_resolve_episode_artifact is True
     assert args.episode_artifact_id is None
+    assert args.terminal_compilation_mode == terminal_cli.TERMINAL_COMPILATION_MODE_V2
+    assert terminal_cli.output_root_for_args(args) == terminal_cli.DEFAULT_OUTPUT_ROOT
     terminal_cli._require_frozen_episode_resolution(  # noqa: SLF001
         _frozen_episode_payload(), args
     )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_format", "expected_features"),
+    (
+        (
+            terminal_cli.TERMINAL_COMPILATION_MODE_V4,
+            terminal_cli.BACKFILL_FORMAT,
+            (False, True),
+        ),
+        (
+            terminal_cli.TERMINAL_COMPILATION_MODE_V5,
+            terminal_cli.LINKED_BACKFILL_FORMAT,
+            (True, True),
+        ),
+    ),
+)
+def test_backfill_cli_modes_use_distinct_successor_default_roots(
+    mode: str,
+    expected_format: str,
+    expected_features: tuple[bool, bool],
+) -> None:
+    args = terminal_cli.build_parser().parse_args(
+        [
+            "construct",
+            "--ordinals",
+            *map(str, terminal_cli.EXACT_ORDINALS),
+            "--terminal-compilation-mode",
+            mode,
+        ]
+    )
+
+    assert terminal_cli.terminal_compilation_format(args) == expected_format
+    assert terminal_cli.terminal_compilation_features(mode) == expected_features
+    assert args.output_root == terminal_cli.DEFAULT_OUTPUT_ROOT
+    assert terminal_cli.output_root_for_args(args) == (
+        terminal_cli.DEFAULT_OUTPUT_ROOT_BY_MODE[mode]
+    )
+    assert terminal_cli.output_root_for_args(args) != terminal_cli.DEFAULT_OUTPUT_ROOT
+
+
+def test_backfill_successor_default_roots_cannot_collide() -> None:
+    roots = {
+        terminal_cli.DEFAULT_OUTPUT_ROOT_BY_MODE[mode]
+        for mode in (
+            terminal_cli.TERMINAL_COMPILATION_MODE_V2,
+            terminal_cli.TERMINAL_COMPILATION_MODE_V4,
+            terminal_cli.TERMINAL_COMPILATION_MODE_V5,
+        )
+    }
+    assert len(roots) == 3
 
 
 def test_terminal_rejects_disabled_episode_resolution_before_rebuild() -> None:

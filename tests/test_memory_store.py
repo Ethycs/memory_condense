@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import timedelta
 
 import numpy as np
@@ -5,6 +6,7 @@ import pytest
 
 from memory_condense.domain import decay
 from memory_condense.persistence.memory_store import MemoryStore
+from memory_condense.persistence.db import Database
 from memory_condense.domain.schemas import (
     CreateOp,
     DeleteOp,
@@ -56,6 +58,33 @@ class StubEmbedder:
         return np.asarray(self.table.get(query, [0.0, 0.0, 0.0, 1.0]), dtype=np.float32)
 
 
+class FailingEmbedder:
+    def embed_query(self, _query):
+        raise RuntimeError("embedding failed")
+
+
+def test_read_only_supersede_rejects_before_embedding(tmp_path):
+    path = tmp_path / "read-only-memory.db"
+    with Database(path) as writable:
+        source = TranscriptStore(writable).append("user", TEXT)
+        old = MemoryStore(writable).create(make_create(source.turn_id))
+
+    embedder = StubEmbedder()
+    with Database(path, read_only=True) as readonly:
+        read_store = MemoryStore(readonly, embedder=embedder)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            read_store.supersede(
+                SupersedeOp(
+                    mem_id=old.mem_id,
+                    replacement=make_create(
+                        source.turn_id, content="A replacement must not embed."
+                    ),
+                )
+            )
+
+    assert embedder.calls == []
+
+
 # ----------------------------------------------------------------------
 # create / get / list
 # ----------------------------------------------------------------------
@@ -91,6 +120,62 @@ def test_create_persists_provenance(store, turn):
         "dark mode",
     }
     assert any(p.chunk_id == "c1" for p in loaded.provenance)
+
+
+def test_create_provenance_failure_cannot_publish_item(store, db, turn):
+    db.execute(
+        "CREATE TEMP TRIGGER fail_memory_provenance "
+        "BEFORE INSERT ON memory_provenance BEGIN "
+        "SELECT RAISE(ABORT, 'synthetic provenance failure'); END"
+    )
+    db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="provenance failure"):
+        store.create(make_create(turn.turn_id), dedupe=False)
+
+    db.execute("DROP TRIGGER fail_memory_provenance")
+    db.commit()
+    assert store.count(status=None) == 0
+
+
+def test_concurrent_exact_create_rechecks_under_write_lock(tmp_path, monkeypatch):
+    path = tmp_path / "concurrent-memory.db"
+    db_a, db_b = Database(path), Database(path)
+    first_turn = TranscriptStore(db_a).append("user", TEXT)
+    second_turn = TranscriptStore(db_b).append("user", TEXT)
+    first, second = MemoryStore(db_a), MemoryStore(db_b)
+    original_build = first._build_item
+    interleaved = False
+
+    def build_after_other_writer(
+        op, *, embedding=None, half_life_turns=30.0, supersedes=None
+    ):
+        nonlocal interleaved
+        if not interleaved:
+            interleaved = True
+            second.create(
+                make_create(second_turn.turn_id, content="one concurrent fact")
+            )
+        return original_build(
+            op,
+            embedding=embedding,
+            half_life_turns=half_life_turns,
+            supersedes=supersedes,
+        )
+
+    monkeypatch.setattr(first, "_build_item", build_after_other_writer)
+    merged = first.create(
+        make_create(first_turn.turn_id, content="one concurrent fact")
+    )
+
+    active = first.list_items(status=MemoryStatus.ACTIVE)
+    assert [item.mem_id for item in active] == [merged.mem_id]
+    assert {citation.turn_id for citation in merged.provenance} == {
+        first_turn.turn_id,
+        second_turn.turn_id,
+    }
+    db_a.close()
+    db_b.close()
 
 
 def test_seed_energy_follows_importance(store, turn):
@@ -177,6 +262,33 @@ def test_update_appends_provenance(store, turn):
     assert len(updated.provenance) == 2
 
 
+def test_update_provenance_failure_rolls_back_content(store, db, turn):
+    item = store.create(make_create(turn.turn_id, content="before"))
+    db.execute(
+        "CREATE TEMP TRIGGER fail_memory_update_provenance "
+        "BEFORE INSERT ON memory_provenance BEGIN "
+        "SELECT RAISE(ABORT, 'synthetic update provenance failure'); END"
+    )
+    db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="update provenance failure"):
+        store.update(
+            UpdateOp(
+                mem_id=item.mem_id,
+                content="after",
+                details="must roll back",
+                provenance=[Provenance(turn_id=turn.turn_id, quote="Postgres")],
+            )
+        )
+
+    db.execute("DROP TRIGGER fail_memory_update_provenance")
+    db.commit()
+    unchanged = store.get(item.mem_id)
+    assert unchanged.content == "before"
+    assert unchanged.details is None
+    assert unchanged.provenance == item.provenance
+
+
 def test_update_missing_returns_none(store):
     assert store.update(UpdateOp(mem_id="ghost", content="x")) is None
 
@@ -201,6 +313,82 @@ def test_supersede_keeps_old_row_with_superseded_status(store, turn):
 def test_supersede_missing_returns_none(store, turn):
     op = SupersedeOp(mem_id="ghost", replacement=make_create(turn.turn_id))
     assert store.supersede(op) is None
+
+
+def test_supersede_embedding_failure_leaves_predecessor_active(db, turn):
+    store = MemoryStore(db, embedder=FailingEmbedder())
+    old = store.create(make_create(turn.turn_id, content="old"), embedding=[1.0])
+
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        store.supersede(
+            SupersedeOp(
+                mem_id=old.mem_id,
+                replacement=make_create(turn.turn_id, content="replacement"),
+            )
+        )
+
+    assert store.get(old.mem_id).status is MemoryStatus.ACTIVE
+    assert store.count() == 1
+
+
+def test_supersede_insert_failure_rolls_back_retirement(store, turn, monkeypatch):
+    old = store.create(make_create(turn.turn_id, content="old"))
+    original_insert = store._insert
+
+    def fail_after_insert(item, *, commit=True):
+        original_insert(item, commit=False)
+        raise RuntimeError("insert publication failed")
+
+    monkeypatch.setattr(store, "_insert", fail_after_insert)
+    with pytest.raises(RuntimeError, match="publication failed"):
+        store.supersede(
+            SupersedeOp(
+                mem_id=old.mem_id,
+                replacement=make_create(turn.turn_id, content="replacement"),
+            )
+        )
+
+    assert store.get(old.mem_id).status is MemoryStatus.ACTIVE
+    assert store.count() == 1
+
+
+def test_create_supersedes_uses_atomic_lifecycle_and_rejects_ghost(store, turn):
+    old = store.create(make_create(turn.turn_id, content="old"))
+    new = store.create(
+        make_create(turn.turn_id, content="replacement"),
+        supersedes=old.mem_id,
+    )
+
+    assert new.supersedes == old.mem_id
+    assert store.get(old.mem_id).status is MemoryStatus.SUPERSEDED
+    with pytest.raises(ValueError, match="must name an active memory item"):
+        store.create(
+            make_create(turn.turn_id, content="ghost replacement"),
+            supersedes="ghost",
+        )
+    assert store.count() == 2
+
+
+def test_supersede_rejects_an_already_retired_predecessor(store, turn):
+    old = store.create(make_create(turn.turn_id, content="old"))
+    first = store.supersede(
+        SupersedeOp(
+            mem_id=old.mem_id,
+            replacement=make_create(turn.turn_id, content="first replacement"),
+        )
+    )
+
+    assert first is not None
+    assert (
+        store.supersede(
+            SupersedeOp(
+                mem_id=old.mem_id,
+                replacement=make_create(turn.turn_id, content="second replacement"),
+            )
+        )
+        is None
+    )
+    assert store.count() == 2
 
 
 def test_delete_is_soft(store, turn):
@@ -751,6 +939,57 @@ class TestDedup:
         assert new.supersedes == old.mem_id
         assert store.get(old.mem_id).status is MemoryStatus.SUPERSEDED
 
+    def test_supersede_coalesces_unrelated_active_duplicate_without_losing_chains(
+        self, store, db, turn
+    ):
+        prior = store.create(make_create(turn.turn_id, content="prior value"))
+        duplicate_turn = TranscriptStore(db).append(
+            "user", "The canonical replacement is independently supported."
+        )
+        duplicate = store.supersede(
+            SupersedeOp(
+                mem_id=prior.mem_id,
+                replacement=make_create(
+                    duplicate_turn.turn_id,
+                    quote="canonical replacement",
+                    content="canonical value",
+                ),
+            )
+        )
+        old = store.create(make_create(turn.turn_id, content="old value"))
+
+        fresh = store.supersede(
+            SupersedeOp(
+                mem_id=old.mem_id,
+                replacement=make_create(
+                    turn.turn_id,
+                    quote="dark mode",
+                    content="canonical value",
+                ),
+            )
+        )
+
+        assert fresh is not None
+        assert fresh.mem_id not in {old.mem_id, duplicate.mem_id}
+        assert fresh.supersedes == old.mem_id
+        assert store.get(old.mem_id).status is MemoryStatus.SUPERSEDED
+        retired_duplicate = store.get(duplicate.mem_id)
+        assert retired_duplicate.status is MemoryStatus.SUPERSEDED
+        assert retired_duplicate.supersedes == prior.mem_id
+        assert [item.mem_id for item in store.successors(old.mem_id)] == [fresh.mem_id]
+        assert [item.mem_id for item in store.successors(duplicate.mem_id)] == [
+            fresh.mem_id
+        ]
+        assert {
+            item.mem_id
+            for item in store.list_items()
+            if item.content == "canonical value"
+        } == {fresh.mem_id}
+        assert {citation.turn_id for citation in fresh.provenance} == {
+            turn.turn_id,
+            duplicate_turn.turn_id,
+        }
+
     def test_apply_reports_duplicates(self, store, turn):
         ops = MemoryOps(
             create=[
@@ -775,14 +1014,56 @@ class TestDedup:
         assert len(active) == 1
         survivor = active[0].mem_id
         assert survivor in {a.mem_id, b.mem_id, c.mem_id}
-        # Nothing destroyed; the losers point at the survivor.
+        # Nothing destroyed; supplemental forward redirects point at the
+        # survivor without reversing the scalar revision-link direction.
         for item in store.list_items(status=MemoryStatus.SUPERSEDED):
-            assert item.supersedes == survivor
+            assert item.supersedes is None
+            assert [successor.mem_id for successor in store.successors(item.mem_id)] == [
+                survivor
+            ]
 
     def test_dedupe_existing_is_a_no_op_on_a_clean_store(self, store, turn):
         store.create(make_create(turn.turn_id, content="one"))
         store.create(make_create(turn.turn_id, content="two"))
         assert store.dedupe_existing() == 0
+
+    @pytest.mark.parametrize(
+        ("loser_created", "survivor_created"),
+        [
+            ("2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00"),
+            ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        ],
+        ids=["ordered", "equal-time"],
+    )
+    def test_successors_reads_pre_v12_reversed_dedupe_links(
+        self, store, db, turn, loser_created, survivor_created
+    ):
+        loser = store.create(
+            make_create(turn.turn_id, content="legacy duplicate"), dedupe=False
+        )
+        survivor = store.create(
+            make_create(turn.turn_id, content="legacy duplicate"), dedupe=False
+        )
+        db.execute(
+            "UPDATE memory_items SET created_at = ? WHERE mem_id = ?",
+            (loser_created, loser.mem_id),
+        )
+        db.execute(
+            "UPDATE memory_items SET created_at = ? WHERE mem_id = ?",
+            (survivor_created, survivor.mem_id),
+        )
+        # Layout written by the old maintenance path: loser.supersedes points
+        # forward at the active survivor instead of backward at a predecessor.
+        db.execute(
+            "UPDATE memory_items SET status = ?, supersedes = ? WHERE mem_id = ?",
+            (MemoryStatus.SUPERSEDED.value, survivor.mem_id, loser.mem_id),
+        )
+        db.commit()
+
+        assert [item.mem_id for item in store.successors(loser.mem_id)] == [
+            survivor.mem_id
+        ]
+        assert store.successors(survivor.mem_id) == []
 
     def test_updating_content_moves_the_identity(self, store, turn):
         item = store.create(make_create(turn.turn_id, content="before"))

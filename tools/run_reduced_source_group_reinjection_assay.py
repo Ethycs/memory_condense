@@ -490,15 +490,23 @@ def build_assay(args: argparse.Namespace) -> dict[str, Any]:
             "R7 lifecycle rows",
         )
     }
-    semantic_policy = residual.SemanticResidualPolicy(
-        max_cell_tokens=int(args.max_cell_tokens),
-        payload_token_cap=sources[8].residual_payload_token_cap,
-        cosine_upper_bound_floor=float(args.cosine_upper_bound_floor),
-        specificity_upper_bound_ratio=float(args.specificity_upper_bound_ratio),
-        dual_gate_enabled=bool(args.dual_gate_enabled),
-    )
+    try:
+        semantic_policy = residual.semantic_residual_policy_from_projection(
+            r7_payload.get("residual_search_policy")
+        )
+    except residual.SemanticResidualSearchError as exc:
+        raise ReducedSourceGroupReinjectionAssayError(
+            "R7 semantic policy authentication failed"
+        ) from exc
     _require(
-        semantic_policy.projection() == r7_payload.get("residual_search_policy")
+        semantic_policy.max_cell_tokens == int(args.max_cell_tokens)
+        and semantic_policy.payload_token_cap
+        == sources[8].residual_payload_token_cap
+        and semantic_policy.cosine_upper_bound_floor
+        == float(args.cosine_upper_bound_floor)
+        and semantic_policy.specificity_upper_bound_ratio
+        == float(args.specificity_upper_bound_ratio)
+        and semantic_policy.dual_gate_enabled is bool(args.dual_gate_enabled)
         and query_preflight.sha256
         == _exact_dict(
             r7_payload.get("resident_index_lifecycle"), "R7 lifecycle"

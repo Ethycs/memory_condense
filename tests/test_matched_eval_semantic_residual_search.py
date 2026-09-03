@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from memory_condense.application.discourse_sources import scan_discourse_source_chunks
 from memory_condense.domain._tokenizer import count_tokens
@@ -19,7 +20,17 @@ from tools.matched_eval.full_store_slot_closure import build_full_store_window_i
 from tools.matched_eval.query_expansion import FrozenSourceNamespace
 from tools.matched_eval.query_guided_scan import cache_namespace_partitions
 from tools.matched_eval.semantic_residual_search import (
+    EVIDENCE_CONSERVING_DECISION_AUDIT_FORMAT,
+    EVIDENCE_CONSERVING_MECHANISM_ID,
+    EVIDENCE_CONSERVING_POLICY_FORMAT,
+    EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
+    EVIDENCE_CONSERVING_RESULT_FORMAT,
+    LEGACY_RESIDUAL_CLASSIFIER_MODE,
+    MECHANISM_ID,
+    POLICY_FORMAT,
+    RESULT_FORMAT,
     SemanticResidualPolicy,
+    SemanticResidualSearchError,
     TYPED_ADAPTER_MECHANISM_ID,
     adapt_semantic_residual_to_typed_contribution,
     build_semantic_residual_index,
@@ -28,6 +39,7 @@ from tools.matched_eval.semantic_residual_search import (
     replay_semantic_residual_search,
     search_semantic_residual,
     semantic_residual_query_facets,
+    semantic_residual_policy_from_projection,
     validate_semantic_residual_search_projection,
 )
 from tools.matched_eval.typed_operator_adapter import (
@@ -95,6 +107,7 @@ def _build(
     max_cell_tokens: int = 256,
     payload_token_cap: int = 500,
     floor: float = 0.4,
+    classifier_mode: str = EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
 ):
     cache = _write_cache(tmp_path / f"{name}.db", rows)
     window_index = build_full_store_window_index(cache)
@@ -102,6 +115,7 @@ def _build(
         max_cell_tokens=max_cell_tokens,
         payload_token_cap=payload_token_cap,
         cosine_upper_bound_floor=floor,
+        classifier_mode=classifier_mode,
     )
     return build_semantic_residual_index(window_index, vectors, policy=policy)
 
@@ -154,6 +168,134 @@ def _source_ids(result) -> set[str]:
 
 def _filler(word: str, count: int = 180) -> str:
     return " ".join(f"{word}{index}" for index in range(count)) + "."
+
+
+def test_classifier_modes_have_distinct_authenticated_policy_identities() -> None:
+    successor = SemanticResidualPolicy()
+    legacy = SemanticResidualPolicy(
+        classifier_mode=LEGACY_RESIDUAL_CLASSIFIER_MODE
+    )
+
+    legacy_body = {
+        "bounded_packing_algorithm": residual_module.BOUNDED_PACKING_ALGORITHM,
+        "cosine_upper_bound_floor": legacy.cosine_upper_bound_floor,
+        "dual_gate_enabled": legacy.dual_gate_enabled,
+        "format": POLICY_FORMAT,
+        "gold_loaded": False,
+        "max_cell_tokens": legacy.max_cell_tokens,
+        "mechanism_id": MECHANISM_ID,
+        "new_provider_calls": 0,
+        "payload_token_cap": legacy.payload_token_cap,
+        "retained_transformer_token_state_bytes": 0,
+        "specificity_upper_bound_ratio": legacy.specificity_upper_bound_ratio,
+        "terminal_after_specialist_selection": True,
+    }
+    assert legacy.projection() == {
+        **legacy_body,
+        "receipt_sha256": identity_sha256(legacy_body),
+    }
+    assert "classifier_mode" not in legacy.projection()
+    assert successor.projection()["classifier_mode"] == (
+        EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE
+    )
+    assert successor.projection()["format"] == EVIDENCE_CONSERVING_POLICY_FORMAT
+    assert successor.projection()["mechanism_id"] == EVIDENCE_CONSERVING_MECHANISM_ID
+    assert successor.receipt_sha256 != legacy.receipt_sha256
+    assert semantic_residual_policy_from_projection(
+        legacy.projection()
+    ).classifier_mode == LEGACY_RESIDUAL_CLASSIFIER_MODE
+    assert semantic_residual_policy_from_projection(
+        successor.projection()
+    ).classifier_mode == EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE
+
+
+def test_classifier_mode_tamper_fails_even_when_policy_receipt_is_resealed() -> None:
+    tampered = SemanticResidualPolicy().projection()
+    tampered["classifier_mode"] = LEGACY_RESIDUAL_CLASSIFIER_MODE
+    body = {
+        key: value for key, value in tampered.items() if key != "receipt_sha256"
+    }
+    tampered["receipt_sha256"] = identity_sha256(body)
+
+    with pytest.raises(
+        SemanticResidualSearchError,
+        match="successor classifier identity changed",
+    ):
+        semantic_residual_policy_from_projection(tampered)
+
+
+def test_legacy_prunes_same_dual_gate_that_successor_keeps_fail_open(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        ("p0::bike", "My touring bicycle is cobalt blue.", BASE, "user"),
+        (
+            "p1::noise",
+            "Quartz mineral catalog inventory notes.",
+            BASE + timedelta(days=1),
+            "user",
+        ),
+    ]
+    vectors = {"p0::bike": [1.0, 0.0], "p1::noise": [-1.0, 0.0]}
+    legacy_index = _build(
+        tmp_path,
+        "legacy-mode",
+        rows,
+        vectors,
+        classifier_mode=LEGACY_RESIDUAL_CLASSIFIER_MODE,
+    )
+    successor_index = _build(
+        tmp_path,
+        "successor-mode",
+        rows,
+        vectors,
+    )
+    question = (
+        "[Question asked at 2026/08/27 12:00] "
+        "What color is my touring bicycle?"
+    )
+
+    def classify_noise(index):
+        query = _compile(index, question, [[1.0, 0.0]])
+        classifier = residual_module._ConservativeResidualClassifier(index, query)
+        noise_cell = next(row for row in index.cells if row.source_id == "p1::noise")
+        noise_node = next(
+            node
+            for node in index.core_tree.nodes
+            if node.is_leaf and node.cell_ids == (noise_cell.cell_id,)
+        )
+        decision = classifier.classify(
+            question=question,
+            node=noise_node,
+            call_ordinal=0,
+        )
+        return decision, classifier.audits[0]
+
+    legacy_decision, legacy_audit = classify_noise(legacy_index)
+    successor_decision, successor_audit = classify_noise(successor_index)
+    assert legacy_audit.reason == successor_audit.reason == "dual_gate"
+    assert legacy_decision.branch_classification == "definitely_no"
+    assert successor_decision.branch_classification == "may_answer"
+    assert legacy_audit.projection()["format"] == (
+        residual_module.DECISION_AUDIT_FORMAT
+    )
+    assert successor_audit.projection()["format"] == (
+        EVIDENCE_CONSERVING_DECISION_AUDIT_FORMAT
+    )
+
+    legacy_result = search_semantic_residual(
+        legacy_index, _compile(legacy_index, question, [[1.0, 0.0]])
+    )
+    successor_result = search_semantic_residual(
+        successor_index, _compile(successor_index, question, [[1.0, 0.0]])
+    )
+    assert legacy_result.projection()["format"] == RESULT_FORMAT
+    assert successor_result.projection()["format"] == (
+        EVIDENCE_CONSERVING_RESULT_FORMAT
+    )
+    assert successor_result.projection()["classifier_mode"] == (
+        EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE
+    )
 
 
 def test_classifier_materializes_manifest_index_once_without_one_use_term_caches(

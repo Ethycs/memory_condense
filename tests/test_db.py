@@ -65,6 +65,9 @@ class TestFreshDatabase:
             "chunk_terms",
             "memory_items",
             "memory_provenance",
+            "memory_successor_redirects",
+            "pending_ingests",
+            "ingest_chunk_reservations",
             "association_artifacts",
             "chunk_cav_signatures",
             "chunk_head_edges",
@@ -206,7 +209,14 @@ class TestMigrationFromV1:
     def test_new_tables_added(self, v1_db_path):
         with Database(v1_db_path) as db:
             tables = _table_names(db)
-        assert {"chunk_terms", "memory_items", "memory_provenance"} <= tables
+        assert {
+            "chunk_terms",
+            "memory_items",
+            "memory_provenance",
+            "memory_successor_redirects",
+            "pending_ingests",
+            "ingest_chunk_reservations",
+        } <= tables
 
     def test_term_count_column_added(self, v1_db_path):
         with Database(v1_db_path) as db:
@@ -315,6 +325,34 @@ class TestSchemaParity:
             assert db.schema_version == CURRENT_SCHEMA_VERSION
             assert self._shape(db) == fresh
 
+    def test_fresh_matches_migrated_from_v12(self, tmp_path):
+        """The immediately preceding schema receives the pending journal."""
+        from memory_condense.persistence.db import _MIGRATIONS
+
+        path = tmp_path / "from_v12.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(_V1_SCHEMA)
+        for target in range(2, 13):
+            conn.executescript(_MIGRATIONS[target])
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(target),),
+            )
+        conn.commit()
+        conn.close()
+
+        with Database(tmp_path / "fresh12.db") as db:
+            fresh = self._shape(db)
+        with Database(path) as db:
+            assert db.schema_version == CURRENT_SCHEMA_VERSION
+            assert self._shape(db) == fresh
+            assert db.execute("SELECT COUNT(*) FROM pending_ingests").fetchone()[
+                0
+            ] == 0
+            assert db.execute(
+                "SELECT COUNT(*) FROM ingest_chunk_reservations"
+            ).fetchone()[0] == 0
+
 
 def test_v10_historical_graph_receipts_are_retired_to_one_v11_baseline(tmp_path):
     from memory_condense.persistence.db import _MIGRATIONS
@@ -372,6 +410,7 @@ def test_v10_historical_graph_receipts_are_retired_to_one_v11_baseline(tmp_path)
         with pytest.raises(KeyError, match="unknown discourse graph revision"):
             store.snapshot(2)
         baseline = store.snapshot(3)
+        assert baseline.schema_version == 11
         assert baseline.artifact_ids == ("artifact-1", "artifact-2")
         assert baseline.source_content_sha256 != "0" * 64
         assert baseline.graph_content_sha256 != "0" * 64

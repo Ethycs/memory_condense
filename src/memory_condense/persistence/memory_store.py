@@ -18,6 +18,7 @@ Three invariants the rest of the system relies on:
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 from typing import Any, Iterable, Optional, Protocol
 
@@ -97,6 +98,22 @@ _FROM_DB = {
 _PROVENANCE_COLUMNS = ("turn_id", "chunk_id", "quote")
 
 
+def _acquire_write_transaction(connection: sqlite3.Connection) -> None:
+    """Start an immediate transaction or upgrade an existing caller one.
+
+    Public memory mutations historically commit the connection, including
+    writes a caller staged immediately beforehand. Preserve that ownership
+    while still acquiring SQLite's write lock before a duplicate/status
+    precondition is read.
+    """
+    if connection.in_transaction:
+        connection.execute(
+            "UPDATE meta SET value = value WHERE key = 'schema_version'"
+        )
+    else:
+        connection.execute("BEGIN IMMEDIATE")
+
+
 class Embedder(Protocol):
     """Duck-typed embedding provider (see ``embedding.BGEM3Embedder``)."""
 
@@ -147,24 +164,42 @@ class MemoryStore:
         things, and collapsing them would destroy the distinction
         :meth:`supersede` exists to record. Semantic conflict already has a
         mechanism, and it is not dedup.
+
+        Supplying ``supersedes`` is retained for API compatibility, but is no
+        longer a way to write a bare pointer. It performs the same atomic
+        status transition as :meth:`supersede` and rejects a missing or
+        already-retired predecessor. That keeps every public creation path
+        from manufacturing a dangling correction chain.
         """
+        self._require_writable()
+        if supersedes is not None:
+            replacement = self._supersede_create(
+                supersedes,
+                op,
+                embedding=embedding,
+                half_life_turns=half_life_turns,
+            )
+            if replacement is None:
+                raise ValueError(
+                    "supersedes must name an active memory item; "
+                    f"got {supersedes!r}"
+                )
+            return replacement
+
         if dedupe:
             existing = self.find_by_content(op.type, op.content)
             if existing is not None:
-                self._insert_provenance(existing.mem_id, op.provenance)
-                self._db.commit()
-                return self.touch(existing.mem_id) or existing
+                merged = self._merge_active_duplicate(op)
+                if merged is not None:
+                    return merged
 
-        item = MemoryItem.from_create(
+        item = self._build_item(
             op,
-            embedding=self._resolve_embedding(op.content, embedding),
+            embedding=embedding,
             half_life_turns=half_life_turns,
-            supersedes=supersedes,
-            # Creation is an access: an item enters the store at the current
-            # turn, not at turn 0. Without this every new memory would be born
-            # already `current_turn` turns behind and go COLD immediately.
-            last_access_turn=self._db.current_turn(),
         )
+        if dedupe:
+            return self._insert_or_merge_active(item)
         self._insert(item)
         return item
 
@@ -193,6 +228,61 @@ class MemoryStore:
         if row is None:
             return None
         return self._row_to_item(row)
+
+    def successors(self, mem_id: str) -> list[MemoryItem]:
+        """Return direct successors without losing duplicate-merge edges.
+
+        Ordinary revisions use the backwards-compatible scalar
+        ``replacement.supersedes`` pointer. Exact-content coalescence can have
+        more than one predecessor, so its additional forward redirects live in
+        ``memory_successor_redirects``. Reading the union here keeps both kinds
+        of history walkable through one public API. Pre-v12
+        :meth:`dedupe_existing` wrote its exact-duplicate pointer in the
+        opposite direction; a newer identical referenced row is recognized as
+        that legacy layout without rewriting the historical row.
+        """
+        predecessor = self.get(mem_id)
+        if predecessor is None:
+            return []
+
+        candidates = [
+            self.get(row[0])
+            for row in self._db.execute(
+                "SELECT mem_id FROM memory_items WHERE supersedes = ? "
+                "UNION SELECT successor_mem_id FROM memory_successor_redirects "
+                "WHERE predecessor_mem_id = ?",
+                (mem_id, mem_id),
+            ).fetchall()
+        ]
+        predecessor_key = content_key(predecessor.type, predecessor.content)
+        successors = {
+            item.mem_id: item
+            for item in candidates
+            if item is not None
+            and not (
+                item.status is MemoryStatus.SUPERSEDED
+                and content_key(item.type, item.content) == predecessor_key
+                and (
+                    predecessor.status is MemoryStatus.ACTIVE
+                    or item.created_at < predecessor.created_at
+                )
+            )
+        }
+
+        if predecessor.status is MemoryStatus.SUPERSEDED and predecessor.supersedes:
+            legacy_target = self.get(predecessor.supersedes)
+            if (
+                legacy_target is not None
+                and content_key(legacy_target.type, legacy_target.content)
+                == predecessor_key
+                and (
+                    legacy_target.status is MemoryStatus.ACTIVE
+                    or legacy_target.created_at > predecessor.created_at
+                )
+            ):
+                successors[legacy_target.mem_id] = legacy_target
+
+        return [successors[key] for key in sorted(successors)]
 
     def list_items(
         self,
@@ -234,6 +324,7 @@ class MemoryStore:
         Timestamps and energy are left alone — an amendment is not an access.
         Use ``supersede`` for semantic reversals.
         """
+        self._require_writable()
         item = self.get(op.mem_id)
         if item is None:
             return None
@@ -247,21 +338,27 @@ class MemoryStore:
             if new_vector is not None:
                 embedding_blob = _to_blob(new_vector)
 
-        self._db.execute(
-            "UPDATE memory_items SET content = ?, details = ?, embedding = ?, "
-            "content_hash = ? WHERE mem_id = ?",
-            (
-                content,
-                details,
-                embedding_blob,
-                # Must move with the content, or an amended item keeps the old
-                # identity and stops deduplicating against its own new text.
-                content_key(item.type, content),
-                op.mem_id,
-            ),
-        )
-        self._insert_provenance(op.mem_id, op.provenance)
-        self._db.commit()
+        connection = self._db.connection
+        try:
+            _acquire_write_transaction(connection)
+            self._db.execute(
+                "UPDATE memory_items SET content = ?, details = ?, embedding = ?, "
+                "content_hash = ? WHERE mem_id = ?",
+                (
+                    content,
+                    details,
+                    embedding_blob,
+                    # Must move with the content, or an amended item keeps the old
+                    # identity and stops deduplicating against its own new text.
+                    content_key(item.type, content),
+                    op.mem_id,
+                ),
+            )
+            self._insert_provenance(op.mem_id, op.provenance)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         return self.get(op.mem_id)
 
     def supersede(self, op: SupersedeOp) -> MemoryItem | None:
@@ -270,20 +367,17 @@ class MemoryStore:
         The old row is never removed: ``replacement.supersedes`` points back at
         it so the correction chain stays walkable.
 
-        The old row is retired **first**, deliberately. In the other order a
-        replacement with identical content (a details-only correction) would
-        find its own still-active predecessor as an exact duplicate, merge into
-        it, and return the old row — no replacement, no chain.
+        Embedding, retirement, replacement insertion, provenance merging, and
+        exact-duplicate redirects form one transaction. A failure therefore
+        leaves the predecessor active. A correction always gets a fresh row;
+        it never silently resolves to an unrelated active duplicate.
         """
-        old = self.get(op.mem_id)
-        if old is None:
-            return None
-
-        self._set_status(op.mem_id, MemoryStatus.SUPERSEDED)
-        return self.create(op.replacement, supersedes=op.mem_id)
+        self._require_writable()
+        return self._supersede_create(op.mem_id, op.replacement)
 
     def delete(self, op: DeleteOp) -> bool:
         """Soft-delete: status becomes ``deleted``, the row survives."""
+        self._require_writable()
         if self.get(op.mem_id) is None:
             return False
         self._set_status(op.mem_id, MemoryStatus.DELETED)
@@ -291,13 +385,18 @@ class MemoryStore:
 
     def pin(self, op: PinOp) -> MemoryItem | None:
         """Pin or unpin an item. Pinned items are exempt from decay."""
+        self._require_writable()
         if self.get(op.mem_id) is None:
             return None
-        self._db.execute(
-            "UPDATE memory_items SET pin = ? WHERE mem_id = ?",
-            (op.pin.value, op.mem_id),
-        )
-        self._db.commit()
+        try:
+            self._db.execute(
+                "UPDATE memory_items SET pin = ? WHERE mem_id = ?",
+                (op.pin.value, op.mem_id),
+            )
+            self._db.commit()
+        except BaseException:
+            self._db.connection.rollback()
+            raise
         return self.get(op.mem_id)
 
     def apply(self, report_or_ops: ValidationReport | MemoryOps) -> dict[str, int]:
@@ -307,6 +406,7 @@ class MemoryStore:
         a raw ``MemoryOps``. Returns a count summary; ops that reference a
         missing ``mem_id`` are counted under ``"skipped"`` rather than raising.
         """
+        self._require_writable()
         ops = (
             report_or_ops.accepted
             if isinstance(report_or_ops, ValidationReport)
@@ -403,6 +503,7 @@ class MemoryStore:
         already loaded ranked items may pass those objects and avoid another
         SELECT per row; ids remain accepted for the ordinary public API.
         """
+        self._require_writable()
         seen: set[str] = set()
         items: list[MemoryItem] = []
         for memory in memories:
@@ -425,6 +526,7 @@ class MemoryStore:
         """Batch-update already-loaded items, avoiding reads and commits per row."""
         if not items:
             return []
+        self._require_writable()
         turn = self._db.current_turn() if now_turn is None else now_turn
         stamp = now or decay.now_utc()
         updates: list[tuple[float, str, int, str]] = []
@@ -447,12 +549,16 @@ class MemoryStore:
                 )
             )
 
-        self._db.executemany(
-            "UPDATE memory_items SET energy = ?, last_access_at = ?,"
-            " last_access_turn = ? WHERE mem_id = ?",
-            updates,
-        )
-        self._db.commit()
+        try:
+            self._db.executemany(
+                "UPDATE memory_items SET energy = ?, last_access_at = ?,"
+                " last_access_turn = ? WHERE mem_id = ?",
+                updates,
+            )
+            self._db.commit()
+        except BaseException:
+            self._db.connection.rollback()
+            raise
         return refreshed
 
     def items_by_heat(
@@ -603,7 +709,7 @@ class MemoryStore:
             )
             for result in results
         ]
-        if not reheat:
+        if not reheat or self._db.read_only:
             return results
 
         refreshed = self._touch_items(
@@ -628,20 +734,180 @@ class MemoryStore:
     # Storage helpers
     # ------------------------------------------------------------------
 
-    def _insert(self, item: MemoryItem) -> None:
+    def _build_item(
+        self,
+        op: CreateOp,
+        *,
+        embedding: Any = None,
+        half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
+        supersedes: str | None = None,
+    ) -> MemoryItem:
+        """Resolve fallible inputs before a mutation transaction begins."""
+        return MemoryItem.from_create(
+            op,
+            embedding=self._resolve_embedding(op.content, embedding),
+            half_life_turns=half_life_turns,
+            supersedes=supersedes,
+            # Creation is an access: an item enters the store at the current
+            # turn, not at turn 0. Without this every new memory would be born
+            # already `current_turn` turns behind and go COLD immediately.
+            last_access_turn=self._db.current_turn(),
+        )
+
+    def _supersede_create(
+        self,
+        predecessor_id: str,
+        replacement: CreateOp,
+        *,
+        embedding: Any = None,
+        half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
+    ) -> MemoryItem | None:
+        """Atomically retire one active row and publish its fresh successor.
+
+        Exact-content deduplication cannot return an already-active row here:
+        that would retire ``predecessor_id`` without creating the canonical
+        backwards link. Instead a fresh successor is inserted, citations from
+        any other active exact duplicates are merged into it, and those rows
+        are retired with explicit forward redirects. Their own ``supersedes``
+        pointers are deliberately left untouched, preserving earlier chains.
+        """
+        self._require_writable()
+        predecessor = self.get(predecessor_id)
+        if predecessor is None or predecessor.status is not MemoryStatus.ACTIVE:
+            return None
+
+        # Embedding may call an external/model provider. Resolve it before any
+        # status mutation so provider failure cannot orphan the predecessor.
+        item = self._build_item(
+            replacement,
+            embedding=embedding,
+            half_life_turns=half_life_turns,
+            supersedes=predecessor_id,
+        )
+        content_hash = content_key(replacement.type, replacement.content)
+        connection = self._db.connection
+
+        try:
+            _acquire_write_transaction(connection)
+            retired = self._db.execute(
+                "UPDATE memory_items SET status = ? "
+                "WHERE mem_id = ? AND status = ?",
+                (
+                    MemoryStatus.SUPERSEDED.value,
+                    predecessor_id,
+                    MemoryStatus.ACTIVE.value,
+                ),
+            )
+            # Another writer may have retired it while the embedding was being
+            # produced. Publish no replacement unless this transaction owns
+            # the active -> superseded transition.
+            if retired.rowcount != 1:
+                connection.rollback()
+                return None
+
+            duplicate_ids = [
+                row[0]
+                for row in self._db.execute(
+                    "SELECT mem_id FROM memory_items "
+                    "WHERE content_hash = ? AND status = ? AND mem_id <> ? "
+                    "ORDER BY created_at, mem_id",
+                    (
+                        content_hash,
+                        MemoryStatus.ACTIVE.value,
+                        predecessor_id,
+                    ),
+                ).fetchall()
+            ]
+
+            self._insert(item, commit=False)
+            for duplicate_id in duplicate_ids:
+                self._db.execute(
+                    "INSERT OR IGNORE INTO memory_provenance "
+                    "(mem_id, turn_id, chunk_id, quote) "
+                    "SELECT ?, turn_id, chunk_id, quote "
+                    "FROM memory_provenance WHERE mem_id = ?",
+                    (item.mem_id, duplicate_id),
+                )
+                self._db.execute(
+                    "UPDATE memory_items SET status = ? "
+                    "WHERE mem_id = ? AND status = ?",
+                    (
+                        MemoryStatus.SUPERSEDED.value,
+                        duplicate_id,
+                        MemoryStatus.ACTIVE.value,
+                    ),
+                )
+                self._db.execute(
+                    "INSERT INTO memory_successor_redirects "
+                    "(predecessor_mem_id, successor_mem_id, reason, created_at) "
+                    "VALUES (?, ?, 'exact_duplicate_merge', ?)",
+                    (duplicate_id, item.mem_id, item.created_at.isoformat()),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+        # Rehydrate after commit so merged provenance is part of the returned
+        # object as well as the durable row.
+        return self.get(item.mem_id)
+
+    def _insert(self, item: MemoryItem, *, commit: bool = True) -> None:
         values = tuple(
             _TO_DB[column](getattr(item, column))
             if column in _TO_DB
             else getattr(item, column)
             for column in _COLUMNS
         )
-        self._db.execute(
-            f"INSERT INTO memory_items ({_ITEM_COLUMNS}, content_hash) "
-            f"VALUES ({', '.join('?' * (len(_COLUMNS) + 1))})",
-            values + (content_key(item.type, item.content),),
-        )
-        self._insert_provenance(item.mem_id, item.provenance)
-        self._db.commit()
+        try:
+            self._db.execute(
+                f"INSERT INTO memory_items ({_ITEM_COLUMNS}, content_hash) "
+                f"VALUES ({', '.join('?' * (len(_COLUMNS) + 1))})",
+                values + (content_key(item.type, item.content),),
+            )
+            self._insert_provenance(item.mem_id, item.provenance)
+            if commit:
+                self._db.commit()
+        except BaseException:
+            if commit:
+                self._db.connection.rollback()
+            raise
+
+    def _merge_active_duplicate(self, op: CreateOp) -> MemoryItem | None:
+        """Serialize duplicate adoption and its provenance/heat mutation."""
+        connection = self._db.connection
+        try:
+            _acquire_write_transaction(connection)
+            existing = self.find_by_content(op.type, op.content)
+            if existing is None:
+                connection.rollback()
+                return None
+            self._insert_provenance(existing.mem_id, op.provenance)
+            # ``_touch_items`` commits the transaction containing both the
+            # citations and heat update. Reload so the caller sees the newly
+            # merged provenance rather than the pre-transaction snapshot.
+            self._touch_items([existing])
+        except BaseException:
+            connection.rollback()
+            raise
+        return self.get(existing.mem_id)
+
+    def _insert_or_merge_active(self, item: MemoryItem) -> MemoryItem:
+        """Atomically recheck exact identity before publishing a new row."""
+        connection = self._db.connection
+        try:
+            _acquire_write_transaction(connection)
+            existing = self.find_by_content(item.type, item.content)
+            if existing is not None:
+                self._insert_provenance(existing.mem_id, item.provenance)
+                self._touch_items([existing])
+                return self.get(existing.mem_id) or existing
+            self._insert(item, commit=False)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return item
 
     def _insert_provenance(
         self, mem_id: str, provenance: Iterable[Provenance]
@@ -666,42 +932,79 @@ class MemoryStore:
         existed. Deliberately **not** run from the migration: it changes data,
         and opening a database should not silently rewrite it.
 
-        Nothing is destroyed — losers become ``superseded`` with ``supersedes``
-        pointing at the survivor, so clause 9 holds and the chain stays
-        walkable. The newest row survives, on the grounds that it carries the
-        most recent provenance.
+        Nothing is destroyed — losers become ``superseded`` and gain explicit
+        forward redirects to the survivor, so clause 9 holds and the chain
+        stays walkable. A loser's existing backwards ``supersedes`` pointer is
+        preserved rather than overwritten. The newest row survives, on the
+        grounds that it carries the most recent provenance.
         """
-        rows = self._db.execute(
-            "SELECT content_hash FROM memory_items "
-            "WHERE status = ? AND content_hash IS NOT NULL "
-            "GROUP BY content_hash HAVING COUNT(*) > 1",
-            (MemoryStatus.ACTIVE.value,),
-        ).fetchall()
-
+        self._require_writable()
+        connection = self._db.connection
         retired = 0
-        for (digest,) in rows:
-            dupes = self._db.execute(
-                "SELECT mem_id FROM memory_items "
-                "WHERE content_hash = ? AND status = ? ORDER BY created_at DESC",
-                (digest, MemoryStatus.ACTIVE.value),
+        try:
+            _acquire_write_transaction(connection)
+            rows = self._db.execute(
+                "SELECT content_hash FROM memory_items "
+                "WHERE status = ? AND content_hash IS NOT NULL "
+                "GROUP BY content_hash HAVING COUNT(*) > 1",
+                (MemoryStatus.ACTIVE.value,),
             ).fetchall()
-            survivor = dupes[0][0]
-            for (loser,) in dupes[1:]:
-                self._db.execute(
-                    "UPDATE memory_items SET status = ?, supersedes = ? "
-                    "WHERE mem_id = ?",
-                    (MemoryStatus.SUPERSEDED.value, survivor, loser),
-                )
-                retired += 1
-        self._db.commit()
+
+            for (digest,) in rows:
+                dupes = self._db.execute(
+                    "SELECT mem_id FROM memory_items "
+                    "WHERE content_hash = ? AND status = ? "
+                    "ORDER BY created_at DESC, mem_id DESC",
+                    (digest, MemoryStatus.ACTIVE.value),
+                ).fetchall()
+                survivor = dupes[0][0]
+                for (loser,) in dupes[1:]:
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO memory_provenance "
+                        "(mem_id, turn_id, chunk_id, quote) "
+                        "SELECT ?, turn_id, chunk_id, quote "
+                        "FROM memory_provenance WHERE mem_id = ?",
+                        (survivor, loser),
+                    )
+                    changed = self._db.execute(
+                        "UPDATE memory_items SET status = ? "
+                        "WHERE mem_id = ? AND status = ?",
+                        (
+                            MemoryStatus.SUPERSEDED.value,
+                            loser,
+                            MemoryStatus.ACTIVE.value,
+                        ),
+                    )
+                    if changed.rowcount != 1:
+                        continue
+                    self._db.execute(
+                        "INSERT INTO memory_successor_redirects "
+                        "(predecessor_mem_id, successor_mem_id, reason, created_at) "
+                        "VALUES (?, ?, 'exact_duplicate_merge', ?)",
+                        (loser, survivor, decay.now_utc().isoformat()),
+                    )
+                    retired += 1
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         return retired
 
+    def _require_writable(self) -> None:
+        """Reject mutation before embedding or any other fallible side effect."""
+        if self._db.read_only:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+
     def _set_status(self, mem_id: str, status: MemoryStatus) -> None:
-        self._db.execute(
-            "UPDATE memory_items SET status = ? WHERE mem_id = ?",
-            (status.value, mem_id),
-        )
-        self._db.commit()
+        try:
+            self._db.execute(
+                "UPDATE memory_items SET status = ? WHERE mem_id = ?",
+                (status.value, mem_id),
+            )
+            self._db.commit()
+        except BaseException:
+            self._db.connection.rollback()
+            raise
 
     def _load_provenance(self, mem_id: str) -> list[Provenance]:
         cur = self._db.execute(

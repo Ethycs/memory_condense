@@ -344,6 +344,125 @@ def test_policy_knobs_are_exposed_without_code_edits() -> None:
     assert policy.dual_gate_enabled is False
 
 
+def test_typed_composer_successor_has_explicit_mode_and_isolated_artifact_path() -> None:
+    legacy = arm.build_parser().parse_args(
+        ["construct", "--expected-vector-sha256", _sha("legacy-vector")]
+    )
+    successor = arm.build_parser().parse_args(
+        [
+            "construct",
+            "--expected-vector-sha256",
+            _sha("successor-vector"),
+            "--typed-composition-mode",
+            arm.POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+        ]
+    )
+
+    assert arm.construction_path_for_args(legacy) == (
+        arm.DEFAULT_OUTPUT_ROOT / arm.CONSTRUCTION_NAME
+    )
+    assert arm.construction_path_for_args(successor) == (
+        arm.DEFAULT_SUCCESSOR_OUTPUT_ROOT / arm.SUCCESSOR_CONSTRUCTION_NAME
+    )
+    assert arm.construction_path_for_args(successor) != (
+        arm.DEFAULT_OUTPUT_ROOT / arm.CONSTRUCTION_NAME
+    )
+
+
+def test_typed_composer_successor_audit_defaults_are_isolated() -> None:
+    legacy = arm.build_parser().parse_args(
+        ["audit", "--expected-construction-sha256", _sha("legacy")]
+    )
+    successor = arm.build_parser().parse_args(
+        [
+            "audit",
+            "--expected-construction-sha256",
+            _sha("successor"),
+            "--typed-composition-mode",
+            arm.POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+        ]
+    )
+
+    assert arm.audit_construction_path_for_args(legacy) == (
+        arm.DEFAULT_OUTPUT_ROOT / arm.CONSTRUCTION_NAME
+    )
+    assert arm.audit_output_path_for_args(legacy) == (
+        arm.DEFAULT_OUTPUT_ROOT / arm.AUDIT_NAME
+    )
+    assert arm.audit_construction_path_for_args(successor) == (
+        arm.DEFAULT_SUCCESSOR_OUTPUT_ROOT / arm.SUCCESSOR_CONSTRUCTION_NAME
+    )
+    assert arm.audit_output_path_for_args(successor) == (
+        arm.DEFAULT_SUCCESSOR_OUTPUT_ROOT / arm.SUCCESSOR_AUDIT_NAME
+    )
+
+
+def test_successor_audit_format_binds_typed_composer_v2(monkeypatch) -> None:
+    target_ids = {
+        42: ("answer_42_a", "answer_42_b"),
+        65: ("answer_65_a", "answer_65_b"),
+        74: ("answer_74",),
+        79: ("answer_79",),
+    }
+    rows = []
+    desired = []
+    for ordinal, expected in target_ids.items():
+        question_id = f"q{ordinal}"
+        attempted_rows = []
+        closure_rows = []
+        for index, target_id in enumerate(expected):
+            binding_receipt = _sha(f"successor-binding-{ordinal}-{index}")
+            segment = _sha(f"successor-segment-{ordinal}-{index}")
+            attempted_rows.append(
+                {
+                    "attempted_selection": {
+                        "local_binding_receipt_sha256": binding_receipt,
+                        "segment_receipt_sha256": segment,
+                        "source_id": f"{question_id}::{target_id}",
+                    }
+                }
+            )
+            closure_rows.append({"segment_receipt_sha256": segment})
+            desired.append(
+                {
+                    "ordinal": ordinal,
+                    "question_id": question_id,
+                    "target_id": target_id,
+                    "target_kind": "source_id",
+                }
+            )
+        rows.append(
+            {
+                "classified_closure": {"rows": closure_rows},
+                "mode": "semantic_residual",
+                "ordinal": ordinal,
+                "question_id": question_id,
+                "semantic_residual_local_audit": {
+                    "attempted_selection_manifest": {"rows": attempted_rows}
+                },
+            }
+        )
+    plan = {"desired_targets": desired, "plan_sha256": _sha("successor-plan")}
+    construction = SealedArtifact(
+        Path("successor-construction.json"),
+        _sha("successor-construction"),
+        {"typed_composition_format": arm.SUCCESSOR_TYPED_COMPOSITION_FORMAT},
+    )
+    monkeypatch.setattr(arm, "validate_construction", lambda _artifact: tuple(rows))
+
+    audit = arm.build_target_audit(
+        construction,
+        plan,
+        target_plan_file_sha256=_sha("successor-plan-file"),
+    )
+
+    assert audit["format"] == arm.SUCCESSOR_AUDIT_FORMAT
+    assert (
+        audit["typed_composition_format"]
+        == arm.SUCCESSOR_TYPED_COMPOSITION_FORMAT
+    )
+
+
 def test_posthoc_audit_reports_exact_six_source_targets(monkeypatch) -> None:
     target_ids = {
         42: ("answer_42_a", "answer_42_b"),

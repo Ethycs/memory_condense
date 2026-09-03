@@ -19,6 +19,7 @@ from typing import Iterable, Sequence
 
 from memory_condense.persistence.db import TURN_SOURCE_ID_SQL, Database
 from memory_condense.domain.schemas import Chunk
+from memory_condense.persistence.pending_ingest_store import PendingIngestStore
 
 # ---------------------------------------------------------------------------
 # Tokenisation
@@ -59,6 +60,11 @@ STOPWORDS: frozenset[str] = frozenset(
 BM25_K1 = 1.5
 #: Okapi BM25 length-normalisation parameter.
 BM25_B = 0.75
+
+#: Shared durability coordinate for every mutation of the chunk retrieval
+#: indexes.  ``IndexLifecycleMixin`` observes this value before answering a
+#: query so process-local source aggregates cannot outlive another writer.
+_INDEX_REVISION_KEY = "chunk_index_revision"
 
 
 def tokenize(text: str) -> list[str]:
@@ -108,13 +114,82 @@ class LexicalIndex:
 
     def __init__(self, db: Database, k1: float = BM25_K1, b: float = BM25_B) -> None:
         self._db = db
+        self._pending_ingests = PendingIngestStore(db)
         self._k1 = k1
         self._b = b
         self._source_length_cache: dict[str, int] | None = None
 
+    def invalidate_cache(self) -> None:
+        """Forget process-local aggregates after another writer changes chunks."""
+        self._source_length_cache = None
+
+    def _bump_index_revision(self) -> None:
+        """Publish a direct lexical mutation to other live retrievers."""
+        self._db.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES (?, '0')",
+            (_INDEX_REVISION_KEY,),
+        )
+        self._db.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+            "WHERE key = ?",
+            (_INDEX_REVISION_KEY,),
+        )
+
     # -- writing ------------------------------------------------------------
 
-    def add_chunks(self, chunks: list[Chunk]) -> None:
+    def validate_chunk_identities(
+        self,
+        chunks: list[Chunk],
+        *,
+        allow_indexed_rebuild: bool = False,
+    ) -> set[str]:
+        """Fail closed on a durable ID whose source-owned fields disagree."""
+        self._pending_ingests.validate_chunk_membership(
+            chunks,
+            allow_indexed_rebuild=allow_indexed_rebuild,
+        )
+        incoming: dict[str, Chunk] = {}
+        for chunk in chunks:
+            previous = incoming.setdefault(chunk.chunk_id, chunk)
+            if previous != chunk:
+                raise ValueError("duplicate chunk_id has different content")
+
+        existing_ids: set[str] = set()
+        ids = list(incoming)
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._db.execute(
+                "SELECT chunk_id, turn_id, text, start_char, end_char, token_count "
+                f"FROM chunks WHERE chunk_id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                chunk_id = str(row[0])
+                existing_ids.add(chunk_id)
+                chunk = incoming[chunk_id]
+                if (
+                    str(row[1]) != chunk.turn_id
+                    or str(row[2]) != chunk.text
+                    or int(row[3]) != chunk.start_char
+                    or int(row[4]) != chunk.end_char
+                    or int(row[5]) != chunk.token_count
+                ):
+                    raise ValueError(
+                        "chunk_id already exists with different content"
+                    )
+        return existing_ids
+
+    def add_chunks(
+        self,
+        chunks: list[Chunk],
+        *,
+        commit: bool = True,
+        validate_identity: bool = True,
+        _trusted_indexed_rebuild: bool = False,
+    ) -> None:
         """Index ``chunks`` lexically.
 
         Writes one ``chunk_terms`` row per distinct term and stores the chunk's
@@ -129,46 +204,73 @@ class LexicalIndex:
         """
         if not chunks:
             return
-        self._source_length_cache = None
-
-        for chunk in chunks:
-            tf = (
-                {t: int(v) for t, v in chunk.lexical_weights.items()}
-                if chunk.lexical_weights
-                else term_frequencies(chunk.text)
-            )
-
-            self._db.execute(
-                "INSERT OR IGNORE INTO chunks "
-                "(chunk_id, turn_id, text, start_char, end_char, token_count) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    chunk.chunk_id,
-                    chunk.turn_id,
-                    chunk.text,
-                    chunk.start_char,
-                    chunk.end_char,
-                    chunk.token_count,
-                ),
-            )
-
-            # Drop stale postings first so a re-index after an edit cannot
-            # leave orphaned terms behind.
-            self._db.execute(
-                "DELETE FROM chunk_terms WHERE chunk_id = ?", (chunk.chunk_id,)
-            )
-            if tf:
-                self._db.executemany(
-                    "INSERT OR REPLACE INTO chunk_terms (term, chunk_id, tf) "
-                    "VALUES (?, ?, ?)",
-                    [(term, chunk.chunk_id, count) for term, count in tf.items()],
+        connection = self._db.connection
+        try:
+            if commit and not connection.in_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            if not commit and not connection.in_transaction:
+                raise RuntimeError(
+                    "commit=False requires an owning SQLite transaction"
                 )
-            self._db.execute(
-                "UPDATE chunks SET term_count = ? WHERE chunk_id = ?",
-                (sum(tf.values()), chunk.chunk_id),
-            )
+            if validate_identity:
+                self.validate_chunk_identities(
+                    chunks,
+                    allow_indexed_rebuild=_trusted_indexed_rebuild,
+                )
+            else:
+                # The caller may have validated global chunk-ID ownership,
+                # but manifest membership is a separate topology invariant and
+                # must hold under this insertion's owning transaction.
+                self._pending_ingests.validate_chunk_membership(
+                    chunks,
+                    allow_indexed_rebuild=_trusted_indexed_rebuild,
+                )
+            self._source_length_cache = None
 
-        self._db.commit()
+            for chunk in chunks:
+                tf = (
+                    {t: int(v) for t, v in chunk.lexical_weights.items()}
+                    if chunk.lexical_weights
+                    else term_frequencies(chunk.text)
+                )
+
+                self._db.execute(
+                    "INSERT OR IGNORE INTO chunks "
+                    "(chunk_id, turn_id, text, start_char, end_char, token_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        chunk.chunk_id,
+                        chunk.turn_id,
+                        chunk.text,
+                        chunk.start_char,
+                        chunk.end_char,
+                        chunk.token_count,
+                    ),
+                )
+
+                # Drop stale postings first so a re-index after an edit cannot
+                # leave orphaned terms behind.
+                self._db.execute(
+                    "DELETE FROM chunk_terms WHERE chunk_id = ?", (chunk.chunk_id,)
+                )
+                if tf:
+                    self._db.executemany(
+                        "INSERT OR REPLACE INTO chunk_terms (term, chunk_id, tf) "
+                        "VALUES (?, ?, ?)",
+                        [(term, chunk.chunk_id, count) for term, count in tf.items()],
+                    )
+                self._db.execute(
+                    "UPDATE chunks SET term_count = ? WHERE chunk_id = ?",
+                    (sum(tf.values()), chunk.chunk_id),
+                )
+
+            if commit:
+                self._bump_index_revision()
+                connection.commit()
+        except BaseException:
+            if commit:
+                connection.rollback()
+            raise
 
     def rebuild(self, chunks_iterable: Iterable[Chunk] | None = None) -> int:
         """Drop and rebuild the whole inverted index. Returns the chunk count.
@@ -177,43 +279,85 @@ class LexicalIndex:
         the index is rebuilt from the text already stored in ``chunks`` — the
         transcript remains the single source of truth either way.
         """
-        self._source_length_cache = None
-        self._db.execute("DELETE FROM chunk_terms")
-        self._db.execute("UPDATE chunks SET term_count = NULL")
-        self._db.commit()
-
-        if chunks_iterable is None:
-            cur = self._db.execute(
-                "SELECT chunk_id, turn_id, text, start_char, end_char, token_count "
-                "FROM chunks"
+        supplied = chunks_iterable is not None
+        batch = list(chunks_iterable) if supplied else []
+        batch = [
+            chunk.model_copy(update={"lexical_weights": None}) for chunk in batch
+        ]
+        connection = self._db.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if not supplied:
+                rows = self._db.execute(
+                    "SELECT chunk_id, turn_id, text, start_char, end_char, "
+                    "token_count FROM chunks "
+                    "WHERE (embedding IS NOT NULL AND hnsw_label IS NOT NULL) "
+                    "OR term_count IS NOT NULL"
+                ).fetchall()
+                batch = [
+                    Chunk(
+                        chunk_id=row[0],
+                        turn_id=row[1],
+                        text=row[2],
+                        start_char=row[3],
+                        end_char=row[4],
+                        token_count=row[5],
+                    )
+                    for row in rows
+                ]
+            self.validate_chunk_identities(
+                batch,
+                allow_indexed_rebuild=not supplied,
             )
-            chunks_iterable = [
-                Chunk(
-                    chunk_id=row[0],
-                    turn_id=row[1],
-                    text=row[2],
-                    start_char=row[3],
-                    end_char=row[4],
-                    token_count=row[5],
-                )
-                for row in cur.fetchall()
-            ]
-
-        batch = list(chunks_iterable)
-        # Re-derive term frequencies from text, ignoring any stored weights.
-        self.add_chunks(
-            [c.model_copy(update={"lexical_weights": None}) for c in batch]
-        )
+            self._source_length_cache = None
+            self._db.execute("DELETE FROM chunk_terms")
+            self._db.execute("UPDATE chunks SET term_count = NULL")
+            # Re-derive term frequencies from text inside the same transaction
+            # that retired the old postings.
+            self.add_chunks(
+                batch,
+                commit=False,
+                validate_identity=False,
+                # The exact batch was checked before term_count was cleared.
+                # Both default and supplied rebuilds need this continuation to
+                # avoid treating their own in-transaction NULL as retirement.
+                _trusted_indexed_rebuild=True,
+            )
+            self._bump_index_revision()
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         return len(batch)
 
-    def delete_chunk(self, chunk_id: str) -> None:
-        """Remove a chunk's postings and clear its document length."""
-        self._source_length_cache = None
-        self._db.execute("DELETE FROM chunk_terms WHERE chunk_id = ?", (chunk_id,))
-        self._db.execute(
-            "UPDATE chunks SET term_count = NULL WHERE chunk_id = ?", (chunk_id,)
-        )
-        self._db.commit()
+    def delete_chunk(self, chunk_id: str, *, commit: bool = True) -> None:
+        """Remove a chunk's postings and clear its document length.
+
+        ``commit=False`` lets the owning index lifecycle combine this cleanup
+        atomically with dense and association retirement.
+        """
+        connection = self._db.connection
+        try:
+            if commit and not connection.in_transaction:
+                connection.execute("BEGIN IMMEDIATE")
+            if not commit and not connection.in_transaction:
+                raise RuntimeError(
+                    "commit=False requires an owning SQLite transaction"
+                )
+            self._source_length_cache = None
+            self._db.execute(
+                "DELETE FROM chunk_terms WHERE chunk_id = ?", (chunk_id,)
+            )
+            self._db.execute(
+                "UPDATE chunks SET term_count = NULL WHERE chunk_id = ?", (chunk_id,)
+            )
+            if commit:
+                self._bump_index_revision()
+                connection.commit()
+        except BaseException:
+            if commit:
+                connection.rollback()
+            raise
 
     # -- reading ------------------------------------------------------------
 

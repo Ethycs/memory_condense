@@ -6,14 +6,14 @@ one or more adjacent bounded semantic cells, orders those cells with a
 deterministic semantic bisection, and delegates uncertainty-preserving tree
 traversal to :mod:`tools.matched_eval.semantic_binary_search`.
 
-The classifier implemented here is deliberately conservative.  A branch is
-``definitely_no`` only when a complete manifest proves a hard contradiction,
-or when a declared dual gate proves both a low vector upper bound and a low
-query-specific IDF/specificity upper bound.  Missing vectors or manifests are
-``may_answer``.  Both uncertain children are traversed.  The complete retained
-population is ranked before protected-evidence deduplication and then greedily
-packed under the exact terminal evidence-plane budget.  Every unpacked novel
-survivor remains explicit in the open packing frontier.
+The active classifier is deliberately evidence-conserving: manifest, literal,
+and dual-gate signals are ranking/audit evidence rather than authenticated
+absence proofs, so they fail open.  A separately identified legacy mode keeps
+the historical heuristic-pruning behavior byte-compatible for sealed R7
+replay.  Missing vectors or manifests are always ``may_answer``.  The complete
+retained population is ranked before protected-evidence deduplication and then
+greedily packed under the exact terminal evidence-plane budget.  Every
+unpacked novel survivor remains explicit in the open packing frontier.
 """
 
 from __future__ import annotations
@@ -85,11 +85,28 @@ from .typed_operator_spec import (
 )
 
 
+# Historical R7 artifacts were sealed under this mechanism/policy identity and
+# used heuristic branch pruning.  Keep both constants stable so those artifacts
+# can still be reconstructed byte-for-byte.
 MECHANISM_ID = "semantic_residual_terminal_branch_and_bound_v3"
+LEGACY_RESIDUAL_CLASSIFIER_MODE = "legacy-heuristic-pruning"
+EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE = (
+    "evidence-conserving-fail-open"
+)
+RESIDUAL_CLASSIFIER_MODES = (
+    EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
+    LEGACY_RESIDUAL_CLASSIFIER_MODE,
+)
+EVIDENCE_CONSERVING_MECHANISM_ID = (
+    "semantic_residual_terminal_evidence_conserving_v4"
+)
 TYPED_ADAPTER_MECHANISM_ID = (
     "semantic_residual_terminal_typed_adapter_packing_bounded_v1"
 )
 POLICY_FORMAT = "memory-condense-semantic-residual-terminal-policy-v2"
+EVIDENCE_CONSERVING_POLICY_FORMAT = (
+    "memory-condense-semantic-residual-terminal-policy-v3"
+)
 VECTOR_SET_FORMAT = "memory-condense-semantic-residual-source-vectors-v1"
 CHUNK_VECTOR_SET_FORMAT = "memory-condense-semantic-residual-stored-chunk-vectors-v2"
 SEGMENT_FORMAT = "memory-condense-semantic-residual-exact-segment-v1"
@@ -98,8 +115,14 @@ NODE_MANIFEST_FORMAT = "memory-condense-semantic-residual-node-manifest-v2"
 INDEX_FORMAT = "memory-condense-semantic-residual-terminal-index-v2"
 QUERY_FORMAT = "memory-condense-semantic-residual-query-policy-v2"
 DECISION_AUDIT_FORMAT = "memory-condense-semantic-residual-decision-audit-v2"
+EVIDENCE_CONSERVING_DECISION_AUDIT_FORMAT = (
+    "memory-condense-semantic-residual-decision-audit-v3"
+)
 EVIDENCE_FORMAT = "memory-condense-semantic-residual-exact-evidence-v1"
 RESULT_FORMAT = "memory-condense-semantic-residual-terminal-result-v3"
+EVIDENCE_CONSERVING_RESULT_FORMAT = (
+    "memory-condense-semantic-residual-terminal-result-v4"
+)
 FRONTIER_FORMAT = "memory-condense-semantic-residual-classified-frontier-v2"
 DUPLICATE_FORMAT = "memory-condense-semantic-residual-protected-duplicate-v1"
 SEMANTIC_SEED_ALGORITHM = "deterministic-two-sweep-cosine-v1"
@@ -266,6 +289,7 @@ class SemanticResidualPolicy:
     cosine_upper_bound_floor: float = DEFAULT_COSINE_UPPER_BOUND_FLOOR
     specificity_upper_bound_ratio: float = DEFAULT_SPECIFICITY_UPPER_BOUND_RATIO
     dual_gate_enabled: bool = True
+    classifier_mode: str = EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
@@ -286,6 +310,10 @@ class SemanticResidualPolicy:
         )
         _require(0.0 < ratio <= 1.0, "semantic specificity ratio escaped (0, 1]")
         _require(type(self.dual_gate_enabled) is bool, "dual gate flag changed")
+        _require(
+            self.classifier_mode in RESIDUAL_CLASSIFIER_MODES,
+            "semantic residual classifier mode changed",
+        )
         object.__setattr__(
             self,
             "receipt_sha256",
@@ -298,13 +326,18 @@ class SemanticResidualPolicy:
         assert_gold_blind(self.projection(), path="semantic_residual_policy")
 
     def projection(self, *, include_receipt: bool = True) -> dict[str, object]:
+        legacy = self.classifier_mode == LEGACY_RESIDUAL_CLASSIFIER_MODE
         value: dict[str, object] = {
             "cosine_upper_bound_floor": self.cosine_upper_bound_floor,
             "dual_gate_enabled": self.dual_gate_enabled,
-            "format": POLICY_FORMAT,
+            "format": (
+                POLICY_FORMAT if legacy else EVIDENCE_CONSERVING_POLICY_FORMAT
+            ),
             "gold_loaded": False,
             "max_cell_tokens": self.max_cell_tokens,
-            "mechanism_id": MECHANISM_ID,
+            "mechanism_id": (
+                MECHANISM_ID if legacy else EVIDENCE_CONSERVING_MECHANISM_ID
+            ),
             "new_provider_calls": 0,
             "payload_token_cap": self.payload_token_cap,
             "bounded_packing_algorithm": BOUNDED_PACKING_ALGORITHM,
@@ -312,9 +345,60 @@ class SemanticResidualPolicy:
             "specificity_upper_bound_ratio": self.specificity_upper_bound_ratio,
             "terminal_after_specialist_selection": True,
         }
+        # Historical R7 policy bytes did not declare a classifier mode.  Its
+        # old format/mechanism pair is the authenticated legacy discriminator.
+        # New artifacts seal the successor mode explicitly.
+        if not legacy:
+            value["classifier_mode"] = self.classifier_mode
         if include_receipt:
             value["receipt_sha256"] = self.receipt_sha256
         return value
+
+
+def semantic_residual_policy_from_projection(
+    value: object,
+    /,
+) -> SemanticResidualPolicy:
+    """Authenticate a sealed policy and infer its classifier semantics.
+
+    The fieldless v2 projection is the only accepted legacy representation.
+    Successor projections must carry the explicit fail-open mode together with
+    the v3 policy format and v4 mechanism identity.  Re-projecting the parsed
+    policy is an exact-schema and receipt check, so adding, removing, or
+    changing the mode cannot silently alter replay behavior.
+    """
+
+    _require(type(value) is dict, "semantic residual policy must be an exact object")
+    row = value
+    if "classifier_mode" not in row:
+        _require(
+            row.get("format") == POLICY_FORMAT
+            and row.get("mechanism_id") == MECHANISM_ID,
+            "fieldless semantic residual policy is not authenticated legacy",
+        )
+        classifier_mode = LEGACY_RESIDUAL_CLASSIFIER_MODE
+    else:
+        classifier_mode = row.get("classifier_mode")
+        _require(
+            classifier_mode == EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE
+            and row.get("format") == EVIDENCE_CONSERVING_POLICY_FORMAT
+            and row.get("mechanism_id") == EVIDENCE_CONSERVING_MECHANISM_ID,
+            "semantic residual successor classifier identity changed",
+        )
+    policy = SemanticResidualPolicy(
+        max_cell_tokens=row.get("max_cell_tokens"),
+        payload_token_cap=row.get("payload_token_cap"),
+        cosine_upper_bound_floor=row.get("cosine_upper_bound_floor"),
+        specificity_upper_bound_ratio=row.get("specificity_upper_bound_ratio"),
+        dual_gate_enabled=row.get("dual_gate_enabled"),
+        classifier_mode=classifier_mode,
+        receipt_sha256=row.get("receipt_sha256"),
+    )
+    _require(
+        policy.projection() == row,
+        "semantic residual policy projection changed",
+    )
+    return policy
 
 
 @dataclass(frozen=True, slots=True)
@@ -1713,6 +1797,8 @@ class SemanticResidualDecisionAudit:
     max_leaf_specificity: float
     specificity_threshold: float
     specificity_gate_available: bool
+    classifier_mode: str
+    classifier_mechanism_id: str
     receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
@@ -1770,6 +1856,16 @@ class SemanticResidualDecisionAudit:
             type(self.specificity_gate_available) is bool,
             "residual specificity gate availability changed",
         )
+        _require(
+            self.classifier_mode in RESIDUAL_CLASSIFIER_MODES
+            and self.classifier_mechanism_id
+            == (
+                MECHANISM_ID
+                if self.classifier_mode == LEGACY_RESIDUAL_CLASSIFIER_MODE
+                else EVIDENCE_CONSERVING_MECHANISM_ID
+            ),
+            "semantic residual audit classifier identity changed",
+        )
         object.__setattr__(
             self,
             "receipt_sha256",
@@ -1781,11 +1877,16 @@ class SemanticResidualDecisionAudit:
         )
 
     def projection(self, *, include_receipt: bool = True) -> dict[str, object]:
+        legacy = self.classifier_mode == LEGACY_RESIDUAL_CLASSIFIER_MODE
         value: dict[str, object] = {
             "absent_exact_literals": list(self.absent_exact_literals),
             "cosine_upper_bound": self.cosine_upper_bound,
             "decision_receipt_sha256": self.decision_receipt_sha256,
-            "format": DECISION_AUDIT_FORMAT,
+            "format": (
+                DECISION_AUDIT_FORMAT
+                if legacy
+                else EVIDENCE_CONSERVING_DECISION_AUDIT_FORMAT
+            ),
             "intersecting_action_concepts": list(self.intersecting_action_concepts),
             "intersecting_surface_terms": list(self.intersecting_surface_terms),
             "missing_required_role": self.missing_required_role,
@@ -1800,6 +1901,9 @@ class SemanticResidualDecisionAudit:
             "tag_gate_available": self.tag_gate_available,
             "vector_gate_available": self.vector_gate_available,
         }
+        if not legacy:
+            value["classifier_mechanism_id"] = self.classifier_mechanism_id
+            value["classifier_mode"] = self.classifier_mode
         if include_receipt:
             value["receipt_sha256"] = self.receipt_sha256
         return value
@@ -1867,8 +1971,19 @@ class _ConservativeResidualClassifier:
             index.policy.specificity_upper_bound_ratio
             * self.max_leaf_specificity
         )
+        self.classifier_mode = index.policy.classifier_mode
+        self.classifier_mechanism_id = (
+            MECHANISM_ID
+            if self.classifier_mode == LEGACY_RESIDUAL_CLASSIFIER_MODE
+            else EVIDENCE_CONSERVING_MECHANISM_ID
+        )
+        decision_audit_format = (
+            DECISION_AUDIT_FORMAT
+            if self.classifier_mode == LEGACY_RESIDUAL_CLASSIFIER_MODE
+            else EVIDENCE_CONSERVING_DECISION_AUDIT_FORMAT
+        )
         specificity_body = {
-            "format": f"{DECISION_AUDIT_FORMAT}-query-specificity-v1",
+            "format": f"{decision_audit_format}-query-specificity-v1",
             "leaf_cell_count": leaf_count,
             "max_leaf_specificity": self.max_leaf_specificity,
             "query_receipt_sha256": query.receipt_sha256,
@@ -1898,7 +2013,8 @@ class _ConservativeResidualClassifier:
         }
         self.query_specificity_receipt_sha256 = identity_sha256(specificity_body)
         self.classifier_id = (
-            f"{MECHANISM_ID}:conservative:{query.receipt_sha256[:16]}:"
+            f"{self.classifier_mechanism_id}:conservative:"
+            f"{query.receipt_sha256[:16]}:"
             f"{self.query_specificity_receipt_sha256[:16]}"
         )
         self.audits: list[SemanticResidualDecisionAudit] = []
@@ -1972,14 +2088,13 @@ class _ConservativeResidualClassifier:
             and (self.term_specificity or self.action_specificity)
             and specificity_upper is not None
         )
-        # These signals are useful ranking/audit evidence, but none is an
-        # authenticated proof that a branch cannot contain support for a
-        # different obligation.  Keep them fail-open until such a proof exists.
-        classification: Literal["definitely_no", "may_answer"] = "may_answer"
+        heuristic_rejection = False
         if missing_role is not None:
             reason = "required_role_absent"
+            heuristic_rejection = True
         elif absent_literals:
             reason = "exact_literal_absent"
+            heuristic_rejection = True
         elif (
             self.index.policy.dual_gate_enabled
             and vector_available
@@ -1991,8 +2106,19 @@ class _ConservativeResidualClassifier:
             and specificity_upper < self.specificity_threshold
         ):
             reason = "dual_gate"
+            heuristic_rejection = True
         else:
             reason = "may_answer"
+        # Legacy R7 treated these heuristic signals as exclusion proofs.  The
+        # evidence-conserving successor records the same diagnostic reason but
+        # fails open because none proves that a different obligation lacks
+        # support somewhere in the branch.
+        classification: Literal["definitely_no", "may_answer"] = (
+            "definitely_no"
+            if heuristic_rejection
+            and self.classifier_mode == LEGACY_RESIDUAL_CLASSIFIER_MODE
+            else "may_answer"
+        )
         decision = make_branch_decision(
             classifier_id=self.classifier_id,
             question_sha256=quote_sha256(question),
@@ -2020,6 +2146,8 @@ class _ConservativeResidualClassifier:
                 max_leaf_specificity=self.max_leaf_specificity,
                 specificity_threshold=self.specificity_threshold,
                 specificity_gate_available=specificity_available,
+                classifier_mode=self.classifier_mode,
+                classifier_mechanism_id=self.classifier_mechanism_id,
             )
         )
         return decision
@@ -2434,10 +2562,19 @@ class SemanticResidualSearchResult:
         _require(type(self.core_result) is SemanticBinarySearchResult, "residual core changed")
         _require(
             type(self.decision_audits) is tuple
+            and bool(self.decision_audits)
             and all(type(row) is SemanticResidualDecisionAudit for row in self.decision_audits)
             and tuple(row.decision_receipt_sha256 for row in self.decision_audits)
             == tuple(row.receipt_sha256 for row in self.core_result.decisions),
             "residual result decision audit changed",
+        )
+        _require(
+            len({row.classifier_mode for row in self.decision_audits}) == 1
+            and len(
+                {row.classifier_mechanism_id for row in self.decision_audits}
+            )
+            == 1,
+            "residual result mixed classifier identities",
         )
         require_sha256(
             self.protected_evidence_population_receipt_sha256,
@@ -2647,12 +2784,17 @@ class SemanticResidualSearchResult:
         )
 
     def projection(self, *, include_receipt: bool = True) -> dict[str, object]:
+        classifier_mode = self.decision_audits[0].classifier_mode
+        legacy = classifier_mode == LEGACY_RESIDUAL_CLASSIFIER_MODE
+        result_format = (
+            RESULT_FORMAT if legacy else EVIDENCE_CONSERVING_RESULT_FORMAT
+        )
         value: dict[str, object] = {
             "attempted_evidence_count": self.attempted_evidence_count,
             "attempted_provider_payload_tokens": self.attempted_provider_payload_tokens,
             "attempted_selection_receipt_sha256": identity_sha256(
                 {
-                    "format": f"{RESULT_FORMAT}-attempted-selection-population-v1",
+                    "format": f"{result_format}-attempted-selection-population-v1",
                     "row_receipt_sha256s": [
                         row.receipt_sha256 for row in self.attempted_selection
                     ],
@@ -2665,7 +2807,7 @@ class SemanticResidualSearchResult:
             "evidence": [row.projection() for row in self.evidence],
             "fallback_reason": self.fallback_reason,
             "fallback_required": self.fallback_required,
-            "format": RESULT_FORMAT,
+            "format": result_format,
             "gold_loaded": False,
             "local_binding_receipt_sha256s": [
                 row.receipt_sha256 for row in self.local_bindings
@@ -2694,6 +2836,11 @@ class SemanticResidualSearchResult:
             "searched_complete_memory_population": True,
             "terminal_after_specialist_selection": True,
         }
+        if not legacy:
+            value["classifier_mechanism_id"] = self.decision_audits[
+                0
+            ].classifier_mechanism_id
+            value["classifier_mode"] = classifier_mode
         if include_receipt:
             value["receipt_sha256"] = self.receipt_sha256
         return value
@@ -2990,10 +3137,10 @@ def search_semantic_residual(
         "residual search query escaped its index",
     )
     classifier = _ConservativeResidualClassifier(residual_index, query)
-    # This terminal classifier is local and deterministic, so descend every
-    # uncertain internal node.  A per-node text-fit stop is not compositional:
-    # several individually fitting survivor branches can overflow their union,
-    # and it prevents the dual gate from pruning irrelevant descendants.
+    # Classify down to leaf granularity whenever a branch remains uncertain.
+    # A per-node text-fit stop is not compositional: several individually
+    # fitting survivor branches can overflow their union.  Legacy mode may
+    # still prune at this classifier boundary; the active successor fails open.
     fit_predicate = lambda node: False
     core = semantic_binary_search(
         residual_index.core_tree,
@@ -3474,8 +3621,15 @@ def adapt_semantic_residual_to_typed_contribution(
 
 __all__ = [
     "ClassifiedResidualFrontierReceipt",
+    "EVIDENCE_CONSERVING_DECISION_AUDIT_FORMAT",
+    "EVIDENCE_CONSERVING_MECHANISM_ID",
+    "EVIDENCE_CONSERVING_POLICY_FORMAT",
+    "EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE",
+    "EVIDENCE_CONSERVING_RESULT_FORMAT",
     "ExactCellSegment",
+    "LEGACY_RESIDUAL_CLASSIFIER_MODE",
     "MECHANISM_ID",
+    "RESIDUAL_CLASSIFIER_MODES",
     "BOUNDED_PACKING_ALGORITHM",
     "SOURCE_GROUP_ALLOCATION_FORMAT",
     "TYPED_ADAPTER_MECHANISM_ID",
@@ -3508,6 +3662,7 @@ __all__ = [
     "semantic_residual_terminal_evidence_rows",
     "semantic_residual_terminal_evidence_sha256",
     "semantic_residual_query_facets",
+    "semantic_residual_policy_from_projection",
     "source_centroid_vector_set",
     "validate_semantic_residual_search",
     "validate_semantic_residual_search_projection",

@@ -157,15 +157,7 @@ def _load_verified_audit(
 
 
 def _policy_from_projection(value: object) -> residual.SemanticResidualPolicy:
-    row = _identity_projection(value, "semantic residual policy")
-    return residual.SemanticResidualPolicy(
-        max_cell_tokens=row.get("max_cell_tokens"),
-        payload_token_cap=row.get("payload_token_cap"),
-        cosine_upper_bound_floor=row.get("cosine_upper_bound_floor"),
-        specificity_upper_bound_ratio=row.get("specificity_upper_bound_ratio"),
-        dual_gate_enabled=row.get("dual_gate_enabled"),
-        receipt_sha256=row.get("receipt_sha256"),
-    )
+    return residual.semantic_residual_policy_from_projection(value)
 
 
 def _node_depths(root: Any) -> dict[str, int]:
@@ -924,6 +916,7 @@ def build_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
                     baseline_policy.specificity_upper_bound_ratio
                 ),
                 dual_gate_enabled=baseline_policy.dual_gate_enabled,
+                classifier_mode=baseline_policy.classifier_mode,
             )
             semantic_index = residual.build_semantic_residual_index(
                 window_index, source_vectors, policy=policy

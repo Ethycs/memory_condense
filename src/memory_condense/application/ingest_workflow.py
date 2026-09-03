@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timezone
 from typing import Sequence
 
 from memory_condense.associations.association_store import AssociationArtifact
 from memory_condense.domain.schemas import Chunk, RetrievalResult, Turn
 from memory_condense.ingest.transcript_source import TranscriptFile
 from memory_condense.persistence.db import INDEXED_CHUNK_SQL
+from memory_condense.persistence.pending_ingest_store import (
+    PendingIngestAlreadyIndexedError,
+    PendingIngestManifest,
+)
 
 
 def _bind_explicit_chunk_ids(
@@ -38,6 +43,60 @@ def _bind_explicit_chunk_ids(
     return output
 
 
+def _validate_embedded_chunks(
+    source_chunks: Sequence[Chunk],
+    embedded_chunks: Sequence[Chunk],
+) -> list[Chunk]:
+    """Accept exactly one derived vector/lexical result per source chunk."""
+    expected: dict[str, Chunk] = {}
+    for chunk in source_chunks:
+        if chunk.chunk_id in expected:
+            raise ValueError("source chunks contain a duplicate chunk identity")
+        expected[chunk.chunk_id] = chunk
+
+    actual: dict[str, Chunk] = {}
+    try:
+        candidates = list(embedded_chunks)
+    except TypeError as exc:
+        raise ValueError("embedder did not return a chunk sequence") from exc
+    for chunk in candidates:
+        if not isinstance(chunk, Chunk):
+            raise ValueError("embedder returned a non-chunk value")
+        if chunk.chunk_id in actual:
+            raise ValueError("embedder returned a duplicate chunk identity")
+        actual[chunk.chunk_id] = chunk
+
+    if set(actual) != set(expected):
+        raise ValueError("embedder changed the complete chunk identity set")
+
+    output: list[Chunk] = []
+    for chunk_id, source in expected.items():
+        embedded = actual[chunk_id]
+        if embedded.embedding is None:
+            raise ValueError("embedder returned a chunk without an embedding")
+        if source.model_copy(
+            update={
+                "embedding": embedded.embedding,
+                "lexical_weights": embedded.lexical_weights,
+            }
+        ) != embedded:
+            raise ValueError("embedder changed a chunk source field")
+        output.append(embedded)
+    return output
+
+
+def _embed_source_chunks(embedder: object, chunks: Sequence[Chunk]) -> list[Chunk]:
+    """Snapshot source ownership before invoking an external provider."""
+    source_snapshot = tuple(chunk.model_copy(deep=True) for chunk in chunks)
+    embed_chunks = getattr(embedder, "embed_chunks")
+    return _validate_embedded_chunks(
+        source_snapshot,
+        embed_chunks(
+            [chunk.model_copy(deep=True) for chunk in source_snapshot]
+        ),
+    )
+
+
 class IngestWorkflowMixin:
     """Internal workflow methods composed by ``MemoryCondenser``."""
 
@@ -57,7 +116,9 @@ class IngestWorkflowMixin:
         proposes memory items, validates their provenance, and applies the
         surviving ops.
         """
-        turn = self._transcript.append(
+        if self._db.read_only:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        turn = self._transcript.stage(
             role,
             text,
             source_id=source_id,
@@ -67,10 +128,20 @@ class IngestWorkflowMixin:
         chunks = self._chunker.chunk_turn(turn.turn_id, text)
         if turn_id is not None:
             chunks = _bind_explicit_chunk_ids(turn.turn_id, chunks)
-
+        manifest = PendingIngestManifest.build(turn, chunks)
         if chunks:
-            chunks = self._embedder.embed_chunks(chunks)
-            self._retriever.add_chunks(chunks)
+            chunks = _embed_source_chunks(self._embedder, chunks)
+
+        published, ingest_status = self._publish_staged_turns(
+            [(turn, created_at is not None)],
+            {turn.turn_id: manifest},
+        )
+        turn = published[turn.turn_id]
+        if chunks and ingest_status[turn.turn_id] == "pending":
+            self._index_pending_manifests(
+                chunks,
+                [manifest],
+            )
 
         if self._auto_extract:
             self.extract_memory([turn], chunks)
@@ -96,6 +167,8 @@ class IngestWorkflowMixin:
         ``auto_extract=False``, which is already the retrieval-evaluation and
         corpus-indexing configuration.
         """
+        if self._db.read_only:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
         records: list[
             tuple[str, str, str | None, datetime | None, str | None]
         ] = []
@@ -113,44 +186,259 @@ class IngestWorkflowMixin:
                 turn_id = str(turn_id).strip()
                 if not turn_id:
                     raise ValueError("explicit turn IDs must be non-empty")
+            if created_at is not None:
+                created_at = (
+                    created_at.replace(tzinfo=timezone.utc)
+                    if created_at.tzinfo is None
+                    else created_at.astimezone(timezone.utc)
+                )
             records.append((role, text, source_id, created_at, turn_id))
+
+        # An omitted timestamp is a wildcard for an explicit identity, just
+        # as it is in sequential ``append``/``publish_turn`` retries. Resolve
+        # every mixed batch group to its one explicit timestamp before any
+        # ``Turn`` generates a default value. Two genuinely explicit values
+        # still conflict and fail before embedding or publication.
+        explicit_times: dict[str, datetime] = {}
+        for _role, _text, _source_id, created_at, explicit_id in records:
+            if explicit_id is None or created_at is None:
+                continue
+            previous_time = explicit_times.setdefault(explicit_id, created_at)
+            if previous_time != created_at:
+                raise ValueError(
+                    "batch contains duplicate turn_id with different content"
+                )
         if self._auto_extract:
             return [
                 self.ingest(
                     role,
                     text,
                     source_id=source_id,
-                    created_at=created_at,
+                    created_at=(
+                        explicit_times[turn_id]
+                        if turn_id in explicit_times and created_at is None
+                        else created_at
+                    ),
                     turn_id=turn_id,
                 )
                 for role, text, source_id, created_at, turn_id in records
             ]
 
         staged: list[tuple[Turn, list[Chunk]]] = []
+        publication_requests: list[tuple[Turn, bool]] = []
         flat_chunks: list[Chunk] = []
+        staged_explicit_turns: dict[str, tuple[Turn, bool]] = {}
         for role, text, source_id, created_at, turn_id in records:
-            turn = self._transcript.append(
+            created_at_was_explicit = created_at is not None
+            effective_created_at = (
+                explicit_times.get(turn_id, created_at)
+                if turn_id is not None
+                else created_at
+            )
+            turn = self._transcript.stage(
                 role,
                 text,
                 source_id=source_id,
-                created_at=created_at,
+                created_at=effective_created_at,
                 turn_id=turn_id,
             )
+            if turn_id is not None:
+                previous = staged_explicit_turns.get(turn_id)
+                if previous is None:
+                    staged_explicit_turns[turn_id] = (
+                        turn,
+                        not created_at_was_explicit,
+                    )
+                elif (
+                    not created_at_was_explicit
+                    and previous[1]
+                    and previous[0].role == turn.role
+                    and previous[0].text == turn.text
+                    and previous[0].source_id == turn.source_id
+                ):
+                    # ``Turn`` generates created_at when it is omitted. Reuse
+                    # the first generated value so an exact repeated explicit
+                    # identity stays idempotent inside this one batch.
+                    turn = previous[0]
             chunks = self._chunker.chunk_turn(turn.turn_id, text)
             if turn_id is not None:
                 chunks = _bind_explicit_chunk_ids(turn.turn_id, chunks)
             staged.append((turn, chunks))
+            publication_requests.append((turn, created_at_was_explicit))
             flat_chunks.extend(chunks)
 
+        self._validate_staged_turns([turn for turn, _chunks in staged])
+        # Exact repeated explicit turns are idempotent at the transcript layer,
+        # but indexing both copies would allocate two HNSW labels for one
+        # deterministic chunk ID.  Collapse only byte-identical chunk models;
+        # a conflicting identity is an input error, not a dedup opportunity.
+        unique_chunks: dict[str, Chunk] = {}
+        for chunk in flat_chunks:
+            previous = unique_chunks.setdefault(chunk.chunk_id, chunk)
+            if previous != chunk:
+                raise ValueError(
+                    "batch contains duplicate chunk_id with different content"
+                )
+        flat_chunks = list(unique_chunks.values())
+        manifests: dict[str, PendingIngestManifest] = {}
+        for turn, chunks in staged:
+            manifest = PendingIngestManifest.build(turn, chunks)
+            previous = manifests.setdefault(turn.turn_id, manifest)
+            if previous != manifest:
+                raise ValueError(
+                    "batch contains duplicate turn_id with different chunks"
+                )
+
         if not flat_chunks:
+            published, _ingest_status = self._publish_staged_turns(
+                publication_requests,
+                manifests,
+            )
+            staged = [(published[turn.turn_id], chunks) for turn, chunks in staged]
             return staged
 
-        embedded = self._embedder.embed_chunks(flat_chunks)
-        self._retriever.add_chunks(embedded)
+        embedded = _embed_source_chunks(self._embedder, flat_chunks)
+        published, ingest_status = self._publish_staged_turns(
+            publication_requests,
+            manifests,
+        )
+        staged = [(published[turn.turn_id], chunks) for turn, chunks in staged]
+        pending_manifests = [
+            manifest
+            for turn_id, manifest in manifests.items()
+            if ingest_status[turn_id] == "pending"
+        ]
+        if pending_manifests:
+            self._index_pending_manifests(embedded, pending_manifests)
         by_turn: dict[str, list[Chunk]] = {}
         for chunk in embedded:
             by_turn.setdefault(chunk.turn_id, []).append(chunk)
         return [(turn, by_turn.get(turn.turn_id, [])) for turn, _ in staged]
+
+    def _validate_staged_turns(self, turns: Sequence[Turn]) -> None:
+        """Reject conflicting identities before a batch publishes anything."""
+        by_id: dict[str, Turn] = {}
+        for turn in turns:
+            previous = by_id.setdefault(turn.turn_id, turn)
+            if previous != turn:
+                raise ValueError(
+                    "batch contains duplicate turn_id with different content"
+                )
+
+    def _publish_staged_turns(
+        self,
+        requests: Sequence[tuple[Turn, bool]],
+        manifests: dict[str, PendingIngestManifest],
+    ) -> tuple[dict[str, Turn], dict[str, str]]:
+        """Atomically publish canonical turns and their replay manifests."""
+        published: dict[str, Turn] = {}
+        ingest_status: dict[str, str] = {}
+        connection = self._db.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for turn, created_at_was_explicit in requests:
+                stored, _inserted = self._transcript.publish_turn(
+                    turn,
+                    compare_created_at=created_at_was_explicit,
+                    commit=False,
+                )
+                published[turn.turn_id] = stored
+                ingest_status[turn.turn_id] = self._pending_ingests.claim(
+                    manifests[turn.turn_id]
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return published, ingest_status
+
+    def _index_pending_manifests(
+        self,
+        embedded: Sequence[Chunk],
+        manifests: Sequence[PendingIngestManifest],
+    ) -> None:
+        """Complete pending receipts, filtering raced completions finitely."""
+        remaining: dict[str, PendingIngestManifest] = {}
+        for manifest in manifests:
+            previous = remaining.setdefault(manifest.turn_id, manifest)
+            if previous != manifest:
+                raise ValueError("conflicting pending manifests in one index pass")
+        while remaining:
+            attempt = tuple(remaining.values())
+            attempt_turn_ids = set(remaining)
+            attempt_chunks = [
+                chunk
+                for chunk in embedded
+                if chunk.turn_id in attempt_turn_ids
+            ]
+            try:
+                if attempt_chunks:
+                    self._retriever.add_chunks(
+                        attempt_chunks,
+                        finalize=lambda attempt=attempt: (
+                            self._pending_ingests.finalize(attempt)
+                        ),
+                    )
+                else:
+                    connection = self._db.connection
+                    try:
+                        connection.execute("BEGIN IMMEDIATE")
+                        self._pending_ingests.finalize(attempt)
+                        connection.commit()
+                    except BaseException:
+                        connection.rollback()
+                        raise
+            except PendingIngestAlreadyIndexedError as exc:
+                previous_count = len(remaining)
+                for turn_id in exc.turn_ids:
+                    remaining.pop(turn_id, None)
+                if len(remaining) == previous_count:
+                    raise RuntimeError(
+                        "indexed-race signal did not identify an attempted receipt"
+                    ) from exc
+            else:
+                return
+
+    def pending_ingest_count(self) -> int:
+        """Return replayable turn publications awaiting complete indexing."""
+        return self._pending_ingests.count()
+
+    def recover_pending_ingests(self) -> list[tuple[Turn, list[Chunk]]]:
+        """Replay every durable pending manifest through the normal indexes."""
+        if self._db.read_only:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        manifests = self._pending_ingests.list_pending()
+        if not manifests:
+            return []
+
+        staged: list[tuple[Turn, list[Chunk]]] = []
+        flat_chunks: list[Chunk] = []
+        unique_chunks: dict[str, Chunk] = {}
+        for manifest in manifests:
+            turn = self._transcript.get_turn(manifest.turn_id)
+            if turn is None:
+                raise RuntimeError("pending ingest references an unknown turn")
+            chunks = manifest.reconstruct(turn)
+            staged.append((turn, chunks))
+            for chunk in chunks:
+                previous = unique_chunks.setdefault(chunk.chunk_id, chunk)
+                if previous != chunk:
+                    raise ValueError(
+                        "pending ingests contain a conflicting chunk identity"
+                    )
+        flat_chunks = list(unique_chunks.values())
+
+        if flat_chunks:
+            embedded = _embed_source_chunks(self._embedder, flat_chunks)
+            self._index_pending_manifests(embedded, manifests)
+        else:
+            self._index_pending_manifests([], manifests)
+            embedded = []
+
+        by_turn: dict[str, list[Chunk]] = {}
+        for chunk in embedded:
+            by_turn.setdefault(chunk.turn_id, []).append(chunk)
+        return [(turn, by_turn.get(turn.turn_id, [])) for turn, _chunks in staged]
 
     def ingest_transcript(
         self,

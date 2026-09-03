@@ -1,22 +1,22 @@
 **Standard ID:** MC-STD-DATA v0
 **Title:** Data contracts — storage, embedding, chunking, memory, loader, eval output
 **Status:** DRAFT (not yet frozen — freeze at first release or first external consumer, whichever comes first)
-**Date:** 2026-08-14
+**Date:** 2026-09-01
 **Supersedes:** the v1-schema-only revision of this standard (documented `turns` + `chunks` and nothing else)
 **Applies to:** `src/memory_condense/` and `eval_results/` JSON
 **Depends on:** • `03 - Architecture/00 - System Overview.md` (as-built map)
 
-> **Current worktree**: `schema_version` 8. v4 moves lifecycle decay to conversation-turn coordinates; v5 adds versioned compact CAV/QK/OV artifacts; v6 adds durable source/session identity; v7 adds artifact-scoped chunk Hebbian co-access; v8 adds model-independent live consolidation across typed memories and chunks. Stores at any earlier version migrate in place on open — see clause 10.
+> **Current worktree**: `schema_version` 13. v4 moves lifecycle decay to conversation-turn coordinates; v5 adds compact CAV/QK/OV artifacts; v6 adds source/session identity; v7 adds chunk Hebbian co-access; v8/v9 add live consolidation and causal counts; v10/v11 add source-grounded discourse plus content-bound revision receipts; v12 adds many-to-one memory-successor redirects; and v13 adds durable pending-to-indexed ingest manifests plus normalized globally unique chunk reservations. Stores at any earlier version migrate in place on open — see clause 10.
 
 ## 0. Scope
 
-Covers: the SQLite schema and migrations through v8, the embedding contract, chunk sizing, the lexical/BM25 index, the memory-item and provenance contract, compact association and consolidation artifacts, loader input formats (Claude exports + LongMemEval/LoCoMo), and eval result JSON.
+Covers: the SQLite schema and migrations through v13, the embedding contract, chunk sizing and crash-replay receipts, dense and lexical indexes, memory-item and provenance contracts, compact association/consolidation/discourse artifacts, loader input formats (Claude exports + LongMemEval/LoCoMo), and eval result JSON.
 
 Does NOT cover: prompt formats (implementation detail), rank weights or `alpha` (tuning parameters, not contract), or the `MemoryOps` **wire** contract for external producers — that gets its own standard (MC-STD-MEMOPS) if and when a non-local producer exists.
 
 ## 1. Normative Goals
 
-1. Derived state MUST be reconstructible from the `turns` table plus configuration. The hnswlib `.bin` file is a cache, never a source of truth. The BM25 inverted index is likewise derived (`LexicalIndex.rebuild()`).
+1. Derived state MUST be reconstructible from the `turns` table plus sealed configuration/receipts. For v13 ingestion, `pending_ingests` and `ingest_chunk_reservations` preserve the exact chunk topology and globally unique ownership when ambient chunker settings later change. The hnswlib `.bin` file is a cache, never a source of truth; a corrupt image MUST rebuild from SQLite. A partial ANN add or synchronization and an ambiguous or interrupted native retirement MUST discard the process-local graph for reconstruction from SQLite. The BM25 inverted index is likewise derived (`LexicalIndex.rebuild()`).
 2. Every chunk MUST carry provenance: `turn_id` + `start_char`/`end_char` spans into the turn text.
 3. Writers MUST NOT mutate or delete `turns` rows (append-only).
 4. Embeddings MUST be `float32`, produced by the configured sentence-transformers model, stored **unnormalized**. A consumer MUST NOT dot-product raw blobs without normalizing; cosine comparisons go through the hnswlib cosine space or explicit normalization.
@@ -42,12 +42,40 @@ Does NOT cover: prompt formats (implementation detail), rank weights or `alpha` 
     decay in conversation-turn space and graph degree plus receipt history MUST
     be bounded. CAV/QK/OV signals MAY weight a scalar update but MUST NOT bypass
     these constraints or become factual authority.
+15. **Turn-to-index publication MUST be replayable and topology sealed.** A
+    newly ingested turn and its canonical chunk manifest MUST publish in one
+    transaction. The manifest MUST name the complete ordered set of chunk IDs,
+    source spans, token counts, and text hashes without copying source text or
+    embeddings. Each manifest member MUST also have one normalized reservation
+    whose `chunk_id` is globally unique and whose owner, span, token count, and
+    text hash exactly equal that manifest member. Its status may advance only
+    `pending -> indexed`, and only in the transaction that proves every expected
+    chunk has an embedding, HNSW
+    label, and lexical document length and that no unexpected chunk belongs to
+    the turn. A failed or interrupted index step MUST leave the append-only turn
+    plus a replayable pending receipt; it MUST NOT compensate by deleting the
+    turn. An embedder result MUST be a one-to-one derivative of a pre-call
+    deep snapshot of the staged chunks; a provider MUST receive separate deep
+    copies, so no nested mutation can alter the validation baseline. No missing,
+    extra, duplicate, unembedded, or source-field replacement is admissible.
+    Completed receipts and reservations MUST remain durable so a
+    retry under different chunker settings fails closed rather than replacing
+    history. Exact manifest-member insertion, receipt-identity and reservation
+    immutability, receipt/reservation durability, and complete monotonic
+    transition MUST be enforced by SQLite triggers with
+    `recursive_triggers=ON` on every connection.
+    Supported direct dense or lexical completion MUST be restricted to pending
+    members. Once a receipt is indexed, a missing or incomplete member is
+    terminal retired state and MUST NOT be reactivated. The sole lexical repair
+    exception is no-argument `LexicalIndex.rebuild()`, which snapshots its live
+    batch from authoritative SQLite before clearing postings; a caller-supplied
+    iterable remains a direct write and MUST reject terminal retired members.
 
 ## 2. Core concept
 
-One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 8) holds everything durable: the source-identified transcript, chunks, BM25 inverted index, memory items with provenance, compact association artifacts, and scalar live-consolidation state. Two derived caches sit beside it — the hnswlib index file (`hnsw_index.bin`, cosine, `M=16`, `ef_construction=200`, `max_elements=100 000`, rebuildable via `rebuild_index()`) and the `chunk_terms` postings (rebuildable via `LexicalIndex.rebuild()`). Qwen is never part of this durable state; it is a bounded compiler/inspector that emits association records and unloads.
+One SQLite database (WAL, `foreign_keys=ON`, `recursive_triggers=ON`, `schema_version` 13) holds everything durable: source-identified turns, exact chunk-ingest receipts and globally unique reservations, chunks/BM25 postings, memories and successor/provenance edges, compact association state, live consolidation, and immutable source-grounded discourse receipts. The hnswlib file beside it is a derived cache (`hnsw_index.bin`, cosine, `M=16`, `ef_construction=200`, `max_elements=100 000`, rebuildable via `rebuild_index()`); it publishes by flushed private file plus atomic replacement. `chunk_terms` is also derived and rebuildable through `LexicalIndex.rebuild()`. Qwen is never part of durable state; it is a bounded compiler/inspector that emits compact records and unloads.
 
-## 3. Storage schema (v8)
+## 3. Storage schema (v13)
 
 | Table | Columns (contract-relevant) | Notes |
 | --- | --- | --- |
@@ -63,13 +91,19 @@ One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 8) holds everythin
 | `consolidation_access_events` | `event_id` PK, observed turn, SHA-256 membership fingerprint, member count | v8 bounded idempotency receipts; no rendered context |
 | `consolidation_nodes` | typed `node_key` pointing to exactly one active `memory_item` or retrievable `chunk`, scalar access mass/count and last-access turn | cross-partition address only; retired source state removes this derived node through triggers |
 | `consolidation_edges` | ordered node pair PK/FKs, scalar co-activation mass/count, causal count, last-reinforced turn | model-independent live assembly; distinguishes completed-interaction binding from incidental co-access; hard degree pruning and turn decay |
-| `meta` | `key` PK, `value` | holds `schema_version` |
+| `discourse_artifacts`, `episodes`, `episode_evidence`, `episode_representatives` | immutable artifact identity, source/ordinal episode boundaries, exact chunk/span/hash evidence coordinates, representative chunk/vector receipts | v10 episodic projection; source text remains in turns/chunks |
+| `discourse_units`, `discourse_unit_evidence`, `discourse_relations`, `discourse_relation_members`, `discourse_relation_evidence` | immutable typed unit/relation identities, scalar confidence/weights, exact evidence coordinates | v10 source-grounded discourse graph; no generated evidence text or token state |
+| `discourse_graph_revisions`, `discourse_revision_state`, `discourse_artifact_coverage`, `discourse_artifact_coverage_receipts` | source and graph revision counters/hashes, artifact coverage including `no_output`, immutable snapshot receipts | v10/v11 closes content/snapshot and zero-output ambiguity |
+| `memory_successor_redirects` | predecessor PK, successor FK, reason, creation time | v12 additive forward edge when one replacement absorbs more predecessors than scalar `supersedes` can name |
+| `pending_ingests` | turn PK/FK, canonical manifest hash/JSON, status CHECK ∈ {pending, indexed}, creation/index times | v13 exact chunk-topology receipt; indexed rows remain durable and pending rows are replayable |
+| `ingest_chunk_reservations` | `chunk_id` PK, turn FK, span, token count, text hash | v13 normalized global ownership; insert must exactly match one member of the owning manifest; rows are immutable and durable |
+| `meta` | `key` PK, `value` | holds `schema_version`, ANN-label allocation, and cross-process `chunk_index_revision` coordinates |
 
 ### 3.1 Migration path
 
 | From | To | Applied changes |
 | --- | --- | --- |
-| (no file / no `meta` table) | 8 | full schema created directly at v8 |
+| (no file / no `meta` table) | 13 | full schema created directly at v13 |
 | 1 | 2 | `ALTER TABLE chunks ADD COLUMN term_count`; create `chunk_terms`, `memory_items`, `memory_provenance` and their indexes; `UPDATE meta SET value = '2'` |
 | 2 | 3 | `ALTER TABLE memory_items ADD COLUMN content_hash`; `idx_memory_content_hash`; **post-migration backfill** of `content_hash` for existing rows; `UPDATE meta SET value = '3'` |
 | 3 | 4 | add `turns.ordinal`, `memory_items.half_life_turns`, and `memory_items.last_access_turn`; backfill turn ordinals and enter existing memories at the latest turn |
@@ -77,10 +111,21 @@ One SQLite database (WAL, `foreign_keys=ON`, `schema_version` 8) holds everythin
 | 5 | 6 | add nullable `turns.source_id` plus `(source_id, ordinal)` index; legacy turns remain valid and use `turn_id` as the source fallback |
 | 6 | 7 | add artifact-scoped bounded Hebbian access-event, chunk-node, and chunk-edge tables |
 | 7 | 8 | add model-independent cross-partition consolidation events, typed nodes, scalar edges, indexes, and retirement triggers |
+| 8 | 9 | add `consolidation_edges.causal_count` so completed-interaction binding is distinct from co-access |
+| 9 | 10 | add immutable source-grounded episode/discourse artifacts, exact evidence coordinates, coverage members, and graph revision receipts |
+| 10 | 11 | add authoritative role/time/turn evidence fields, monotonic source/graph content revisions and hashes, exact per-artifact chunk coverage including `no_output`, and immutable publication triggers |
+| 11 | 12 | add `memory_successor_redirects` for many-to-one exact-duplicate successor history |
+| 12 | 13 | add canonical pending-to-indexed ingest receipts, normalized global chunk reservations, and trigger-enforced exact membership/durability/monotonicity; migration seals every legacy chunked turn as historical `indexed` state and leaves zero-chunk legacy turns unclaimed because interruption cannot be inferred safely |
 
 `Database.schema_version` reports the on-disk version (`0` when unreadable). Migrations run inside `Database.__init__`, so opening a v1 file upgrades it — no separate migration command exists, and none should be added without also making the upgrade opt-in.
 
-Some migrations need work SQL cannot express — the v3 backfill hashes content, and stock SQLite has neither `sha256` nor a way to collapse internal whitespace runs. Those live in `db._POST_MIGRATIONS`, keyed by target version and run immediately after that version's SQL.
+Some migrations need work SQL cannot express — v3 hashes normalized memory content, v4 backfills the turn clock, v11 seals a content-bound discourse baseline, and v13 builds canonical manifests and reservations for legacy chunked turns. Those live in `db._POST_MIGRATIONS`, keyed by target version, and execute inside the same migration transaction as their schema/version publication.
+
+The trigger contract protects supported writers and migrations; it is not a
+security boundary against a caller with arbitrary raw-SQL authority. Such a
+caller can manufacture an initially `indexed` receipt because the completion
+proof trigger governs updates. Public stores, ingest/index APIs, and migrations
+MUST fail closed and MUST NOT expose that privileged construction path.
 
 **`content_hash` is indexed but deliberately not UNIQUE.** Stores written before v3 almost certainly already contain duplicates — that is the bug the column exists to stop — and `CREATE UNIQUE INDEX` would raise inside `Database.__init__`, making an existing store permanently unopenable. Uniqueness is enforced in `MemoryStore.create`; `MemoryStore.dedupe_existing()` cleans a legacy store on request (never from a migration: opening a database must not silently rewrite it). Promoting the constraint into the schema is a later version, after that cleanup has run.
 
@@ -147,13 +192,11 @@ pixi run -e dev pytest -q -m "not slow" tests/test_db.py tests/test_memory_store
 pixi run python -c "import sqlite3, tempfile, pathlib; from memory_condense.persistence.db import Database; p=pathlib.Path(tempfile.mkdtemp())/'v.db'; d=Database(p); print(d.schema_version); print(sorted(r[0] for r in d.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")))"
 ```
 
-Expect `11` and a table list containing the transcript, chunk/BM25,
-memory/provenance, CAV/QK/OV, v7 Hebbian, v8/v9 consolidation, and v10/v11
-source-grounded discourse tables. Schema v9 adds
-`consolidation_edges.causal_count`; schema v10 adds annotation artifacts,
-episodes, representatives, units, relations, exact evidence-coordinate tables,
-and immutable graph revisions. Schema v11 adds content-bound source/graph
-revision counters, per-artifact chunk coverage (including zero-output rows),
-and authoritative turn-role/time fields on evidence references.
+Expect `13` and a table list containing transcript, chunk/BM25,
+memory/provenance/successor redirects, CAV/QK/OV, Hebbian and consolidation,
+source-grounded discourse/coverage/revision receipts, `pending_ingests`, and
+`ingest_chunk_reservations`.
+Schema v12 adds explicit many-to-one successor redirects; schema v13 seals the
+turn-to-index topology and recovery state described by clause 15.
 
 Drift between `_SCHEMA_SQL` and `_MIGRATIONS` is no longer something to catch by hand: `tests/test_db.py::TestSchemaParity` builds a fresh database and a migrated one from both v1 and v2, then asserts they converge on the same tables, columns, and indexes. It compares shape rather than DDL text, because `ALTER TABLE ADD COLUMN` and `CREATE TABLE` render the same logical column differently and a text comparison would fail on every additive migration until everyone learned to ignore it.

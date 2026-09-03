@@ -30,6 +30,9 @@ from memory_condense.domain._tokenizer import (  # noqa: E402
 )
 from memory_condense.domain.discourse import quote_sha256  # noqa: E402
 from tools import build_exact11_semantic_atom_manifest as atom_cli  # noqa: E402
+from tools import (  # noqa: E402
+    run_locked_semantic_global_terminal_full100_construction as full100_cli,
+)
 from tools import run_reduced_semantic_global_terminal_assay as terminal_cli  # noqa: E402
 from tools.matched_eval.artifacts import (  # noqa: E402
     SealedArtifact,
@@ -42,8 +45,15 @@ from tools.matched_eval.contracts import (  # noqa: E402
     require_sha256,
 )
 from tools.matched_eval.semantic_global_terminal_adapter import (  # noqa: E402
+    BACKFILL_AUDIT_FORMAT,
+    BACKFILL_FORMAT,
     HARD_PROMPT_TOKEN_CAP,
+    LINKED_BACKFILL_FORMAT,
     OUTPUT_TOKEN_RESERVE,
+    PLANE_ORDER,
+)
+from tools.matched_eval.semantic_residual_search import (  # noqa: E402
+    EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
 )
 from tools.matched_eval.typed_memory_final_arm import (  # noqa: E402
     PACKET_CONSTRUCTION_OUTPUT_TOKEN_RESERVE,
@@ -653,10 +663,259 @@ def _is_usable(
     )
 
 
+def _verified_retention_populations(
+    compilation: Mapping[str, Any],
+) -> tuple[set[str], set[str], dict[str, str]] | None:
+    """Authenticate selected/dedup/backfill authority when it is available.
+
+    Historical unit fixtures predate the production plane/dedup receipts.  A
+    real backfill compilation may not use that compatibility path: every
+    retained row must be traced either to the initial dedup population or to
+    an admission in the sealed post-dedup backfill receipt.
+    """
+
+    compilation_format = compilation.get("format")
+    has_backfill = "post_dedup_backfill" in compilation
+    is_backfill_format = compilation_format in {
+        BACKFILL_FORMAT,
+        LINKED_BACKFILL_FORMAT,
+    }
+    _require(
+        has_backfill == is_backfill_format,
+        "terminal compilation/backfill format binding changed",
+    )
+    has_plane_selections = "plane_selections" in compilation
+    has_post_selection_dedup = "post_selection_dedup" in compilation
+    _require(
+        has_plane_selections == has_post_selection_dedup,
+        "terminal plane-selection/dedup authority is partial",
+    )
+    has_plane_authority = has_plane_selections and has_post_selection_dedup
+    if not has_plane_authority:
+        _require(
+            not has_backfill,
+            "terminal backfill omitted plane-selection or dedup authority",
+        )
+        return None
+
+    selections = tuple(
+        _dict(row, "terminal plane selection")
+        for row in _list(
+            compilation.get("plane_selections"),
+            "terminal plane selections",
+        )
+    )
+    _require(
+        len(selections) == len(PLANE_ORDER)
+        and tuple(row.get("plane") for row in selections) == PLANE_ORDER,
+        "terminal plane-selection order changed",
+    )
+    selected: list[str] = []
+    candidate_plane: dict[str, str] = {}
+    skipped_by_plane: dict[str, tuple[str, ...]] = {}
+    considered_by_plane: dict[str, tuple[str, ...]] = {}
+    selection_receipts: list[str] = []
+    for plane, selection in zip(PLANE_ORDER, selections, strict=True):
+        selection_receipts.append(
+            _self_sha(selection, "receipt_sha256", "terminal plane selection")
+        )
+        candidates = tuple(
+            _sha(value, "terminal plane candidate")
+            for value in _list(
+                selection.get("candidate_receipt_sha256s"),
+                "terminal plane candidates",
+            )
+        )
+        plane_selected = tuple(
+            _sha(value, "terminal selected candidate")
+            for value in _list(
+                selection.get("selected_candidate_receipt_sha256s"),
+                "terminal selected candidates",
+            )
+        )
+        skipped = tuple(
+            _sha(value, "terminal skipped candidate")
+            for value in _list(
+                selection.get("skipped_candidate_receipt_sha256s"),
+                "terminal skipped candidates",
+            )
+        )
+        consideration = tuple(
+            _sha(
+                _dict(row, "terminal consideration row").get(
+                    "candidate_receipt_sha256"
+                ),
+                "terminal considered candidate",
+            )
+            for row in _list(
+                selection.get("consideration_order"),
+                "terminal consideration order",
+            )
+        )
+        _require(
+            len(set(candidates)) == len(candidates)
+            and len(set(plane_selected)) == len(plane_selected)
+            and len(set(skipped)) == len(skipped)
+            and len(set(consideration)) == len(consideration)
+            and set(plane_selected).isdisjoint(skipped)
+            and set(plane_selected).union(skipped) == set(candidates)
+            and set(consideration) == set(candidates),
+            f"terminal {plane} selection population changed",
+        )
+        for receipt in candidates:
+            _require(
+                receipt not in candidate_plane,
+                "terminal candidate crossed independent plane populations",
+            )
+            candidate_plane[receipt] = plane
+        selected.extend(plane_selected)
+        skipped_by_plane[plane] = skipped
+        considered_by_plane[plane] = tuple(
+            receipt for receipt in consideration if receipt in set(skipped)
+        )
+
+    dedup = _dict(
+        compilation.get("post_selection_dedup"),
+        "terminal post-selection dedup",
+    )
+    dedup_receipt = _self_sha(
+        dedup,
+        "receipt_sha256",
+        "terminal post-selection dedup",
+    )
+    dedup_selected = tuple(
+        _sha(value, "terminal pre-dedup candidate")
+        for value in _list(
+            dedup.get("selected_before_dedup_receipt_sha256s"),
+            "terminal pre-dedup candidates",
+        )
+    )
+    dedup_retained = tuple(
+        _sha(value, "terminal dedup-retained candidate")
+        for value in _list(
+            dedup.get("retained_after_dedup_receipt_sha256s"),
+            "terminal dedup-retained candidates",
+        )
+    )
+    _require(
+        tuple(selected) == dedup_selected
+        and len(set(dedup_retained)) == len(dedup_retained)
+        and set(dedup_retained) <= set(dedup_selected),
+        "terminal dedup population escaped independent plane selection",
+    )
+
+    final_retained = dedup_retained
+    if has_backfill:
+        backfill = _dict(
+            compilation.get("post_dedup_backfill"),
+            "terminal post-dedup backfill",
+        )
+        _require(
+            set(backfill)
+            == {
+                "admitted_candidate_receipt_sha256s_by_plane",
+                "considered_candidate_receipt_sha256s_by_plane",
+                "final_retained_candidate_receipt_sha256s",
+                "format",
+                "globally_novel_exact_spans_only",
+                "initial_dedup_receipt_sha256",
+                "original_plane_budgets_reused",
+                "plane_selection_receipt_sha256s",
+                "receipt_sha256",
+            }
+            and backfill.get("format") == BACKFILL_AUDIT_FORMAT
+            and backfill.get("globally_novel_exact_spans_only") is True
+            and backfill.get("original_plane_budgets_reused") is True
+            and _self_sha(
+                backfill,
+                "receipt_sha256",
+                "terminal post-dedup backfill",
+            )
+            == backfill.get("receipt_sha256")
+            and backfill.get("initial_dedup_receipt_sha256") == dedup_receipt
+            and tuple(backfill.get("plane_selection_receipt_sha256s", ()))
+            == tuple(selection_receipts),
+            "terminal post-dedup backfill identity changed",
+        )
+
+        def by_plane(key: str, label: str) -> dict[str, tuple[str, ...]]:
+            rows = tuple(
+                _dict(row, label)
+                for row in _list(backfill.get(key), label)
+            )
+            _require(
+                len(rows) == len(PLANE_ORDER)
+                and tuple(row.get("plane") for row in rows) == PLANE_ORDER,
+                f"{label} plane order changed",
+            )
+            result: dict[str, tuple[str, ...]] = {}
+            observed: list[str] = []
+            for plane, row in zip(PLANE_ORDER, rows, strict=True):
+                receipts = tuple(
+                    _sha(value, label)
+                    for value in _list(
+                        row.get("candidate_receipt_sha256s"), label
+                    )
+                )
+                _require(
+                    len(set(receipts)) == len(receipts),
+                    f"{label} repeated a candidate",
+                )
+                result[plane] = receipts
+                observed.extend(receipts)
+            _require(
+                len(set(observed)) == len(observed),
+                f"{label} crossed plane populations",
+            )
+            return result
+
+        considered = by_plane(
+            "considered_candidate_receipt_sha256s_by_plane",
+            "terminal backfill considered candidates",
+        )
+        admitted = by_plane(
+            "admitted_candidate_receipt_sha256s_by_plane",
+            "terminal backfill admitted candidates",
+        )
+        _require(
+            all(considered[plane] == considered_by_plane[plane] for plane in PLANE_ORDER)
+            and all(
+                set(admitted[plane]) <= set(considered[plane])
+                and set(admitted[plane]) <= set(skipped_by_plane[plane])
+                and admitted[plane]
+                == tuple(
+                    receipt
+                    for receipt in considered[plane]
+                    if receipt in set(admitted[plane])
+                )
+                for plane in PLANE_ORDER
+            ),
+            "terminal backfill escaped skipped plane consideration",
+        )
+        admitted_order = tuple(
+            receipt for plane in PLANE_ORDER for receipt in admitted[plane]
+        )
+        final_retained = tuple(
+            _sha(value, "terminal final backfill candidate")
+            for value in _list(
+                backfill.get("final_retained_candidate_receipt_sha256s"),
+                "terminal final backfill candidates",
+            )
+        )
+        _require(
+            final_retained == (*dedup_retained, *admitted_order)
+            and len(set(final_retained)) == len(final_retained),
+            "terminal final backfill population/order changed",
+        )
+
+    return set(selected), set(final_retained), candidate_plane
+
+
 def _audit_terminal_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     ordinal = _integer(plan.get("ordinal"), "terminal plan ordinal")
     question_id = _text(plan.get("question_id"), "terminal plan question ID")
     compilation = _dict(plan.get("terminal_compilation"), "terminal compilation")
+    retention_authority = _verified_retention_populations(compilation)
     local_audit = _dict(compilation.get("local_audit"), "terminal local audit")
     packet = _dict(compilation.get("packet"), "terminal packet")
     _require(
@@ -800,10 +1059,28 @@ def _audit_terminal_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             "terminal post-dedup retention",
         )
         typed_value = row.get("typed_terminal")
-        _require(
+        outer_mapping_valid = (
             candidate_receipt not in seen_local_candidate_receipts
             and (typed_value is not None) == retained_after_dedup
-            and (not retained_after_dedup or selected_before_dedup),
+        )
+        if retention_authority is None:
+            outer_mapping_valid = outer_mapping_valid and (
+                not retained_after_dedup or selected_before_dedup
+            )
+        else:
+            selected_receipts, retained_receipts, candidate_plane = (
+                retention_authority
+            )
+            outer_mapping_valid = (
+                outer_mapping_valid
+                and candidate.get("plane") == candidate_plane.get(candidate_receipt)
+                and selected_before_dedup
+                == (candidate_receipt in selected_receipts)
+                and retained_after_dedup
+                == (candidate_receipt in retained_receipts)
+            )
+        _require(
+            outer_mapping_valid,
             f"terminal outer selection/dedup mapping changed at ordinal {ordinal}",
         )
         seen_local_candidate_receipts.add(candidate_receipt)
@@ -940,6 +1217,12 @@ def _audit_terminal_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
                 "selected_by_independent_plane_budget": selected_before_dedup,
                 "source_id": local_source_id,
             }
+        )
+    if retention_authority is not None:
+        _require(
+            seen_local_candidate_receipts == set(retention_authority[2]),
+            "terminal local rows escaped the authenticated candidate population "
+            f"at ordinal {ordinal}",
         )
     declared_retained_receipts = _ordered_unique_text(
         compilation.get("retained_row_receipt_sha256s"),
@@ -2032,12 +2315,40 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     # Ordering is a security boundary: do not stat, open, or parse the target
     # plan until both terminal artifacts and their V7 ancestry are sealed and
     # strictly authenticated by the production reader.
-    construction, replay, plans = terminal_cli.load_verified_terminal_assay(
-        args.terminal_root,
-        args.expected_construction_sha256,
-        args.expected_replay_sha256,
-        v7_source_root=args.v7_source_root,
-    )
+    if bool(getattr(args, "promotion_from_full100", False)):
+        _require(
+            getattr(args, "r7_construction", None) is not None
+            and getattr(args, "expected_r7_construction_sha256", None)
+            is not None,
+            "full100 promotion requires the explicit successor R7 path and SHA-256",
+        )
+        detailed = full100_cli.load_verified_full100_construction_detailed(
+            args.terminal_root,
+            args.expected_construction_sha256,
+            args.expected_replay_sha256,
+            r7_path=args.r7_construction,
+            expected_r7_sha256=args.expected_r7_construction_sha256,
+        )
+        _require(
+            detailed.residual_policy.classifier_mode
+            == EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
+            "full100 promotion requires the evidence-conserving R7 successor",
+        )
+        construction = detailed.construction
+        replay = detailed.replay
+        plans = detailed.exact11_terminal_plans
+    else:
+        _require(
+            getattr(args, "r7_construction", None) is None
+            and getattr(args, "expected_r7_construction_sha256", None) is None,
+            "successor R7 arguments require --promotion-from-full100",
+        )
+        construction, replay, plans = terminal_cli.load_verified_terminal_assay(
+            args.terminal_root,
+            args.expected_construction_sha256,
+            args.expected_replay_sha256,
+            v7_source_root=args.v7_source_root,
+        )
     target_plan, source_targets = _verified_target_plan(
         Path(args.target_plan),
         args.expected_target_plan_sha256,
@@ -2132,6 +2443,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--v7-source-root", type=Path, default=terminal_cli.DEFAULT_V7_SOURCE_ROOT
     )
+    parser.add_argument(
+        "--promotion-from-full100",
+        action="store_true",
+        help=(
+            "audit the fixed exact11 projection from authenticated full100 "
+            "namespace sidecars instead of a separately sealed reduced assay"
+        ),
+    )
+    parser.add_argument("--r7-construction", type=Path)
+    parser.add_argument("--expected-r7-construction-sha256")
     parser.add_argument("--target-plan", type=Path, default=DEFAULT_TARGET_PLAN)
     parser.add_argument(
         "--expected-target-plan-sha256", default=DEFAULT_TARGET_PLAN_SHA256

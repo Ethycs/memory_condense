@@ -193,6 +193,10 @@ def test_compiled_store_builds_once_then_reopens_without_embedding(tmp_path: Pat
     receipt = first.compiled_cache_receipt
     with pytest.raises(sqlite3.OperationalError):
         first.ingest("user", "A compiled cache reader must reject writes.")
+    with pytest.raises(sqlite3.OperationalError):
+        first.ingest_many(
+            [("user", "A batch cache reader must reject writes.", "session-a")]
+        )
     first.close()
     assert embedder.chunk_calls == 1
     manifests = _manifests(cache)

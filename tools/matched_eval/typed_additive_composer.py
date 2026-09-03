@@ -19,7 +19,7 @@ receipt can be passed directly to ``fit_typed_final_prompt``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from .contracts import (
     MatchedEvalContractError,
@@ -57,8 +57,21 @@ from .typed_operator_spec import TypedOperatorSpec
 
 FORMAT = "memory-condense-typed-additive-composer-v1"
 DEDUP_FORMAT = f"{FORMAT}-post-selection-dedup-v1"
-DEDUP_BACKFILL_FORMAT = f"{FORMAT}-post-dedup-capacity-backfill-v1"
 FAIR_MERGE_FORMAT = f"{FORMAT}-fair-premerge-v1"
+POST_DEDUP_BACKFILL_FORMAT = "memory-condense-typed-additive-composer-v2"
+POST_DEDUP_BACKFILL_DEDUP_FORMAT = (
+    f"{POST_DEDUP_BACKFILL_FORMAT}-post-selection-dedup-v1"
+)
+DEDUP_BACKFILL_FORMAT = (
+    f"{POST_DEDUP_BACKFILL_FORMAT}-post-dedup-capacity-backfill-v1"
+)
+POST_DEDUP_BACKFILL_FAIR_MERGE_FORMAT = (
+    f"{POST_DEDUP_BACKFILL_FORMAT}-fair-premerge-v1"
+)
+
+LEGACY_COMPOSITION_MODE = "legacy_v1"
+POST_DEDUP_BACKFILL_COMPOSITION_MODE = "post_dedup_backfill_v2"
+CompositionMode = Literal["legacy_v1", "post_dedup_backfill_v2"]
 
 
 def _require(ok: object, message: str) -> None:
@@ -261,6 +274,7 @@ def deduplicate_selected_contributions(
     owner_priority_by_mechanism: Mapping[str, int],
     exact_span_keys_by_handle: Mapping[str, Sequence[str]] | None = None,
     operation_position: str = "after_all_mechanism_selection",
+    audit_format: str = DEDUP_FORMAT,
 ) -> tuple[tuple[TypedEvidenceContribution, ...], dict[str, Any]]:
     """Deduplicate only identity-proven semantic equivalents after selection.
 
@@ -273,6 +287,10 @@ def deduplicate_selected_contributions(
 
     _validate_input_partitions(contributions)
     require_text(operation_position, "dedup operation position")
+    _require(
+        audit_format in {DEDUP_FORMAT, POST_DEDUP_BACKFILL_DEDUP_FORMAT},
+        "dedup audit format changed",
+    )
     mechanisms = tuple(row.mechanism_id for row in contributions)
     priorities = _normalized_mechanism_priorities(
         owner_priority_by_mechanism,
@@ -375,7 +393,7 @@ def deduplicate_selected_contributions(
                     "accepted_item_receipt_sha256s": [
                         item.receipt_sha256 for item in accepted
                     ],
-                    "format": f"{DEDUP_FORMAT}-parse-subset",
+                    "format": f"{audit_format}-parse-subset",
                     "original_parse_receipt_sha256": (
                         contribution.parsed.parse_receipt_sha256
                     ),
@@ -407,7 +425,7 @@ def deduplicate_selected_contributions(
                 for handle in sorted(span_keys)
             ],
             "exclusions": exclusions,
-            "format": DEDUP_FORMAT,
+            "format": audit_format,
             "gold_loaded": False,
             "input_contribution_receipt_sha256s": [
                 row.receipt_sha256 for row in contributions
@@ -756,14 +774,15 @@ def _fair_merge_contributions(
     operator_spec: TypedOperatorSpec,
     contributions: tuple[TypedEvidenceContribution, ...],
     *,
-    original_protected_item_receipt_sha256s: tuple[str, ...],
+    original_protected_item_receipt_sha256s: tuple[str, ...] | None,
     protected_item_receipt_sha256s: tuple[str, ...],
     minimum_allocation_receipt_sha256: str,
     surplus_fill_audit: Mapping[str, Any],
-    post_selection_dedup_audit: Mapping[str, Any],
+    post_selection_dedup_audit: Mapping[str, Any] | None,
     mechanism_priority_by_mechanism: Mapping[str, int],
     local_selection_priority_by_handle: Mapping[str, tuple[int, ...]],
     provider_payload_mode: ProviderPayloadMode,
+    composition_mode: CompositionMode,
 ) -> tuple[TypedEvidencePacket, dict[str, Any]]:
     """Fairly build the compact pre-fit packet while preserving lane minima."""
 
@@ -781,42 +800,77 @@ def _fair_merge_contributions(
         surplus_fill_audit,
         label="fair merge surplus fill audit",
     )
-    dedup_receipt = _verify_sealed_audit(
-        post_selection_dedup_audit,
-        label="fair merge post-admission dedup audit",
-    )
-    initial_dedup_audit = post_selection_dedup_audit.get(
-        "initial_post_selection_dedup_audit"
-    )
-    _verify_sealed_audit(
-        initial_dedup_audit,
-        label="fair merge initial post-admission dedup audit",
-    )
-    original_protected_receipts = tuple(
-        original_protected_item_receipt_sha256s
-    )
+    successor = composition_mode == POST_DEDUP_BACKFILL_COMPOSITION_MODE
     _require(
-        surplus_fill_audit.get("minimum_allocation_receipt_sha256")
-        == minimum_receipt
-        and surplus_fill_audit.get("minimum_item_receipt_sha256s")
-        == list(original_protected_receipts)
-        and post_selection_dedup_audit.get("input_contribution_receipt_sha256s")
-        == surplus_fill_audit.get("contribution_receipt_sha256s")
-        and initial_dedup_audit.get("input_contribution_receipt_sha256s")
-        == surplus_fill_audit.get("contribution_receipt_sha256s")
-        and initial_dedup_audit.get("output_contribution_receipt_sha256s")
-        == post_selection_dedup_audit.get(
-            "pre_backfill_contribution_receipt_sha256s"
-        )
-        and post_selection_dedup_audit.get("output_contribution_receipt_sha256s")
-        == [row.receipt_sha256 for row in contributions]
-        and post_selection_dedup_audit.get("operation_position")
-        == (
-            "after_independent_lane_admission_and_shared_surplus_fill_"
-            "then_dedup_and_freed_capacity_backfill"
-        ),
-        "fair merge inputs do not match the sealed surplus fill",
+        composition_mode
+        in {LEGACY_COMPOSITION_MODE, POST_DEDUP_BACKFILL_COMPOSITION_MODE},
+        "fair merge composition mode changed",
     )
+    fair_merge_format = (
+        POST_DEDUP_BACKFILL_FAIR_MERGE_FORMAT if successor else FAIR_MERGE_FORMAT
+    )
+    if successor:
+        _require(
+            type(post_selection_dedup_audit) is dict
+            and type(original_protected_item_receipt_sha256s) is tuple,
+            "successor fair merge lost its post-dedup authority",
+        )
+        dedup_receipt = _verify_sealed_audit(
+            post_selection_dedup_audit,
+            label="fair merge post-admission dedup audit",
+        )
+        initial_dedup_audit = post_selection_dedup_audit.get(
+            "initial_post_selection_dedup_audit"
+        )
+        _verify_sealed_audit(
+            initial_dedup_audit,
+            label="fair merge initial post-admission dedup audit",
+        )
+        original_protected_receipts = tuple(
+            original_protected_item_receipt_sha256s
+        )
+        _require(
+            surplus_fill_audit.get("minimum_allocation_receipt_sha256")
+            == minimum_receipt
+            and surplus_fill_audit.get("minimum_item_receipt_sha256s")
+            == list(original_protected_receipts)
+            and post_selection_dedup_audit.get(
+                "input_contribution_receipt_sha256s"
+            )
+            == surplus_fill_audit.get("contribution_receipt_sha256s")
+            and initial_dedup_audit.get("input_contribution_receipt_sha256s")
+            == surplus_fill_audit.get("contribution_receipt_sha256s")
+            and initial_dedup_audit.get("output_contribution_receipt_sha256s")
+            == post_selection_dedup_audit.get(
+                "pre_backfill_contribution_receipt_sha256s"
+            )
+            and post_selection_dedup_audit.get(
+                "output_contribution_receipt_sha256s"
+            )
+            == [row.receipt_sha256 for row in contributions]
+            and post_selection_dedup_audit.get("operation_position")
+            == (
+                "after_independent_lane_admission_and_shared_surplus_fill_"
+                "then_dedup_and_freed_capacity_backfill"
+            ),
+            "fair merge inputs do not match the sealed surplus fill",
+        )
+    else:
+        _require(
+            post_selection_dedup_audit is None
+            and original_protected_item_receipt_sha256s is None
+            and provider_payload_mode is ProviderPayloadMode.COMPACT_FINAL
+            and surplus_fill_audit.get("minimum_allocation_receipt_sha256")
+            == minimum_receipt
+            and surplus_fill_audit.get("minimum_item_receipt_sha256s")
+            == list(protected_item_receipt_sha256s)
+            and surplus_fill_audit.get("contribution_receipt_sha256s")
+            == [row.receipt_sha256 for row in contributions],
+            "legacy v1 fair merge inputs changed",
+        )
+        dedup_receipt = ""
+        initial_dedup_audit = None
+        original_protected_receipts = tuple(protected_item_receipt_sha256s)
 
     binding_by_handle: dict[str, EvidenceHandleBinding] = {}
     owner_by_item_receipt: dict[str, str] = {}
@@ -872,64 +926,79 @@ def _fair_merge_contributions(
     for value in protected_receipts:
         require_sha256(value, "fair merge protected item receipt")
     item_by_receipt = {row.receipt_sha256: row for row in ordered_items}
-    raw_exclusions = post_selection_dedup_audit.get("exclusions")
-    _require(
-        type(raw_exclusions) is list
-        and all(type(row) is dict for row in raw_exclusions),
-        "fair merge dedup exclusions changed schema",
-    )
-    _require(
-        raw_exclusions == initial_dedup_audit.get("exclusions"),
-        "fair merge backfill changed the exact dedup authority",
-    )
-    exclusion_by_duplicate = {
-        row["duplicate_item_receipt_sha256"]: row for row in raw_exclusions
-    }
-    _require(
-        len(exclusion_by_duplicate) == len(raw_exclusions),
-        "fair merge dedup exclusions repeated a duplicate item",
-    )
-    expected_effective_protection: list[str] = []
     protection_transfers: list[dict[str, Any]] = []
-    for original_receipt in original_protected_receipts:
-        if original_receipt in item_by_receipt:
-            effective_receipt = original_receipt
-        else:
-            exclusion = exclusion_by_duplicate.get(original_receipt)
-            _require(
-                exclusion is not None,
-                "protected lane minimum disappeared without dedup authority",
-            )
-            effective_receipt = exclusion["owner_item_receipt_sha256"]
-            _require(
-                effective_receipt in item_by_receipt,
-                "dedup owner did not survive post-admission composition",
-            )
-            protection_transfers.append(
-                {
-                    "effective_item_receipt_sha256": effective_receipt,
-                    "original_item_receipt_sha256": original_receipt,
-                    "shared_exact_span_receipt_sha256s": exclusion[
-                        "shared_exact_span_receipt_sha256s"
-                    ],
-                }
-            )
-        if effective_receipt not in expected_effective_protection:
-            expected_effective_protection.append(effective_receipt)
-    _require(
-        tuple(expected_effective_protection) == protected_receipts,
-        "effective protected minima disagree with dedup authority transfer",
-    )
+    exclusion_by_duplicate: dict[str, Mapping[str, Any]] = {}
+    if successor:
+        _require(type(post_selection_dedup_audit) is dict, "dedup audit changed")
+        raw_exclusions = post_selection_dedup_audit.get("exclusions")
+        _require(
+            type(raw_exclusions) is list
+            and all(type(row) is dict for row in raw_exclusions),
+            "fair merge dedup exclusions changed schema",
+        )
+        _require(
+            type(initial_dedup_audit) is dict
+            and raw_exclusions == initial_dedup_audit.get("exclusions"),
+            "fair merge backfill changed the exact dedup authority",
+        )
+        exclusion_by_duplicate = {
+            row["duplicate_item_receipt_sha256"]: row for row in raw_exclusions
+        }
+        _require(
+            len(exclusion_by_duplicate) == len(raw_exclusions),
+            "fair merge dedup exclusions repeated a duplicate item",
+        )
+        expected_effective_protection: list[str] = []
+        for original_receipt in original_protected_receipts:
+            if original_receipt in item_by_receipt:
+                effective_receipt = original_receipt
+            else:
+                exclusion = exclusion_by_duplicate.get(original_receipt)
+                _require(
+                    exclusion is not None,
+                    "protected lane minimum disappeared without dedup authority",
+                )
+                effective_receipt = exclusion["owner_item_receipt_sha256"]
+                _require(
+                    effective_receipt in item_by_receipt,
+                    "dedup owner did not survive post-admission composition",
+                )
+                protection_transfers.append(
+                    {
+                        "effective_item_receipt_sha256": effective_receipt,
+                        "original_item_receipt_sha256": original_receipt,
+                        "shared_exact_span_receipt_sha256s": exclusion[
+                            "shared_exact_span_receipt_sha256s"
+                        ],
+                    }
+                )
+            if effective_receipt not in expected_effective_protection:
+                expected_effective_protection.append(effective_receipt)
+        _require(
+            tuple(expected_effective_protection) == protected_receipts,
+            "effective protected minima disagree with dedup authority transfer",
+        )
     _require(
         set(protected_receipts) <= set(item_by_receipt)
         and all(_usable_item(item_by_receipt[row], operator_spec) for row in protected_receipts),
         "fair merge protected lane minimum is missing or unusable",
     )
     protected = [item_by_receipt[row] for row in protected_receipts]
-    # A mechanism's minimum can be represented by an exact duplicate owned by
-    # another mechanism.  The receipt-by-receipt authority transfer above is
-    # the conservation proof; requiring every still-nonempty mechanism to own
-    # an effective minimum would reject valid unique backfill from that lane.
+    if not successor:
+        protected_owner_ids = {
+            owner_by_item_receipt[item.receipt_sha256] for item in protected
+        }
+        _require(
+            all(
+                not any(
+                    _usable_item(item, operator_spec)
+                    for item in row.parsed.accepted_items
+                )
+                or row.mechanism_id in protected_owner_ids
+                for row in contributions
+            ),
+            "fair merge protected lane minima lost a nonempty mechanism",
+        )
     protected_handles = {
         handle for item in protected for handle in item.handle_ids
     }
@@ -939,29 +1008,36 @@ def _fair_merge_contributions(
         for binding in contribution.bindings
         if binding.handle_id in protected_handles
     )
-    original_minimum_binding_receipts = set(
-        surplus_fill_audit.get("minimum_binding_receipt_sha256s", ())
-    )
-    effective_binding_receipt_set = set(protected_binding_receipts)
-    transferred_duplicate_bindings: set[str] = set()
-    for original_receipt in original_protected_receipts:
-        exclusion = exclusion_by_duplicate.get(original_receipt)
-        if exclusion is None:
-            continue
-        duplicate_bindings = set(
-            exclusion["duplicate_binding_receipt_sha256s"]
+    if successor:
+        original_minimum_binding_receipts = set(
+            surplus_fill_audit.get("minimum_binding_receipt_sha256s", ())
         )
-        owner_bindings = set(exclusion["owner_binding_receipt_sha256s"])
-        transferred_duplicate_bindings.update(duplicate_bindings)
+        effective_binding_receipt_set = set(protected_binding_receipts)
+        transferred_duplicate_bindings: set[str] = set()
+        for original_receipt in original_protected_receipts:
+            exclusion = exclusion_by_duplicate.get(original_receipt)
+            if exclusion is None:
+                continue
+            duplicate_bindings = set(
+                exclusion["duplicate_binding_receipt_sha256s"]
+            )
+            owner_bindings = set(exclusion["owner_binding_receipt_sha256s"])
+            transferred_duplicate_bindings.update(duplicate_bindings)
+            _require(
+                owner_bindings <= effective_binding_receipt_set,
+                "dedup protection transfer lost its owner bindings",
+            )
         _require(
-            owner_bindings <= effective_binding_receipt_set,
-            "dedup protection transfer lost its owner bindings",
+            original_minimum_binding_receipts
+            <= effective_binding_receipt_set | transferred_duplicate_bindings,
+            "fair merge protected binding partition changed",
         )
-    _require(
-        original_minimum_binding_receipts
-        <= effective_binding_receipt_set | transferred_duplicate_bindings,
-        "fair merge protected binding partition changed",
-    )
+    else:
+        _require(
+            set(protected_binding_receipts)
+            == set(surplus_fill_audit.get("minimum_binding_receipt_sha256s", ())),
+            "fair merge protected binding partition changed",
+        )
 
     selected = list(protected)
     selected_receipts = set(protected_receipts)
@@ -1013,7 +1089,7 @@ def _fair_merge_contributions(
                     "contribution_receipt_sha256s": [
                         row.receipt_sha256 for row in contributions
                     ],
-                    "format": f"{FAIR_MERGE_FORMAT}-parse-subset",
+                    "format": f"{fair_merge_format}-parse-subset",
                     "rejected_item_receipt_sha256s": [
                         row.rejection_sha256 for row in rejected
                     ],
@@ -1079,9 +1155,8 @@ def _fair_merge_contributions(
                 ),
             }
         )
-    audit = _sealed_audit(
-        {
-            "format": FAIR_MERGE_FORMAT,
+    audit_body = {
+            "format": fair_merge_format,
             "gold_loaded": False,
             "input_contribution_receipt_sha256s": [
                 row.receipt_sha256 for row in contributions
@@ -1089,7 +1164,7 @@ def _fair_merge_contributions(
             "local_selection_priority_receipt_sha256": identity_sha256(
                 {
                     "fixed_width": LOCAL_RETENTION_PRIORITY_WIDTH,
-                    "format": f"{FAIR_MERGE_FORMAT}-local-priority-v1",
+                    "format": f"{fair_merge_format}-local-priority-v1",
                     "rows": [
                         {"handle_id": handle, "priority": list(priority)}
                         for handle, priority in sorted(
@@ -1121,7 +1196,16 @@ def _fair_merge_contributions(
             "provider_prompt_count": 0,
             "retained_transformer_token_state_bytes": 0,
             "shared_lane_surplus_fill_receipt_sha256": surplus_receipt,
-        },
+        }
+    if not successor:
+        for key in (
+            "original_protected_minimum_item_receipt_sha256s",
+            "post_admission_dedup_receipt_sha256",
+            "protected_minimum_item_transfer_rows",
+        ):
+            audit_body.pop(key)
+    audit = _sealed_audit(
+        audit_body,
         path="typed_additive_fair_premerge",
     )
     return packet, audit
@@ -1179,6 +1263,7 @@ class AdditiveTypedComposition:
     fair_merge_audit: Mapping[str, Any]
     dropped_binding_projections: tuple[Mapping[str, Any], ...]
     receipt_sha256: str = ""
+    format_id: str = FORMAT
 
     def __post_init__(self) -> None:
         _require(type(self.packet) is TypedEvidencePacket, "additive packet changed type")
@@ -1192,6 +1277,10 @@ class AdditiveTypedComposition:
             type(self.minimum_allocation) is TypedLaneAllocation,
             "additive minimum allocation changed type",
         )
+        _require(
+            self.format_id in {FORMAT, POST_DEDUP_BACKFILL_FORMAT},
+            "additive composition format changed",
+        )
         mechanism = dict(self.mechanism_by_handle)
         _require(
             set(mechanism) == {row.handle_id for row in self.packet.handles},
@@ -1204,6 +1293,27 @@ class AdditiveTypedComposition:
             (self.fair_merge_audit, "additive fair merge audit"),
         ):
             _verify_sealed_audit(audit, label=label)
+        expected_dedup_format = (
+            DEDUP_FORMAT
+            if self.format_id == FORMAT
+            else DEDUP_BACKFILL_FORMAT
+        )
+        expected_fair_format = (
+            FAIR_MERGE_FORMAT
+            if self.format_id == FORMAT
+            else POST_DEDUP_BACKFILL_FAIR_MERGE_FORMAT
+        )
+        _require(
+            self.post_selection_dedup_audit.get("format")
+            == expected_dedup_format
+            and self.fair_merge_audit.get("format") == expected_fair_format
+            and (
+                self.format_id == FORMAT
+                or "initial_post_selection_dedup_audit"
+                in self.post_selection_dedup_audit
+            ),
+            "additive format does not identify its construction semantics",
+        )
         _require(
             tuple(self.fair_merge_audit.get("protected_minimum_item_receipt_sha256s", ()))
             == self.protected_item_receipt_sha256s
@@ -1238,7 +1348,7 @@ class AdditiveTypedComposition:
             "fair_merge_audit_receipt_sha256": self.fair_merge_audit[
                 "receipt_sha256"
             ],
-            "format": FORMAT,
+            "format": self.format_id,
             "gold_loaded": False,
             "mechanism_by_handle": dict(self.mechanism_by_handle),
             "minimum_allocation_receipt_sha256": (
@@ -1255,7 +1365,7 @@ class AdditiveTypedComposition:
             "retained_local_priority_receipt_sha256": identity_sha256(
                 {
                     "fixed_width": LOCAL_RETENTION_PRIORITY_WIDTH,
-                    "format": f"{FORMAT}-retained-local-priority-v1",
+                    "format": f"{self.format_id}-retained-local-priority-v1",
                     "rows": [
                         {"handle_id": handle, "priority": list(priority)}
                         for handle, priority in sorted(
@@ -1285,6 +1395,7 @@ def compose_additive_typed_evidence(
     local_selection_priority_by_handle: Mapping[str, Sequence[int]] | None = None,
     fair_merge_priority_by_mechanism: Mapping[str, int] | None = None,
     provider_payload_mode: ProviderPayloadMode = ProviderPayloadMode.COMPACT_FINAL,
+    composition_mode: CompositionMode = LEGACY_COMPOSITION_MODE,
 ) -> AdditiveTypedComposition:
     """Compose independently selected mechanism outputs into one typed packet.
 
@@ -1298,6 +1409,11 @@ def compose_additive_typed_evidence(
         raise TypeError("operator_spec must be exact")
     if type(provider_payload_mode) is not ProviderPayloadMode:
         raise TypeError("provider_payload_mode must be exact")
+    if composition_mode not in {
+        LEGACY_COMPOSITION_MODE,
+        POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+    }:
+        raise ValueError("unsupported additive composition mode")
     _validate_input_partitions(contributions)
     mechanisms = tuple(row.mechanism_id for row in contributions)
     dedup_priorities = _normalized_mechanism_priorities(
@@ -1317,6 +1433,115 @@ def compose_additive_typed_evidence(
         local_selection_priority_by_handle,
         known_handles=input_handles,
     )
+
+    if composition_mode == LEGACY_COMPOSITION_MODE:
+        if provider_payload_mode is not ProviderPayloadMode.COMPACT_FINAL:
+            raise ValueError(
+                "legacy_v1 requires the historical compact-final provider mode"
+            )
+        deduplicated, dedup_audit = deduplicate_selected_contributions(
+            contributions,
+            owner_priority_by_mechanism=dedup_priorities,
+            exact_span_keys_by_handle=exact_span_keys_by_handle,
+        )
+        deduplicated_handles = {
+            row.handle_id
+            for contribution in deduplicated
+            for row in contribution.bindings
+        }
+        retained_priorities = {
+            handle: priority
+            for handle, priority in local_priorities.items()
+            if handle in deduplicated_handles
+        }
+        minimum = allocate_typed_contribution_lanes(
+            deduplicated,
+            lane_budgets=lane_budgets,
+            lane_by_mechanism=lane_by_mechanism,
+            operator_spec=operator_spec,
+            local_selection_priority_by_handle=retained_priorities,
+        )
+        minimum_by_mechanism = {
+            row.mechanism_id: row for row in minimum.contributions
+        }
+        _require(
+            all(
+                not any(
+                    _usable_item(item, operator_spec)
+                    for item in original.parsed.accepted_items
+                )
+                or any(
+                    _usable_item(item, operator_spec)
+                    for item in minimum_by_mechanism[
+                        original.mechanism_id
+                    ].parsed.accepted_items
+                )
+                for original in deduplicated
+            ),
+            "non-borrowable lane cap starved a nonempty additive mechanism",
+        )
+        protected_receipts = tuple(
+            receipt
+            for lane_receipt in minimum.receipts
+            for receipt in lane_receipt.selected_item_receipt_sha256s
+        )
+        _require(
+            bool(protected_receipts),
+            "additive composition requires at least one usable lane minimum",
+        )
+        expanded, surplus_audit = fill_typed_lane_surplus(
+            deduplicated,
+            minimum,
+            lane_budgets=lane_budgets,
+            lane_by_mechanism=lane_by_mechanism,
+            operator_spec=operator_spec,
+            local_selection_priority_by_handle=retained_priorities,
+        )
+        expanded_handles = {
+            row.handle_id
+            for contribution in expanded
+            for row in contribution.bindings
+        }
+        expanded_priorities = {
+            handle: priority
+            for handle, priority in retained_priorities.items()
+            if handle in expanded_handles
+        }
+        packet, fair_audit = _fair_merge_contributions(
+            operator_spec,
+            expanded,
+            original_protected_item_receipt_sha256s=None,
+            protected_item_receipt_sha256s=protected_receipts,
+            minimum_allocation_receipt_sha256=minimum.receipt_sha256,
+            surplus_fill_audit=surplus_audit,
+            post_selection_dedup_audit=None,
+            mechanism_priority_by_mechanism=merge_priorities,
+            local_selection_priority_by_handle=expanded_priorities,
+            provider_payload_mode=provider_payload_mode,
+            composition_mode=composition_mode,
+        )
+        mechanism_by_handle, dropped = retained_mechanism_bindings(
+            expanded, packet
+        )
+        validate_disjoint_contribution_ranges(packet, mechanism_by_handle)
+        packet_priorities = {
+            handle: priority
+            for handle, priority in expanded_priorities.items()
+            if handle in mechanism_by_handle
+        }
+        return AdditiveTypedComposition(
+            packet,
+            expanded,
+            minimum,
+            mechanism_by_handle,
+            protected_receipts,
+            packet_priorities,
+            dedup_audit,
+            surplus_audit,
+            fair_audit,
+            dropped,
+            format_id=FORMAT,
+        )
 
     # Each mechanism first spends its own protected allowance.  Physical
     # deduplication before this point is non-monotonic: a preferred owner can
@@ -1378,6 +1603,7 @@ def compose_additive_typed_evidence(
         operation_position=(
             "after_independent_lane_admission_and_shared_surplus_fill"
         ),
+        audit_format=POST_DEDUP_BACKFILL_DEDUP_FORMAT,
     )
     expanded, dedup_audit = _backfill_freed_dedup_capacity(
         operator_spec,
@@ -1436,6 +1662,7 @@ def compose_additive_typed_evidence(
         mechanism_priority_by_mechanism=merge_priorities,
         local_selection_priority_by_handle=expanded_priorities,
         provider_payload_mode=provider_payload_mode,
+        composition_mode=composition_mode,
     )
     mechanism_by_handle, dropped = retained_mechanism_bindings(expanded, packet)
     validate_disjoint_contribution_ranges(packet, mechanism_by_handle)
@@ -1455,15 +1682,22 @@ def compose_additive_typed_evidence(
         surplus_audit,
         fair_audit,
         dropped,
+        format_id=POST_DEDUP_BACKFILL_FORMAT,
     )
 
 
 __all__ = [
     "AdditiveTypedComposition",
+    "CompositionMode",
     "DEDUP_BACKFILL_FORMAT",
     "DEDUP_FORMAT",
     "FAIR_MERGE_FORMAT",
     "FORMAT",
+    "LEGACY_COMPOSITION_MODE",
+    "POST_DEDUP_BACKFILL_COMPOSITION_MODE",
+    "POST_DEDUP_BACKFILL_DEDUP_FORMAT",
+    "POST_DEDUP_BACKFILL_FAIR_MERGE_FORMAT",
+    "POST_DEDUP_BACKFILL_FORMAT",
     "compose_additive_typed_evidence",
     "deduplicate_selected_contributions",
     "retained_mechanism_bindings",

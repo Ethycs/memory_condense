@@ -112,6 +112,10 @@ DEFAULT_PARENT_ROOT = parent_cli.DEFAULT_PARENT_ROOT
 DEFAULT_OUTPUT_ROOT = REPOSITORY_ROOT / (
     "eval_results/matched_eval_100/locked-semantic-residual-v4-r7"
 )
+DEFAULT_SUCCESSOR_OUTPUT_ROOT = REPOSITORY_ROOT / (
+    "eval_results/matched_eval_100/"
+    "locked-semantic-residual-v4-r7-evidence-conserving-r1"
+)
 DEFAULT_GATE = DEFAULT_OUTPUT_ROOT / GATE_NAME
 DEFAULT_VECTORS = DEFAULT_OUTPUT_ROOT / VECTOR_NAME
 DEFAULT_VECTOR_REPLAY = DEFAULT_OUTPUT_ROOT / VECTOR_REPLAY_NAME
@@ -1834,6 +1838,13 @@ def build_construction(args: argparse.Namespace) -> dict[str, Any]:
         cosine_upper_bound_floor=float(args.cosine_upper_bound_floor),
         specificity_upper_bound_ratio=float(args.specificity_upper_bound_ratio),
         dual_gate_enabled=bool(args.dual_gate_enabled),
+        classifier_mode=str(
+            getattr(
+                args,
+                "residual_classifier_mode",
+                residual.EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
+            )
+        ),
     )
     question_by_ordinal: dict[int, dict[str, Any]] = {}
     lifecycle: list[dict[str, Any]] = []
@@ -2032,7 +2043,7 @@ def build_construction(args: argparse.Namespace) -> dict[str, Any]:
 def run_construct(args: argparse.Namespace) -> dict[str, Any]:
     payload = build_construction(args)
     artifact, created = publish_sealed_json(
-        Path(args.output_root) / CONSTRUCTION_NAME, payload
+        construction_output_root_for_args(args) / CONSTRUCTION_NAME, payload
     )
     return {
         "construction_sha256": artifact.sha256,
@@ -2048,7 +2059,7 @@ def run_construct(args: argparse.Namespace) -> dict[str, Any]:
 def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     rebuilt = build_construction(args)
     artifact = _verified_artifact(
-        Path(args.output_root) / CONSTRUCTION_NAME,
+        construction_output_root_for_args(args) / CONSTRUCTION_NAME,
         str(args.expected_construction_output_sha256),
         "residual_construction",
     )
@@ -2057,7 +2068,7 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         "semantic residual construction differs from exact store replay",
     )
     replay, _created = publish_sealed_json(
-        Path(args.output_root) / REPLAY_NAME, rebuilt
+        construction_output_root_for_args(args) / REPLAY_NAME, rebuilt
     )
     _require(replay.sha256 == artifact.sha256, "residual replay is not byte-identical")
     return {
@@ -2086,6 +2097,25 @@ def _add_sources(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gate", type=Path, default=DEFAULT_GATE)
     parser.add_argument("--expected-gate-sha256")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+
+
+def construction_output_root_for_args(args: argparse.Namespace) -> Path:
+    """Keep the active successor away from the sealed historical R7 root."""
+
+    root = Path(args.output_root)
+    mode = str(
+        getattr(
+            args,
+            "residual_classifier_mode",
+            residual.EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE,
+        )
+    )
+    if (
+        root == DEFAULT_OUTPUT_ROOT
+        and mode == residual.EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE
+    ):
+        return DEFAULT_SUCCESSOR_OUTPUT_ROOT
+    return root
 
 
 def _add_budget(parser: argparse.ArgumentParser) -> None:
@@ -2169,6 +2199,7 @@ __all__ = [
     "DEFAULT_CONSTRUCTION",
     "DEFAULT_GATE",
     "DEFAULT_OUTPUT_ROOT",
+    "DEFAULT_SUCCESSOR_OUTPUT_ROOT",
     "DEFAULT_PRIOR_ANSWER",
     "DEFAULT_VECTORS",
     "DEFAULT_VECTOR_REPLAY",
@@ -2188,6 +2219,7 @@ __all__ = [
     "build_separate_terminal_prompt",
     "main",
     "run_construct",
+    "construction_output_root_for_args",
     "run_gate",
     "run_gate_replay",
     "run_replay",

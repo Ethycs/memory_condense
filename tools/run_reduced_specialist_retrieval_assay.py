@@ -81,6 +81,10 @@ from tools.matched_eval.temporal_insufficiency_specialist import (  # noqa: E402
     scan_temporal_insufficiency_specialist,
 )
 from tools.matched_eval.typed_additive_composer import (  # noqa: E402
+    FORMAT as LEGACY_TYPED_COMPOSITION_FORMAT,
+    LEGACY_COMPOSITION_MODE,
+    POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+    POST_DEDUP_BACKFILL_FORMAT as SUCCESSOR_TYPED_COMPOSITION_FORMAT,
     compose_additive_typed_evidence,
 )
 from tools.matched_eval.typed_lane_allocator import (  # noqa: E402
@@ -887,6 +891,7 @@ def _composed_question(
     terminal_prompt_envelope_renderer: (
         Callable[[Mapping[str, Any]], Any] | None
     ) = None,
+    typed_composition_mode: str = LEGACY_COMPOSITION_MODE,
 ) -> dict[str, Any]:
     dated_question, parent_prediction, question_id = _question_inputs(
         composition_row
@@ -982,7 +987,12 @@ def _composed_question(
         exact_span_keys_by_handle=exact_span_keys,
         local_selection_priority_by_handle=local_priorities,
         fair_merge_priority_by_mechanism=fair_priorities,
-        provider_payload_mode=ProviderPayloadMode.COMPACT_FINAL_V2,
+        provider_payload_mode=(
+            ProviderPayloadMode.COMPACT_FINAL
+            if typed_composition_mode == LEGACY_COMPOSITION_MODE
+            else ProviderPayloadMode.COMPACT_FINAL_V2
+        ),
+        composition_mode=typed_composition_mode,
     )
     fitted = fit_typed_final_prompt(
         dated_question=dated_question,
@@ -1064,6 +1074,7 @@ def build_construction(
     terminal_prompt_envelope_renderer: (
         Callable[[Mapping[str, Any]], Any] | None
     ) = None,
+    typed_composition_mode: str = LEGACY_COMPOSITION_MODE,
 ) -> dict[str, Any]:
     frozen = _frozen_exact10(Path(args.frozen_reduced))
     frozen_rows = _frozen_question_rows(frozen)
@@ -1093,6 +1104,7 @@ def build_construction(
                 terminal_message_renderer_format=(
                     terminal_message_renderer_format
                 ),
+                typed_composition_mode=typed_composition_mode,
                 terminal_prompt_envelope_renderer=(
                     terminal_prompt_envelope_renderer
                 ),
@@ -1132,6 +1144,12 @@ def build_construction(
         "target_labels_loaded": False,
         "target_plan_loaded": False,
     }
+    if typed_composition_mode != LEGACY_COMPOSITION_MODE:
+        _require(
+            typed_composition_mode == POST_DEDUP_BACKFILL_COMPOSITION_MODE,
+            "specialist typed composition mode changed",
+        )
+        payload["typed_composition_format"] = SUCCESSOR_TYPED_COMPOSITION_FORMAT
     assert_gold_blind(payload, path="reduced_specialist_construction")
     payload["construction_identity_sha256"] = identity_sha256(payload)
     return payload
@@ -1164,8 +1182,32 @@ def _validate_construction(
     )
     _require(identity_sha256(unsigned) == declared, "construction identity changed")
     result = tuple(_exact_dict(row, "specialist question") for row in rows)
+    declared_typed_format = payload.get("typed_composition_format")
+    expected_typed_format = (
+        LEGACY_TYPED_COMPOSITION_FORMAT
+        if declared_typed_format is None
+        else require_text(declared_typed_format, "specialist typed composition format")
+    )
     _require(
-        tuple(row.get("ordinal") for row in result) == TARGET_ORDINALS,
+        tuple(row.get("ordinal") for row in result) == TARGET_ORDINALS
+        and expected_typed_format
+        in {LEGACY_TYPED_COMPOSITION_FORMAT, SUCCESSOR_TYPED_COMPOSITION_FORMAT}
+        and (
+            expected_typed_format == LEGACY_TYPED_COMPOSITION_FORMAT
+            or declared_typed_format == SUCCESSOR_TYPED_COMPOSITION_FORMAT
+        )
+        and all(
+            (
+                type(row.get("additive_composition")) is dict
+                and row["additive_composition"].get("format")
+                == expected_typed_format
+            )
+            or (
+                declared_typed_format is None
+                and row.get("additive_composition") is None
+            )
+            for row in result
+        ),
         "specialist question order changed",
     )
     assert_gold_blind(payload, path="validated_reduced_specialist_construction")

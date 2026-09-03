@@ -12,9 +12,14 @@ from memory_condense.domain.schemas import (
 )
 from memory_condense.persistence.transcript_store import TranscriptStore
 from memory_condense.ingest.validator import (
+    REASON_CHUNK_QUOTE_NOT_FOUND,
+    REASON_CHUNK_SPAN_MISMATCH,
+    REASON_CHUNK_TURN_MISMATCH,
     REASON_EMPTY_CONTENT,
+    REASON_INVALID_MEM_STATUS,
     REASON_MISSING_PROVENANCE,
     REASON_QUOTE_NOT_FOUND,
+    REASON_UNKNOWN_CHUNK,
     REASON_UNKNOWN_MEM_ID,
     REASON_UNKNOWN_TURN,
     Validator,
@@ -32,6 +37,19 @@ def _create(turn_id, quote, content="prefers dark mode"):
         content=content,
         provenance=[Provenance(turn_id=turn_id, quote=quote)],
     )
+
+
+def _chunk(db, turn, *, chunk_id="chunk-1", start=0, end=None, text=None):
+    stop = len(turn.text) if end is None else end
+    chunk_text = turn.text[start:stop] if text is None else text
+    db.execute(
+        "INSERT INTO chunks "
+        "(chunk_id, turn_id, text, start_char, end_char, token_count) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (chunk_id, turn.turn_id, chunk_text, start, stop, 1),
+    )
+    db.commit()
+    return chunk_id
 
 
 # ----------------------------------------------------------------------
@@ -133,6 +151,118 @@ def test_all_provenance_entries_must_check_out(db):
     )
     report = Validator(db).validate(MemoryOps(create=[op]))
     assert report.rejected[0].reason == REASON_QUOTE_NOT_FOUND
+
+
+def test_optional_chunk_provenance_must_exist(db):
+    turn = _turn(db)
+    op = CreateOp(
+        type=MemoryType.PREFERENCE,
+        content="prefers dark mode",
+        provenance=[
+            Provenance(
+                turn_id=turn.turn_id,
+                chunk_id="ghost-chunk",
+                quote="I prefer dark mode",
+            )
+        ],
+    )
+
+    report = Validator(db).validate(MemoryOps(create=[op]))
+
+    assert report.rejected[0].reason == REASON_UNKNOWN_CHUNK
+    assert not report.accepted.create
+
+
+def test_optional_chunk_provenance_must_belong_to_cited_turn(db):
+    cited = _turn(db)
+    owner = _turn(db, "I prefer dark mode in this separate turn.")
+    chunk_id = _chunk(db, owner)
+    op = CreateOp(
+        type=MemoryType.PREFERENCE,
+        content="prefers dark mode",
+        provenance=[
+            Provenance(
+                turn_id=cited.turn_id,
+                chunk_id=chunk_id,
+                quote="I prefer dark mode",
+            )
+        ],
+    )
+
+    report = Validator(db).validate(MemoryOps(create=[op]))
+
+    assert report.rejected[0].reason == REASON_CHUNK_TURN_MISMATCH
+
+
+def test_optional_chunk_provenance_quote_must_be_inside_chunk(db):
+    turn = _turn(db, "Alpha evidence is here. Beta evidence is elsewhere.")
+    end = turn.text.index(" Beta")
+    chunk_id = _chunk(db, turn, end=end)
+    op = CreateOp(
+        type=MemoryType.DECISION,
+        content="beta evidence",
+        provenance=[
+            Provenance(
+                turn_id=turn.turn_id,
+                chunk_id=chunk_id,
+                quote="Beta evidence",
+            )
+        ],
+    )
+
+    report = Validator(db).validate(MemoryOps(create=[op]))
+
+    assert report.rejected[0].reason == REASON_CHUNK_QUOTE_NOT_FOUND
+
+
+def test_optional_chunk_provenance_span_must_match_turn(db):
+    turn = _turn(db, "Alpha evidence is here. Beta evidence is elsewhere.")
+    chunk_id = _chunk(
+        db,
+        turn,
+        start=0,
+        end=len("Alpha evidence"),
+        text="Beta evidence",
+    )
+    op = CreateOp(
+        type=MemoryType.DECISION,
+        content="beta evidence",
+        provenance=[
+            Provenance(
+                turn_id=turn.turn_id,
+                chunk_id=chunk_id,
+                quote="Beta evidence",
+            )
+        ],
+    )
+
+    report = Validator(db).validate(MemoryOps(create=[op]))
+
+    assert report.rejected[0].reason == REASON_CHUNK_SPAN_MISMATCH
+
+
+def test_valid_chunk_provenance_survives_validator_apply(db):
+    turn = _turn(db)
+    chunk_id = _chunk(db, turn)
+    op = CreateOp(
+        type=MemoryType.PREFERENCE,
+        content="prefers dark mode",
+        provenance=[
+            Provenance(
+                turn_id=turn.turn_id,
+                chunk_id=chunk_id,
+                quote="I prefer dark mode",
+            )
+        ],
+    )
+
+    report = Validator(db).validate(MemoryOps(create=[op]))
+    summary = MemoryStore(db).apply(report)
+
+    assert report.ok
+    assert summary["created"] == 1
+    stored = MemoryStore(db).list_items()[0]
+    assert stored.provenance[0].chunk_id == chunk_id
 
 
 def test_mixed_batch_partially_accepted(db):
@@ -244,6 +374,22 @@ def test_supersede_replacement_missing_provenance_rejected(db):
     )
     report = Validator(db).validate(MemoryOps(supersede=[op]))
     assert report.rejected[0].reason == REASON_MISSING_PROVENANCE
+
+
+def test_supersede_requires_an_active_predecessor(db):
+    turn = _turn(db)
+    store = MemoryStore(db)
+    item = store.create(_create(turn.turn_id, "I prefer dark mode"))
+    store.delete(DeleteOp(mem_id=item.mem_id))
+    op = SupersedeOp(
+        mem_id=item.mem_id,
+        replacement=_create(turn.turn_id, "dark mode", content="replacement"),
+    )
+
+    report = Validator(db).validate(MemoryOps(supersede=[op]))
+
+    assert report.rejected[0].reason == REASON_INVALID_MEM_STATUS
+    assert not report.accepted.supersede
 
 
 # ----------------------------------------------------------------------

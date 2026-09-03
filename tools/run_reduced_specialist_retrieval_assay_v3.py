@@ -49,6 +49,7 @@ def run_construct(args: argparse.Namespace) -> dict[str, Any]:
         construction_format=CONSTRUCTION_FORMAT,
         terminal_message_renderer_format=SPECIALIST_PROMPT_FORMAT,
         terminal_prompt_envelope_renderer=render_specialist_scoped_prompt,
+        typed_composition_mode=base.LEGACY_COMPOSITION_MODE,
     )
     artifact, created = publish_sealed_json(
         Path(args.output_root) / CONSTRUCTION_NAME,

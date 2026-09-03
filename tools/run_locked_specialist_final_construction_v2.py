@@ -2,11 +2,16 @@
 """Promote repaired specialist/operator routing into the locked 100 rows.
 
 The sealed full-100 specialist-v1 construction is the immutable base.  This
-successor preserves every non-target row byte-for-byte and replaces exactly:
+successor preserves every non-target row byte-for-byte and derives replacements
+from question-local contracts:
 
-* all ten question-only ``LATEST_STATE`` rows with the repaired temporal
-  specialist route, grouped into one read/index pass per used namespace; and
-* ordinals 42, 65, and 74 with the sealed missing-four v4 operator rows.
+* ``LATEST_STATE`` questions accepted by the temporal specialist are routed in
+  one read/index pass per used namespace; and
+* sealed v4 operator rows are admitted only when their typed spec, selected
+  evidence, operator state, and provider envelope form one valid receipt chain.
+
+The historical ordinal tuples remain audit expectations for the sealed
+validation100 artifact; they do not choose routes.
 
 Construction is gold-blind, provider-free, and retains no transformer state.
 """
@@ -20,6 +25,7 @@ import json
 import sys
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +66,7 @@ from tools.matched_eval.temporal_insufficiency_specialist import (  # noqa: E402
 )
 from tools.matched_eval.typed_operator_spec import (  # noqa: E402
     TemporalMode,
+    TypedOperatorSpec,
     compile_typed_operator_spec,
 )
 from tools.matched_eval.typed_operator_adapter import (  # noqa: E402
@@ -116,6 +123,14 @@ class LockedSpecialistFinalConstructionV2Error(MatchedEvalContractError):
     """A sealed parent, replacement, provenance, or prompt invariant changed."""
 
 
+class SuccessorRouteKind(str, Enum):
+    """Question-local successor action, independent of benchmark coordinates."""
+
+    PRESERVE = "preserve"
+    LATEST_STATE = "typed_latest_state_temporal_specialist"
+    REPAIRED_OPERATOR = "question_local_repaired_operator"
+
+
 def _require(ok: object, message: str) -> None:
     if not ok:
         raise LockedSpecialistFinalConstructionV2Error(message)
@@ -150,6 +165,468 @@ def _validate_receipt(
     return row
 
 
+def _compact_operator_spec(spec: TypedOperatorSpec) -> dict[str, Any]:
+    """Reproduce the historical compact-final question-only spec surface."""
+
+    projection = spec.projection(include_receipt=False)
+    for key in (
+        "format",
+        "question_sha256",
+        "retained_transformer_token_state_bytes",
+        "route_receipt_sha256",
+    ):
+        projection.pop(key)
+    projection["required_slots"] = [
+        {key: value for key, value in slot.items() if key != "format"}
+        for slot in projection["required_slots"]
+    ]
+    return projection
+
+
+def _validate_question_local_operator_envelope(
+    *,
+    dated_question: str,
+    base_row: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> None:
+    """Validate the common typed/evidence envelope without IDs or ordinals.
+
+    The v4 compiler emits several operator families, but their safe routing
+    boundary is common: a question-derived typed spec, content-addressed local
+    bindings, a sealed operator state, and one fitted provider envelope must
+    all describe the same question and evidence handles.  Family-specific
+    state checks are delegated below.
+    """
+
+    spec = compile_typed_operator_spec(dated_question)
+    _validate_receipt(
+        base_row,
+        label="generic successor base question",
+        key="question_receipt_sha256",
+    )
+    row = _validate_receipt(
+        candidate,
+        label="generic successor operator question",
+        key="question_receipt_sha256",
+    )
+    _require(
+        base_row.get("mode") == "parent_passthrough"
+        and base_row.get("dated_question_sha256") == spec.question_sha256
+        and row.get("format") == v4.QUESTION_FORMAT
+        and row.get("dated_question_sha256") == spec.question_sha256
+        and row.get("question_sha256") == base_row.get("question_sha256")
+        and row.get("namespace_id") == base_row.get("namespace_id")
+        and row.get("new_provider_calls") == 0
+        and row.get("retained_transformer_token_state_bytes") == 0,
+        "generic repaired-operator question boundary changed",
+    )
+
+    operator = _validate_receipt(
+        row.get("operator"),
+        label="generic successor operator state",
+        key="operator_receipt_sha256",
+    )
+    selection = _validate_receipt(
+        row.get("selection"), label="generic successor selection"
+    )
+    provenance = tuple(
+        _validate_receipt(value, label="generic successor provenance")
+        for value in _exact_list(
+            row.get("local_provenance"), "generic successor provenance"
+        )
+    )
+    methods = tuple(
+        _validate_receipt(
+            value,
+            label="generic successor method",
+            key="method_receipt_sha256",
+        )
+        for value in _exact_list(row.get("methods"), "generic successor methods")
+    )
+    fitted = _exact_dict(
+        row.get("fitted_typed_prompt"), "generic successor fitted prompt"
+    )
+    terminal = _exact_dict(
+        row.get("terminal_prompt"), "generic successor terminal prompt"
+    )
+    provider_input = _exact_dict(
+        terminal.get("provider_input"), "generic successor provider input"
+    )
+    typed_evidence = _exact_dict(
+        provider_input.get("typed_evidence"), "generic successor typed evidence"
+    )
+    advisories = tuple(
+        _exact_dict(value, "generic successor advisory")
+        for value in _exact_list(
+            provider_input.get("specialist_advisories"),
+            "generic successor advisories",
+        )
+    )
+
+    # This validator accepts the candidate's own coordinate only to verify its
+    # row seal.  The coordinate is never compared with a routing allowlist and
+    # changing it (with a refreshed row receipt) cannot change applicability.
+    candidate_coordinate = row.get("ordinal")
+    _require(
+        type(candidate_coordinate) is int,
+        "generic successor candidate coordinate must be exact",
+    )
+    answer_v2._prompt_plan_row(row, candidate_coordinate)  # noqa: SLF001
+
+    mechanism_plan = tuple(
+        require_text(value, "generic successor planned mechanism")
+        for value in _exact_list(
+            row.get("mechanism_plan"), "generic successor mechanism plan"
+        )
+    )
+    selected_handles = tuple(
+        require_text(value, "generic successor selected handle")
+        for value in _exact_list(
+            selection.get("selected_handle_ids"),
+            "generic successor selected handles",
+        )
+    )
+    terminal_handles = tuple(
+        require_text(value, "generic successor terminal handle")
+        for value in _exact_list(
+            fitted.get("allowed_handle_ids"), "generic successor terminal handles"
+        )
+    )
+    provenance_by_handle: dict[str, dict[str, Any]] = {}
+    for value in provenance:
+        handle_id = require_text(value.get("handle_id"), "generic provenance handle")
+        binding = _validate_receipt(
+            value.get("typed_binding"), label="generic successor typed binding"
+        )
+        _require(
+            handle_id == binding.get("handle_id")
+            and handle_id not in provenance_by_handle,
+            "generic successor provenance handle binding changed",
+        )
+        provenance_by_handle[handle_id] = value
+
+    provenance_receipts = tuple(
+        require_sha256(value.get("receipt_sha256"), "generic provenance")
+        for value in provenance
+    )
+    selected_binding_receipts = tuple(
+        require_sha256(value, "generic selected binding")
+        for value in _exact_list(
+            selection.get("selected_binding_receipt_sha256s"),
+            "generic selected binding receipts",
+        )
+    )
+    _require(
+        provider_input.get("dated_question") == dated_question
+        and typed_evidence.get("operator_spec") == _compact_operator_spec(spec)
+        and bool(mechanism_plan)
+        and len(mechanism_plan) == len(set(mechanism_plan))
+        and tuple(selection.get("mechanism_ids", ())) == mechanism_plan
+        and tuple(method.get("mechanism_id") for method in methods)
+        == mechanism_plan
+        and tuple(advisory.get("mechanism_id") for advisory in advisories)
+        == mechanism_plan
+        and bool(selected_handles)
+        and bool(terminal_handles)
+        and set(selected_handles) <= set(provenance_by_handle)
+        and set(terminal_handles) <= set(provenance_by_handle)
+        and selected_binding_receipts
+        == tuple(
+            require_sha256(
+                _exact_dict(
+                    provenance_by_handle[handle].get("typed_binding"),
+                    "generic selected typed binding",
+                ).get("receipt_sha256"),
+                "generic selected typed binding",
+            )
+            for handle in selected_handles
+        )
+        and all(
+            tuple(method.get("local_provenance_receipt_sha256s", ()))
+            == provenance_receipts
+            for method in methods
+        ),
+        "generic repaired-operator typed/evidence envelope changed",
+    )
+
+    if operator.get("decision") is not None:
+        _validate_conjunctive_event_operator_state(
+            dated_question=dated_question,
+            spec=spec,
+            row=row,
+            operator=operator,
+            advisory=advisories[0],
+        )
+    elif operator.get("compression") is not None:
+        _validate_action_set_operator_state(
+            spec=spec,
+            row=row,
+            operator=operator,
+            advisory=advisories[0],
+            terminal_handles=terminal_handles,
+        )
+    elif operator.get("typed_contribution_receipt_sha256") is not None:
+        _validate_semantic_residual_operator_state(
+            row=row,
+            operator=operator,
+            advisory=advisories[0],
+            method=methods[0],
+            selected_handles=selected_handles,
+            terminal_handles=terminal_handles,
+        )
+    else:
+        raise LockedSpecialistFinalConstructionV2Error(
+            "generic repaired-operator family is unsupported"
+        )
+
+
+def _validate_conjunctive_event_operator_state(
+    *,
+    dated_question: str,
+    spec: TypedOperatorSpec,
+    row: Mapping[str, Any],
+    operator: Mapping[str, Any],
+    advisory: Mapping[str, Any],
+) -> None:
+    decision = _validate_receipt(
+        operator.get("decision"), label="generic conjunctive-event decision"
+    )
+    advisory_decision = _validate_receipt(
+        advisory.get("conjunctive_event_decision_state"),
+        label="generic conjunctive-event advisory decision",
+    )
+    program = _validate_receipt(
+        advisory.get("conjunctive_event_program"),
+        label="generic conjunctive-event program",
+    )
+    obligations = tuple(
+        _validate_receipt(value, label="generic conjunctive-event obligation")
+        for value in _exact_list(
+            program.get("obligations"), "generic conjunctive-event obligations"
+        )
+    )
+    frontier = _exact_dict(
+        advisory.get("support_frontier"), "generic conjunctive-event frontier"
+    )
+    _require(
+        spec.temporal_mode is TemporalMode.NONE
+        and bool(obligations)
+        and program.get("question") == dated_question
+        and program.get("question_sha256") == spec.question_sha256
+        and program.get("mechanism_id") == advisory.get("mechanism_id")
+        and decision == advisory_decision
+        and decision.get("overlay_receipt_sha256") == program.get("receipt_sha256")
+        and decision.get("disposition") == "keep_parent"
+        and decision.get("terminal_authorized") is False
+        and decision.get("semantic_absence_may_be_inferred") is False
+        and operator.get("packing_closed") is True
+        and operator.get("support_frontier_closed") is False
+        and operator.get("semantic_absence_may_be_inferred") is False
+        and row.get("terminal_kind") == "conjunctive_event_synthesis"
+        and advisory.get("proof_kind") == "same_event_conjunctive_obligation"
+        and frontier.get("generic_frontier_closed") is False
+        and frontier.get("semantic_absence_may_be_inferred") is False,
+        "generic conjunctive-event evidence state changed",
+    )
+
+
+def _validate_action_set_operator_state(
+    *,
+    spec: TypedOperatorSpec,
+    row: Mapping[str, Any],
+    operator: Mapping[str, Any],
+    advisory: Mapping[str, Any],
+    terminal_handles: tuple[str, ...],
+) -> None:
+    compression = _validate_receipt(
+        operator.get("compression"), label="generic action-set compression"
+    )
+    demand = _validate_receipt(
+        compression.get("demand"), label="generic action-set demand"
+    )
+    closure = _validate_receipt(
+        compression.get("closure"), label="generic action-set closure"
+    )
+    overlay = _validate_receipt(
+        operator.get("downstream_overlay"), label="generic action-set overlay"
+    )
+    execution = _validate_receipt(
+        operator.get("execution"), label="generic action-set execution"
+    )
+    contribution = _validate_receipt(
+        operator.get("terminal_typed_contribution"),
+        label="generic action-set contribution",
+    )
+    facts = tuple(
+        _validate_receipt(value, label="generic action-set fact")
+        for value in _exact_list(compression.get("facts"), "generic action-set facts")
+    )
+    bound_candidates = tuple(
+        _validate_receipt(value, label="generic action-set candidate")
+        for value in _exact_list(
+            compression.get("bound_candidates"), "generic action-set candidates"
+        )
+    )
+    cardinality = demand.get("cardinality")
+    fact_handles = tuple(
+        dict.fromkeys(
+            handle
+            for fact in facts
+            for handle in _exact_list(
+                fact.get("handle_ids"), "generic action-set fact handles"
+            )
+        )
+    )
+    provider_facts = tuple(
+        _exact_dict(value, "generic provider action-set fact")
+        for value in _exact_list(
+            advisory.get("facts"), "generic provider action-set facts"
+        )
+    )
+    provider_facts_match = len(provider_facts) == len(facts) and all(
+        provider_fact.get("action") == fact.get("action_concept")
+        and provider_fact.get("member") == fact.get("member_text")
+        and provider_fact.get("relation_anchor_terms")
+        == fact.get("relation_anchor_terms")
+        and tuple(
+            support.get("evidence_handle")
+            for support in (
+                _exact_dict(value, "generic provider action-set support")
+                for value in _exact_list(
+                    provider_fact.get("support"),
+                    "generic provider action-set support",
+                )
+            )
+        )
+        == tuple(fact.get("handle_ids", ()))
+        for provider_fact, fact in zip(provider_facts, facts, strict=True)
+    )
+    _require(
+        spec.temporal_mode is TemporalMode.NONE
+        and spec.answer_shape.value == "set_list"
+        and demand.get("question_sha256") == spec.question_sha256
+        and demand.get("operator_spec_receipt_sha256") == spec.receipt_sha256
+        and demand.get("downstream_overlay_receipt_sha256")
+        == overlay.get("receipt_sha256")
+        and overlay.get("question_sha256") == spec.question_sha256
+        and overlay.get("legacy_operator_spec_receipt_sha256")
+        == spec.receipt_sha256
+        and type(cardinality) is int
+        and cardinality > 0
+        and len(facts) == cardinality
+        and len(bound_candidates) >= cardinality
+        and closure.get("demand_receipt_sha256") == demand.get("receipt_sha256")
+        and closure.get("explicit_cardinality") == cardinality
+        and closure.get("distinct_supported_member_count") == cardinality
+        and closure.get("explicit_cardinality_satisfied") is True
+        and closure.get("support_frontier_closed") is True
+        and tuple(closure.get("bound_candidate_receipt_sha256s", ()))
+        == tuple(value.get("receipt_sha256") for value in bound_candidates)
+        and tuple(closure.get("compressed_fact_receipt_sha256s", ()))
+        == tuple(value.get("receipt_sha256") for value in facts)
+        and compression.get("selection_precedes_fact_compression") is True
+        and operator.get("raw_selected_lane_merged_after_compression") is False
+        and operator.get("generic_frontier_closed") is False
+        and operator.get("selected_scope_cardinality_satisfied") is True
+        and operator.get("selected_scope_only") is True
+        and operator.get("upstream_truncated") is True
+        and execution.get("status") == "insufficient"
+        and not execution.get("used_handle_ids")
+        and contribution.get("frontier_mode") == FrontierMode.BOUNDED.value
+        and contribution.get("truncated") is True
+        and set(fact_handles) == set(terminal_handles)
+        and row.get("terminal_kind") == "selected_scope_action_set_synthesis"
+        and advisory.get("cardinality") == cardinality
+        and provider_facts_match
+        and advisory.get("generic_frontier_closed") is False
+        and advisory.get("scope") == "selected_action_linked_members_only"
+        and advisory.get("selected_scope_cardinality_satisfied") is True
+        and advisory.get("upstream_truncated") is True
+        and tuple(advisory.get("used_handle_ids", ())) == fact_handles,
+        "generic action-set evidence state changed",
+    )
+
+
+def _validate_semantic_residual_operator_state(
+    *,
+    row: Mapping[str, Any],
+    operator: Mapping[str, Any],
+    advisory: Mapping[str, Any],
+    method: Mapping[str, Any],
+    selected_handles: tuple[str, ...],
+    terminal_handles: tuple[str, ...],
+) -> None:
+    contribution = _validate_receipt(
+        method.get("typed_contribution"),
+        label="generic semantic-residual contribution",
+    )
+    _require(
+        len(selected_handles) >= 2
+        and selected_handles == terminal_handles
+        and method.get("accepted_typed_item_count") == len(terminal_handles)
+        and contribution.get("mechanism_id") == method.get("mechanism_id")
+        and contribution.get("frontier_mode") == FrontierMode.BOUNDED.value
+        and contribution.get("truncated") is False
+        and operator.get("typed_contribution_receipt_sha256")
+        == contribution.get("receipt_sha256")
+        and operator.get("frontier_mode") == FrontierMode.BOUNDED.value
+        and operator.get("truncated") is False
+        and operator.get("semantic_global_exhaustiveness_claimed") is False
+        and row.get("terminal_kind") == "semantic_residual_synthesis"
+        and advisory.get("proof_kind") == "sealed_semantic_residual_lane"
+        and advisory.get("frontier_mode") == FrontierMode.BOUNDED.value
+        and advisory.get("global_exhaustiveness_claimed") is False
+        and advisory.get("sealed_lane_complete") is True
+        and advisory.get("truncated") is False
+        and tuple(advisory.get("lane_handle_ids", ())) == terminal_handles,
+        "generic semantic-residual evidence state changed",
+    )
+
+
+def validation_independent_successor_route(
+    *,
+    dated_question: str,
+    base_row: Mapping[str, Any],
+    repaired_operator_candidate: Mapping[str, Any] | None = None,
+) -> SuccessorRouteKind:
+    """Choose a successor route from question and sealed local proof state.
+
+    Benchmark IDs, ordinals, target registries, references, predictions, and
+    judge outcomes are deliberately absent from the decision boundary.
+    Malformed or incomplete repaired-operator candidates fail closed.
+    """
+
+    spec = compile_typed_operator_spec(dated_question)
+    try:
+        _validate_receipt(
+            base_row,
+            label="generic successor base question",
+            key="question_receipt_sha256",
+        )
+    except (MatchedEvalContractError, KeyError, TypeError, ValueError):
+        return SuccessorRouteKind.PRESERVE
+    if base_row.get("mode") != "parent_passthrough":
+        return SuccessorRouteKind.PRESERVE
+    if (
+        base_row.get("dated_question_sha256") == spec.question_sha256
+        and spec.temporal_mode is TemporalMode.LATEST_STATE
+        and specialist.applicable_specialist_ids(dated_question)
+        == (TEMPORAL_MECHANISM_ID,)
+    ):
+        return SuccessorRouteKind.LATEST_STATE
+    if repaired_operator_candidate is None:
+        return SuccessorRouteKind.PRESERVE
+    try:
+        _validate_question_local_operator_envelope(
+            dated_question=dated_question,
+            base_row=base_row,
+            candidate=repaired_operator_candidate,
+        )
+    except (MatchedEvalContractError, KeyError, TypeError, ValueError):
+        return SuccessorRouteKind.PRESERVE
+    return SuccessorRouteKind.REPAIRED_OPERATOR
+
+
 def _load_v1(
     path: Path,
     *,
@@ -169,6 +646,49 @@ def _load_v4(
         "missing-four v4 construction artifact changed",
     )
     return artifact, v4.validate_construction(artifact)
+
+
+def _validation_independent_replacement_plan(
+    *,
+    base_rows: Sequence[Mapping[str, Any]],
+    composition_rows: Sequence[Mapping[str, Any]],
+    repaired_operator_rows: Sequence[Mapping[str, Any]],
+) -> dict[int, tuple[SuccessorRouteKind, Mapping[str, Any] | None]]:
+    """Compile replacement choices without reading benchmark coordinates."""
+
+    _require(
+        len(base_rows) == len(composition_rows),
+        "generic successor base/composition populations differ",
+    )
+    candidates_by_question: dict[str, Mapping[str, Any]] = {}
+    for candidate in repaired_operator_rows:
+        question_sha256 = require_sha256(
+            candidate.get("dated_question_sha256"),
+            "generic successor candidate dated question",
+        )
+        _require(
+            question_sha256 not in candidates_by_question,
+            "generic successor candidates repeat a dated question",
+        )
+        candidates_by_question[question_sha256] = candidate
+
+    plan: dict[int, tuple[SuccessorRouteKind, Mapping[str, Any] | None]] = {}
+    for coordinate, (base_row, composition_row) in enumerate(
+        zip(base_rows, composition_rows, strict=True)
+    ):
+        dated_question, _parent_prediction, _question_id = (
+            specialist._question_inputs(composition_row)  # noqa: SLF001
+        )
+        spec = compile_typed_operator_spec(dated_question)
+        candidate = candidates_by_question.get(spec.question_sha256)
+        route = validation_independent_successor_route(
+            dated_question=dated_question,
+            base_row=base_row,
+            repaired_operator_candidate=candidate,
+        )
+        if route is not SuccessorRouteKind.PRESERVE:
+            plan[coordinate] = (route, candidate)
+    return plan
 
 
 def _fixed_temporal_route(
@@ -223,15 +743,14 @@ def _temporal_replacement(
     composition_row: Mapping[str, Any],
     composition_sha256: str,
     base_row: Mapping[str, Any],
-    v4_q79: Mapping[str, Any],
+    repaired_operator_candidate: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     dated_question, _parent_prediction, question_id = specialist._question_inputs(  # noqa: SLF001
         composition_row
     )
     spec = compile_typed_operator_spec(dated_question)
     _require(
-        ordinal in LATEST_STATE_ORDINALS
-        and spec.temporal_mode is TemporalMode.LATEST_STATE
+        spec.temporal_mode is TemporalMode.LATEST_STATE
         and specialist.applicable_specialist_ids(dated_question)
         == (TEMPORAL_MECHANISM_ID,)
         and base_row.get("mode") == "parent_passthrough"
@@ -258,16 +777,19 @@ def _temporal_replacement(
         and advisories[0].get("mechanism_id") == TEMPORAL_MECHANISM_ID,
         f"latest-state temporal advisory changed at ordinal {ordinal}",
     )
-    if ordinal == 79:
+    if repaired_operator_candidate is not None:
         bundle = _exact_dict(
-            advisories[0].get("temporal_bundle"), "q79 temporal bundle"
+            advisories[0].get("temporal_bundle"), "temporal comparison bundle"
         )
-        v4_operator = _exact_dict(v4_q79.get("operator"), "q79 v4 operator")
+        v4_operator = _exact_dict(
+            repaired_operator_candidate.get("operator"),
+            "comparison temporal operator",
+        )
         _require(
             bundle.get("winner_handle_id")
             == v4_operator.get("winner_handle_id")
             and v4_operator.get("global_exhaustiveness_claimed") is False,
-            "q79 full-100 temporal winner diverged from sealed v4",
+            "full-100 temporal winner diverged from sealed operator candidate",
         )
     body = dict(generic)
     generic_receipt = require_sha256(
@@ -297,43 +819,47 @@ def _temporal_replacement(
     return {**body, "question_receipt_sha256": identity_sha256(body)}
 
 
-def _q74_terminal_rebased_to_v1_parent(
+def _residual_terminal_rebased_to_v1_parent(
     *,
     v4_row: Mapping[str, Any],
     parent_source: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Refit the exact sealed q74 lane with the newer v1 parent fallback."""
+    """Refit a sealed residual lane with the newer v1 parent fallback."""
 
     source_terminal = _exact_dict(
-        v4_row.get("terminal_prompt"), "q74 v4 source terminal"
+        v4_row.get("terminal_prompt"), "residual v4 source terminal"
     )
     source_input = _exact_dict(
-        source_terminal.get("provider_input"), "q74 v4 source provider input"
+        source_terminal.get("provider_input"), "residual v4 source provider input"
     )
     dated_question = require_text(
-        source_input.get("dated_question"), "q74 dated question"
+        source_input.get("dated_question"), "residual dated question"
     )
     spec = compile_typed_operator_spec(dated_question)
     provenance = tuple(
-        _exact_dict(value, "q74 v4 provenance")
-        for value in _exact_list(v4_row.get("local_provenance"), "q74 provenance")
+        _exact_dict(value, "residual v4 provenance")
+        for value in _exact_list(
+            v4_row.get("local_provenance"), "residual provenance"
+        )
     )
     bindings = tuple(
         reduced_cli._rehydrate_handle_binding(  # noqa: SLF001
-            _exact_dict(value.get("typed_binding"), "q74 typed binding")
+            _exact_dict(value.get("typed_binding"), "residual typed binding")
         )
         for value in provenance
     )
-    compact = _exact_dict(source_input.get("typed_evidence"), "q74 typed evidence")
+    compact = _exact_dict(
+        source_input.get("typed_evidence"), "residual typed evidence"
+    )
     raw_items = tuple(
-        _exact_dict(value, "q74 typed item")
-        for value in _exact_list(compact.get("items"), "q74 typed items")
+        _exact_dict(value, "residual typed item")
+        for value in _exact_list(compact.get("items"), "residual typed items")
     )
     _require(
-        tuple(binding.handle_id for binding in bindings) == ("H950001", "H950002")
+        len(bindings) >= 2
         and tuple(item.get("handle_ids") for item in raw_items)
-        == (["H950001"], ["H950002"]),
-        "q74 sealed two-item lane changed before parent rebinding",
+        == tuple([binding.handle_id] for binding in bindings),
+        "sealed residual lane changed before parent rebinding",
     )
     parsed = parse_typed_items(
         [v4._clean_compact_item(value) for value in raw_items],  # noqa: SLF001
@@ -341,8 +867,8 @@ def _q74_terminal_rebased_to_v1_parent(
         bindings=bindings,
     )
     _require(
-        not parsed.rejected_items and len(parsed.accepted_items) == 2,
-        "q74 sealed lane failed typed parent rebinding",
+        not parsed.rejected_items and len(parsed.accepted_items) == len(bindings),
+        "sealed residual lane failed typed parent rebinding",
     )
     contribution = TypedEvidenceContribution(
         residual.TYPED_ADAPTER_MECHANISM_ID,
@@ -363,7 +889,9 @@ def _q74_terminal_rebased_to_v1_parent(
     )
     fitted = fit_typed_final_prompt(
         dated_question=dated_question,
-        parent_prediction=require_text(parent_source.get("prediction"), "q74 v1 parent"),
+        parent_prediction=require_text(
+            parent_source.get("prediction"), "residual v1 parent"
+        ),
         packet=packet,
         mechanism_by_handle={
             binding.handle_id: residual.TYPED_ADAPTER_MECHANISM_ID
@@ -382,20 +910,20 @@ def _q74_terminal_rebased_to_v1_parent(
     )
     fitted_projection = fitted.projection()
     rebound_input = _exact_dict(
-        terminal.get("provider_input"), "q74 rebound provider input"
+        terminal.get("provider_input"), "residual rebound provider input"
     )
     rebound_parent = _exact_dict(
-        rebound_input.get("protected_parent_fallback"), "q74 rebound parent"
+        rebound_input.get("protected_parent_fallback"), "residual rebound parent"
     )
     _require(
-        fitted.allowed_handle_ids == ("H950001", "H950002")
+        fitted.allowed_handle_ids == tuple(binding.handle_id for binding in bindings)
         and rebound_parent.get("prediction") == parent_source.get("prediction")
         and rebound_parent.get("prediction_sha256")
         == parent_source.get("prediction_sha256")
         and rebound_input.get("typed_evidence") == source_input.get("typed_evidence")
         and terminal.get("full_chat_plus_output_tokens")
         <= HARD_COMPLETE_CHAT_TOKEN_CAP,
-        "q74 parent rebinding changed evidence or escaped 8k",
+        "residual parent rebinding changed evidence or escaped 8k",
     )
     return fitted_projection, terminal
 
@@ -407,9 +935,7 @@ def _operator_replacement(
     v4_row: Mapping[str, Any],
 ) -> dict[str, Any]:
     _require(
-        ordinal in REPAIRED_OPERATOR_ORDINALS
-        and base_row.get("mode") == "parent_passthrough"
-        and base_row.get("question_id") == v4_row.get("question_id")
+        base_row.get("mode") == "parent_passthrough"
         and base_row.get("question_sha256") == v4_row.get("question_sha256")
         and base_row.get("dated_question_sha256")
         == v4_row.get("dated_question_sha256")
@@ -434,11 +960,13 @@ def _operator_replacement(
         )
         terminal_prompt = dict(terminal)
     else:
+        operator = _exact_dict(v4_row.get("operator"), "residual v4 operator")
         _require(
-            ordinal == 74,
-            f"v4 operator escaped the sealed v1 parent at ordinal {ordinal}",
+            operator.get("typed_contribution_receipt_sha256") is not None
+            and v4_row.get("terminal_kind") == "semantic_residual_synthesis",
+            f"non-residual v4 operator escaped the sealed v1 parent at {ordinal}",
         )
-        fitted_prompt, terminal_prompt = _q74_terminal_rebased_to_v1_parent(
+        fitted_prompt, terminal_prompt = _residual_terminal_rebased_to_v1_parent(
             v4_row=v4_row,
             parent_source=parent_source,
         )
@@ -539,6 +1067,28 @@ def build_construction(args: argparse.Namespace) -> dict[str, Any]:
         },
         "v1 construction escaped its official parent inputs",
     )
+    replacement_plan = _validation_independent_replacement_plan(
+        base_rows=base_rows,
+        composition_rows=composition_rows,
+        repaired_operator_rows=v4_rows,
+    )
+    latest_state_ordinals = tuple(
+        coordinate
+        for coordinate, (route, _candidate) in replacement_plan.items()
+        if route is SuccessorRouteKind.LATEST_STATE
+    )
+    repaired_operator_by_ordinal = {
+        coordinate: candidate
+        for coordinate, (route, candidate) in replacement_plan.items()
+        if route is SuccessorRouteKind.REPAIRED_OPERATOR and candidate is not None
+    }
+    # These constants are historical audit expectations only.  They can catch
+    # drift in this sealed validation population, but they do not select rows.
+    _require(
+        latest_state_ordinals == LATEST_STATE_ORDINALS
+        and tuple(repaired_operator_by_ordinal) == REPAIRED_OPERATOR_ORDINALS,
+        "question-local successor routing changed the sealed audit population",
+    )
 
     context = typed_cli._guided_context(reduced_cli._guided_args(args))  # noqa: SLF001
     context_by_question = {
@@ -548,7 +1098,7 @@ def build_construction(args: argparse.Namespace) -> dict[str, Any]:
         row.namespace_id: row for row in context.population.namespaces
     }
     ordinals_by_namespace: dict[str, list[int]] = defaultdict(list)
-    for ordinal in LATEST_STATE_ORDINALS:
+    for ordinal in latest_state_ordinals:
         base_row = base_rows[ordinal]
         question_id = require_text(base_row.get("question_id"), "latest-state question")
         population_row = context_by_question.get(question_id)
@@ -600,7 +1150,7 @@ def build_construction(args: argparse.Namespace) -> dict[str, Any]:
                 composition_row=composition_rows[ordinal],
                 composition_sha256=composition.sha256,
                 base_row=base_rows[ordinal],
-                v4_q79=v4_by_ordinal[79],
+                repaired_operator_candidate=replacement_plan[ordinal][1],
             )
         scan_receipts.append(
             _replacement_scan_receipt(
@@ -614,11 +1164,11 @@ def build_construction(args: argparse.Namespace) -> dict[str, Any]:
         del index, cache
         gc.collect()
 
-    for ordinal in REPAIRED_OPERATOR_ORDINALS:
+    for ordinal, candidate in repaired_operator_by_ordinal.items():
         replacements[ordinal] = _operator_replacement(
             ordinal=ordinal,
             base_row=base_rows[ordinal],
-            v4_row=v4_by_ordinal[ordinal],
+            v4_row=candidate,
         )
     _require(
         tuple(sorted(replacements)) == REPLACED_ORDINALS,
@@ -1031,10 +1581,12 @@ __all__ = [
     "REPAIRED_OPERATOR_ORDINALS",
     "REPLACED_ORDINALS",
     "LockedSpecialistFinalConstructionV2Error",
+    "SuccessorRouteKind",
     "build_construction",
     "build_parser",
     "load_verified_construction",
     "main",
     "run_construct",
+    "validation_independent_successor_route",
     "validate_construction",
 ]

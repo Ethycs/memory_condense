@@ -70,7 +70,10 @@ def _fake_plan_validator(raw: dict, _question: dict) -> dict:
 
 def _source_fixture(tmp_path: Path) -> tuple[full100._SourceArtifacts, tuple[int, ...]]:
     source_root = tmp_path / "sources"
-    excluded = set(range(0, 96, 3))
+    # The real promotion population contains every locked exact11 target.  Keep
+    # the synthetic 68/32 split while preserving that authenticated invariant.
+    excluded = set(range(0, 96, 3)) - set(full100.terminal_cli.EXACT_ORDINALS)
+    excluded.update((96, 98))
     eligible_ordinals = tuple(
         ordinal for ordinal in range(full100.QUESTION_COUNT) if ordinal not in excluded
     )
@@ -155,7 +158,8 @@ def _source_fixture(tmp_path: Path) -> tuple[full100._SourceArtifacts, tuple[int
     assert vectors.sha256 == vector_replay.sha256
 
     r7_rows = [
-        {
+        _with_receipt(
+            {
             "dated_question_sha256": parent_rows[ordinal]["dated_question_sha256"],
             "mode": (
                 "residual_synthesis"
@@ -165,7 +169,9 @@ def _source_fixture(tmp_path: Path) -> tuple[full100._SourceArtifacts, tuple[int
             "ordinal": ordinal,
             "question_id": parent_rows[ordinal]["question_id"],
             "question_sha256": parent_rows[ordinal]["question_sha256"],
-        }
+            },
+            "question_receipt_sha256",
+        )
         for ordinal in range(full100.QUESTION_COUNT)
     ]
     r7_body = {
@@ -190,7 +196,10 @@ def _source_fixture(tmp_path: Path) -> tuple[full100._SourceArtifacts, tuple[int
 
 
 def _terminalized(
-    sources: full100._SourceArtifacts, eligible_ordinals: tuple[int, ...]
+    sources: full100._SourceArtifacts,
+    eligible_ordinals: tuple[int, ...],
+    *,
+    compilation_format: str = full100.terminal_cli.TERMINAL_COMPILATION_FORMAT,
 ) -> dict:
     terminal_policy = SemanticGlobalTerminalPolicy().projection()
     sealed_sources = TerminalSealedSources(
@@ -202,12 +211,16 @@ def _terminalized(
     by_namespace: dict[str, list[str]] = {}
     for ordinal in eligible_ordinals:
         gate_row = sources.gate_rows[ordinal]
-        compilation_body = {"policy": terminal_policy}
+        compilation_body = {
+            "format": compilation_format,
+            "policy": terminal_policy,
+        }
         compilation = {
             **compilation_body,
             "receipt_sha256": identity_sha256(compilation_body),
         }
         plan_body = {
+            "ordinal": ordinal,
             "parent_prediction": gate_row["current_prediction"],
             "parent_prediction_sha256": gate_row["current_prediction_sha256"],
             "source_artifact_bindings": sealed_sources,
@@ -226,6 +239,10 @@ def _terminalized(
                 "ordinal": ordinal,
                 "question_id": gate_row["question_id"],
                 "question_sha256": gate_row["question_sha256"],
+                "r7_exact_question_rebuilt": True,
+                "r7_question_receipt_sha256": sources.r7_rows[ordinal][
+                    "question_receipt_sha256"
+                ],
                 "retained_transformer_token_state_bytes": 0,
                 "terminal_answer_plan": plan,
             },
@@ -355,6 +372,162 @@ def test_cli_has_no_ordinal_selector() -> None:
     for child in subparsers.choices.values():
         assert "ordinals" not in {action.dest for action in child._actions}
         assert "--ordinals" not in child._option_string_actions
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        full100.terminal_cli.TERMINAL_COMPILATION_MODE_V4,
+        full100.terminal_cli.TERMINAL_COMPILATION_MODE_V5,
+    ),
+)
+def test_full100_backfill_modes_route_away_from_frozen_default_root(
+    mode: str,
+) -> None:
+    args = full100.build_parser().parse_args(
+        ["construct", "--terminal-compilation-mode", mode]
+    )
+
+    assert args.output_root == full100.DEFAULT_OUTPUT_ROOT
+    assert full100.output_root_for_args(args) == full100.DEFAULT_OUTPUT_ROOT_BY_MODE[
+        mode
+    ]
+    assert full100.output_root_for_args(args) != full100.DEFAULT_OUTPUT_ROOT
+
+
+def test_full100_backfill_successor_default_roots_are_pairwise_distinct() -> None:
+    modes = (
+        full100.terminal_cli.TERMINAL_COMPILATION_MODE_V2,
+        full100.terminal_cli.TERMINAL_COMPILATION_MODE_V4,
+        full100.terminal_cli.TERMINAL_COMPILATION_MODE_V5,
+    )
+    assert len({full100.DEFAULT_OUTPUT_ROOT_BY_MODE[mode] for mode in modes}) == 3
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        full100.terminal_cli.TERMINAL_COMPILATION_MODE_V4,
+        full100.terminal_cli.TERMINAL_COMPILATION_MODE_V5,
+    ),
+)
+def test_full100_backfill_successor_manifest_and_sidecars_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    monkeypatch.setattr(
+        full100, "_validate_terminal_answer_plan", _fake_plan_validator
+    )
+    sources, eligible_ordinals = _source_fixture(tmp_path / mode)
+    compilation_format = full100.terminal_cli.TERMINAL_COMPILATION_FORMAT_BY_MODE[
+        mode
+    ]
+    terminalized = _terminalized(
+        sources,
+        eligible_ordinals,
+        compilation_format=compilation_format,
+    )
+    bundle = full100._compose_payload(  # noqa: SLF001
+        sources=sources,
+        terminalized=terminalized,
+        terminal_policy=SemanticGlobalTerminalPolicy(),
+        terminal_mode=mode,
+    )
+    root = tmp_path / f"sealed-{mode}"
+    digest = _publish_pair(root, bundle.manifest, bundle.sidecars)
+
+    assert bundle.manifest["terminal_compilation_format"] == compilation_format
+    construction, replay, plans, passthroughs = (
+        full100.load_verified_full100_construction(
+            root,
+            digest,
+            digest,
+            gate_path=sources.gate.path,
+            expected_gate_sha256=sources.gate.sha256,
+            r7_path=sources.r7.path,
+            expected_r7_sha256=sources.r7.sha256,
+            vectors_path=sources.vectors.path,
+            vector_replay_path=sources.vector_replay.path,
+            expected_vector_sha256=sources.vectors.sha256,
+            parent_path=sources.parent.path,
+            expected_parent_sha256=sources.parent.sha256,
+        )
+    )
+    assert construction.sha256 == replay.sha256 == digest
+    assert len(plans) == full100.ELIGIBLE_COUNT
+    assert len(passthroughs) == full100.PASSTHROUGH_COUNT
+
+
+def test_detailed_loader_preserves_legacy_tuple_and_exposes_exact11(
+    fixture: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = fixture.root / "detailed-loader"
+    digest = _publish_pair(root, fixture.bundle.manifest, fixture.bundle.sidecars)
+    legacy = _reader(fixture, root, digest)
+    observed_ordinals: list[int] = []
+    original = full100._require_r7_question_reexecution  # noqa: SLF001
+
+    def observe(question, r7_row):
+        observed_ordinals.append(question["ordinal"])
+        original(question, r7_row)
+
+    monkeypatch.setattr(full100, "_require_r7_question_reexecution", observe)
+    sources = fixture.sources
+    detailed = full100.load_verified_full100_construction_detailed(
+        root,
+        digest,
+        digest,
+        gate_path=sources.gate.path,
+        expected_gate_sha256=sources.gate.sha256,
+        r7_path=sources.r7.path,
+        expected_r7_sha256=sources.r7.sha256,
+        vectors_path=sources.vectors.path,
+        vector_replay_path=sources.vector_replay.path,
+        expected_vector_sha256=sources.vectors.sha256,
+        parent_path=sources.parent.path,
+        expected_parent_sha256=sources.parent.sha256,
+    )
+
+    assert detailed.legacy_tuple() == legacy
+    assert tuple(plan["ordinal"] for plan in detailed.exact11_terminal_plans) == (
+        full100.terminal_cli.EXACT_ORDINALS
+    )
+    assert observed_ordinals == list(
+        payload["ordinal"]
+        for sidecar in fixture.bundle.sidecars
+        for payload in sidecar["questions"]
+    )
+
+
+def test_compose_rejects_resealed_question_without_exact_r7_binding(
+    fixture: _Fixture,
+) -> None:
+    changed = deepcopy(fixture.terminalized)
+    question = changed["questions"][0]
+    question["r7_question_receipt_sha256"] = identity_sha256(
+        {"foreign": "R7 question"}
+    )
+    question_body = {
+        key: value
+        for key, value in question.items()
+        if key != "question_assay_receipt_sha256"
+    }
+    question["question_assay_receipt_sha256"] = identity_sha256(question_body)
+    changed_body = {
+        key: value
+        for key, value in changed.items()
+        if key != "construction_identity_sha256"
+    }
+    changed["construction_identity_sha256"] = identity_sha256(changed_body)
+
+    with pytest.raises(
+        full100.LockedSemanticGlobalTerminalFull100Error,
+        match="lost exact R7 reexecution binding",
+    ):
+        full100._compose_payload(  # noqa: SLF001
+            sources=fixture.sources,
+            terminalized=changed,
+            terminal_policy=SemanticGlobalTerminalPolicy(),
+        )
 
 
 def test_build_derives_workset_and_invokes_existing_resident_callback(
@@ -580,6 +753,55 @@ def _resumable_args(root: Path) -> argparse.Namespace:
     return argparse.Namespace(output_root=root)
 
 
+def test_resumable_namespace_rejects_resealed_question_without_r7_binding(
+    fixture: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        full100, "_load_build_sources", lambda _args: fixture.sources
+    )
+    context = resumable._build_context(  # noqa: SLF001
+        _resumable_args(fixture.root / "resumable-r7-binding")
+    )
+    population_row = context.namespace_population[0]
+    changed = _terminalized_subset(
+        fixture.terminalized, tuple(population_row["ordinals"])
+    )
+    question = changed["questions"][0]
+    old_receipt = question["question_assay_receipt_sha256"]
+    question["r7_exact_question_rebuilt"] = False
+    question_body = {
+        key: value
+        for key, value in question.items()
+        if key != "question_assay_receipt_sha256"
+    }
+    question["question_assay_receipt_sha256"] = identity_sha256(question_body)
+    namespace = changed["namespace_receipts"][0]
+    namespace["question_assay_receipt_sha256s"] = [
+        question["question_assay_receipt_sha256"] if value == old_receipt else value
+        for value in namespace["question_assay_receipt_sha256s"]
+    ]
+    namespace_body = {
+        key: value
+        for key, value in namespace.items()
+        if key != "namespace_assay_receipt_sha256"
+    }
+    namespace["namespace_assay_receipt_sha256"] = identity_sha256(namespace_body)
+    changed_body = {
+        key: value
+        for key, value in changed.items()
+        if key != "construction_identity_sha256"
+    }
+    changed["construction_identity_sha256"] = identity_sha256(changed_body)
+
+    with pytest.raises(
+        full100.LockedSemanticGlobalTerminalFull100Error,
+        match="lost exact R7 reexecution binding",
+    ):
+        resumable._validate_namespace_execution(  # noqa: SLF001
+            context, population_row, changed
+        )
+
+
 def test_resumable_crash_skips_only_complete_checkpoints_and_matches_resident(
     fixture: _Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -714,6 +936,14 @@ def test_resumable_cli_has_no_ordinal_and_requires_nonlegacy_output_root() -> No
         resumable._safe_output_root(  # noqa: SLF001
             argparse.Namespace(output_root=full100.DEFAULT_OUTPUT_ROOT)
         )
+    for root in full100.DEFAULT_OUTPUT_ROOT_BY_MODE.values():
+        with pytest.raises(
+            resumable.LockedSemanticGlobalTerminalFull100ResumableError,
+            match="refuses the legacy default",
+        ):
+            resumable._safe_output_root(  # noqa: SLF001
+                argparse.Namespace(output_root=root)
+            )
 
 
 def _legacy_import_args(

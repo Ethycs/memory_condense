@@ -350,15 +350,20 @@ def _strict_source_fixture(root: Path):
         root / "vector-replay.json", vector_payload
     )
     r7_rows = [
-        {
-            "dated_question_sha256": original.parent_rows[ordinal][
-                "dated_question_sha256"
-            ],
-            "mode": "residual_synthesis" if ordinal in eligible else "not_eligible",
-            "ordinal": ordinal,
-            "question_id": original.parent_rows[ordinal]["question_id"],
-            "question_sha256": original.parent_rows[ordinal]["question_sha256"],
-        }
+        _with_receipt(
+            {
+                "dated_question_sha256": original.parent_rows[ordinal][
+                    "dated_question_sha256"
+                ],
+                "mode": (
+                    "residual_synthesis" if ordinal in eligible else "not_eligible"
+                ),
+                "ordinal": ordinal,
+                "question_id": original.parent_rows[ordinal]["question_id"],
+                "question_sha256": original.parent_rows[ordinal]["question_sha256"],
+            },
+            "question_receipt_sha256",
+        )
         for ordinal in answer.ALL_ORDINALS
     ]
     r7_body = {
@@ -400,7 +405,7 @@ def _strict_plan(
         }
         allowed: list[str] = []
         compilation: dict[str, Any] = {
-            "format": "synthetic-strict-terminal-compilation-v1",
+            "format": answer.terminal_cli.TERMINAL_COMPILATION_FORMAT,
             "new_provider_calls": 0,
             "retained_transformer_token_state_bytes": 0,
         }
@@ -410,6 +415,9 @@ def _strict_plan(
         provider_input["protected_parent_fallback"] = {"prediction": parent}
         allowed = list(audit_plan["allowed_handle_ids"])
         compilation = deepcopy(audit_plan["terminal_compilation"])
+        compilation.setdefault(
+            "format", answer.terminal_cli.TERMINAL_COMPILATION_FORMAT
+        )
     compilation.update(
         {
             "policy": answer.full100_cli.SemanticGlobalTerminalPolicy().projection(),
@@ -479,6 +487,10 @@ def _strict_terminalized(
                 "ordinal": ordinal,
                 "question_id": gate["question_id"],
                 "question_sha256": gate["question_sha256"],
+                "r7_exact_question_rebuilt": True,
+                "r7_question_receipt_sha256": sources.r7_rows[ordinal][
+                    "question_receipt_sha256"
+                ],
                 "retained_transformer_token_state_bytes": 0,
                 "terminal_answer_plan": plan,
             },
@@ -553,7 +565,10 @@ def _args(tmp_path: Path, fixture: _Fixture) -> SimpleNamespace:
         model=answer.DEFAULT_MODEL,
         output_root=tmp_path / "answer-root",
         postseal_audit=fixture.audit.path,
+        promotion_from_full100=False,
         promotion_terminal_root=tmp_path / "promotion-root",
+        r7_construction=None,
+        expected_r7_construction_sha256=None,
     )
 
 
@@ -578,6 +593,99 @@ def _install_sources(
     monkeypatch.setattr(
         answer.postseal_cli, "load_verified_promotion_audit", audit_reader
     )
+
+
+def test_direct_full100_promotion_uses_one_canonical_source_and_explicit_r7(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    args = _args(tmp_path, fixture)
+    shared_root = tmp_path / "shared-full100"
+    args.promotion_from_full100 = True
+    args.full100_terminal_root = shared_root
+    args.promotion_terminal_root = shared_root / "."
+    args.expected_promotion_terminal_construction_sha256 = fixture.construction.sha256
+    args.expected_promotion_terminal_replay_sha256 = fixture.replay.sha256
+    args.r7_construction = tmp_path / "successor-r7.json"
+    args.expected_r7_construction_sha256 = _sha("successor R7")
+    captured: dict[str, Any] = {}
+    detailed = SimpleNamespace(
+        construction=fixture.construction,
+        replay=fixture.replay,
+        provider_plans=fixture.provider_plans,
+        passthroughs=fixture.passthroughs,
+        exact11_terminal_plans=fixture.promotion_plans,
+        residual_policy=SimpleNamespace(
+            classifier_mode=answer.EVIDENCE_CONSERVING_RESIDUAL_CLASSIFIER_MODE
+        ),
+    )
+
+    def load_detailed(root, construction_sha, replay_sha, **kwargs):
+        captured.update(
+            root=root,
+            construction_sha=construction_sha,
+            replay_sha=replay_sha,
+            **kwargs,
+        )
+        return detailed
+
+    def read_audit(_path, _sha256, *, construction_sha256, replay_sha256):
+        captured["audit_construction_sha"] = construction_sha256
+        captured["audit_replay_sha"] = replay_sha256
+        return fixture.audit
+
+    monkeypatch.setattr(
+        answer.full100_cli,
+        "load_verified_full100_construction_detailed",
+        load_detailed,
+    )
+    monkeypatch.setattr(
+        answer.full100_cli,
+        "load_verified_full100_construction",
+        lambda *_args, **_kwargs: pytest.fail("direct mode used the legacy accessor"),
+    )
+    monkeypatch.setattr(
+        answer.terminal_cli,
+        "load_verified_terminal_assay",
+        lambda *_args, **_kwargs: pytest.fail("direct mode opened a reduced assay"),
+    )
+    monkeypatch.setattr(answer, "_read_promotion_audit", read_audit)
+
+    verified = answer._load_verified_sources(args)  # noqa: SLF001
+
+    assert verified.full100_construction is verified.promotion_construction
+    assert verified.full100_replay is verified.promotion_replay
+    assert verified.promotion_plans == fixture.promotion_plans
+    assert captured["root"] == shared_root
+    assert captured["construction_sha"] == fixture.construction.sha256
+    assert captured["replay_sha"] == fixture.replay.sha256
+    assert captured["r7_path"] == args.r7_construction
+    assert captured["expected_r7_sha256"] == args.expected_r7_construction_sha256
+    assert captured["audit_construction_sha"] == fixture.construction.sha256
+    assert captured["audit_replay_sha"] == fixture.replay.sha256
+
+
+def test_direct_full100_promotion_rejects_different_sha_before_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    args = _args(tmp_path, fixture)
+    args.promotion_from_full100 = True
+    args.promotion_terminal_root = args.full100_terminal_root
+    args.expected_promotion_terminal_construction_sha256 = _sha("foreign full100")
+    args.r7_construction = tmp_path / "successor-r7.json"
+    args.expected_r7_construction_sha256 = _sha("successor R7")
+    monkeypatch.setattr(
+        answer.full100_cli,
+        "load_verified_full100_construction_detailed",
+        lambda *_args, **_kwargs: pytest.fail("mismatched roots reached the loader"),
+    )
+
+    with pytest.raises(
+        answer.LockedSemanticGlobalTerminalFull100AnswerError,
+        match="canonical same-root/same-SHA",
+    ):
+        answer._load_verified_sources(args)  # noqa: SLF001
 
 
 def test_preflight_seals_fixed_68_32_population_and_hard_budget(tmp_path: Path) -> None:

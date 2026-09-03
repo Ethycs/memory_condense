@@ -54,6 +54,7 @@ from memory_condense.ingest.validator import Validator
 from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.persistence.db import Database
 from memory_condense.persistence.memory_store import MemoryStore
+from memory_condense.persistence.pending_ingest_store import PendingIngestStore
 from memory_condense.persistence.transcript_store import TranscriptStore
 from memory_condense.search.indexes.retrieval import SimilarityRetriever
 from memory_condense.search.packing.context_packer import (
@@ -209,6 +210,7 @@ class MemoryCondenser(
         self._db = database
         self._init_discourse_workflow()
         self._transcript = TranscriptStore(self._db)
+        self._pending_ingests = PendingIngestStore(self._db)
         self._chunker = Chunker(
             min_tokens=chunker_min_tokens,
             max_tokens=chunker_max_tokens,
@@ -520,14 +522,20 @@ class MemoryCondenser(
                 "consolidation_event_id": event_id,
             }
         )
-        if reheat_memories:
+        # A read-only facade must remain a pure retrieval surface even when a
+        # caller uses the public mutation-enabled defaults.  Suppress both
+        # post-pack feedback paths at this boundary so every packed result is
+        # still returned, while no store-specific write guard or SQLite error
+        # can leak into retrieval.
+        writable = not self._db.read_only
+        if reheat_memories and writable:
             now_turn = self._transcript.current_turn()
             ranked_by_id = {result.item.mem_id: result.item for result in memories}
             self._memory.touch_many(
                 [ranked_by_id[mem_id] for mem_id in packed.memory_ids],
                 now_turn=now_turn,
             )
-        if learn_consolidation:
+        if learn_consolidation and writable:
             # Learn from independent retrieval evidence only.  A candidate
             # admitted by this graph must later be found directly before it can
             # strengthen the assembly, avoiding a self-confirming feedback loop.

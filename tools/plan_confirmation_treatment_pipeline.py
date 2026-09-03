@@ -180,6 +180,8 @@ def _sidecar_bytes(path: Path, digest: str) -> bytes:
 
 def read_sealed_confirmation_pipeline_plan(
     path: str | Path,
+    *,
+    expected_sha256: str | None = None,
 ) -> SealedConfirmationPipelinePlan:
     target = Path(path)
     sidecar = target.with_name(target.name + ".sha256")
@@ -199,6 +201,15 @@ def read_sealed_confirmation_pipeline_plan(
     if type(payload) is not dict or raw != canonical_json_bytes(payload) + b"\n":
         raise ConfirmationPipelineSealError("pipeline plan is not canonical JSON")
     digest = hashlib.sha256(raw).hexdigest()
+    if expected_sha256 is not None:
+        if not _SHA256.fullmatch(expected_sha256):
+            raise ConfirmationPipelineSealError(
+                "expected pipeline plan sha256 is invalid"
+            )
+        if digest != expected_sha256:
+            raise ConfirmationPipelineSealError(
+                "pipeline plan does not match expected sha256"
+            )
     try:
         sidecar_raw = sidecar.read_bytes()
     except OSError as exc:

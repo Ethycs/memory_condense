@@ -179,6 +179,19 @@ def test_deterministic_seal_is_no_clobber_with_digest_sidecar(tmp_path: Path) ->
     assert second_created is False
     assert first.sha256 == second.sha256
     assert planner.read_sealed_confirmation_pipeline_plan(output).sha256 == first.sha256
+    assert (
+        planner.read_sealed_confirmation_pipeline_plan(
+            output, expected_sha256=first.sha256
+        ).sha256
+        == first.sha256
+    )
+    with pytest.raises(
+        planner.ConfirmationPipelineSealError,
+        match="does not match expected sha256",
+    ):
+        planner.read_sealed_confirmation_pipeline_plan(
+            output, expected_sha256="0" * 64
+        )
     assert output.with_name(output.name + ".sha256").is_file()
 
     changed = _treatment(_samples(5), tag="expanded")

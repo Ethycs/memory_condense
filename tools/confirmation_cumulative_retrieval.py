@@ -236,6 +236,12 @@ class ConfirmationCumulativeInput:
     workset: ConfirmationNamespaceWorkset
     base_execution: ConfirmationNamespaceExecution
 
+    @property
+    def source_policy_sha256(self) -> str:
+        """Return the policy identity, distinct from the runtime file seal."""
+
+        return self.workset.freeze_sha256
+
 
 @dataclass(frozen=True, slots=True)
 class ConfirmationQuery:
@@ -966,7 +972,7 @@ def _request_for_work(
         work=work,
         queries=_queries_for_work(work, queries_by_receipt),
         base=base,
-        policy_freeze_sha256=inputs.policy_freeze.sha256,
+        policy_freeze_sha256=inputs.source_policy_sha256,
         preflight_sha256=inputs.preflight.sha256,
         workset_identity_sha256=inputs.workset.workset_identity_sha256,
     )
@@ -1009,7 +1015,7 @@ def execute_confirmation_cumulative_namespaces(
     backend_identity = _sha256(backend.identity_sha256, "cumulative backend identity")
     _require(
         _sha256(backend.policy_freeze_sha256, "backend policy freeze")
-        == inputs.policy_freeze.sha256,
+        == inputs.source_policy_sha256,
         "cumulative backend binds another policy freeze",
     )
     root = Path(output_root)

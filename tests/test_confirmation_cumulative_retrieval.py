@@ -603,7 +603,8 @@ def _execute(
     root: Path,
     inputs: cumulative.ConfirmationCumulativeInput,
 ) -> tuple[_CumulativeBackend, cumulative.ConfirmationCumulativeExecution]:
-    backend = _CumulativeBackend(inputs.policy_freeze.sha256)
+    assert inputs.policy_freeze.sha256 != inputs.source_policy_sha256
+    backend = _CumulativeBackend(inputs.source_policy_sha256)
     execution = cumulative.execute_confirmation_cumulative_namespaces(
         inputs,
         output_root=root / "cumulative",
@@ -851,7 +852,7 @@ def test_arbitrary_namespace_schedule_and_foreign_question_fail_closed(
         cumulative.execute_confirmation_cumulative_namespaces(
             inputs,
             output_root=tmp_path / "cumulative",
-            backend=EscapingBackend(inputs.policy_freeze.sha256),
+            backend=EscapingBackend(inputs.source_policy_sha256),
             token_counter=lambda text: len(text.split()),
     )
     assert not (tmp_path / "cumulative" / "checkpoints").exists()
@@ -924,7 +925,7 @@ def test_production_adapter_reuses_mocked_store_and_retrieval_runtime(
         queries_by_receipt=query_map,
         base_locations=base_locations,
     )
-    synthetic = _CumulativeBackend(inputs.policy_freeze.sha256)
+    synthetic = _CumulativeBackend(inputs.source_policy_sha256)
     typed_questions = {
         query.question: synthetic._question(request, query)
         for query in request.queries
@@ -978,7 +979,7 @@ def test_production_adapter_reuses_mocked_store_and_retrieval_runtime(
             return {"retrieval": "synthetic-population-neutral"}
 
     backend = cumulative.ProductionCumulativeNamespaceBackend(
-        policy_freeze_sha256=inputs.policy_freeze.sha256,
+        policy_freeze_sha256=inputs.source_policy_sha256,
         runtime_policy_binding={
             "model_residency_mode": cumulative.RESIDENT_PRODUCTION_MODE,
             "policy": "synthetic-frozen",
@@ -1273,15 +1274,16 @@ def _run_staged(
     root: Path,
     events: list[str],
 ) -> staged.StagedCoordinatorExecution:
+    assert inputs.policy_freeze.sha256 != inputs.source_policy_sha256
     return staged.execute_staged_confirmation_cumulative(
         inputs,
         output_root=root,
         preparation_backend=_StagedPreparationBackend(
-            inputs.policy_freeze.sha256, events
+            inputs.source_policy_sha256, events
         ),
         qwen_factory=_StagedQwenFactory(events),
         retrieval_factory=_StagedRetrievalFactory(
-            inputs.policy_freeze.sha256, events
+            inputs.source_policy_sha256, events
         ),
         token_counter=lambda text: len(text.split()),
     )
@@ -1332,7 +1334,7 @@ def test_staged_before_release_hook_runs_after_prepare_and_before_bge_close(
     inputs = _make_inputs(tmp_path, treatment, (1, 1), target_tokens=3)
     events: list[str] = []
     preparation_backend = _StagedPreparationBackend(
-        inputs.policy_freeze.sha256, events
+        inputs.source_policy_sha256, events
     )
 
     def freeze_semantic_facets(
@@ -1350,7 +1352,7 @@ def test_staged_before_release_hook_runs_after_prepare_and_before_bge_close(
         preparation_backend=preparation_backend,
         qwen_factory=_StagedQwenFactory(events),
         retrieval_factory=_StagedRetrievalFactory(
-            inputs.policy_freeze.sha256, events
+            inputs.source_policy_sha256, events
         ),
         token_counter=lambda text: len(text.split()),
         before_bge_release=freeze_semantic_facets,
@@ -1391,11 +1393,11 @@ def test_semantic_facet_hook_freezes_then_verifies_without_reembedding(
         inputs,
         output_root=root,
         preparation_backend=_StagedPreparationBackend(
-            inputs.policy_freeze.sha256, first_events
+            inputs.source_policy_sha256, first_events
         ),
         qwen_factory=_StagedQwenFactory(first_events),
         retrieval_factory=_StagedRetrievalFactory(
-            inputs.policy_freeze.sha256, first_events
+            inputs.source_policy_sha256, first_events
         ),
         token_counter=lambda text: len(text.split()),
         before_bge_release=first_hook,
@@ -1430,11 +1432,11 @@ def test_semantic_facet_hook_freezes_then_verifies_without_reembedding(
         inputs,
         output_root=root,
         preparation_backend=_StagedPreparationBackend(
-            inputs.policy_freeze.sha256, second_events
+            inputs.source_policy_sha256, second_events
         ),
         qwen_factory=_StagedQwenFactory(second_events),
         retrieval_factory=_StagedRetrievalFactory(
-            inputs.policy_freeze.sha256, second_events
+            inputs.source_policy_sha256, second_events
         ),
         token_counter=lambda text: len(text.split()),
         before_bge_release=second_hook,
@@ -1539,11 +1541,11 @@ def test_production_qwen_factory_loads_post_barrier_and_closes(tmp_path: Path) -
         inputs,
         output_root=tmp_path / "staged-production-qwen",
         preparation_backend=_StagedPreparationBackend(
-            inputs.policy_freeze.sha256, events
+            inputs.source_policy_sha256, events
         ),
         qwen_factory=factory,
         retrieval_factory=_StagedRetrievalFactory(
-            inputs.policy_freeze.sha256, events
+            inputs.source_policy_sha256, events
         ),
         token_counter=lambda text: len(text.split()),
     )

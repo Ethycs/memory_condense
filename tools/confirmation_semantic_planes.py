@@ -608,7 +608,7 @@ def prepare_confirmation_semantic_facet_vectors(
     backend_identity = _sha(backend.identity_sha256, "semantic facet backend")
     _require(
         _sha(backend.policy_freeze_sha256, "semantic facet policy freeze")
-        == inputs.policy_freeze.sha256,
+        == inputs.source_policy_sha256,
         "semantic facet backend binds another policy freeze",
     )
     embedding_identity = cumulative._plain_json(backend.embedding_identity)  # noqa: SLF001
@@ -775,7 +775,7 @@ def prepare_confirmation_semantic_facet_vectors(
         "backend_identity_sha256": backend_identity,
         "embedding_identity_sha256": embedding_sha,
         "format": FACET_PREPARATION_FORMAT,
-        "freeze_sha256": inputs.policy_freeze.sha256,
+        "freeze_sha256": inputs.source_policy_sha256,
         "gold_loaded": False,
         "namespace_count": len(descriptors),
         "physical_provider_calls": 0,

@@ -527,7 +527,7 @@ def _preparation_checkpoint_body(
         "combined_store_receipt": normalized["combined_store_receipt"],
         "compilation_receipt_sha256": normalized["compilation_receipt_sha256"],
         "format": PREPARATION_FORMAT,
-        "freeze_sha256": inputs.policy_freeze.sha256,
+        "freeze_sha256": inputs.source_policy_sha256,
         "gold_loaded": False,
         "namespace_id": request.work.namespace_id,
         "namespace_store_id": request.work.namespace_store_id,
@@ -557,7 +557,7 @@ def prepare_staged_namespaces(
     backend_identity = _sha256(backend.identity_sha256, "preparation backend identity")
     _require(
         _sha256(backend.policy_freeze_sha256, "preparation policy freeze")
-        == inputs.policy_freeze.sha256,
+        == inputs.source_policy_sha256,
         "preparation backend binds another policy freeze",
     )
     embedding_identity = cumulative._plain_json(backend.embedding_identity)  # noqa: SLF001
@@ -599,7 +599,7 @@ def prepare_staged_namespaces(
                 and payload.get("backend_identity_sha256") == backend_identity
                 and payload.get("base_checkpoint_sha256")
                 == request.base.checkpoint.sha256
-                and payload.get("freeze_sha256") == inputs.policy_freeze.sha256
+                and payload.get("freeze_sha256") == inputs.source_policy_sha256
                 and payload.get("preflight_sha256") == inputs.preflight.sha256
                 and payload.get("workset_identity_sha256")
                 == inputs.workset.workset_identity_sha256
@@ -729,7 +729,7 @@ def _publish_barrier(
     )
     body = {
         "format": BARRIER_FORMAT,
-        "freeze_sha256": inputs.policy_freeze.sha256,
+        "freeze_sha256": inputs.source_policy_sha256,
         "gold_loaded": False,
         "physical_provider_calls": 0,
         "preflight_sha256": inputs.preflight.sha256,

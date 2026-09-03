@@ -109,6 +109,7 @@ DEFAULT_OFFLINE_TEST_FILES = (
     "tests/test_confirmation_production_phase_adapters.py",
     "tests/test_confirmation_production_final_adapters.py",
     "tests/test_confirmation_production_runtime.py",
+    "tests/test_confirmation_diffuse_base_smoke.py",
     "tests/test_run_confirmation_policy_v5_r3.py",
 )
 

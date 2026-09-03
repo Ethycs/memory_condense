@@ -94,6 +94,13 @@ _BASE_DERIVED_TABLES = (
     "memory_provenance",
 )
 
+# A deterministic base ingests the complete sample through one ``ingest_many``
+# call.  The durable index-visibility coordinate introduced by the concurrent
+# index lifecycle must therefore exist at revision one after that single
+# source-only publication.
+_BASE_INDEX_REVISION_KEY = "chunk_index_revision"
+_BASE_INDEX_REVISION = "1"
+
 
 @dataclass(frozen=True, slots=True)
 class _StoreAudit:
@@ -649,6 +656,7 @@ def _audit_store(
             ).fetchall()
         ]
         if meta_rows != [
+            (_BASE_INDEX_REVISION_KEY, _BASE_INDEX_REVISION),
             ("next_hnsw_label", str(len(labels))),
             ("schema_version", str(CURRENT_SCHEMA_VERSION)),
         ]:

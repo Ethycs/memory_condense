@@ -187,6 +187,13 @@ class EmbeddingService:
                 kwargs["device"] = self._device
             if self._model_revision is not None:
                 kwargs["revision"] = self._model_revision
+            if self._verify_checkpoint:
+                # A checksum-pinned production checkpoint must be resolved
+                # entirely from the authenticated local cache.  Besides
+                # preventing mutable network input, this avoids Transformers
+                # probing optional Hugging Face metadata files with retry
+                # backoff before every fresh process.
+                kwargs["local_files_only"] = True
             model = SentenceTransformer(self._model_name, **kwargs)
             verified_checkpoint_sha256: str | None = None
             if self._verify_checkpoint:

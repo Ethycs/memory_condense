@@ -186,7 +186,11 @@ def test_default_model_load_is_revision_pinned_and_hash_verified(monkeypatch):
     assert calls == [
         (
             DEFAULT_MODEL_NAME,
-            {"device": "cpu", "revision": DEFAULT_MODEL_REVISION},
+            {
+                "device": "cpu",
+                "revision": DEFAULT_MODEL_REVISION,
+                "local_files_only": True,
+            },
         )
     ]
     assert svc._verified_checkpoint_sha256 == BGE_M3_CHECKPOINT_SHA256

@@ -20,6 +20,19 @@ The [status report](07%20-%20Status%20Reports/2026-09-23_ten-session-battery-and
 records the handoff; [Analysis 35](08%20-%20Analysis/35%20-%20Ten-session%20failure%20patterns%20and%20repair%20priorities%202026-09-23.md)
 holds the failure findings, source examples, and repair priorities.
 
+**Priority-1 trace and repair:** The three named missing-turn cases were traced
+to routing (H8 Q83, H6 Q51) and to hydration order (H1 Q66), where late user
+additions lost the shared budget to assistant sections the projection then
+discarded. A new sealed stage, user completion routing, hydrates user routes
+before assistant context and completes routed conversations' user turns under
+a bounded cap. A provider-free replay of all 1,000 sealed packets raises
+recorded-support coverage from **972 to 989** at cap 8 with every prior span
+preserved. A bounded answer run with the unchanged reader, model and grader
+recovers **27 of the 87 misses** while **85 of 87 matched controls** still
+pass, at about 20% more prompt tokens. The full-campaign effect is not yet
+measured: the sampled control loss rate would cost roughly 21 of the 913
+passing answers if it held. See [Research Log 245](10%20-%20Research%20Log/245%20-%202026-09-23%20-%20Earliest%20loss%20trace%20and%20user%20completion%20routing.md).
+
 **Engineering artifact comparison:** The original longer session's implementation
 and the preserved memory-generated code were checked with the same behavioral
 assertions: **8/8 original, 7/8 memory**, with only the MCP energy display failing

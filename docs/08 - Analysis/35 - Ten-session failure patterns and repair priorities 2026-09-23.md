@@ -1,6 +1,6 @@
 # Ten-session failure patterns and repair priorities
 
-**Status:** CURRENT — measured diagnosis; proposed repairs remain unimplemented.  
+**Status:** CURRENT — measured diagnosis. Priority 1 traced, repaired in code and checked on the 87 misses plus matched controls (27 recovered, 2 controls lost); the full-campaign effect is unmeasured. See [Research Log 245](../10%20-%20Research%20Log/245%20-%202026-09-23%20-%20Earliest%20loss%20trace%20and%20user%20completion%20routing.md).  
 **Date:** 2026-09-23.  
 **Applies to:** The completed ten-history, 1,000-question user-spine memory evaluation.  
 **Depends on:** [Research Log 244](../10%20-%20Research%20Log/244%20-%202026-09-22%20-%20Ten%20million-token%20session%20evaluation.md) and the [sealed evaluation artifacts](../../eval_results/native-spine-ten100-20260922-r1/aggregate-report.json).

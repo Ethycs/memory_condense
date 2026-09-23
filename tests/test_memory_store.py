@@ -20,6 +20,7 @@ from memory_condense.domain.schemas import (
     SupersedeOp,
     UpdateOp,
     ValidationReport,
+    content_key,
 )
 from memory_condense.persistence.transcript_store import TranscriptStore
 from memory_condense.ingest.validator import Validator
@@ -148,7 +149,12 @@ def test_concurrent_exact_create_rechecks_under_write_lock(tmp_path, monkeypatch
     interleaved = False
 
     def build_after_other_writer(
-        op, *, embedding=None, half_life_turns=30.0, supersedes=None
+        op,
+        *,
+        embedding=None,
+        half_life_turns=30.0,
+        supersedes=None,
+        _resolved_embedding=None,
     ):
         nonlocal interleaved
         if not interleaved:
@@ -161,6 +167,7 @@ def test_concurrent_exact_create_rechecks_under_write_lock(tmp_path, monkeypatch
             embedding=embedding,
             half_life_turns=half_life_turns,
             supersedes=supersedes,
+            _resolved_embedding=_resolved_embedding,
         )
 
     monkeypatch.setattr(first, "_build_item", build_after_other_writer)
@@ -1055,8 +1062,14 @@ class TestDedup:
         # Layout written by the old maintenance path: loser.supersedes points
         # forward at the active survivor instead of backward at a predecessor.
         db.execute(
-            "UPDATE memory_items SET status = ?, supersedes = ? WHERE mem_id = ?",
-            (MemoryStatus.SUPERSEDED.value, survivor.mem_id, loser.mem_id),
+            "UPDATE memory_items SET status = ?, supersedes = ?, "
+            "retired_at_turn = ? WHERE mem_id = ?",
+            (
+                MemoryStatus.SUPERSEDED.value,
+                survivor.mem_id,
+                db.current_turn(),
+                loser.mem_id,
+            ),
         )
         db.commit()
 
@@ -1064,6 +1077,82 @@ class TestDedup:
             survivor.mem_id
         ]
         assert store.successors(survivor.mem_id) == []
+
+    def test_prepared_create_deduplicates_provider_work_and_obeys_source_order(
+        self, db, turn
+    ):
+        embedder = StubEmbedder()
+        store = MemoryStore(db, embedder=embedder)
+        operation = make_create(turn.turn_id, content="source-ordered fact")
+        existing = store.create(operation)
+        store.delete(DeleteOp(mem_id=existing.mem_id))
+
+        old_ops = MemoryOps(create=[operation, operation])
+        old_plan = store.prepare_create_embeddings(old_ops, source_ordinal=1)
+        db.connection.execute("BEGIN IMMEDIATE")
+        store.apply(old_ops, _commit=False, _prepared_embeddings=old_plan)
+        db.commit()
+
+        assert embedder.calls == ["source-ordered fact"]
+        # The first call came from the explicit active row. The delayed plan
+        # itself needed no vector and did not resurrect that retired row.
+        assert store.count(status=MemoryStatus.ACTIVE) == 0
+
+        later = TranscriptStore(db).append(
+            "user", "I now reassert the source-ordered fact."
+        )
+        later_operation = make_create(
+            later.turn_id,
+            quote="source-ordered fact",
+            content="source-ordered fact",
+        )
+        later_ops = MemoryOps(create=[later_operation, later_operation])
+        later_plan = store.prepare_create_embeddings(later_ops, source_ordinal=2)
+        db.connection.execute("BEGIN IMMEDIATE")
+        summary = store.apply(
+            later_ops, _commit=False, _prepared_embeddings=later_plan
+        )
+        db.commit()
+
+        # Identical operations share one precomputed vector; the second is an
+        # in-batch duplicate after the first publishes the active row.
+        assert embedder.calls == ["source-ordered fact", "source-ordered fact"]
+        assert summary["created"] == 1
+        assert summary["duplicate"] == 1
+        assert store.count(status=MemoryStatus.ACTIVE) == 1
+
+    def test_content_update_tombstone_blocks_older_delayed_identity(
+        self, db, turn
+    ):
+        embedder = StubEmbedder()
+        store = MemoryStore(db, embedder=embedder)
+        old_operation = make_create(turn.turn_id, content="old identity")
+        active = store.create(old_operation)
+        TranscriptStore(db).append("user", "The identity is new now.")
+
+        updated = store.update(
+            UpdateOp(mem_id=active.mem_id, content="new identity")
+        )
+        old_plan = store.prepare_create_embeddings(
+            MemoryOps(create=[old_operation]), source_ordinal=1
+        )
+        db.connection.execute("BEGIN IMMEDIATE")
+        summary = store.apply(
+            MemoryOps(create=[old_operation]),
+            _commit=False,
+            _prepared_embeddings=old_plan,
+        )
+        db.commit()
+
+        assert updated.content == "new identity"
+        assert summary["created"] == 0
+        assert summary["duplicate"] == 1
+        assert [item.content for item in store.list_items()] == ["new identity"]
+        assert db.execute(
+            "SELECT retired_at_turn, reason FROM memory_identity_retirements "
+            "WHERE mem_id = ?",
+            (active.mem_id,),
+        ).fetchall() == [(2, "updated")]
 
     def test_updating_content_moves_the_identity(self, store, turn):
         item = store.create(make_create(turn.turn_id, content="before"))
@@ -1074,3 +1163,270 @@ class TestDedup:
         assert store.count(status=MemoryStatus.ACTIVE) == 1
         store.create(make_create(turn.turn_id, content="before"))
         assert store.count(status=MemoryStatus.ACTIVE) == 2
+
+    def test_same_content_update_needs_no_provider(self, db, turn):
+        item = MemoryStore(db).create(
+            make_create(turn.turn_id, content="provider-independent")
+        )
+        failing = MemoryStore(db, embedder=FailingEmbedder())
+
+        updated = failing.update(
+            UpdateOp(
+                mem_id=item.mem_id,
+                content="provider-independent",
+                details="details still update",
+            )
+        )
+
+        assert updated is not None
+        assert updated.details == "details still update"
+
+    def test_details_only_update_allows_legacy_active_duplicates(self, store, turn):
+        first = store.create(
+            make_create(turn.turn_id, content="legacy duplicate update"),
+            dedupe=False,
+        )
+        second = store.create(
+            make_create(turn.turn_id, content="legacy duplicate update"),
+            dedupe=False,
+        )
+
+        updated = store.update(UpdateOp(mem_id=first.mem_id, details="kept"))
+
+        assert updated is not None
+        assert updated.details == "kept"
+        assert store.get(second.mem_id).status is MemoryStatus.ACTIVE
+
+    def test_update_rejects_collision_without_retiring_source(self, store, db, turn):
+        first = store.create(make_create(turn.turn_id, content="first identity"))
+        second = store.create(make_create(turn.turn_id, content="second identity"))
+
+        assert store.update(
+            UpdateOp(mem_id=first.mem_id, content="second identity")
+        ) is None
+
+        assert {
+            item.content for item in store.list_items(status=MemoryStatus.ACTIVE)
+        } == {"first identity", "second identity"}
+        assert db.execute(
+            "SELECT COUNT(*) FROM memory_identity_retirements "
+            "WHERE mem_id = ?",
+            (first.mem_id,),
+        ).fetchone() == (0,)
+        assert store.get(second.mem_id).status is MemoryStatus.ACTIVE
+
+    def test_normalized_content_edit_does_not_retire_same_identity(
+        self, store, db, turn
+    ):
+        item = store.create(make_create(turn.turn_id, content="Same Identity"))
+
+        updated = store.update(
+            UpdateOp(mem_id=item.mem_id, content=" same   identity ")
+        )
+
+        assert updated is not None
+        assert updated.content == " same   identity "
+        assert db.execute(
+            "SELECT COUNT(*) FROM memory_identity_retirements "
+            "WHERE mem_id = ?",
+            (item.mem_id,),
+        ).fetchone() == (0,)
+
+    def test_v15_trigger_fences_legacy_identity_update(self, store, db, turn):
+        item = store.create(make_create(turn.turn_id, content="old fenced identity"))
+
+        with pytest.raises(sqlite3.IntegrityError, match="retirement receipt"):
+            db.execute(
+                "UPDATE memory_items SET content = ?, content_hash = ? "
+                "WHERE mem_id = ?",
+                (
+                    "new unfenced identity",
+                    content_key(MemoryType.PREFERENCE, "new unfenced identity"),
+                    item.mem_id,
+                ),
+            )
+        db.connection.rollback()
+
+        assert store.get(item.mem_id).content == "old fenced identity"
+
+    def test_v15_trigger_fences_legacy_retired_identity_update(
+        self, store, db, turn
+    ):
+        item = store.create(make_create(turn.turn_id, content="retired identity"))
+        assert store.delete(DeleteOp(mem_id=item.mem_id))
+
+        with pytest.raises(sqlite3.IntegrityError, match="identity is immutable"):
+            db.execute(
+                "UPDATE memory_items SET content = ?, content_hash = ? "
+                "WHERE mem_id = ?",
+                (
+                    "rewritten retired identity",
+                    content_key(
+                        MemoryType.PREFERENCE, "rewritten retired identity"
+                    ),
+                    item.mem_id,
+                ),
+            )
+        db.connection.rollback()
+
+        assert store.get(item.mem_id).content == "retired identity"
+
+    def test_v15_trigger_rejects_reactivating_terminal_memory(self, store, db, turn):
+        item = store.create(make_create(turn.turn_id, content="terminal identity"))
+        assert store.delete(DeleteOp(mem_id=item.mem_id))
+
+        with pytest.raises(sqlite3.IntegrityError, match="status is immutable"):
+            db.execute(
+                "UPDATE memory_items SET status = 'active', retired_at_turn = NULL "
+                "WHERE mem_id = ?",
+                (item.mem_id,),
+            )
+        db.connection.rollback()
+
+        assert store.get(item.mem_id).status is MemoryStatus.DELETED
+
+    def test_v15_trigger_makes_terminal_retirement_chronology_immutable(
+        self, store, db, turn
+    ):
+        item = store.create(make_create(turn.turn_id, content="fixed chronology"))
+        assert store.delete(DeleteOp(mem_id=item.mem_id))
+        [(retired_at_turn,)] = db.execute(
+            "SELECT retired_at_turn FROM memory_items WHERE mem_id = ?",
+            (item.mem_id,),
+        ).fetchall()
+
+        for replacement in (retired_at_turn + 1, None):
+            with pytest.raises(sqlite3.IntegrityError, match="chronology is immutable"):
+                db.execute(
+                    "UPDATE memory_items SET retired_at_turn = ? WHERE mem_id = ?",
+                    (replacement, item.mem_id),
+                )
+            db.connection.rollback()
+
+        assert db.execute(
+            "SELECT retired_at_turn FROM memory_items WHERE mem_id = ?",
+            (item.mem_id,),
+        ).fetchone() == (retired_at_turn,)
+
+    def test_noop_mutations_preserve_caller_transaction(self, store, db, turn):
+        first = store.create(make_create(turn.turn_id, content="caller first"))
+        second = store.create(make_create(turn.turn_id, content="caller second"))
+
+        cases = [
+            ("pin", lambda: store.pin(PinOp(mem_id="ghost")), None),
+            ("delete", lambda: store.delete(DeleteOp(mem_id="ghost")), False),
+            (
+                "collision",
+                lambda: store.update(
+                    UpdateOp(mem_id=first.mem_id, content="caller second")
+                ),
+                None,
+            ),
+            (
+                "supersede",
+                lambda: store.supersede(
+                    SupersedeOp(
+                        mem_id=first.mem_id,
+                        replacement=make_create(
+                            turn.turn_id, content="caller replacement"
+                        ),
+                    ),
+                    _expected_content_hash="not-the-current-hash",
+                ),
+                None,
+            ),
+            (
+                "legacy-bind",
+                lambda: store.bind_legacy_retirement(
+                    first.mem_id, retired_at_turn=0
+                ),
+                False,
+            ),
+            (
+                "duplicate-race",
+                lambda: store._merge_active_duplicate(
+                    make_create(turn.turn_id, content="not currently active")
+                ),
+                None,
+            ),
+        ]
+
+        for marker, operation, expected in cases:
+            db.connection.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT INTO meta(key, value) VALUES (?, 'preserved')",
+                (f"caller-{marker}",),
+            )
+
+            assert operation() == expected
+            assert db.connection.in_transaction
+            assert db.execute(
+                "SELECT value FROM meta WHERE key = ?", (f"caller-{marker}",)
+            ).fetchone() == ("preserved",)
+            db.commit()
+
+        assert store.get(first.mem_id).content == "caller first"
+        assert store.get(second.mem_id).status is MemoryStatus.ACTIVE
+
+    def test_commit_failure_preserves_original_error_and_rolls_back(self, store, db, turn):
+        item = store.create(make_create(turn.turn_id, content="commit failure"))
+        db.execute("PRAGMA defer_foreign_keys = ON")
+        db.connection.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "INSERT INTO memory_provenance (mem_id, turn_id, chunk_id, quote) "
+            "VALUES ('missing-memory', ?, NULL, 'deferred violation')",
+            (turn.turn_id,),
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            store.pin(PinOp(mem_id=item.mem_id, pin=PinState.USER))
+
+        assert not db.connection.in_transaction
+        assert store.get(item.mem_id).pin is PinState.NONE
+        assert db.execute(
+            "SELECT COUNT(*) FROM memory_provenance "
+            "WHERE mem_id = 'missing-memory'"
+        ).fetchone() == (0,)
+
+
+def test_source_order_retirement_is_rechecked_under_write_lock(tmp_path, monkeypatch):
+    path = tmp_path / "retirement-race.db"
+    with Database(path) as first_db:
+        source = TranscriptStore(first_db).append("user", "A delayed exact fact.")
+        operation = make_create(
+            source.turn_id,
+            quote="A delayed exact fact",
+            content="delayed exact fact",
+        )
+        first = MemoryStore(first_db)
+        source_ordinal = int(
+            first_db.execute(
+                "SELECT ordinal FROM turns WHERE turn_id = ?", (source.turn_id,)
+            ).fetchone()[0]
+        )
+        plan = first.prepare_create_embeddings(
+            MemoryOps(create=[operation]), source_ordinal=source_ordinal
+        )
+        with Database(path) as second_db:
+            second = MemoryStore(second_db)
+            original_insert = first._insert_or_merge_active
+
+            def retire_before_lock(item, **kwargs):
+                concurrent = second.create(operation, embedding=np.zeros(4))
+                assert concurrent is not None
+                assert second.delete(DeleteOp(mem_id=concurrent.mem_id))
+                return original_insert(item, **kwargs)
+
+            monkeypatch.setattr(first, "_insert_or_merge_active", retire_before_lock)
+
+            result = first.create(
+                operation,
+                _resolved_embedding=plan.create[0],
+                _source_ordinal=source_ordinal,
+            )
+
+        assert result is None
+        assert first.count(status=MemoryStatus.ACTIVE) == 0
+        assert first._has_suppressing_retirement(
+            operation.type, operation.content, source_ordinal
+        )

@@ -1,0 +1,253 @@
+"""Compare a complete reader on the same 100 questions and unchanged live memory.
+
+This is development on the exposed single-history question set. Reuse the
+existing ingestion, routing, streaming, judge and raw audit implementations.
+"""
+import argparse
+from contextlib import closing
+from functools import lru_cache
+import json
+import os
+from pathlib import Path
+import sqlite3
+import time
+
+import psutil
+
+from memory_condense.domain._discourse_identity import identity_sha256, quote_sha256
+from memory_condense.eval import spine_reader_policy_v6 as reader
+from tools import evaluate_native_spine_single_history100 as baseline
+from tools.assemble_native_spine_summaries import digest
+from tools.matched_eval.artifacts import publish_sealed_json, read_sealed_json
+from tools.prepare_native_spine_design_slice import binding, bound
+
+frozen = baseline.frozen
+BASELINE = Path('eval_results/native-spine-single-history100-20260915-r1')
+ARMS = ('parent_context', 'parent_context_api')
+
+
+def implementation():
+    return {**frozen.implementation(), str(baseline.__file__): digest(baseline.__file__),
+            str(reader.__file__): digest(reader.__file__), str(__file__): digest(__file__)}
+
+
+def build(memory, question):
+    messages, hydration, routing = frozen.build(memory, question, 'parent_context')
+    return reader.complete_reader_messages(messages), hydration, routing
+
+
+def validate_plan(plan):
+    p = plan.payload
+    if (p['implementation'] != implementation() or p['history_count'] != 1
+            or p['namespace_load_count'] != 1 or p['question_count'] != 100
+            or p['new_history_compilations'] != 0 or p['model'] != frozen.MODEL
+            or p['gold_loaded'] is not False):
+        raise ValueError('reader experiment implementation or lifecycle changed')
+    questions, scope = bound(p['questions']), bound(p['scope'])
+    cases = baseline.validate_population(questions, scope)
+    calls = p['calls']
+    if len(calls) != 200 or [c['call_index'] for c in calls] != list(range(200)):
+        raise ValueError('requires 100 questions and 100 matched controls')
+    for ordinal, case in enumerate(cases):
+        group = calls[ordinal * 2:ordinal * 2 + 2]
+        if (tuple(c['arm'] for c in group) != (ARMS if ordinal % 2 == 0 else ARMS[::-1])
+                or any(c['question'] != frozen.question(case) for c in group)
+                or group[0]['messages'] != group[1]['messages']
+                or any(c['messages_sha256'] != identity_sha256(c['messages']) for c in group)):
+            raise ValueError('reader schedule, question, or matched prompt changed')
+    return questions, scope
+
+
+def seal_answers(root, plan):
+    observations = frozen.recorded(root, plan)
+    if len(observations) != 200:
+        raise ValueError('all 100 questions and controls must finish before grading')
+    answers, _ = publish_sealed_json(root / 'answers.json', {'preflight_sha256': plan.sha256,
+        'rows': [{'call_index': c['call_index'], 'response_sha256': r.sha256,
+                  'prediction_sha256': r.payload['measurement']['prediction_sha256']}
+                 for c, r in observations]})
+    return answers, observations
+
+
+def judge(root, enable=False):
+    plan = read_sealed_json(root / 'preflight.json')
+    questions, scope = validate_plan(plan)
+    answers, observations = seal_answers(root, plan)
+    refs = bound(questions.payload['references'])
+    if refs.payload['scope_sha256'] != scope.sha256 or refs.payload['ingest_use_permitted'] is not False:
+        raise ValueError('references changed their evaluation-only scope')
+    references = {r['question_id']: r for r in refs.payload['references']}
+    cases = {q['question_id']: q for q in questions.payload['questions']}
+    if set(references) != set(cases) or len(refs.payload['references']) != 100:
+        raise ValueError('references must match all 100 locked questions')
+    rows = []
+    for call, response in observations:
+        if call['arm'] != 'parent_context':
+            continue
+        q, m = call['question'], response.payload['measurement']
+        answer = references[q['question_id']]['answer']
+        if quote_sha256(answer) != cases[q['question_id']]['reference_sha256']:
+            raise ValueError('reference answer changed')
+        rows.append({'ordinal': q['ordinal'], 'question_id': q['question_id'],
+            'prediction_sha256': m['prediction_sha256'], 'response_sha256': response.sha256,
+            'reference_sha256': quote_sha256(answer),
+            'messages': frozen.build_judge_prompt(q['retrieval_query'], answer, m['prediction'])})
+    inputs, _ = publish_sealed_json(root / 'judge-preflight.json', {'answers_sha256': answers.sha256, 'rows': rows})
+    def factory(client):
+        return frozen.FastCompletionRuntime(checkpoint_dir=root / 'judge-checkpoints',
+            prompt_population=[r['messages'] for r in rows], model='codex_sdk/gpt-5.6-sol', client=client,
+            max_prompt_tokens=4096, max_new_tokens=frozen.JUDGE_MAX_TOKENS, max_concurrency=8,
+            retries=0, request_options={'temperature': 0},
+            benchmark_provenance={'binding_sha256': inputs.sha256, 'phase': 'judge'})
+    with closing(factory(None)) as runtime:
+        remaining = runtime.population.unique_prompt_count - len(frozen._authenticated_records(runtime))
+    batch, calls, hits, _ = frozen._run_exactly_authorized(runtime_factory=factory,
+        authorized_provider_calls=remaining, enable_provider=enable,
+        client_factory=lambda: frozen.ThreadLocalProvider(lambda: frozen._completion_client('LITELLM_KEY', frozen.GATEWAY)))
+    judged = [{**{k: v for k, v in row.items() if k != 'messages'}, 'verdict': verdict,
+        'correct': frozen.parse_binary_judge_verdict(verdict)}
+        for row, verdict in zip(rows, batch.logical_completions, strict=True)]
+    correct = sum(row['correct'] for row in judged)
+    latency = {}
+    for arm in ARMS:
+        measurements = [r.payload['measurement'] for c, r in observations if c['arm'] == arm]
+        latency[arm] = {metric: baseline.audit_tools.distribution([m[metric] for m in measurements])
+                       for metric in ('prepare_s', 'e2e_ttft_s', 'e2e_total_s')}
+    stopped = all(r.payload['measurement']['finish_reason'] == 'stop' for _, r in observations)
+    report, _ = publish_sealed_json(root / 'joint-report.json', {
+        'preflight_sha256': plan.sha256, 'questions_sha256': questions.sha256,
+        'answers_sha256': answers.sha256, 'references_sha256': refs.sha256,
+        'judge_preflight_sha256': inputs.sha256, 'rows': judged,
+        'judge_response_journal_shas': [r.response_journal_sha256 for r in batch.unique_records],
+        'history_count': 1, 'question_count': 100, 'actual_body_tokens': scope.payload['actual_body_tokens'],
+        'accuracy': {'correct': correct, 'questions': 100}, 'latency': latency,
+        'candidate_answers_under_five_seconds': sum(r.payload['measurement']['e2e_total_s'] < 5
+            for c, r in observations if c['arm'] == 'parent_context'),
+        'all_answers_stopped': stopped, 'target_gate_passed': correct >= 95 and stopped
+            and latency['parent_context']['e2e_total_s']['median_s'] < 5,
+        'historical_question_exposure': True, 'development_set': True,
+        'generalization_established': False, 'official_longmemeval_score': False})
+    print({'report_sha256': report.sha256, 'accuracy': report.payload['accuracy'], 'latency': latency,
+           'target_gate_passed': report.payload['target_gate_passed'], 'new_judge_calls': calls, 'cache_hits': hits}, flush=True)
+    return report
+
+
+def audit(root):
+    plan = read_sealed_json(root / 'preflight.json')
+    _, scope = validate_plan(plan)
+    answers, observations = seal_answers(root, plan)
+    report = read_sealed_json(root / 'joint-report.json')
+    if report.payload['answers_sha256'] != answers.sha256:
+        raise ValueError('report changed its answer binding')
+    sessions = bound(scope.payload['namespace']).payload['sessions']
+    bank_path = Path(scope.payload['body_bank']['path'])
+    if digest(bank_path) != scope.payload['body_bank']['sha256']:
+        raise ValueError('raw source bank changed')
+    packets = spans = 0
+    with closing(sqlite3.connect(bank_path.as_uri() + '?mode=ro', uri=True)) as raw:
+        @lru_cache(maxsize=1024)
+        def load_body(sha):
+            return json.loads(raw.execute('SELECT body_json FROM bodies WHERE body_sha256=?', (sha,)).fetchone()[0])
+        for call, response in observations:
+            if call['arm'] != 'parent_context':
+                continue
+            messages, count = baseline.audit_tools.verify_packet(call['question'], response.payload['hydration'],
+                response.payload['routing'], sessions, load_body)
+            if reader.complete_reader_messages(messages) != call['messages']:
+                raise ValueError('reader prompt differs from reconstructed raw evidence')
+            packets += 1
+            spans += count
+    result, _ = publish_sealed_json(root / 'raw-audit.json', {'joint_report': binding(report),
+        'verified_memory_packets': packets, 'verified_raw_spans': spans, 'new_model_calls': 0,
+        'history_count': 1, 'question_count': 100})
+    print({'raw_audit_sha256': result.sha256, 'verified_memory_packets': packets, 'verified_raw_spans': spans}, flush=True)
+    return result
+
+
+def run(root, enable=False):
+    if not enable or root.exists():
+        raise ValueError('provider execution flag and a fresh output root are required')
+    frozen.require_idle()
+    original, questions, _ = baseline.load_plan(BASELINE)
+    process = psutil.Process(os.getpid())
+    publish_sealed_json(root / 'worker-started.json', {'pid': process.pid, 'create_time': process.create_time(),
+        'history_count': 1, 'question_count': 100})
+    started = time.perf_counter()
+    scope, namespace = baseline.pilot.load_namespace(baseline.HISTORY)
+    cases = baseline.validate_population(questions, scope)
+    vectors = frozen.vector_compiler.NativeSummaryVectors(baseline.HISTORY / 'vectors')
+    admission = frozen.population.namespace_receipt(namespace, scope.payload['case'], vectors)
+    with closing(frozen.EmbeddingService(device='cuda', batch_size=8)) as encoder:
+        encoder.embed_query('One cached history, one hundred questions, warmup.')
+        memory = frozen.resident(namespace, vectors, encoder)
+        setup = time.perf_counter() - started
+        calls = []
+        for case in cases:
+            q = frozen.question(case)
+            messages, hydration, routing = build(memory, q)
+            old = read_sealed_json(BASELINE / 'evidence' / f'{case["ordinal"]:03d}.json')
+            if (messages != reader.complete_reader_messages(old.payload['messages']['parent_context'])
+                    or hydration != old.payload['hydration']['parent_context']
+                    or routing != old.payload['routing']['parent_context']):
+                raise ValueError('reader-only experiment changed retrieval or hydrated evidence')
+            evidence, _ = publish_sealed_json(root / 'evidence' / f'{case["ordinal"]:03d}.json',
+                {'messages': {a: messages for a in ARMS},
+                 'hydration': {'parent_context': hydration}, 'routing': {'parent_context': routing}})
+            for arm in (ARMS if case['ordinal'] % 2 == 0 else ARMS[::-1]):
+                calls.append({'call_index': len(calls), 'question': q, 'arm': arm, 'messages': messages,
+                    'messages_sha256': identity_sha256(messages), 'evidence_sha256': evidence.sha256})
+        plan, _ = publish_sealed_json(root / 'preflight.json', {'implementation': implementation(),
+            'baseline': binding(original), 'questions': binding(questions), 'scope': binding(scope),
+            'admission': admission, 'vectors': binding(vectors.result), 'calls': calls,
+            'history_count': 1, 'question_count': 100, 'namespace_load_count': 1,
+            'new_history_compilations': 0, 'gold_loaded': False, 'model': frozen.MODEL,
+            'reader_policy': 'v6', 'routing_method': frozen.METHOD,
+            'resident_setup_s_excluded': setup, 'live_retrieval_inside_timer': True,
+            'retrieval_and_raw_packets_identical_to_baseline': True, 'automatic_retries': 0,
+            'fresh_answer_calls': 200, 'logical_judgments': 100, 'development_set': True})
+        validate_plan(plan)
+        with (root / 'execution.reserved').open('x', encoding='utf-8') as stream:
+            stream.write(plan.sha256 + '\n')
+        print({'preflight_sha256': plan.sha256, 'history_count': 1, 'question_count': 100,
+               'body_tokens': admission['body_tokens'], 'answer_streams': 200, 'reader_only': True}, flush=True)
+        with closing(frozen._completion_client('LITELLM_KEY', frozen.GATEWAY)) as client:
+            for call in calls:
+                prefix = root / 'journal' / f'{call["call_index"]:03d}'
+                request, _ = publish_sealed_json(prefix.with_suffix('.request.json'),
+                    {'preflight_sha256': plan.sha256, 'call': call})
+                with prefix.with_suffix('.reserved').open('x', encoding='utf-8') as stream:
+                    stream.write(plan.sha256 + '\n')
+                evidence = read_sealed_json(root / 'evidence' / f'{call["question"]["ordinal"]:03d}.json')
+                prepared = {}
+                def prompt():
+                    m, h, r = build(memory, call['question']) if call['arm'] == 'parent_context' else (call['messages'], None, None)
+                    if m != call['messages'] or (call['arm'] == 'parent_context' and
+                            (h != evidence.payload['hydration']['parent_context']
+                             or r != evidence.payload['routing']['parent_context'])):
+                        raise ValueError('timed retrieval changed the locked packet')
+                    prepared.update(messages=m, hydration=h, routing=r)
+                    return m
+                measurement = frozen.measure_streaming_answer(client=client, model=frozen.MODEL,
+                    prepare_prompt=prompt, max_tokens=256)
+                publish_sealed_json(prefix.with_suffix('.response.json'),
+                    {'request_sha256': request.sha256, 'measurement': measurement, **prepared})
+                if (call['call_index'] + 1) % 2 == 0:
+                    print({'completed_questions': (call['call_index'] + 1) // 2, 'required': 100}, flush=True)
+    report = judge(root, True)
+    raw = audit(root)
+    publish_sealed_json(root / 'complete.json', {'joint_report': binding(report), 'raw_audit': binding(raw),
+        'target_gate_passed': report.payload['target_gate_passed']})
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('phase', choices=('run', 'judge', 'audit'))
+    parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--enable-provider', action='store_true')
+    args = parser.parse_args()
+    if args.phase == 'run':
+        run(args.root, args.enable_provider)
+    elif args.phase == 'judge':
+        judge(args.root, args.enable_provider)
+    else:
+        audit(args.root)

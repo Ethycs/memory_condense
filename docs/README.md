@@ -1,11 +1,807 @@
 # memory_condense — documentation tree
 
 **Status**: Living Document
-**Date**: 2026-09-03 (includes the proof-carrying 95/100 validation pass)
+**Date**: 2026-09-23 (includes the completed ten-session battery and engineering replay)
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
+
+**Ten-session battery complete:** Ten additional histories of **1.06–1.16M eligible
+raw tokens**, with 100 new questions each, scored **913/1,000 (91.3%)** under the
+unchanged grader. Warm median was **4.783 s**, mean **5.238 s**, p95 **8.935 s**;
+mean answer input was **1,500 tokens**, and retrieval/prompt preparation averaged
+**0.282 s**. All 1,000 exact raw-evidence checks passed. Every history used fresh
+application ingestion and a separate-process reopen with cached summary/attention
+compilation. Two sessions reached 95%; the aggregate target remains unmet.
+All workers are closed. See [Research Log 244](10%20-%20Research%20Log/244%20-%202026-09-22%20-%20Ten%20million-token%20session%20evaluation.md).
+
+The [status report](07%20-%20Status%20Reports/2026-09-23_ten-session-battery-and-failure-review.md)
+records the handoff; [Analysis 35](08%20-%20Analysis/35%20-%20Ten-session%20failure%20patterns%20and%20repair%20priorities%202026-09-23.md)
+holds the failure findings, source examples, and repair priorities.
+
+**Engineering artifact comparison:** The original longer session's implementation
+and the preserved memory-generated code were checked with the same behavioral
+assertions: **8/8 original, 7/8 memory**, with only the MCP energy display failing
+in the memory artifact. It plausibly substitutes for the core implementation and
+fixes an evaluation-side reheating issue. It has not reproduced the original
+session's real-data measurements, which the replay's tool surface did not expose.
+Latency is assumed equal at the earlier seconds-level rate. No new model calls
+were needed. See [Research Log 243](10%20-%20Research%20Log/243%20-%202026-09-22%20-%20Engineering%20artifact%20substitution%20assessment.md).
+
+The separately attempted fresh full-context control failed at the gateway before
+any new engineering answer and is not used to judge code quality. That attempt is
+closed; the user's subsequent request was to compare the saved artifacts. See
+[Research Log 242](10%20-%20Research%20Log/242%20-%202026-09-22%20-%20Matched%20engineering%20control%20gateway%20failure.md).
+
+**Real engineering-session result:** All **8 original prompts** were replayed on
+the historical checkout, producing **25 changed files**. Final validation found
+**237 regression checks passed**, **73 additional checks passed**, and **6/8 frozen
+independent checks passed**. Earlier completed work was recovered through memory,
+with a bounded current-user working conversation. The final memory save **failed**:
+a separate process reopened **481 of 524 journaled turns**, leaving 43 final events
+outside application memory. Live retrieval averaged **2.460 s**, but successful
+ingestion batches took **176–554 s**. This demonstrates useful engineering work;
+reliable, interactive context replacement remains unproven. All workers are closed.
+See [Research Log 240](10%20-%20Research%20Log/240%20-%202026-09-22%20-%20Real%20engineering%20session%20replay%20outcome.md).
+
+**Engineering token savings:** Recorded coding and summary generation used
+**4.616M input tokens**, versus an estimated **49.821M** for resending the same
+observed history at every response, excluding internal memory receipts: **90.73%
+fewer input tokens**. This includes recorded summary overhead and retries; it is
+a local-token estimate, with no full-context control. See
+[Research Log 241](10%20-%20Research%20Log/241%20-%202026-09-22%20-%20Engineering%20session%20token%20savings.md).
+
+**Previous engineering result:** The bounded replay stopped with **3/8 prompts
+completed, zero code changes and zero test runs**. A repaired retrieval policy was
+checked for five more coding actions; all remained reads/searches. Both workers
+are closed. This setup has not demonstrated replacement of context during real
+engineering work. The five-action check required 88 generation calls, with mean
+per-action ingestion of 152.88 s, retrieval of 1.84 s and coding generation of
+19.70 s. That failure motivated the bounded working conversation evaluated above.
+See [Research Log 239](10%20-%20Research%20Log/239%20-%202026-09-17%20-%20Bounded%20engineering%20session%20memory%20evaluation.md).
+
+**Completed question-answer evaluation:** Five additional 100-question tests scored **93, 92,
+90, 96 and 91**, totaling **462/500 (92.4%)**. Each history contained over 1.1M
+eligible raw tokens and followed normal ingestion plus a separate-process reopen.
+Combined warm median was **4.469 s**, p95 **6.893 s**, and mean input **1,537 tokens**;
+all 500 exact raw evidence checks passed. The subsequent eight-prompt raw-transcript
+build replay changed 16 isolated files: **240 regression checks passed**, while
+**four of eight independent behavioral checks failed**. It exposed a user-requirement
+continuity gap, missing reinforcement during rapid turns, and an MCP energy-display
+bug. Those runs are complete and their workers closed. See
+[Research Log 238](10%20-%20Research%20Log/238%20-%202026-09-16%20-%20Five%20new%20100%20question%20evaluations%20and%20build%20replay.md).
+
+**Previous completed result:** **96/100** on the original 100 questions over one
+normally ingested and reopened **1,098,417-token** history. User-spine routing and
+summary-only Qwen artifacts are unchanged; the answer context retains exact user
+sections and omits whole assistant-only sections. Warm median is **4.947 s**
+versus **4.356 s** for matched direct API calls; p95 is 7.638 s and 52/100 memory
+answers finish under five seconds. Cold setup is 30.308 s. All 100 packets pass
+raw reconstruction, and provider-free grading replay is identical. The original
+fixed-benchmark threshold is met. This exposed development result has known
+semantic-grader limitations and does not establish held-out accuracy. See
+[Research Log 237](10%20-%20Research%20Log/237%20-%202026-09-15%20-%20Whole%20assistant%20section%20ablation%20on%20the%20user%20spine.md).
+The chronological record below retains earlier, superseded results.
+
+> **Prior completed scope: exactly 100 questions on one already ingested ~1M-token history.**
+> The user explicitly rejected 100 histories. The r3 100-history controller and
+> admission worker are stopped; no benchmark answers were released by that run.
+> Do not resume them. The corrected run reuses the existing 1,098,417-token memory,
+> with 100 source-grounded questions locked before answers. It loads one namespace
+> once and uses the frozen retrieval method. Questions and reference answers do
+> not enter ingestion. Follow
+> [Research Log 218](10%20-%20Research%20Log/218%20-%202026-09-15%20-%20Correct%20scope%20to%20100%20questions%20on%20one%20ingested%20history.md)
+> for the completed run and audit. The candidate scored **71/100**, versus 64/100
+> for user-first retrieval. Warm median total was **3.700 s**, versus 3.677 s for
+> the matched API control; p95 was 6.478 s and 83/100 answers finished below 5 s.
+> All 200 memory packets passed exact raw reconstruction. The 95% target remains
+> unmet. These are generated questions over real transcripts, not an official
+> LongMemEval score. Cold load and ingestion are excluded from warm latency.
+> The completed reader-completeness comparison scored **81/100**, a ten-point gain
+> on the same questions and identical retrieved packets under unchanged grading.
+> Its warm median total was **3.695 s**, versus 3.780 s for fresh matched API controls;
+> all 100 memory packets passed raw reconstruction. The goal remains unmet.
+> Follow [Research Log 219](10%20-%20Research%20Log/219%20-%202026-09-15%20-%20Complete%20reader%20on%20the%20locked%20single%20history%20100%20questions.md).
+> A separate prediction-blind review of all 100 evaluation items is complete.
+> It flags question/reference defects without changing either score; two questions
+> have confirmed ambiguity among real source statements. Follow
+> [Research Log 220](10%20-%20Research%20Log/220%20-%202026-09-15%20-%20Prediction%20blind%20quality%20audit%20of%20the%20100%20question%20set.md)
+> for those limitations and the next summary-routing work on this same history.
+> The completed semantic-seed/two-level-parent comparison scored **84/100**, using
+> a 2,048-token raw packet with the v6 reader and grading unchanged. Warm median
+> total was **3.985 s**, versus 3.869 s for the matched API. All 100 packets passed
+> raw reconstruction; 97 contain every recorded support quote. That coverage is
+> not an accuracy score, and the 95% goal remains unmet. No new ingestion occurred.
+> Follow
+> [Research Log 221](10%20-%20Research%20Log/221%20-%202026-09-15%20-%20Dense%20seeded%20parent%20context%20on%20one%20history.md)
+> for the result, sealed policy, failures and next work on the same history.
+> **Lifecycle boundary of the earlier scores:** Those runs exercised cached ingestion artifacts loaded
+> into the native memory components, fresh question retrieval, exact hydration,
+> and answer grading. They do not exercise `MemoryCondenser.ingest` or the normal
+> application's persistence/restart path. They establish cached-memory answer
+> accuracy, not full application lifecycle validation. The latest audit reproduced
+> all 100 packets and 2,656 original raw spans with zero model calls. See
+> [Research Log 222](10%20-%20Research%20Log/222%20-%202026-09-15%20-%20Memory%20evaluation%20lifecycle%20boundary.md).
+> Application integration is now verified: normal ingestion persisted all 5,357
+> raw turns, and a new process reopened the application and reproduced all 100
+> baseline packets and 2,656 exact spans. Eleven lifecycle tests, 138 existing
+> condenser tests and 17 admission/presentation checks pass.
+> Follow [Research Log 223](10%20-%20Research%20Log/223%20-%202026-09-15%20-%20Application%20native%20memory%20ingest%20and%20reopen.md).
+> The completed conversation-order comparison scored **85/100** through that
+> reopened application, with unchanged evidence and reader. Warm median was
+> **3.964 s** versus 3.688 s for matched API controls; p95 was 6.331 s and 79/100
+> finished below five seconds. All 100 packets and 2,656 raw spans passed audit.
+> Five gains and four losses do not establish a reliable layout improvement.
+> The 95% target remains unmet. See [Research Log 224](10%20-%20Research%20Log/224%20-%202026-09-15%20-%20Conversation%20ordered%20answers%20through%20persisted%20application%20memory.md).
+> The completed v7 reader comparison scored **87/100** on that same application
+> memory, changing only system instructions. Warm median was **4.465 s** versus
+> 3.962 s for matched API controls; p95 was 7.015 s and 71/100 finished below five
+> seconds. All 100 packets and 2,656 raw spans passed audit. The 95% goal remains
+> unmet. Follow [Research Log 225](10%20-%20Research%20Log/225%20-%202026-09-15%20-%20Complete%20user%20statement%20reader%20through%20application%20memory.md).
+> A provider-free packet-width diagnostic retained all recorded support on the
+> same 97 questions while reducing median conversations from 14 to 4. All 200
+> candidate packets passed raw reconstruction. This is coverage, not accuracy;
+> the next answer comparison tests 8 direct matches with the reader unchanged.
+> See [Research Log 226](10%20-%20Research%20Log/226%20-%202026-09-15%20-%20Narrower%20retrieval%20packet%20coverage.md).
+> The completed width-8 comparison scored **93/100** through the reopened application,
+> with the same reader/model and unchanged grading. Warm median was **4.298 s**
+> versus 4.251 s for matched API controls; p95 was 6.741 s and 73/100 finished below
+> five seconds. All 100 packets and 1,430 exact spans passed audit. The seven misses
+> include two clear reader omissions, one routing miss and evaluation defects.
+> The 95% target remains unmet. Follow [Research Log 227](10%20-%20Research%20Log/227%20-%202026-09-15%20-%20Eight%20direct%20matches%20through%20application%20memory.md).
+> The completed Sol comparison also scored **93/100** on identical user-spine
+> packets, with three gains and three losses. Warm median was **4.615 s**, versus
+> 4.383 s for matched direct Sol; p95 was 8.500 s. All 100 packets and 1,430 spans
+> passed raw audit. The model switch did not improve the total score.
+> Follow [Research Log 228](10%20-%20Research%20Log/228%20-%202026-09-15%20-%20Answer%20model%20comparison%20on%20identical%20user%20spine%20packets.md).
+> Two complete lexical-summary diagnostics recovered the remaining empty-support
+> question but exposed competition in parent expansion. Neither is promoted.
+> Next work appends one lexical address after the unchanged semantic/parent routes,
+> preserving the existing packet before using spare capacity. No reingestion is needed.
+> Follow [Research Log 229](10%20-%20Research%20Log/229%20-%202026-09-15%20-%20Restore%20lexical%20recall%20without%20displacing%20semantic%20seeds.md).
+> The append-only implementation now preserves every prior route and raw section
+> across all 100 questions. Recorded-support coverage rises to **98/100**, with no
+> losses; all 100 packets and 1,439 spans pass independent raw audit. Coverage is
+> not accuracy. The completed 100-answer Terra comparison scored **87/100**, with
+> median **4.945 s** versus 4.383 s for matched API controls; p95 was 7.347 s.
+> Seven of eight regressions occurred on byte-identical prompts to the prior run,
+> exposing answer/grading variability. All 100 packets passed raw audit. The
+> change is not promoted on accuracy; the best completed result remains 93/100.
+> Follow [Research Log 230](10%20-%20Research%20Log/230%20-%202026-09-15%20-%20Append%20lexical%20summaries%20after%20preserved%20parent%20context.md).
+> The next comparison groups exact user statements before assistant context within
+> each conversation, preserving all evidence, retrieval and reader instructions.
+> The completed comparison scored **93/100**, with median **4.651 s** versus
+> 4.581 s for matched API controls, and p95 7.084 s. All 100 packets and 1,439
+> spans passed independent raw verification. It ties the best score; 95% remains
+> unmet. Two remaining support gaps trace to parent-seed selection and a parent
+> group that omits an earlier user statement. A Sonnet readiness request was rejected by the
+> upstream account's insufficient credit, so this comparison uses the available
+> Terra model. Follow [Research Log 231](10%20-%20Research%20Log/231%20-%202026-09-15%20-%20User%20statements%20before%20assistant%20context.md).
+> A new persisted index of 522 complete parent user summaries now supplies up to
+> two additional exact user atoms after the unchanged route. All original evidence
+> survives; recorded-support coverage rises to **99/100**, with all 100 packets
+> and 1,459 spans passing raw audit. The completed answer comparison scores
+> **93/100**, with warm median **4.246 s** versus 3.872 s for matched API controls,
+> and p95 6.518 s. The saved-grade replay confirms the result with zero new calls.
+> Coverage improved but answer accuracy still ties the best result; 95% remains
+> unmet. Remaining misses include reader omissions despite complete user-spine
+> evidence, conversation-scope errors and documented question/reference defects.
+> No history was reingested and no new Qwen pass was needed. Follow
+> [Research Log 232](10%20-%20Research%20Log/232%20-%202026-09-15%20-%20Supplemental%20routing%20through%20complete%20parent%20user%20summaries.md).
+> The shorter extractive reader completed at **90/100**, versus 93/100 on identical
+> v7 packets, and is not promoted. Its warm median is **4.025 s** versus 3.624 s
+> for matched API controls, with p95 7.406 s. All 100 packets and 1,459 spans pass
+> raw audit; the saved-grade replay is identical. Twenty-seven checks pass.
+> A separate audit verifies all 520 source-body hierarchies against 525 stored
+> user-summary attention windows and exact atomic addresses. The best accuracy
+> remains 93/100; 95% is unmet. Follow
+> [Research Log 233](10%20-%20Research%20Log/233%20-%202026-09-15%20-%20Extractive%20reader%20on%20unchanged%20user%20spine%20evidence.md).
+> The completed paired-answer diagnostic scores the saved API controls at
+> **93/100**, matching memory, with three different passes and three different
+> failures. All 35 identical predictions receive matching grades; inspection of
+> the six disagreements finds both reader omissions and semantic grading defects.
+> No score is revised or combined. Follow
+> [Research Log 234](10%20-%20Research%20Log/234%20-%202026-09-15%20-%20Paired%20answer%20variation%20on%20identical%20user%20spine%20prompts.md).
+> Sol on the current user-first packets and v7 reader scores **94/100**, a new
+> best under unchanged grading. Warm median is **3.854 s** versus 3.532 s for
+> matched direct Sol, with p95 5.021 s; 93/100 finish under five seconds. All 100
+> packets and 1,459 spans pass raw audit; the saved-grade replay is identical.
+> The sole new failed grade contradicts an explicit user statement about prior
+> open-mic attendance. Its grade remains unchanged after the separate source review;
+> the original 95% acceptance gate is still unmet. Twenty-eight checks pass.
+> Follow [Research Log 235](10%20-%20Research%20Log/235%20-%202026-09-15%20-%20Sol%20on%20complete%20parent%20user%20packets.md).
+> The separate source-grounded review of **all 100** saved Sol answers is complete
+> and reproduced with 100 cache hits and zero new calls. It returned 87 correct,
+> seven incorrect, two ambiguous and four invalid reviews. These are diagnostic
+> labels, not a replacement score. Source inspection finds both grading defects
+> and answer attribution/qualification errors that the original grader passed;
+> the new reviewer also makes mistakes. All 100 items and original grades remain
+> intact. The acceptance gate remains unchanged pending the user's preference. Follow
+> [Research Log 236](10%20-%20Research%20Log/236%20-%202026-09-15%20-%20Source%20grounded%20review%20of%20all%20100%20Sol%20answers.md).
+> The completed assistant-context ablation scores **96/100** with the same Sol
+> reader, routing, hydration, questions and original grader. All user sections
+> remain exact; 314 whole assistant-only sections are omitted. Warm median is
+> **4.947 s** versus 4.356 s for matched API calls; p95 is 7.638 s and 52/100 finish
+> under five seconds. Twenty-nine checks and the full raw/requirement audit pass.
+> The original benchmark gate is met; grader limitations and lack of held-out
+> generalization remain explicit.
+> Follow [Research Log 237](10%20-%20Research%20Log/237%20-%202026-09-15%20-%20Whole%20assistant%20section%20ablation%20on%20the%20user%20spine.md).
+>
+> **Superseded 100-history preparation — historical record only:** The user
+> rejected full100-scale preparation during design iteration. That iteration is
+> now complete on one cached 1,098,417-token history: the latest parent-context
+> candidate scored 8/8 on the small development set, including denial, preference
+> update and cross-conversation ordering. This establishes no population accuracy.
+> Its median total was 4.783 s versus 4.117 s for the matched API control. A separate
+> offline profile measured 0.172 s median packet preparation with identical packets.
+> The candidate fixes the reader, 1,024-token cap, zero protected prefix and bounded
+> parent context. No further pilot expansion is required before broad evaluation.
+> The user accepted the observed sub-five-second response time and asked to focus
+> on accuracy. Stop serving-latency tuning; retain accuracy and timing measurement
+> together in the broad run. The reported 4.783 s is a median, not a tail guarantee.
+> The original controller remains stopped: it binds the old router and repeatedly
+> replays compilation ancestry. The active continuation completes the remaining
+> corpus from existing caches and already binds the broad runner to the frozen
+> candidate. Source summaries
+> cover all 31,166 bodies; existing manifests contain parent trees for 13,768, leaving
+> 17,398. This is a cache inventory, not a new full admission check. See
+> [Research Log 212](10%20-%20Research%20Log/212%20-%202026-09-14%20-%20Candidate%20freeze%20after%20eight%20question%20design%20check.md).
+> The 51 missing exchange bodies are complete, with all 707 raw spans independently
+> verified. All 17,642 remaining attention windows are now cached. The parent
+> compiler has completed and validated the combined 31,166-body cache, including
+> all 17,398 missing parent hierarchies. Vector encoding also finished successfully:
+> 323,124 rows, including 142,846 reused and 180,278 newly encoded summaries.
+> The controller has started full100 population admission and packet preparation.
+> Follow [Research Log 217](10%20-%20Research%20Log/217%20-%202026-09-15%20-%20Frozen%20corpus%20ready%20and%20full100%20preparation%20started.md)
+> for the current process and completed cache bindings.
+> The first continuation stopped after 15,616 of 17,398 missing parent bodies.
+> Its saved checkpoints and journals were authenticated, and the replacement
+> controller found one missing checksum in the unfinished batch. That body was
+> reproduced byte-for-byte from cached summaries and attention; only its missing
+> checksum was restored, with zero new model calls. The r3 controller now resumes
+> the remaining work with the same frozen evaluation.
+> [Research Log 216](10%20-%20Research%20Log/216%20-%202026-09-15%20-%20Resume%20interrupted%20frozen%20corpus%20evaluation.md)
+> records that recovery; the original interruption cause is unknown.
+> The new broad runner binds the frozen candidate: 100 questions, two scored
+> methods and matched candidate API controls. Eight focused runner checks pass,
+> in addition to ten remaining-parent compiler and reader checks. The real
+> answer run still awaits population admission and packet preparation.
+> Follow [Research Log 214](10%20-%20Research%20Log/214%20-%202026-09-15%20-%20Complete%20exchanges%20and%20bind%20frozen%20full100%20evaluation.md).
+> A separate result audit is prepared to recompute final scores and timings and
+> verify every served raw excerpt against its original occurrence. Its nine checks
+> pass; run it after the real report exists. See
+> [Research Log 215](10%20-%20Research%20Log/215%20-%202026-09-15%20-%20Independent%20full100%20result%20audit%20prepared.md).
+> The 129-token label repair remains verified at 22 tokens; its 74 software checks
+> establish no answer-accuracy score. No native full100 result exists. See
+> [Research Log 208](10%20-%20Research%20Log/208%20-%202026-09-14%20-%20Defer%20full100%20until%20design%20is%20finalized.md).
+>
+> **Historical first single-history design check:** One history contains
+> 1,098,417 actual eligible text tokens across 520 unique bodies. Its exchange,
+> attention, parent and vector data are now cached for further iteration. Five
+> fresh answers and two judgments completed. Flat scored 1/1 and the candidate
+> 0/1, but all four evidence-bearing prompts were identical. The router consulted
+> exchange leaves whose atoms were already in the direct shortlist, so it added
+> no candidates before hydration. The packet also used 3,065 of 3,072 context
+> tokens. The identical-prompt controls returned the opposite answers. This
+> exposes ineffective context expansion and answer variability; it demonstrates
+> no hierarchy advantage or population accuracy. Those findings led to the later
+> cached-history checks and candidate freeze above. The original 100-history
+> controller remains stopped; the current continuation is described above. See
+> [Research Log 209](10%20-%20Research%20Log/209%20-%202026-09-14%20-%20Single%20history%20design%20pilot.md).
+
+> **Follow-up on that same cached history:** User-first packet ordering and
+> bounded parent context each answered correctly on both repetitions; the old
+> packet answered correctly once out of two. Median total times were 4.41 s,
+> 5.30 s and 4.91 s respectively. These are repetitions of one exposed question,
+> not population accuracy. Both revised packets retained 20 user sections versus
+> 13 previously; parent context added no new evidence beyond user-first ordering
+> on this question. Keep that hierarchy option experimental. Fourteen routing
+> checks pass, and all eight streams and six judgments completed. See
+> [Research Log 210](10%20-%20Research%20Log/210%20-%202026-09-14%20-%20User-first%20packet%20and%20bounded%20parent%20context.md).
+
+> **Prior packet-budget finding:** On six frozen questions in that same history,
+> user-first ordering scored 6/6 at 3,072 context tokens, while parent context
+> scored 5/6. Reducing the cap to 1,024 lost a field-guide fact because a protected
+> 561-token assistant reply crowded it out. The router now permits a zero-length
+> protected prefix so all user evidence can be scheduled first. That repair
+> passed a focused two-question check in both methods; the field-guide answer
+> took 3.41 s versus 3.54 s for its matched API control. Twenty-three checks pass.
+> These are one exposed official question plus manually authored design probes;
+> neither 95% benchmark accuracy nor the joint latency target is established.
+> The fresh complete design-set run and temporal/update coverage were subsequently
+> completed in Research Log 212. See
+> [Research Log 211](10%20-%20Research%20Log/211%20-%202026-09-14%20-%20Six%20question%20packet%20budget%20comparison%20and%20user%20priority%20repair.md).
+
+> **Active target: at least 95% answer accuracy over 1M-token memories, with
+> end-to-end latency close to a matched direct API conversation.** Accuracy and
+> latency must pass together on the same implementation. The historical slow
+> 95/100 and fast 73/100 results cannot be combined into a target pass. The
+> earlier 95/100 already covered approximately 1M-token memories; it used the
+> cumulative retrieval and answer-repair pipeline, without demonstrating
+> API-like end-to-end query latency. See
+> [Research Log 132](10%20-%20Research%20Log/132%20-%202026-09-09%20-%20Joint%201M%20accuracy%20and%20latency%20target.md).
+>
+> **Latest full100: reject hierarchical routing, 8/100 versus flat 84/100.**
+> All 400 fresh answer streams completed; 200 logical judgments and the joint
+> report replay with zero new calls. Hierarchy median total latency is 6.46 s
+> versus 4.49 s for its identical-evidence API control and 3.94 s for short chat.
+> Both target gates fail. All ten compiled hierarchies replay independently;
+> the compiler and evaluation handoff have exited successfully.
+> Saved-route tracing finds annotated support in 94/97 root shortlists,
+> 62/97 root selections and only 9/97 final leaf selections. Exact hydration
+> preserves those nine; the major loss occurs during attention pruning.
+> Retain the flat packet while investigating the Qwen scoring policy. See
+> [Research Log 181](10%20-%20Research%20Log/181%20-%202026-09-12%20-%20Full100%20hierarchy%20failure%20assessment.md).
+>
+> **Historical source preparation (broad execution now deferred).** Further inspection
+> confirms the previously documented pooled-history conflicts in flat misses.
+> The existing M+S source bank keeps the 100 histories separate. All exceed 1M
+> body tokens even after excluding generated source boundaries; the minimum
+> through the question day is 1,007,016. The date-independent cache, batch runner
+> and exact raw hydration integration pass 181 focused checks. Larger Terra batches produced all 50 summaries
+> for the same probe fragments in three calls, with 54% less summed request
+> time than the eight-call format. This is ingest work, not serving latency.
+> Haiku returned no completions because its provider credit balance was too low.
+> Full preparation is complete: 13,812 requests cover 323,143 fragments from
+> all 31,166 bodies. The live handoff has released bounded Terra execution.
+> The first Terra execution stopped after 2,735 completed batches and six
+> transport failures. Its continuation accepted the first fresh batch and has
+> resumed the remaining never-sent batches. Six interrupted batches now have
+> verified recovery outputs, with their original uncertain requests preserved.
+> The new summary-body store replays
+> identically; real integration preserves all 76 tested occurrence-bound spans
+> through the existing hydrator. Seven failed batches now have exact source
+> subdivision repairs, preserving all 153 originally valid summaries. The
+> initial admission snapshot incorporates those repairs into 1,669 complete bodies and
+> 17,190 sections; incomplete bodies remain excluded. All 261 tested raw spans
+> across the 23 bodies touched by the repairs hydrate exactly, with zero new
+> model calls. Those 1,669 bodies now have 8,650 user-led exchanges and 1,695
+> cached local-Qwen attention windows. Both stages replay without model calls;
+> the 14 bodies needing Qwen merges preserve all 104 tested raw spans and actual
+> dates through hydration. Separate parent budgets published 1,526 body trees
+> without new generation; another 147 local jobs completed all 1,669. The new
+> serving adapter preserves all original attention partitions and raw addresses.
+> Real occurrence rebinding preserves 940 tested raw spans, and all six
+> oversized-exchange probes recover their selected original atom within budget.
+> The native serving candidate retains direct atomic matches and adds context
+> from attention-defined chunks. All 100 separate namespace checks pass with
+> exact hydration of 400 selected spans; every incomplete namespace correctly
+> rejects full-evaluation admission. All 17,146 unique summary embeddings are now
+> complete. A real BGE resident probe preserves all baseline evidence and exactly
+> hydrates 5,584 spans across both arms. Retrieval median is 0.105 s direct and
+> 0.107 s with added chunk context, on partial histories of only 34k–91k tokens;
+> this is not a 1M or API comparison. All 79 selected failed batches are now
+> repaired, retaining 1,696 valid summaries. The prior body snapshot admits 5,481
+> complete bodies and 57,217 sections, preserving the earlier cache exactly.
+> A further 40 batches are now repaired, retaining 875 valid original summaries.
+> The successor store includes those repairs and six recovered batches, admitting
+> 7,121 complete bodies and 74,327 sections; 10,641 batches remain pending in that
+> snapshot. All 142 recovered sections hydrate exactly through actual namespaces.
+> The 74,059-summary vector population is complete, reusing 57,020 vectors and
+> computing 17,039 new ones. Expanded user-spine inputs are prepared; main
+> ingestion continues.
+> The expanded 57,020-summary embedding stage is complete. A diagnostic using all
+> 100 benchmark questions finds annotated support available for only 21 of 97
+> annotated cases; direct retrieval and exact hydration retain it for 20.
+> Attention context preserves that evidence but does not improve this count.
+> These are partial 166k–260k-token histories, not an accuracy or latency pass.
+> The old Qwen compiler stopped cleanly. The successor completed all initial
+> trees; real checks across all 100 partial namespaces preserve baseline evidence
+> and exactly hydrate 3,556 spans. Expanded exchange compilation stopped on two
+> over-length summaries; separately recorded local recovery now admits both under
+> the unchanged 128-token limit. Subsequent local compilation completed all 7,121
+> prepared body exchange sets, containing 37,226 exchanges. Attention is also
+> complete for those bodies, with 7,217 cached summary windows; parent compilation
+> is released. Another 71 failed source batches are fully repaired, retaining
+> 1,541 valid original summaries. The next admitted store contains 11,438 bodies
+> and 119,144 sections, preserving the previous store. Its 118,693-summary vector
+> stage is prepared and queued. The native full100 joint runner passes 43 focused
+> checks, including synthetic stream/judge orchestration. Actual admission rejects
+> the incomplete corpus before any model or provider construction; no native
+> full100 accuracy or API-latency result is available yet.
+> Another 54 failed batches are fully repaired, preserving 1,161 valid original
+> summaries. A malformed JSON batch separately recovered all 21 fragments in
+> three calls. The successor assembler preserves that original failure record;
+> 15 recovery/admission checks pass. Real serving verification of 6,725 expanded
+> body hierarchies passes across all 100 partial histories, preserving baseline
+> evidence and exactly hydrating 3,450 raw spans. The fresh corpus snapshot is
+> complete with 13,468 bodies and 140,256 sections, preserving the earlier store.
+> Its expanded exchange inputs are complete and reuse 317 authenticated Qwen
+> summaries without new generation. A zero-generation pass completed 13,316 of
+> its body exchange sets; 152 bodies still need merges. Matching attention,
+> parent and vector stages are queued. Parent compilation on the earlier snapshot
+> completed all 7,121 body hierarchies; 663 parent summaries are verified reusable.
+> Another 34 rejected batches are now repaired, preserving 718 valid summaries;
+> those repairs await a later body snapshot. The full100 loader supports the new
+> producers and passes 44 focused checks. Real admission still rejects the
+> incomplete corpus before model construction; the joint target remains unverified.
+> The 118,693-summary vector build has completed and released expanded local-Qwen
+> generation. The next vector population contains 139,694 summaries. A new live
+> coordinator automatically repairs newly rejected public source batches and will
+> assemble the full corpus after all original requests and repairs complete.
+> It authenticated 286 existing repairs and six transport recoveries; its first
+> cohort contains 25 further failures. Fourteen new orchestration checks pass,
+> including both repair types followed by full-store assembly. The actual final
+> corpus and native full100 evaluation remain incomplete.
+> That first repair cohort has now completed all 25 batches in 19 calls. The
+> complete-corpus handoff is live: it waits for the six existing producers, reuses
+> their finished caches, compiles the full 31,166-body store in separate model
+> processes, then runs and replays the unchanged joint full100 comparison.
+> Fourteen additional pipeline checks pass. No full-corpus model stage or native
+> full100 answer has been released yet.
+> Exchanges are now complete for all 13,468 R6 bodies: 70,218 exchanges, with 437
+> new local jobs and exact atomic coverage. That process exited successfully and
+> released attention preparation. The stage prepared 13,643 summary windows and
+> completed all of them with summary-only local Qwen. The attention worker exited
+> successfully and released expanded parent compilation.
+> The first parent pass completed 12,794 of 13,468 body trees without generation;
+> the remaining 674 bodies require summary merges in the bounded continuation.
+> Further automatic cohorts repaired 12 batches
+> in five calls, 15 batches in eight calls, and ten batches in six calls. Full source ingestion and
+> the joint native evaluation remain incomplete.
+> A read-only verification of the new expanded reader and exact hydration is
+> queued after the R6 parent/vector jobs. It uses existing summaries and cached
+> vectors across all 100 partial namespaces, with no model or answer calls.
+> An early check now loads all 12,794 initial parent templates through the new
+> reader and constructs one real partial namespace, exactly hydrating all four
+> raw spans of a selected leaf without model calls. Full admission still rejects it.
+> Further source compilation,
+> repairs, complete hierarchy construction and a fresh joint full100 comparison
+> remain pending. See
+> [Research Log 182](10%20-%20Research%20Log/182%20-%202026-09-12%20-%20Native%20history%20summary%20cache%20and%20exact%20occurrences.md) and
+> [Research Log 183](10%20-%20Research%20Log/183%20-%202026-09-12%20-%20Complete%20native%20summary%20batches%20and%20backend%20comparison.md) and
+> [Research Log 184](10%20-%20Research%20Log/184%20-%202026-09-12%20-%20Native%20summary%20body%20storage%20and%20exact%20hydration.md) and
+> [Research Log 185](10%20-%20Research%20Log/185%20-%202026-09-12%20-%20Dense-list%20summary%20repair%20with%20exact%20source%20subdivision.md) and
+> [Research Log 186](10%20-%20Research%20Log/186%20-%202026-09-12%20-%20Repair-aware%20native%20body%20admission.md) and
+> [Research Log 187](10%20-%20Research%20Log/187%20-%202026-09-12%20-%20Native%20user-spine%20exchanges%20and%20reusable%20Qwen%20attention.md) and
+> [Research Log 188](10%20-%20Research%20Log/188%20-%202026-09-12%20-%20Native%20hierarchy%20compilation%20and%20atomic%20evidence%20recovery.md) and
+> [Research Log 189](10%20-%20Research%20Log/189%20-%202026-09-12%20-%20Native%20namespace%20retrieval%20and%20reusable%20summary%20vectors.md) and
+> [Research Log 190](10%20-%20Research%20Log/190%20-%202026-09-12%20-%20Native%20resident%20retrieval%20probe%20and%20direct%20source%20repairs.md) and
+> [Research Log 191](10%20-%20Research%20Log/191%20-%202026-09-12%20-%20Native%20benchmark%20support%20availability%20and%20ingestion%20continuation.md) and
+> [Research Log 192](10%20-%20Research%20Log/192%20-%202026-09-12%20-%20Explicit%20transport%20recovery%20and%20complete%20repaired%20body%20admission.md) and
+> [Research Log 193](10%20-%20Research%20Log/193%20-%202026-09-12%20-%20Separate%20parent%20budgets%20reduce%20native%20Qwen%20compilation.md) and
+> [Research Log 194](10%20-%20Research%20Log/194%20-%202026-09-12%20-%20Complete%20parent%20budgets%20and%20reusable%20native%20exchange%20expansion.md) and
+> [Research Log 195](10%20-%20Research%20Log/195%20-%202026-09-12%20-%20Bounded%20summary%20recovery%20and%20expanded%20source%20repairs.md) and
+> [Research Log 196](10%20-%20Research%20Log/196%20-%202026-09-12%20-%20Native%20full100%20runner%20and%20completed%20expanded%20attention.md) and
+> [Research Log 197](10%20-%20Research%20Log/197%20-%202026-09-12%20-%20Malformed%20JSON%20recovery%20and%20expanded%20native%20admission.md) and
+> [Research Log 198](10%20-%20Research%20Log/198%20-%202026-09-12%20-%20Reusable%20expansion%20of%20repaired%20native%20summaries.md) and
+> [Research Log 199](10%20-%20Research%20Log/199%20-%202026-09-12%20-%20Automatic%20source%20repair%20and%20full%20corpus%20assembly.md) and
+> [Research Log 200](10%20-%20Research%20Log/200%20-%202026-09-12%20-%20Full%20corpus%20compilation%20and%20joint%20evaluation%20handoff.md) and
+> [Research Log 201](10%20-%20Research%20Log/201%20-%202026-09-12%20-%20Expanded%20exchanges%20complete%20and%20attention%20released.md) and
+> [Research Log 202](10%20-%20Research%20Log/202%20-%202026-09-12%20-%20Real%20expanded%20reader%20verification%20handoff.md).
+>
+> **Hierarchy restoration and bounded Qwen traversal implemented and evaluated.**
+> All ten memories have validated plans for 22,257 parents, preserving all
+> 27,062 existing leaves. The resident routing/hydration integration passes
+> 32 focused tests. The first real parent-summary run failed because the local
+> gateway's `qwen3-8b` alias points to an unavailable `qwen3-8b-gguf` backend.
+> The local fallback below has since completed all ten memories. The full100
+> result above rejects the current traversal policy.
+> See [Research Log 173](10%20-%20Research%20Log/173%20-%202026-09-10%20-%20Restored%20attention%20topology%20and%20bounded%20hierarchy%20routing.md).
+>
+> **Earlier evaluator admission checks.** Sixteen additional checks include a
+> complete synthetic 400-stream execution, 200 logical judgments and zero-call
+> replay. Real admission correctly rejects the unfinished parents. A fresh
+> readiness request confirms that the Qwen backend is still unavailable.
+> Existing cached Qwen merges can recover some parent trees without new calls;
+> provenance-bound cache reuse is the next compilation step. No real quality
+> or latency gain is claimed. See
+> [Research Log 174](10%20-%20Research%20Log/174%20-%202026-09-10%20-%20Full100%20hierarchy%20evaluator%20and%20Qwen%20readiness.md).
+>
+> **Earlier cached parent recovery completed and replayed.** It preserves 450 parents
+> across 489 complete source trees with zero new calls. The remaining 4,316
+> sources need summary merges; no complete hierarchy is ready yet. Five new
+> cache checks pass. The full local-Qwen fit test completed: the real summary
+> passed validation in 12.18 seconds with a 4.70 GiB peak allocation. This is
+> ingest generation, not query latency or an accuracy result. Query-time
+> attention remains unchanged. See
+> [Research Log 175](10%20-%20Research%20Log/175%20-%202026-09-10%20-%20Cached%20parent%20recovery%20and%20local%20Qwen%20fallback.md).
+>
+> **Local parent compiler added.** Nine focused checks cover completion,
+> replay, interrupted execution, attribution and bounded recovery. The eight-job
+> real run completed: seven outputs passed immediately, one exceeded its summary
+> budget, and 12 additional parents were published. Replay preserves the same
+> progress with zero model calls. Its bounded repair passed, and the subsequent
+> run supplied 90 reusable local summaries before a deliberate batch-policy
+> switch. See
+> [Research Log 176](10%20-%20Research%20Log/176%20-%202026-09-10%20-%20Local%20Qwen%20parent%20compiler.md).
+>
+> **Four-summary ingest batch measured 1.82x faster on the same four jobs.**
+> All outputs passed validation at 5.07 GiB peak allocation. That successor
+> reused 90 local summaries and started offset 000 from 159 completed source
+> trees and 345 parents. Session 65191 later stopped on the JSON error above.
+> All 4,805 source trees fit the query depth limit. No new answer-accuracy or
+> query-latency result is claimed. See
+> [Research Log 177](10%20-%20Research%20Log/177%20-%202026-09-10%20-%20Four-summary%20local%20Qwen%20ingest%20batches.md).
+> **All ten hierarchies are complete and independently replayed.** Offset 000
+> contains all 499 source trees, 2,245 parents and 2,744 unchanged original leaves;
+> offset 010 contains all 464 source trees, 2,161 parents and 2,625 unchanged
+> original leaves; offset 020 contains all 479 source trees, 2,214 parents and
+> 2,693 unchanged original leaves; offset 030 contains all 473 source trees,
+> 2,278 parents and 2,751 unchanged original leaves; offset 040 contains all 481
+> source trees, 2,256 parents and 2,737 unchanged original leaves; offset 050
+> contains all 480 source trees, 2,232 parents and 2,712 unchanged original leaves;
+> offset 060 contains all 457 source trees, 2,155 parents and 2,612 unchanged
+> original leaves; offset 070 contains all 488 source trees, 2,198 parents and
+> 2,686 unchanged original leaves; offset 080 contains all 488 source trees,
+> 2,220 parents and 2,708 unchanged original leaves; offset 090 contains all 496
+> source trees, 2,298 parents and 2,794 unchanged original leaves.
+> All ten complete hierarchies reconstruct identically from saved outputs with
+> zero model calls, using the same compilation method. The tenth replay ran
+> after the timed evaluation exited. Both full100 target gates failed.
+> A small manual check found a parent that flattened conflicting event status
+> and another that dropped named entities. Exact leaf evidence is preserved;
+> the impact of these summary losses on routing accuracy is still unmeasured.
+> A separate recount verified every memory exceeds one million `cl100k_base`
+> BPE tokens in complete raw turns, excluding chat framing; the minimum is
+> 1,039,792 tokens. This check made no model calls.
+>
+> **Original full100 handoff stopped safely.** Session 61096 stopped when its
+> compiler terminated without a complete ten-memory population. It sent no
+> evaluation calls. The successor handoff above retains the same complete-parent
+> admission, idle-workspace check, 400 fresh answer streams, 200 logical judgments
+> and zero-provider replay. Nine handoff checks pass. See
+> [Research Log 178](10%20-%20Research%20Log/178%20-%202026-09-10%20-%20Full100%20handoff%20after%20local%20parent%20compilation.md).
+>
+> **Four-summary Terra generation comparison completed.** All four outputs
+> passed the same summary contract, but the concurrent batch took 15.57 s versus
+> 13.64 s for the saved Qwen batch. This small sample does not demonstrate an
+> ingest speed gain; Qwen remained the compiler backend. Replay verified the
+> four responses with zero new calls. See
+> [Research Log 179](10%20-%20Research%20Log/179%20-%202026-09-10%20-%20Four-parent%20Terra%20generation%20comparison.md).
+>
+> **Previous timed full100: control 81/100, grouped 77/100, supplemented 76/100.**
+> Both candidates are rejected with the same v2 reader throughout. All600
+> fresh streams completed and 151 Sol judge calls replay with zero new calls.
+> Grouped median/p95 total time is 5.055/9.814 s; supplemented is 5.346/9.350 s.
+> Both fail their matched API allowance and short-chat allowance. Retain the
+> flat packet and v2 reader. Twenty-four focused checks pass.
+>
+> **Earlier implementation gap, now addressed: the serving indexes were leaf-only.**
+> They contained 27,062 leaves and zero parent summaries. Qwen shaped ingest
+> partitions, while those query paths used BGE leaf retrieval. Parent compilation
+> and the full100 hierarchical evaluation above now address that missing work;
+> completing the architecture did not establish useful routing quality.
+> See [Research Log 172](10%20-%20Research%20Log/172%20-%202026-09-10%20-%20Additive%20user%20evidence%20with%20unchanged%20reader%20joint%20evaluation.md).
+>
+> **Previous timed full100: current control 80/100; grouped evidence/v4 reader
+> 78/100. Reject the combined change.** It preserves all 2,680 selected raw
+> spans and cuts median context from 2,959 to 2,454 tokens, but loses more
+> answers than it gains. Candidate median/p95 total latency is 4.729/8.247 s,
+> versus 4.379/11.583 s for identical-evidence API and 3.221/4.556 s for short
+> chat. Accuracy and short-chat latency fail. All400 streamed responses are
+> verified; uniform judging recovered from a TLS failure and replays with
+> 145 hits and zero calls. Retain the prior reader and retrieval path.
+> See [Research Log 171](10%20-%20Research%20Log/171%20-%202026-09-10%20-%20Conversation%20ordered%20evidence%20joint%20full100%20evaluation.md).
+>
+> **Earlier timed full100 comparison: as-of date cutoff 80/100, semantic
+> seeds 74/100.** All ten memories contain approximately 1.04M token proxies.
+> All 500 fresh Terra responses sealed before 200 logical Sol judgments using
+> 136 physical calls. Source admission and judgments replayed without new calls.
+> The cutoff's median/p95 total latency was 6.580/9.366 s, versus 6.039/9.734 s
+> for its identical-evidence API control and 5.083/6.353 s for short API chat.
+> Both methods pass the provisional matched-evidence latency allowance, and
+> both fail accuracy and short-chat latency. Neither joint target gate passes.
+> Qwen still receives summaries only; query-time routing uses BGE summary
+> addresses over Qwen attention-partitioned leaves, followed by exact raw hydration.
+> See [Research Log 166](10%20-%20Research%20Log/166%20-%202026-09-10%20-%20Full100%20as-of%20result%20and%20reader%20failure%20audit.md).
+>
+> **New bounded routing fix, fresh accuracy screen: 78/100 versus 76/100.**
+> Relative-day user evidence reservation changes three packets, recovering the
+> smoker purchase and first-client contract answers with no paired regressions.
+> All100 questions were answered afresh; 97 identical packets share fresh
+> responses across arms. The 103 Terra answers and 103 Sol judgments replay
+> with no calls. Thirty-six focused checks pass. This batch does not measure
+> serving latency or replace the earlier independently timed 80/100 result.
+> The prepared native corpus remains parked. See
+> [Research Log 169](10%20-%20Research%20Log/169%20-%202026-09-10%20-%20Relative%20day%20user%20evidence%20reservation.md).
+>
+> **Global fine user-summary retrieval failed its full100 comparison.** The
+> fresh control scores 81/100, versus 72/100 at 3,072 context tokens and 71/100
+> at 2,048. The candidates recover some facts but lose more correct answers;
+> neither is promoted. All 300 Terra responses and 158 Sol judgments replay
+> with zero calls, and sixteen focused checks pass. Retain the prior retrieval
+> path. These are batched accuracy results; the latest independently timed
+> full100 at that point remained 80/100 and the joint target is still unmet.
+> See [Research Log 170](10%20-%20Research%20Log/170%20-%202026-09-10%20-%20Fine%20user%20summary%20retrieval%20and%20compact%20full100%20comparison.md).
+>
+> **Historical95 versus current80 is now paired:** 78 both correct, 17 old-only,
+> 2 current-only and 3 both wrong. Twelve of the seventeen losses are multi-session
+> or temporal questions. The old cumulative answer-repair result did not prove
+> matched API-like latency; the current independently timed pipeline has not
+> regained its accuracy. See
+> [Research Log 167](10%20-%20Research%20Log/167%20-%202026-09-10%20-%20Historical95%20comparison%20and%20native%20history%20conflict%20audit.md).
+>
+> **Reader and corpus audit complete.** Sol on the same twenty miss packets gets
+> four judge accepts, including one inconsistent judgment of essentially the
+> same university answer. This is not an 84/100 result or a latency measurement.
+> All100 native-history checks find every original turn in the pooled memory;
+> twelve wrong answers already have every annotated support turn in their packet.
+> Ninety-six packets also contain user statements from outside the question's
+> original history. One verified case adds an incompatible Sophia meeting to
+> the packet. Foreign membership alone does not prove a contradiction. The audit
+> replays identically with no calls and does not change scores or production routes.
+> The native-data continuation below prepares a separate complete corpus;
+> the old scores and their source population remain preserved.
+>
+> **Complete same-history M+S corpus prepared and verified.** The 100 separate
+> memories contain 113.27M tokens in total, at least 1.076M each and at least
+> 1.019M through each question day. The construction preserves native M and
+> adds absent sessions from the same record's S history. It removes the known
+> cross-history Sophia conflict without pooling different question histories.
+> Repeated session IDs are preserved as separate occurrences. The verifier
+> checks all 52,207 occurrences, 31,166 shared text bodies, raw-source identities
+> and the separate evaluation plane. Earlier grouped-ID counts are superseded.
+> Twenty-four focused checks pass. No model was called and no new score is
+> claimed. This corpus is prepared and parked. Following the user's request
+> for concrete progress, the immediate work returns to a bounded retrieval or
+> reader improvement on the existing 80/100 population before further ingestion.
+> See [Research Log 168](10%20-%20Research%20Log/168%20-%202026-09-10%20-%20Complete%20native%20history%20corpus%20and%20occurrence%20verification.md).
+>
+> **Full100 preparation: ten complete memories, 500 control requests prepared.**
+> All ten admissions verify under the common v11 method. The final memory has
+> 5,624 admitted fragments, 2,794 attention leaves across 496 sources, and all
+> three summary indexes, including 6,007 passage addresses. Both raw ingestion
+> and compilation schedulers finished successfully. The token-accounting repair
+> preserves every raw byte and distinguishes fragment counts from whole-turn
+> counts. Earlier failed executions and their reservations remain preserved.
+> The old r3 controls supplied the completed comparison below; their original
+> answer campaign remains unexecuted.
+>
+> **Completed timed full100 comparison:** the frozen experiment compares
+> semantic seeds with the as-of date cutoff, keeping the same reader and raw
+> budgets. It requires 500 fresh requests, both API latency controls, and all
+> answers sealed before judging. All ten memories supply 500 prepared requests.
+> The first namespace and offsets 050–090 used live query encoding;
+> offsets 010–040 reuse authenticated live-diagnostic prompts for preflight only.
+> Every timed memory request still recomputes embedding, routing, and hydration.
+> Thirty-one evaluation checks pass. The actual runner validated all 500 requests,
+> both fresh synthetic readiness probes passed, and all 500 responses completed.
+> The final report verifies the same predictions and timings across all ten
+> complete memories. See [Research Log 166](10%20-%20Research%20Log/166%20-%202026-09-10%20-%20Full100%20as-of%20result%20and%20reader%20failure%20audit.md).
+>
+> **Automatic evaluation handoff completed the comparison.** It verified both
+> completed dependencies, prepared offsets 080/090, and released the unchanged
+> experiment after readiness passed. Twenty focused checks pass. Failures
+> preserve reservations and stop without automatic retries. All 500 answers
+> sealed before any judging. Session 13811 exited successfully; its completion
+> explicitly records that the target gate failed. Preserve the frozen runtime.
+> The handoff protocol is documented in
+> [Research Log 163](10%20-%20Research%20Log/163%20-%202026-09-10%20-%20Automatic%20full100%20handoff%20after%20complete%20ingestion.md).
+> Ninth-memory admission is recorded in
+> [Research Log 164](10%20-%20Research%20Log/164%20-%202026-09-10%20-%20Ninth%20memory%20admission%20and%20final%20raw%20namespace.md).
+>
+> **Earlier date-aware routing diagnostic:** the separate as-of candidate reproduces
+> all fifty semantic-seed controls, removes all 240 future raw spans, and adds
+> 273 eligible spans. The missing April 21 tomato-planting statement now reaches
+> the gardening packet. All fourteen packets without future spans are unchanged;
+> the other 36 change, displacing eleven previously included eligible user spans.
+> A separate relative-date hint changes only one packet and is not needed for
+> the planting-statement recovery. Mixed-date sources retain older evidence;
+> exact hydration still enforces the same raw budgets. Twenty-two focused checks
+> pass. No answer accuracy or API-relative latency gain is claimed, and the
+> frozen full100 comparison is unchanged. See
+> [Research Log 159](10%20-%20Research%20Log/159%20-%202026-09-10%20-%20As-of%20summary%20routing%20and%20exact%20dated%20hydration.md).
+>
+> **Earlier passage-routing diagnostic:** additional addresses from exact passages within
+> stored user summaries recover all three third-memory witness statements while
+> retaining every previously hydrated user statement across all 30 development
+> questions. All three memories have compiled passage indexes. The fresh answers
+> above recover two of those questions but lose the painting recommendation,
+> showing that recovered evidence alone does not ensure answer synthesis. See
+> [Research Log 142](10%20-%20Research%20Log/142%20-%202026-09-09%20-%20Summary%20passage%20addresses%20and%20preserved%20user%20evidence.md).
+> The full100 passage report and support-syntax recovery now pass 54 focused
+> checks. The fourth raw namespace is complete; its new full audit has six
+> oversized summaries and no unresolved schema failures. All six compacted in
+> one summary-only Qwen call; complete source admission now reproduces all
+> 5,516 fragments without calls. Its 2,751 attention-guided leaves are complete,
+> along with semantic vectors and 5,849 passage addresses. All four memories now
+> share the replayed version-6 admission method. See
+> [Research Log 143](10%20-%20Research%20Log/143%20-%202026-09-10%20-%20Full100%20passage%20gate%20and%20support%20syntax%20recovery.md).
+>
+> **Completed reader experiment (preparation history):** 240 requests were prepared for all 40 questions in
+> the four complete memories. The shorter policy adds precise entity/event
+> qualification and direct preference-to-recommendation binding. All control
+> prompts match the existing passage prompts byte for byte, with identical raw
+> evidence for both readers. Eighty-two focused checks pass. The serial runner
+> stopped before sending any answers when the fifth-memory ingest timed out.
+> The prepared reader comparison remains unchanged. No new accuracy result is claimed.
+> See [Research Log 145](10%20-%20Research%20Log/145%20-%202026-09-10%20-%20Qualified%20reader%20and%20complete%20memory%20development40%20preflight.md).
+> Both local model readiness probes subsequently returned HTTP 500. A separate
+> recovery stage preserves all 99 completed fifth-memory responses and lists
+> 733 first attempts plus five bounded additional attempts, without clearing
+> original reservations or making recovery calls. Both original processes are
+> terminal. See [Research Log 146](10%20-%20Research%20Log/146%20-%202026-09-10%20-%20Fifth%20memory%20gateway%20timeout%20and%20preserved%20recovery.md).
+> **Continuation:** the 240-request comparison completed with the results above.
+> Fresh readiness passed again, and the offset-40 recovery executor is now
+> running after timed evaluation finished. A source-scoped summary-term
+> supplement recovers the named schedule while preserving prior user evidence
+> in all 40 diagnostic packets; its answer accuracy remains unmeasured. All four complete
+> memories replay under one version-7 admission method with unchanged atom
+> bytes; 120 focused recovery, admission, gate and scheduling checks pass.
+> See [Research Log 147](10%20-%20Research%20Log/147%20-%202026-09-10%20-%20Preserved%20recovery%20execution%20and%20resumed%20reader%20comparison.md).
+>
+> The first two memories have complete admitted atoms, attention-guided leaves,
+> semantic vectors, and user-summary addresses. The third is now fully admitted
+> at 5,357 atoms and 1.045M token proxies. Its 2,693 attention-guided leaves,
+> semantic vectors, and user-summary addresses are complete. Nine oversized source summaries
+> were compacted in two Qwen batches plus one bounded recovery call. All three
+> memories now share the same replayed version-4 admission method; 28 focused
+> tests pass. See
+> [Research Log 140](10%20-%20Research%20Log/140%20-%202026-09-09%20-%20Multi-batch%20admission%20and%20third%20complete%20memory.md).
+> The fourth raw namespace has finished all 838 requests and complete source
+> admission. The fifth stopped with 99 completed responses and five unresolved
+> requests; five more namespaces are prepared but unstarted. Gateway inference
+> had recovered from the earlier outage before the renewed failure above.
+> Original failed reservations and completed responses from that earlier outage
+> remain preserved through explicit transport accounting. See
+> [Research Log 138](10%20-%20Research%20Log/138%20-%202026-09-09%20-%20Explicit%20transport%20recovery%20and%20resumed%20joint%20evaluation.md).
+> Full100 evaluation and untouched confirmation remain outstanding.
+
+> **Completed real-data pilot: user-spine hierarchy and exact raw hydration.**
+> Forty Terra answers across five routing variants have now been judged by Sol.
+> Every variant scored **7/7 on source-derived diagnostic questions and 0/1 on
+> the separate benchmark chronology question**. This is a small development
+> comparison over 39 turns in three already selected conversations, not a
+> full-corpus validation. User-only Qwen routing reduced input tokens by 35%
+> and observed provider time by 24%, without improving accuracy. All answer and
+> judge phases replay with 61 authenticated hits and zero new calls. The local
+> integration suite passes 115 tests. Qwen receives summaries only. No router
+> is promoted. The user's subsequent continuation instruction resolved the
+> execution review block. See
+> [Research Log 131](10%20-%20Research%20Log/131%20-%202026-09-09%20-%20Real%20data%20user%20spine%20answer%20and%20judge%20results.md)
+> for measured results, failure analysis, and reproducible artifacts.
+
+> **Completed conventional packet comparisons.** The fresh r9
+> reduced30 control scored 12/30. Source grouping scored 8/30, BGE ordering
+> 10/30, MiniLM ordering 12/30, raw-only 12/30 and verbatim highlights 11/30.
+> A compact packet reduced prompt tokens by 64% but scored 10/30 and did not
+> improve observed answer latency. None was promoted; answer reliability remains
+> unresolved. All seven arms are sealed and replayed, with 189 tests passing. See
+> [Research Log 128](10%20-%20Research%20Log/128%20-%202026-09-08%20-%20Compact%20conventional%20fast%20packet%20admission.md)
+> for results, exact call accounting and the remaining failure mechanisms.
+>
+> **Conventional routing remains a control.** Conventional routing with the
+> fast packet has not been ruled out. On the same 48 synthetic summary queries
+> presented in two orders, BGE-M3 selected correctly in 96/96 presentations;
+> full Qwen returned 90 valid selections and six over-cap label lists. This is
+> routing-only evidence, not fast-packet answer accuracy. Keep the Qwen routers
+> experimental pending broader matched evidence on the new shared hierarchy. See
+> [Research Log 124](10%20-%20Research%20Log/124%20-%202026-09-08%20-%20Summary%20routing%20controls%20before%20fast%20packet%20promotion.md).
+
+> **Earlier experimental Qwen summary hierarchy.** Attention-guided
+> hierarchical chunking and summary routing are implemented as an opt-in path.
+> Qwen sees only summaries and the query; exact raw sections are authenticated
+> and hydrated afterward. The latest integration suite passes 282 tests. A real local
+> Qwen smoke verified zero raw model inputs and exact hydration, but selected
+> the wrong semantic branch. Corpus-scale compilation, timing and matched answer
+> accuracy remain unmeasured. See
+> [Research Log 122](10%20-%20Research%20Log/122%20-%202026-09-08%20-%20Qwen%20summary%20hierarchy%20and%20exact%20section%20hydration.md)
+> for the API, model-input boundary, local Qwen smoke and separate r9 lineage.
+
+> **Authorized temporal-reference evaluation.** The user confirmed authorization
+> for the local gateways. The previously prepared successor completed 30 Terra
+> answer calls and 30 Sol judge calls, scoring **12/30 versus r9's 11/30**.
+> Both artifacts replayed with zero calls. The changed-prompt group improved
+> from 0/3 to 1/3; unchanged prompts had two gains and two losses. This does not
+> evaluate the Qwen summary hierarchy or establish a causal improvement. See
+> [Research Log 123](10%20-%20Research%20Log/123%20-%202026-09-08%20-%20Authorized%20temporal%20reference%20chain%20reduced30%20result.md).
+
+> **Fast-packet r9 handoff (separate lineage).** The additive v7/r9 packet
+> construction preserves all protected parent evidence and passes its focused
+> 107-test contract suite, but the sealed answer result is only **11/30** on the
+> exact v6/r3 failure cohort. The corresponding 81/100 number is a conditional
+> non-regression projection, not a measured full100 result; no r9 full100 run
+> was promoted. Gold-open inspection found sufficient supporting material in
+> 18/19 remaining incorrect packets, localizing most residuals to source/event
+> binding, temporal/operator semantics, preference synthesis, and final answer
+> policy rather than raw-window absence. The implementation/docs are currently
+> untracked and the sealed artifacts live under ignored `eval_results/`, so the
+> operational continuation and durability warning are in [Research Log
+> 121](10%20-%20Research%20Log/121%20-%202026-09-08%20-%20r9%20reduced30%20execution%20handoff.md),
+> with mechanism details in [Research Log
+> 120](10%20-%20Research%20Log/120%20-%202026-09-08%20-%20Fact-reserved%20episodic%20packet%20repair.md).
 
 > **The locked validation100 promotion gate now passes at 95/100; confirmation remains open.** The proof-carrying `policy-v5-r3` successor combines the frozen terminal P/R/L/G memory stack with an exhaustive numeric frontier and reducer-observable post-admission state equivalence. Its provider-free frontier closed Q28, Q53, Q67, and Q69 while correctly leaving Q14, Q40, and Q77 open. The final differential judge reused 97 authenticated Sol judgments, made exactly three new zero-retry calls, and sealed **95/100** with five remaining misses. This is still analysis-used validation evidence: the policy must be source-frozen before the disjoint confirmation200 treatment is opened, and confirmation must report both full200 and the predeclared non-exposed185 sensitivity slice. See [Research Log 101](10%20-%20Research%20Log/101%20-%202026-09-01%20-%20Terminal%20v5%2095%20percent%20campaign.md) and [Analysis 30](08%20-%20Analysis/30%20-%20Proof-carrying%20computable%20answer%20policy%202026-09-02.md). `git log --oneline` and the machine-readable artifacts remain the authority over prose.
 
@@ -82,6 +878,9 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | [08 - Analysis/25 - Resumable namespace construction successor 2026-08-30.md](08%20-%20Analysis/25%20-%20Resumable%20namespace%20construction%20successor%202026-08-30.md) | **production import/replay complete / compact v2 preferred** | The v1 importer proved byte equivalence but took about 50m40s, sampled 5--11 GB working set, and duplicated 2.288 GiB of sidecars in 2.288 GiB of checkpoint payloads. Compact v2 imported the same `7fe63e38…` construction in about 12m55s at 0.87--0.99 GB, reduced ten checkpoints to about 19 KiB, and replayed byte-identically in 20.281s under exact attestation pinning and fail-closed filesystem controls. This is an apparatus result, not QA accuracy. |
 | [08 - Analysis/26 - Method eligibility failure attribution and apparatus cleanup 2026-09-01.md](08%20-%20Analysis/26%20-%20Method%20eligibility%20failure%20attribution%20and%20apparatus%20cleanup%202026-09-01.md) | **current evaluation-contract analysis / initial cleanup measured** | Separates method ineligibility, non-attempt, retrieval-stage loss, packing/admission loss, and downstream answer failure; defines a common outcome ledger and records the first behavior-preserving cleanup, whose fixed provider-free slice fell from 60.19 to 23.71 seconds without changing sealed behavior. |
 | [08 - Analysis/27 - Provider boundary and semantic storage cleanup 2026-09-01.md](08%20-%20Analysis/27%20-%20Provider%20boundary%20and%20semantic%20storage%20cleanup%202026-09-01.md) | **implemented / provider-free / compatibility-preserving** | Finds no gold, raw locator, path, or model-state leak in the active provider route, then introduces an explicit compact-v2 provider schema, call-scoped trace caches, zero-reuse classifier-cache removal, and one-population semantic trees. The sealed-ten full chat falls 29.32% and 1,024-cell descendant tuple storage falls 95.2%; historical compact v1 remains exact. |
+| [08 - Analysis/31 - Minimal-compute hot-memory retrieval architecture 2026-09-05.md](08%20-%20Analysis/31%20-%20Minimal-compute%20hot-memory%20retrieval%20architecture%202026-09-05.md) | **adaptive full100 measured / v8 binary packer sealed / 93 of 100 source-complete / 70 of 100 semantic** | Provider-free source-balanced admission raises complete-source packets from 72 to 93 and semantic accuracy from 66 to 70. Sealed v8 preserves all 100 provider-bound payloads byte-for-byte while cutting packing mean 4.295x and p95 5.113x against the non-contemporaneous same-machine v7 artifact; this is packing-only, not end-to-end provider latency. |
+| [08 - Analysis/32 - Incremental conversational association graph overlay 2026-09-06.md](08%20-%20Analysis/32%20-%20Incremental%20conversational%20association%20graph%20overlay%202026-09-06.md) | **persistent provider-free T1g + v4 graph read measured / 99 of 100 source-complete** | Defines the HippoRAG/Graphiti-shaped additive address plane, then records its append-at-ingest journal, immutable phrase/story deltas, bounded bootstrap, restart-safe hydration, and authenticated resident story query. The v4 assay reaches 99/100 strict source coverage with no retrieval-time model calls; production `build_context` composition remains open. |
+| [08 - Analysis/33 - User-led conversational envelopes and additive recall overlay 2026-09-07.md](08%20-%20Analysis/33%20-%20User-led%20conversational%20envelopes%20and%20additive%20recall%20overlay%202026-09-07.md) | **schema-v17 envelope lifecycle + provider-free architecture pilot / opt-in** | Makes each user turn the stable lead of an exact conversational envelope, attaches machine turns without promoting their authority, and keeps surprise/coherence structure as links over preserved microepisodes. The sealed eight-question pilot reaches complete target evidence with fewer tokens, but is not a full100, 1M, or judged answer result. |
 | `10 - Research Log/02 - 2026-08-16 - Qwen3 prefix CAV gate.md` | **new measurement** | Layers 0–5 passed held-out accuracy, bootstrap stability, and random-label controls for two project-relevant CAVs; layer 5 selected for the first live-memory prototype |
 | `10 - Research Log/03 - 2026-08-16 - Live Qwen head memory smokes.md` | **new measurement** | Layer-5 CAV entry reached 0.750/0.875; calibrated layer-1 head/direction association reached 1.000 R@1/R@3 on four development links; fresh blind replication is required |
 | `10 - Research Log/04 - 2026-08-16 - Safe associative memory confirmation.md` | **new confirmation** | On a locked fresh six-family split, safe CAV/QK arms preserved 83.3% hybrid recall while reducing prompt tokens by 1.3–2.7%; degree-two pruning removed 392/1,204 edges without a recall loss; no fresh recall gain was observed |
@@ -154,6 +953,23 @@ This tree follows the folder system in the style guide: each numbered folder is 
 | [10 - Research Log/98 - 2026-09-01 - Provider slot and semantic storage cleanup.md](10%20-%20Research%20Log/98%20-%202026-09-01%20-%20Provider%20slot%20and%20semantic%20storage%20cleanup.md) | **implemented provider-free cleanup / no accuracy claim** | Keeps compact v1 byte-identical, adds strict compact v2 with H/S/K aliases and local-only stable IDs, removes process-global raw-text caches, and stores one shared semantic cell population. Sealed-ten full-chat tokens fall from 40,783 to 28,827 and the complete matched-eval suite passes 878 with one skip. |
 | [10 - Research Log/100 - 2026-09-01 - Orphaning audit and lifecycle repair.md](10%20-%20Research%20Log/100%20-%202026-09-01%20-%20Orphaning%20audit%20and%20lifecycle%20repair.md) | **provider-free lifecycle repair / no accuracy claim** | Repairs pending-ingest ownership and index publication so committed memory cannot be orphaned between database and index state, with explicit recovery and compatibility tests. |
 | [10 - Research Log/101 - 2026-09-01 - Terminal v5 95 percent campaign.md](10%20-%20Research%20Log/101%20-%202026-09-01%20-%20Terminal%20v5%2095%20percent%20campaign.md) | **sealed validation pass / 95 of 100 / confirmation pending** | Freezes the terminal-v5 lineage, adds proof-carrying numeric frontier closure and reducer-observable state equivalence, reuses 97 exact prior judgments, and accepts all three novel rows. The disjoint confirmation200 population remains unopened pending source freeze and its missing 20-shard execution lifecycle. |
+| [10 - Research Log/102 - 2026-09-03 - Policy v5 r3 freeze and confirmation executor.md](10%20-%20Research%20Log/102%20-%202026-09-03%20-%20Policy%20v5%20r3%20freeze%20and%20confirmation%20executor.md) | **policy source freeze / confirmation unopened** | Binds the 95/100 validation lineage to an exact implementation tree and immutable manifest, records the five remaining validation misses and exposure boundary, and implements the small content-addressed confirmation executor without opening the disjoint confirmation200 answers. |
+| [10 - Research Log/103 - 2026-09-03 - Durable capture and searchable ingest throughput rig.md](10%20-%20Research%20Log/103%20-%202026-09-03%20-%20Durable%20capture%20and%20searchable%20ingest%20throughput%20rig.md) | **capture-first pipeline / controlled local-disk fake-model measurement** | Defines T0 durable capture, T1 searchable publication, and deferred T2 enrichment. The 2026-09-04 v3/r15 finite burst passed all applicable gates at 19,387.1924 end-to-end chunk-token proxies/s and 1.4880827 s T1 p95 lag; synchronized-repository diagnostics explain the slower-path regression and argue against a full Rust rewrite. |
+| [10 - Research Log/104 - 2026-09-04 - Ingest-derived episode descriptor shadow.md](10%20-%20Research%20Log/104%20-%202026-09-04%20-%20Ingest-derived%20episode%20descriptor%20shadow.md) | **query-independent descriptor compilation / live narrowing disabled** | Compiles and validates the 1M store's 2,238 episode representatives once into an 8.74 MiB resident matrix. Warm exact scoring measures 0.246 ms median, but Qwen winner containment and an apply treatment remain promotion gates. |
+| [10 - Research Log/105 - 2026-09-05 - Source-local contextual cards with LFM2 Transcript.md](10%20-%20Research%20Log/105%20-%202026-09-05%20-%20Source-local%20contextual%20cards%20with%20LFM2%20Transcript.md) | **sidecar contextual-card prototype / synthetic 3 of 3 composed smoke** | On the same one-summary v4 wire, LFM2-2.6B-Transcript produced 3/3 structurally accepted cards while 350M Extract produced 0/3, but native Transcript compilation was 43.9% slower. A 57-query post-warm-up comparison found that shadow source gating cut mean/median/p95 card-search latency by about 35% and candidate inspections by 44.4%; narrowed routes remain additive and require an untimed raw fallback. This is not a 1M or benchmark accuracy claim. |
+| [10 - Research Log/106 - 2026-09-05 - QKOV to MiniLM distillation cascade.md](10%20-%20Research%20Log/106%20-%202026-09-05%20-%20QKOV%20to%20MiniLM%20distillation%20cascade.md) | **negative proxy-teacher distillation pilot / no live narrowing** | A tuned MiniLM ranker reached 56.7% held-out top-one agreement with independent Qwen coverage rankings and exposed no subset meeting the 95% calibration-precision gate. MiniLM was fast, but the teacher target was neither production nested linking nor evidence accuracy, so all cases correctly fell back. |
+| [10 - Research Log/107 - 2026-09-05 - Evidence-supervised MiniLM accuracy experiment.md](10%20-%20Research%20Log/107%20-%202026-09-05%20-%20Evidence-supervised%20MiniLM%20accuracy%20experiment.md) | **development OOF accuracy gate failed / generic reranker retired** | Five fresh out-of-fold MiniLM models moved oracle-proxy session hit@8 from lexical 178/200 to 181/200 and all-session coverage from 138 to 145, but exact annotated-turn hit@8 fell from 155 to 127 with 43 regressions. All seven advance checks failed, including 75.62 ms p95; validation100 and confirmation200 remained closed. |
+| [10 - Research Log/108 - 2026-09-05 - Hot raw-chunk retrieval and source-local linking.md](10%20-%20Research%20Log/108%20-%202026-09-05%20-%20Hot%20raw-chunk%20retrieval%20and%20source-local%20linking.md) | **linked-windowed dev1M successor / 71.4195 ms p95 / 10 of 10 Terra-Sol semantic** | The protected four-lane raw-chunk union reaches all required sources, restores `Serenity Yoga`, and applies an explicit calendar lookback before every lane selects, removing the stale Killers decoy that held v5 to 9/10. Retrieval replay is byte-identical with zero provider calls, raw packets max at 4,460/5,041 context/workspace proxies, and the separate 10-Terra/10-Sol zero-retry plane scores 10/10 on development—not the locked 95% validation population. |
+| [10 - Research Log/109 - 2026-09-05 - Hot raw-chunk locked100 comparative result.md](10%20-%20Research%20Log/109%20-%202026-09-05%20-%20Hot%20raw-chunk%20locked100%20comparative%20result.md) | **policy-frozen comparative full100 / 72.5515 ms p95 / 66 of 100 semantic** | Across ten independent approximately-1M-token memories, provider-free retrieval replays byte-identically at 51.93795/72.5515 ms p50/p95 and the sealed 100-Terra/100-Sol answer plane scores 66/100. The wide frontier covers all sources for 95/100 but fixed admission retains only 72/100; this analysis-used fixture is not untouched confirmation. |
+| [10 - Research Log/110 - 2026-09-06 - Adaptive source-balanced hot full100 result.md](10%20-%20Research%20Log/110%20-%202026-09-06%20-%20Adaptive%20source-balanced%20hot%20full100%20result.md) | **adaptive comparative full100 / 93 of 100 source-complete / 70 of 100 semantic** | V7 protects the exact v6 packet and admits 32 source-balanced candidates from its sealed BM25/dense/temporal frontiers. Complete-source reach rises 72→93, literal containment 51→54, and Terra/Sol semantic accuracy 66→70 through eight wins and four losses. Retrieval and both provider journals replay exactly; its quadratic overflow-packing tail is repaired byte-identically by sealed v8. |
+| [10 - Research Log/111 - 2026-09-06 - Binary ranked-prefix packing full100 result.md](10%20-%20Research%20Log/111%20-%202026-09-06%20-%20Binary%20ranked-prefix%20packing%20full100%20result.md) | **sealed provider-free v8 packer / 100 of 100 byte-equivalent** | Binary ranked-prefix packing preserves every v7 provider-bound payload with 56 full-fit fast paths and 44 binary fallbacks, zero provider calls, and exact replay. Packing falls from 129.835349 to 30.229117 ms mean and 346.8103 to 67.8294 ms p95: 4.295x and 5.113x speedups against a non-contemporaneous same-machine baseline. Retrieval/provider accuracy is unchanged by byte equivalence. |
+| [10 - Research Log/112 - 2026-09-06 - Activated-source assertion projection v2 provider-free result.md](10%20-%20Research%20Log/112%20-%202026-09-06%20-%20Activated-source%20assertion%20projection%20v2%20provider-free%20result.md) | **sealed provider-free projection / source-preserving hybrid candidate** | Exact assertion spans use about 2.5k context tokens and improve mean evidence F1, but standalone projection loses whole activated sources (81/100 complete versus v7's 93/100). A post-hoc source-seed hybrid preserves 93/100 source reach, raises literal containment 54→56, and identifies a 1,400-token projection budget for a separately sealed v3 candidate; no new semantic-answer claim is made. |
+| [10 - Research Log/113 - 2026-09-06 - Source-seed assertion hybrid v3 provider-free result.md](10%20-%20Research%20Log/113%20-%202026-09-06%20-%20Source-seed%20assertion%20hybrid%20v3%20provider-free%20result.md) | **sealed provider-free source-seed hybrid / semantic evaluation pending** | The computable hybrid protects one raw chunk per v7 source, adds a 1,400-token assertion prefix, then refills from raw. All 100 packets take the hybrid route with zero fallback, preserving 93/100 complete-source reach while moving literal containment 54→56 and mean best evidence F1 0.099386→0.115009 (+15.72% relative). These are analysis-used evidence diagnostics, not semantic accuracy or a 95% claim. |
+| [10 - Research Log/114 - 2026-09-06 - Provider-free typed witness successor and monotonicity rejection.md](10%20-%20Research%20Log/114%20-%202026-09-06%20-%20Provider-free%20typed%20witness%20successor%20and%20monotonicity%20rejection.md) | **97 of 100 structural source coverage / composition rejected** | Profile, typed-witness, and activated-turn lanes add four complete-source cases without provider calls, but exact-ID excerpt collisions and packing displacement violate monotone parent protection. The source diagnostic remains valid; the composition is not promoted and is not a 97% answer score. |
+| [10 - Research Log/115 - 2026-09-06 - Gold-blind ordered-story residual7 repair.md](10%20-%20Research%20Log/115%20-%202026-09-06%20-%20Gold-blind%20ordered-story%20residual7%20repair.md) | **sealed provider-free residual7 evidence gain** | A strict exact-cardinality story selector recovers q86's Muir Woods → Big Sur/Monterey → Yosemite source sequence, moving source recall 2/3→3/3 while packing fewer rows and leaving six controls unchanged. No answer-model judgment ran. |
+| [10 - Research Log/116 - 2026-09-06 - Persistent conversational graph and full100 transfer.md](10%20-%20Research%20Log/116%20-%202026-09-06%20-%20Persistent%20conversational%20graph%20and%20full100%20transfer.md) | **durable T1g graph + 98 of 100 structural source coverage** | Persists bounded phrase, sequence, and source-story deltas as turns become searchable, with fail-open retry, restart hydration without re-extraction, and exact receipts. The ordered-story full100 transfer reaches 98/100 complete reference-source coverage; resident q86 graph lookup is 3.332 ms core and 7.086 ms p95 through the authenticated wrapper. These are evidence and latency results, not judged answer accuracy. |
+| [10 - Research Log/117 - 2026-09-07 - Online graph fast-path full100 99 source coverage.md](10%20-%20Research%20Log/117%20-%202026-09-07%20-%20Online%20graph%20fast-path%20full100%2099%20source%20coverage.md) | **sealed v4 / 99 of 100 structural source coverage / exact replay** | Composes the authenticated resident ordered-story graph and bounded business-milestone frontier, reaching 99/100 strict source coverage versus the 93/100 parent with 100 exact replay arms and zero retrieval model/provider calls. The sole strict miss already contains the literal answer; judged fast-path answer accuracy remains a separate gate. |
+| [10 - Research Log/118 - 2026-09-07 - User-led envelope pilot and additive segmentation assay.md](10%20-%20Research%20Log/118%20-%202026-09-07%20-%20User-led%20envelope%20pilot%20and%20additive%20segmentation%20assay.md) | **sealed provider-free 8Q pilot / 100% target evidence / opt-in** | Preserves raw anchors, packs exact user-to-machine microepisodes atomically, and traverses separately sealed macro links only for frontier questions. Mean packet size is 59.875 tokens versus 87.25/127.25 for the representative comparators; this small synthetic architecture pilot is not answer accuracy or a causal segmentation-only estimate. |
 | `07 - Status Reports/…` | ✅ | Six dated handoffs through 2026-08-19; the 2026-08-15 report remains the retrieval-measurement handoff, while the 2026-08-19 reports cover the later simplification audit and implementation |
 
 ## The tree
@@ -191,6 +1007,9 @@ docs/
 
 ## Where to start
 
+- Resuming the user-spine hierarchy? → [Research Log 129](10%20-%20Research%20Log/129%20-%202026-09-09%20-%20User%20spine%20attention%20hierarchy%20and%20summary%20compilation.md). The builder and summary-only Qwen smoke are implemented; 93 tests pass. The smoke exposes narrow-branch routing loss, and the real-source compiler is prepared pending explicit raw-payload approval.
+- Reviewing the conventional fast-packet work? → [Research Log 128](10%20-%20Research%20Log/128%20-%202026-09-08%20-%20Compact%20conventional%20fast%20packet%20admission.md). Seven fixed-pool packet controls are complete; none improved the fresh 12/30 baseline. Admission lost source/story witnesses, while temporal interpretation also failed with evidence present. The user has since resumed hierarchical attention.
+- Resuming the requested summary-routing task? → [Research Log 122](10%20-%20Research%20Log/122%20-%202026-09-08%20-%20Qwen%20summary%20hierarchy%20and%20exact%20section%20hydration.md). Qwen attention operates on hierarchical summaries; raw hydration happens only after selection.
 - Resuming cold? → **`06 - Roadmaps/01 - Delivering the Specified System.md` first** — it explains why every memory-arm number on record is void and what order the remaining work has to happen in. Then `07 - Status Reports/2026-08-15_retrieval-measurement-session.md` for the retrieval half, which still stands.
 - "What does the system do?" → `03 - Architecture/00 - System Overview.md`.
 - "How did factual retrieval improve, and what remains unproven?" → `00 - Theory/04 - From Top-K Recall to Proof-Carrying Factual Retrieval.md`.
@@ -199,6 +1018,8 @@ docs/
 - "How would a native hypergraph interact with live memory?" → `03 - Architecture/01 - Native Hypergraph Memory Plane.md` — canonical higher-order observations, pairwise serving projections, bounded traversal, and event-aware pruning.
 - "How are complete sets deduplicated without losing distinct events?" → `03 - Architecture/02 - Query-Conditioned Bayesian Coverage Loop.md` — a primary six-layer Qwen3-8B QK/OV affinity arm plus a secondary compact-INI classifier, followed by recall-safe representative-first packing; the locked baseline isolates a 100%-raw versus 94.7%-packed gap and the prefix treatment is pending measurement.
 - "What's left to build?" → `06 - Roadmaps/00 - Gap Analysis and Roadmap.md`.
+- "How do we cut 1M-memory retrieval latency with minimal online compute?" → [Analysis 31](08%20-%20Analysis/31%20-%20Minimal-compute%20hot-memory%20retrieval%20architecture%202026-09-05.md), [Analysis 32](08%20-%20Analysis/32%20-%20Incremental%20conversational%20association%20graph%20overlay%202026-09-06.md), and [Research Log 117](10%20-%20Research%20Log/117%20-%202026-09-07%20-%20Online%20graph%20fast-path%20full100%2099%20source%20coverage.md) — source-balanced admission and binary packing provide the fast raw path; the online graph and typed temporal frontier raise strict source coverage to 99/100 with warm processing at 139.164 ms mean and 337.139 ms p95. This is evidence coverage, not judged answer accuracy.
+- "How does user-led conversational ingest become episodic recall?" → [Analysis 33](08%20-%20Analysis/33%20-%20User-led%20conversational%20envelopes%20and%20additive%20recall%20overlay%202026-09-07.md) and [Research Log 118](10%20-%20Research%20Log/118%20-%202026-09-07%20-%20User-led%20envelope%20pilot%20and%20additive%20segmentation%20assay.md) — user turns own stable envelopes, assistant/system payloads remain exact evidence, and macro structure links rather than replaces microepisodes. The opt-in production read API now expands selected raw hits under a separate companion budget; the eight-question pilot is positive and provider-free, while the full100 shadow gate remains open.
 - "How do I run it?" → `02 - Implementation/01 - Running the Eval Harness.md` (start with the free `--compare` mode).
 - "How do I run the Qwen attention-prefix experiment?" → `02 - Implementation/03 - Qwen3 Prefix Attention Lab.md`.
 - "How will episode retrieval feed the K-latent attention fusion stage?" → `02 - Implementation/04 - Episode-Primary Latent Evidence Fusion.md` — a design-frozen, query-conditioned GPU feature-to-router contract with no trained or measured fusion claim yet.

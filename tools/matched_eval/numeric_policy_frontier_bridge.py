@@ -186,7 +186,11 @@ def _material_fact_projection(
         # handled by the compiler gate.  The successor profile can therefore
         # compare the operator-visible eligibility state while v2 keeps its
         # exact historical status contract for byte replay.
-        status=("operator_eligible" if operator_material_status else atom.status),
+        status=(
+            "operator_eligible"
+            if operator_material_status
+            else str(item.get("status", atom.status))
+        ),
         temporal_basis=atom.temporal_basis.value,
         unit=atom.unit,
     )
@@ -727,7 +731,9 @@ def build_operator_first_numeric_frontier(
                 entity_key=atom.entity_key,
                 event_key=atom.event_key,
                 status=(
-                    "operator_eligible" if operator_material_status else atom.status
+                    "operator_eligible"
+                    if operator_material_status
+                    else str(source_item.get("status", atom.status))
                 ),
                 event_date=atom.event_date,
                 temporal_basis=atom.temporal_basis.value,

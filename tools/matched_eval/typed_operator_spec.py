@@ -15,7 +15,10 @@ import hashlib
 import re
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Literal
+
+from memory_condense.domain.text_numbers import NUMBER_WORDS
 
 from tools._routed_repair_routing import (
     RoutedRepairReason,
@@ -32,7 +35,7 @@ from .contracts import (
 )
 
 
-FORMAT = "memory-condense-typed-operator-spec-v1"
+FORMAT = "memory-condense-typed-operator-spec-v3"
 SLOT_FORMAT = "memory-condense-typed-required-slot-v1"
 
 
@@ -283,6 +286,24 @@ _COMPARISON_ENTITY_STOP = frozenset(
 _LATEST_TRANSACTION_RE = re.compile(
     r"\bhow much did I (?:spend|pay)(?:\s+for|\s+on)\b", re.I
 )
+_CARDINAL_TOKEN = r"\d+|" + "|".join(
+    sorted(NUMBER_WORDS, key=len, reverse=True)
+)
+_ORDERED_LIST_CARDINALITY_RE = re.compile(
+    r"\b(?:order|sequence)\s+of\s+(?:the\s+)?"
+    rf"(?P<operator_count>{_CARDINAL_TOKEN})\b|"
+    rf"\b(?:the\s+)?(?P<member_count>{_CARDINAL_TOKEN})\s+"
+    r"(?:(?:[A-Za-z][A-Za-z0-9'’-]*)\s+){0,3}"
+    r"(?:trips?|events?|visits?|activities?|journeys?|milestones?)\b",
+    re.IGNORECASE,
+)
+_QUESTION_TYPO_ALIASES = MappingProxyType(
+    {
+        # Observed conversational spelling.  Keep this list deliberately tiny:
+        # it is a deterministic surface alias, not a general spell checker.
+        "buisiness": "business",
+    }
+)
 
 _STOP = frozenset(
     {
@@ -300,6 +321,7 @@ def normalize_term(value: str) -> str:
     """Small deterministic normalizer shared with the typed evidence adapter."""
 
     word = value.casefold().replace("’", "'").strip("' -_")
+    word = _QUESTION_TYPO_ALIASES.get(word, word)
     if word.endswith("ies") and len(word) > 4:
         word = word[:-3] + "y"
     elif word.endswith("oes") and len(word) > 4:
@@ -315,6 +337,24 @@ def normalize_term(value: str) -> str:
     return word
 
 
+def canonicalize_question_text(value: str, /) -> str:
+    """Apply the sealed, bounded conversational typo aliases.
+
+    This intentionally performs no probabilistic or open-vocabulary spelling
+    correction.  Routing sees the canonical surface while the enclosing typed
+    specification continues to bind the exact original question bytes.
+    """
+
+    require_text(value, "question text")
+    pattern = r"\b(?:" + "|".join(map(re.escape, _QUESTION_TYPO_ALIASES)) + r")\b"
+    return re.sub(
+        pattern,
+        lambda match: _QUESTION_TYPO_ALIASES[match.group(0).casefold()],
+        value,
+        flags=re.IGNORECASE,
+    )
+
+
 def normalized_terms(value: str) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
@@ -323,6 +363,24 @@ def normalized_terms(value: str) -> tuple[str, ...]:
             if (term := normalize_term(raw)) and term not in _STOP
         )
     )
+
+
+def ordered_list_requested_cardinality(body: str, /) -> int | None:
+    """Return an explicit ordered-list member count from question text.
+
+    The grammar is intentionally anchored either to ``order/sequence of`` or
+    to a small set of enumerable event nouns.  Consequently a duration such
+    as ``past three months`` cannot become the requested answer cardinality.
+    Callers must still establish that the compiled answer shape is an ordered
+    list before applying the result.
+    """
+
+    require_text(body, "ordered-list question body")
+    match = _ORDERED_LIST_CARDINALITY_RE.search(body)
+    if match is None:
+        return None
+    raw = (match.group("operator_count") or match.group("member_count")).casefold()
+    return int(raw) if raw.isdigit() else NUMBER_WORDS[raw]
 
 
 def _compared_entity_pair(body: str) -> tuple[str, str] | None:
@@ -585,8 +643,9 @@ def compile_typed_operator_spec(question: str, /) -> TypedOperatorSpec:
         raise TypeError("question must be exact text")
     if not question or question.strip() != question:
         raise ValueError("question must be non-empty normalized text")
-    route = route_question(question)
-    body = _DATED_RE.sub("", question).strip()
+    routed_question = canonicalize_question_text(question)
+    route = route_question(routed_question)
+    body = _DATED_RE.sub("", routed_question).strip()
     if not body:
         raise ValueError("dated question body must be non-empty")
     shape = _answer_shape(route.style, route.reason, body)
@@ -602,6 +661,9 @@ def compile_typed_operator_spec(question: str, /) -> TypedOperatorSpec:
         or any(slot.kind in {SlotKind.OPERAND, SlotKind.TEMPORAL_BOUNDARY} for slot in slots)
         or temporal_mode is TemporalMode.LATEST_STATE
     )
+    cardinality = route.modifiers.cardinality
+    if cardinality is None and shape is AnswerShape.ORDERED_LIST:
+        cardinality = ordered_list_requested_cardinality(body)
     return TypedOperatorSpec(
         question_sha256=hashlib.sha256(question.encode("utf-8")).hexdigest(),
         route_receipt_sha256=route.receipt_sha256,
@@ -617,7 +679,7 @@ def compile_typed_operator_spec(question: str, /) -> TypedOperatorSpec:
         specificity_required=specificity,
         personalization_required=personalization,
         include_proposed=include_proposed,
-        cardinality=route.modifiers.cardinality,
+        cardinality=cardinality,
         ordering=route.modifiers.ordering,
         query_timestamp=route.modifiers.query_timestamp,
         temporal_window_days=route.modifiers.temporal_window_days,
@@ -633,7 +695,9 @@ __all__ = [
     "SlotKind",
     "TemporalMode",
     "TypedOperatorSpec",
+    "canonicalize_question_text",
     "compile_typed_operator_spec",
     "normalize_term",
     "normalized_terms",
+    "ordered_list_requested_cardinality",
 ]

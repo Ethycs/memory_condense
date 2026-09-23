@@ -21,13 +21,17 @@ matching. An LLM that paraphrases gets rejected, which is the point.
 from __future__ import annotations
 
 import re
+from typing import Sequence
 
 from memory_condense.persistence.db import Database
 from memory_condense.domain.schemas import (
+    Chunk,
     CreateOp,
     MemoryOps,
+    MemoryType,
     Provenance,
     SupersedeOp,
+    Turn,
     UpdateOp,
     ValidationError,
     ValidationReport,
@@ -45,6 +49,8 @@ REASON_QUOTE_NOT_FOUND = "quote_not_found"
 REASON_UNKNOWN_MEM_ID = "unknown_mem_id"
 REASON_INVALID_MEM_STATUS = "invalid_mem_status"
 REASON_EMPTY_CONTENT = "empty_content"
+REASON_OUTSIDE_EVIDENCE_VIEW = "outside_evidence_view"
+REASON_REQUIRES_TARGET_BINDING = "requires_target_binding"
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -96,7 +102,9 @@ class Validator:
             )
 
         for update in ops.update:
-            error = self._check_mem_id(update.mem_id, "update")
+            error = self._check_mem_id(
+                update.mem_id, "update", require_active=True
+            )
             if error is None:
                 error = self._check_provenance(
                     update.provenance,
@@ -121,10 +129,18 @@ class Validator:
             admit(sup, error, accepted.supersede)
 
         for dele in ops.delete:
-            admit(dele, self._check_mem_id(dele.mem_id, "delete"), accepted.delete)
+            admit(
+                dele,
+                self._check_mem_id(dele.mem_id, "delete", require_active=True),
+                accepted.delete,
+            )
 
         for pin in ops.pin:
-            admit(pin, self._check_mem_id(pin.mem_id, "pin"), accepted.pin)
+            admit(
+                pin,
+                self._check_mem_id(pin.mem_id, "pin", require_active=True),
+                accepted.pin,
+            )
 
         return ValidationReport(accepted=accepted, rejected=rejected)
 
@@ -135,6 +151,122 @@ class Validator:
             return False
         needle = _normalize(quote)
         return bool(needle) and needle in _normalize(text)
+
+    def validate_for_enrichment(
+        self,
+        ops: MemoryOps,
+        turn: Turn,
+        chunks: Sequence[Chunk],
+        *,
+        allow_unbound_corrections: bool = False,
+    ) -> ValidationReport:
+        """Validate globally, then confine provenance to the supplied live view.
+
+        The transcript is append-only even after a chunk is retired, so the
+        ordinary validator intentionally still recognizes its historical
+        text. Deferred T2 extraction has a stricter boundary: an operation may
+        cite only evidence that was actually present in its current live chunk
+        window. This rejects both explicit retired chunk IDs and a chunk-less
+        quote that exists only in a retired span.
+        """
+        report = self.validate(ops)
+        accepted = MemoryOps()
+        rejected = list(report.rejected)
+        live_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+
+        def visible_provenance(provenance: list[Provenance]):
+            visible_entries: list[Provenance] = []
+            for entry in provenance:
+                if entry.turn_id != turn.turn_id:
+                    continue
+                needle = _normalize(entry.quote)
+                if entry.chunk_id is not None:
+                    candidate = live_by_id.get(entry.chunk_id)
+                    visible = (
+                        candidate is not None
+                        and needle
+                        and needle in _normalize(candidate.text)
+                    )
+                else:
+                    visible = bool(needle) and any(
+                        needle in _normalize(chunk.text) for chunk in chunks
+                    )
+                if visible:
+                    visible_entries.append(entry)
+            return visible_entries
+
+        def admit(op, provenance: list[Provenance], kind: str, bucket: list):
+            visible = visible_provenance(provenance)
+            if visible:
+                bucket.append(
+                    op
+                    if len(visible) == len(provenance)
+                    else op.model_copy(update={"provenance": visible})
+                )
+            else:
+                rejected.append(
+                    ValidationError(
+                        op_kind=kind,
+                        reason=REASON_OUTSIDE_EVIDENCE_VIEW,
+                        detail="no provenance remains in the live chunk view",
+                    )
+                )
+
+        for op in report.accepted.create:
+            if op.type is MemoryType.CORRECTION:
+                if allow_unbound_corrections:
+                    admit(op, op.provenance, "create", accepted.create)
+                else:
+                    rejected.append(
+                        ValidationError(
+                            op_kind="create",
+                            reason=REASON_REQUIRES_TARGET_BINDING,
+                            detail=(
+                                "deferred corrections require an explicit "
+                                "versioned supersede target"
+                            ),
+                        )
+                    )
+            else:
+                admit(op, op.provenance, "create", accepted.create)
+        # Deferred T2 sees one local evidence window, not a versioned snapshot
+        # of the whole memory store. It may publish grounded facts, but it may
+        # not mutate existing rows whose status/content could change between
+        # staging and replay. Those operations remain available through the
+        # explicit/public validation path, where the caller controls context.
+        for _op in report.accepted.update:
+            rejected.append(
+                ValidationError(
+                    op_kind="update",
+                    reason=REASON_OUTSIDE_EVIDENCE_VIEW,
+                    detail="deferred updates require a versioned target binding",
+                )
+            )
+        for _op in report.accepted.supersede:
+            rejected.append(
+                ValidationError(
+                    op_kind="supersede",
+                    reason=REASON_OUTSIDE_EVIDENCE_VIEW,
+                    detail="deferred supersedes require a versioned target binding",
+                )
+            )
+        for _op in report.accepted.delete:
+            rejected.append(
+                ValidationError(
+                    op_kind="delete",
+                    reason=REASON_OUTSIDE_EVIDENCE_VIEW,
+                    detail="deferred deletes have no evidence binding",
+                )
+            )
+        for _op in report.accepted.pin:
+            rejected.append(
+                ValidationError(
+                    op_kind="pin",
+                    reason=REASON_OUTSIDE_EVIDENCE_VIEW,
+                    detail="deferred pins have no evidence binding",
+                )
+            )
+        return ValidationReport(accepted=accepted, rejected=rejected)
 
     # ------------------------------------------------------------------
     # Individual checks

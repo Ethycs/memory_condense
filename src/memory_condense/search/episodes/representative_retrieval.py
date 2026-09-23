@@ -9,7 +9,7 @@ the call.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -43,6 +43,15 @@ from memory_condense.domain._discourse_identity import (
     normalize_fields,
 )
 from memory_condense.domain.schemas import RetrievalResult
+
+from .representative_prefilter import (
+    EpisodeRepresentativeEmbedding,
+    EpisodeRepresentativePrefilterPolicy,
+    EpisodeRepresentativePrefilterResult,
+    prefilter_episode_representatives,
+    prefilter_prescored_episode_representatives,
+)
+from .descriptor_index import EpisodeDescriptorIndex
 
 
 def _finite_float(value: Any, label: str) -> float:
@@ -125,6 +134,140 @@ class RepresentativeHydrator(Protocol):
         score: float,
         route: str,
     ) -> RetrievalResult | None: ...
+
+
+@runtime_checkable
+class RepresentativeEmbeddingLoader(Protocol):
+    """Load exact durable vectors for an explicit representative ID set."""
+
+    def __call__(
+        self,
+        chunk_ids: Sequence[str],
+    ) -> Mapping[str, Sequence[float]]: ...
+
+
+EpisodeRepresentativePrefilterObserver = Callable[
+    [EpisodeRepresentativePrefilterResult],
+    None,
+]
+
+
+class _FailedRepresentativeEmbeddingRows(dict[str, object]):
+    """Turn an unexpected loader failure into the core's sealed fail-open path."""
+
+    def __getitem__(self, key: str) -> object:
+        raise RuntimeError(f"representative embedding load failed for {key}")
+
+
+def _shadow_prefilter(
+    query: str,
+    population: tuple[AssociativeMemoryCandidate, ...],
+    witnesses: tuple[EpisodeRepresentativeWitness, ...],
+    *,
+    query_vector: Sequence[float] | None,
+    descriptor_index: EpisodeDescriptorIndex | None,
+    embedding_loader: RepresentativeEmbeddingLoader | None,
+    embedding_identity: Mapping[str, object] | None,
+    protected_episode_ids: Sequence[str],
+    requires_complete_frontier: bool,
+    policy: EpisodeRepresentativePrefilterPolicy,
+    max_representatives: int,
+) -> EpisodeRepresentativePrefilterResult:
+    """Build verified rows from durable representatives and run shadow ranking."""
+
+    if policy.mode == "apply":
+        raise ValueError(
+            "live representative prefilter apply mode requires shadow promotion"
+        )
+    rows: Mapping[str, Sequence[EpisodeRepresentativeEmbedding]]
+    should_load = bool(
+        policy.mode == "shadow"
+        and not requires_complete_frontier
+        and len(population) >= policy.top_k
+    )
+    if should_load and descriptor_index is not None and query_vector is not None:
+        try:
+            descriptor_embedding_identity = dict(embedding_identity or {})
+            descriptor_embedding_identity_sha256 = identity_sha256(
+                descriptor_embedding_identity
+            )
+            score_result = descriptor_index.score(
+                query_vector,
+                tuple(item.episode_id for item in population),
+                max_representatives=max_representatives,
+                embedding_identity=descriptor_embedding_identity,
+            )
+            return prefilter_prescored_episode_representatives(
+                query,
+                population,
+                ranked_scores=tuple(
+                    (item.episode_id, item.score)
+                    for item in score_result.scores
+                ),
+                query_feature_sha256=(
+                    score_result.receipt.query_feature_sha256
+                ),
+                embedding_identity_sha256=(
+                    descriptor_embedding_identity_sha256
+                ),
+                descriptor_catalog_receipt_sha256=(
+                    score_result.receipt.catalog_receipt_sha256
+                ),
+                protected_episode_ids=protected_episode_ids,
+                requires_complete_frontier=requires_complete_frontier,
+                policy=policy,
+            )
+        except Exception:
+            # Shadow operation may fall back to the explicit durable vectors;
+            # either route still leaves the live Qwen population untouched.
+            pass
+    if not should_load:
+        rows = {}
+    elif embedding_loader is None:
+        rows = _FailedRepresentativeEmbeddingRows()
+    else:
+        chunk_ids = tuple(
+            dict.fromkeys(
+                chunk_id
+                for witness in witnesses
+                for chunk_id in witness.representative_chunk_ids
+            )
+        )
+        try:
+            vectors = embedding_loader(chunk_ids)
+            if not isinstance(vectors, Mapping):
+                raise TypeError("representative embedding loader returned a non-mapping")
+            rows = {
+                witness.episode_id: tuple(
+                    EpisodeRepresentativeEmbedding(
+                        representative=EpisodeRepresentative(
+                            episode_id=witness.episode_id,
+                            chunk_id=chunk_id,
+                            rank=rank,
+                            vector_identity_sha256=(
+                                witness.representative_identity_sha256s[rank]
+                            ),
+                        ),
+                        vector=vectors.get(chunk_id),
+                    )
+                    for rank, chunk_id in enumerate(
+                        witness.representative_chunk_ids
+                    )
+                )
+                for witness in witnesses
+            }
+        except Exception:
+            rows = _FailedRepresentativeEmbeddingRows()
+    return prefilter_episode_representatives(
+        query,
+        population,
+        query_vector=query_vector,
+        representative_embeddings=rows,
+        protected_episode_ids=protected_episode_ids,
+        requires_complete_frontier=requires_complete_frontier,
+        embedding_identity=dict(embedding_identity or {}),
+        policy=policy,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -546,6 +689,14 @@ def retrieve_episode_representatives(
     *,
     policy: EpisodeRepresentativeRetrievalPolicy,
     source_scope: EpisodeSourceCandidateScope | None = None,
+    prefilter_policy: EpisodeRepresentativePrefilterPolicy | None = None,
+    query_vector: Sequence[float] | None = None,
+    representative_embedding_loader: RepresentativeEmbeddingLoader | None = None,
+    representative_descriptor_index: EpisodeDescriptorIndex | None = None,
+    embedding_identity: Mapping[str, object] | None = None,
+    protected_episode_ids: Sequence[str] = (),
+    requires_complete_frontier: bool = False,
+    prefilter_observer: EpisodeRepresentativePrefilterObserver | None = None,
 ) -> EpisodeRepresentativeRetrievalPlan:
     """Discover episodes independently of direct chunk hits.
 
@@ -680,6 +831,36 @@ def retrieve_episode_representatives(
                 status="identity_error" if invalid_row else "ok",
             )
         )
+
+    population = tuple(inspection_candidates.values())
+    if prefilter_policy is not None:
+        prefilter_result = _shadow_prefilter(
+            normalized_query,
+            population,
+            tuple(witnesses),
+            query_vector=query_vector,
+            descriptor_index=representative_descriptor_index,
+            embedding_loader=representative_embedding_loader,
+            embedding_identity=embedding_identity,
+            protected_episode_ids=protected_episode_ids,
+            requires_complete_frontier=requires_complete_frontier,
+            policy=prefilter_policy,
+            max_representatives=policy.max_representatives_per_episode,
+        )
+        if (
+            prefilter_result.population_ids
+            != tuple(item.episode_id for item in population)
+            or prefilter_result.output_ids
+            != tuple(item.episode_id for item in population)
+        ):
+            raise RuntimeError("shadow prefilter changed the effective population")
+        if prefilter_observer is not None:
+            try:
+                prefilter_observer(prefilter_result)
+            except Exception:
+                # Diagnostics are explicitly non-authoritative and cannot
+                # change the sealed legacy retrieval path.
+                pass
 
     groups = [
         tuple(rows[start : start + policy.group_size])

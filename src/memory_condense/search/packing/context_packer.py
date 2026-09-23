@@ -34,6 +34,7 @@ from memory_condense.search.packing.expansion_assembly import (
 from memory_condense.search.packing.packing_contracts import (
     EXPANSION_PREFIX,
     MEMORY_HEADER_PREFIX,
+    AtomicExpansionContract,
     ExpansionSelector,
 )
 from memory_condense.search.packing.source_provenance import (
@@ -70,6 +71,8 @@ class ContextPacker(_ExpansionPackingMixin):
             "closure_scope": "",
             "closure_global_recall_guaranteed": False,
         }
+        self._last_packed_expansion_rows: list[Any] = []
+        self._last_expansion_source_timestamps: dict[str, str] = {}
         self._sentence_segmenter = (
             pysbd.Segmenter(language="en", clean=False)
             if self.budget.query_aware_sentence_expansions
@@ -89,6 +92,7 @@ class ContextPacker(_ExpansionPackingMixin):
         active_partition_total: int | None = None,
         active_partition_inspected: int | None = None,
         active_partition_scan: Mapping[str, Any] | None = None,
+        atomic_expansion_contract: AtomicExpansionContract | None = None,
     ) -> PackedContext:
         """Assemble a `PackedContext`. Every section is independently capped."""
         memories = memories or []
@@ -112,6 +116,7 @@ class ContextPacker(_ExpansionPackingMixin):
             active_partition_total=active_partition_total,
             active_partition_inspected=active_partition_inspected,
             active_partition_scan=active_partition_scan,
+            atomic_contract=atomic_expansion_contract,
         )
 
         messages: list[dict[str, str]] = []

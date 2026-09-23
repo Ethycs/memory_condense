@@ -1,0 +1,13 @@
+{
+  "population_kind": "source-derived development probes, not untouched benchmark validation",
+  "source_turn_population_sha256": "8b5d302f977ad5143aa20ba32a8cbf9b60134fce63c3c7d9b0fb8267dcf91f73",
+  "cases": [
+    {"id": "prior_trail", "question": "Which trail had I hiked at Muir Woods before requesting similar Eastern Sierra hikes?"},
+    {"id": "hike_companions", "question": "Who accompanied me on the day hike to Muir Woods National Monument?"},
+    {"id": "backpack_trip_length", "question": "What trip length did I want my new lightweight backpack to be suitable for?"},
+    {"id": "tent_requirements", "question": "What capacity and qualities did I request for a tent for the Eastern Sierra trip?"},
+    {"id": "bear_observations", "question": "Did I actually see bears on the Big Sur and Monterey road trip, and what signs did I observe?"},
+    {"id": "lodging_town", "question": "In which town was my Airbnb during the Big Sur and Monterey road trip?"},
+    {"id": "campsite_access", "question": "For the Eastern Sierra trip, how did I want to reach the more secluded campsites?"}
+  ]
+}

@@ -1,0 +1,366 @@
+"""Compare semantic seeds with date-aware routing using fresh matched answers.
+
+Both methods retain the v2 reader and raw budgets. Accuracy judges these same
+streamed predictions; all full100 answers must be sealed before judging.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+from pathlib import Path
+import time
+
+from memory_condense.domain._discourse_identity import identity_sha256, quote_sha256
+from memory_condense.domain._tokenizer import count_chat_prompt_token_proxy
+from memory_condense.eval._retrieval_qa_prompt import QA_USER_TEMPLATE, QA_NO_CONTEXT
+from memory_condense.eval.spine_reader_policy_v2 import SPINE_READER_SYSTEM_PROMPT_V2 as QA_SYSTEM_PROMPT
+from tools.spine_as_of_memory import ResidentMemory
+from tools import evaluate_spine_semantic_seeds as seed_evaluation
+from tools.evaluate_spine_source_coverage import (
+    IMPLEMENTATION as SOURCE_IMPLEMENTATION, SOURCE_COVERAGE_POLICY, TERM_COVERAGE_POLICY)
+from memory_condense.eval.streaming_latency import measure_streaming_answer, latency_distribution
+from memory_condense.eval._binary_judge_protocol import JUDGE_MAX_TOKENS
+from tools.benchmark_hot_api_latency import PROBES, PROBE_SHA, MODEL, GATEWAY
+from tools.compile_spine_semantic_index import load_index
+from tools.matched_eval.artifacts import read_sealed_json, publish_sealed_json
+from tools.run_hot_reduced30_answer_judge import _completion_client
+
+
+MEMORY_ARMS = ("semantic_seeds", "as_of")
+ARMS = ("short_api", *(a for arm in MEMORY_ARMS for a in (arm, arm + "_api")))
+ROUTES = {"semantic_seeds": "source_spine_semantic_seeds", "as_of": "source_spine_as_of"}
+SHORT_CONTROLS = {arm: "short_api" for arm in MEMORY_ARMS}
+AS_OF_POLICY = {"baseline_sections": 6, "lexical_reserve_both_arms": 0,
+    "cutoff": "transcript mention day <= bound question day", "same_day_retained": True,
+    "event_dates_used_for_eligibility": False, "filter_before_top_k": True,
+    "mixed_date_leaves_retain_eligible_spans": True, "mixed_summaries_can_describe_later_mentions": True,
+    "user_backfill_filtered_before_reservation": True, "extended_relative_prior": False,
+    "exact_raw_hydration_after_projection": True, "prior_user_evidence_preservation_required": False,
+    "additional_query_embeddings": 0, "query_time_qwen_calls": 0}
+IMPLEMENTATION = tuple(dict.fromkeys((*seed_evaluation.IMPLEMENTATION,
+    "tools/evaluate_spine_as_of.py", "tools/spine_as_of_memory.py",
+    "src/memory_condense/search/as_of_spine_routing.py",
+    "src/memory_condense/search/summary_time_prior_v2.py")))
+
+
+def short_control(arm):
+    return SHORT_CONTROLS[arm]
+
+
+def reader_policies():
+    return {arm: quote_sha256(QA_SYSTEM_PROMPT) for arm in MEMORY_ARMS}
+
+
+def call_arm_order(ordinal):
+    pairs = [(arm, arm + "_api") if ordinal % 2 == 0 else (arm + "_api", arm) for arm in MEMORY_ARMS]
+    groups = [("short_api",), *pairs]
+    offset = ordinal % len(groups)
+    return tuple(arm for group in groups[offset:] + groups[:offset] for arm in group)
+
+
+def prepare(root, control_root):
+    control = seed_evaluation.load_preflight(control_root)
+    cp = control.payload
+    index_root, addresses_root, atoms_path, facets_root = (
+        Path(cp[name]) for name in ("index_root", "addresses_root", "atoms_path", "facets_root"))
+    manifest, _ = load_index(index_root)
+    p = manifest.payload
+    if not p["complete_namespace"] or p["raw_token_proxy"] < 1_000_000:
+        raise ValueError("evaluation requires a complete 1M-token namespace")
+    probes = read_sealed_json(PROBES)
+    if probes.sha256 != PROBE_SHA:
+        raise ValueError("locked probe population changed")
+    questions = [q for q in probes.payload["questions"] if q["shard_offset"] == p["shard_offset"]]
+    if len(questions) != 10:
+        raise ValueError("expected all ten namespace questions")
+    # Freeze only the evidence prompts for matched API controls. Live arms must
+    # recompute routing/hydration inside their clocks and reproduce these bytes;
+    # neither question vectors nor predictions are cached or reused.
+    memory = ResidentMemory(index_root, manifest.sha256, addresses_root, atoms_path, facets_root)
+    calls = []
+    try:
+        for i, question in enumerate(questions):
+            messages = {short_control(arm): answer_messages(question, policy=arm) for arm in MEMORY_ARMS}
+            for arm in MEMORY_ARMS:
+                hydrated = memory.retrieve(question["retrieval_query"], ROUTES[arm], question["prompt_question"])
+                messages[arm] = answer_messages(question, hydrated, policy=arm)
+                messages[arm + "_api"] = messages[arm]
+            ordered = call_arm_order(i)
+            for arm in ordered:
+                calls.append({"call_index": len(calls), "question": question, "arm": arm,
+                              "messages": messages[arm], "messages_sha256": identity_sha256(messages[arm])})
+    finally:
+        memory.encoder.close()
+    validate_matched_calls(calls)
+    validate_control_calls(control, calls)
+    artifact, _ = publish_sealed_json(root / "preflight.json", {
+        "format": "memory-condense-joint-spine-as-of-eval-v1", "index_root": str(index_root.resolve()),
+        "control_preflight_root": str(control_root.resolve()), "control_preflight_sha256": control.sha256,
+        "index_manifest_sha256": manifest.sha256, "addresses_root": str(addresses_root.resolve()),
+        "addresses_sha256": memory.addresses_sha256, "atoms_path": str(atoms_path.resolve()),
+        "facets_root": str(facets_root.resolve()), "facets_sha256": memory.facets_sha256,
+        "atoms_sha256": memory.atoms_sha256, "role_partition_sha256": memory.source_spine.index.receipt_sha256,
+        "source_expansion": {"source_cap": 6, "user_section_cap": 24, "user_reservation_estimate": 2048,
+            "context_tokens": 3072, "max_raw_spans": 128, "selected_user_turns_before_backfill": True,
+            "overflow": "protected prior user turns, then omitted routed user turns, then prior attached context",
+            "facets": "baseline overflow users first, then interleaved user top8 and passage top8 users, then prior attached context",
+            "additional_user_sections": 8, "additional_facet_sections": 8},
+        "term_coverage": TERM_COVERAGE_POLICY, "source_coverage": SOURCE_COVERAGE_POLICY,
+        "as_of_policy": AS_OF_POLICY, "routes": ROUTES, "short_controls": SHORT_CONTROLS,
+        "judge_max_new_tokens": JUDGE_MAX_TOKENS, "probes_sha256": probes.sha256, "shard_offset": p["shard_offset"],
+        "raw_token_proxy": p["raw_token_proxy"], "calls": calls, "physical_answer_call_cap": len(calls),
+        "model": MODEL, "gateway": GATEWAY, "max_tokens": 256, "concurrency": 1, "retries": 0,
+        "baseline_sections": 6, "user_supplement_sections": 4, "calendar_preferred_sections": 4,
+        "calendar_frontier": 32, "calendar_max_sections_per_source": 1, "selected_section_cap": 14,
+        "max_context_tokens": 3072, "max_raw_spans": 128, "max_answer_prompt_tokens": 5500,
+        "gold_loaded": False, "live_retrieval_included": True, "full100_target_eligible": False,
+        "provisional_latency_ratio_limit": 1.10,
+        "baseline": "one shared v2 short API control; every memory arm has its own identical-evidence API control",
+        "reader_policies": reader_policies(),
+        "identical_evidence_arms": [],
+        "identical_reader_arms": list(MEMORY_ARMS),
+        "matched_api_controls": "each memory arm has an API control with byte-identical evidence messages",
+        "order": "adjacent matched pairs; each method runs first in five of ten questions; group order rotates",
+        "cached_query_vectors": False, "cached_predictions": False,
+        "implementation": {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in IMPLEMENTATION}})
+    print({"preflight_sha256": artifact.sha256, "questions": 10, "answer_calls": len(calls), "new_calls": 0}, flush=True)
+
+
+def load_preflight(root):
+    artifact = read_sealed_json(root / "preflight.json")
+    p = artifact.payload
+    if (p["format"] != "memory-condense-joint-spine-as-of-eval-v1" or
+            p["reader_policies"] != reader_policies() or p["routes"] != ROUTES or
+            p["short_controls"] != SHORT_CONTROLS or p["as_of_policy"] != AS_OF_POLICY or
+            p["source_coverage"] != SOURCE_COVERAGE_POLICY or p["term_coverage"] != TERM_COVERAGE_POLICY or
+            p["identical_evidence_arms"] != [] or p["identical_reader_arms"] != list(MEMORY_ARMS)):
+        raise ValueError("reader or routing comparison changed")
+    if p["implementation"] != {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in IMPLEMENTATION}:
+        raise ValueError("evaluation implementation changed")
+    if p["model"] != MODEL or p["gateway"] != GATEWAY:
+        raise ValueError("evaluation model or gateway changed")
+    fixed = {"max_tokens": 256, "concurrency": 1, "retries": 0,
+        "max_context_tokens": 3072, "max_raw_spans": 128, "max_answer_prompt_tokens": 5500,
+        "physical_answer_call_cap": 50, "gold_loaded": False,
+        "cached_query_vectors": False, "cached_predictions": False, "live_retrieval_included": True}
+    if any(type(p.get(key)) is not type(value) or p[key] != value for key, value in fixed.items()):
+        raise ValueError("answer budgets or live-execution policy changed")
+    control = seed_evaluation.load_preflight(Path(p["control_preflight_root"]))
+    if control.sha256 != p["control_preflight_sha256"] or any(p[key] != control.payload[key] for key in (
+        "index_root", "index_manifest_sha256", "addresses_root", "addresses_sha256",
+        "atoms_path", "atoms_sha256", "facets_root", "facets_sha256", "shard_offset",
+        "raw_token_proxy", "role_partition_sha256", "probes_sha256")):
+        raise ValueError("date experiment changed its frozen control memory")
+    validate_matched_calls(p["calls"])
+    validate_control_calls(control, p["calls"])
+    return artifact
+
+
+
+def validate_control_calls(control, calls):
+    original = {c["question"]["ordinal"]: c for c in control.payload["calls"] if c["arm"] == "semantic_seeds"}
+    if len(original) != 10 or len(calls) != 50:
+        raise ValueError("as-of comparison requires ten complete matched control questions")
+    offset = control.payload["shard_offset"]
+    for index, call in enumerate(calls):
+        ordinal = offset + index // 5
+        if (ordinal not in original or call["call_index"] != index or
+                call["question"] != original[ordinal]["question"] or
+                call["arm"] != call_arm_order(index // 5)[index % 5]):
+            raise ValueError("date comparison population or counterbalanced order changed")
+        if call["arm"] in ("semantic_seeds", "semantic_seeds_api") and call["messages"] != original[ordinal]["messages"]:
+            raise ValueError("semantic-seed control prompt changed")
+
+
+def validate_matched_calls(calls):
+    groups = {}
+    for call in calls:
+        key = call["question"]["ordinal"]
+        arm = call["arm"]
+        group = groups.setdefault(key, {})
+        if arm not in ARMS or arm in group or call["messages_sha256"] != identity_sha256(call["messages"]):
+            raise ValueError("matched call identity changed")
+        group[arm] = call
+    for group in groups.values():
+        if set(group) != set(ARMS):
+            raise ValueError("each question requires all memory and API control arms")
+        if any(call["question"] != group["short_api"]["question"] for call in group.values()):
+            raise ValueError("matched questions differ")
+        for arm in MEMORY_ARMS:
+            if group[arm]["messages"] != group[arm + "_api"]["messages"]:
+                raise ValueError("matched evidence prompts differ")
+            if group[arm]["messages"][0] != group[short_control(arm)]["messages"][0]:
+                raise ValueError("short API control uses another reader policy")
+        for arm in MEMORY_ARMS:
+            if group[short_control(arm)]["messages"] != answer_messages(group[arm]["question"], policy=arm):
+                raise ValueError("short API prompt does not match the declared reader and question")
+
+
+def answer_messages(question, hydrated=None, *, policy="semantic_seeds"):
+    if policy not in MEMORY_ARMS:
+        raise ValueError("unknown reader policy")
+    context = hydrated.render_context() if hydrated else ""
+    messages = [{"role": "system", "content": QA_SYSTEM_PROMPT}, {"role": "user", "content":
+        QA_USER_TEMPLATE.format(context=context or QA_NO_CONTEXT, question=question["prompt_question"])}]
+    if count_chat_prompt_token_proxy(messages) > 5500:
+        raise ValueError("answer prompt exceeds its budget")
+    return messages
+
+
+def recorded(root, preflight):
+    validate_matched_calls(preflight.payload["calls"])
+    results = []
+    for call in preflight.payload["calls"]:
+        prefix = root / "journal" / f'{call["call_index"]:03d}'
+        if prefix.with_suffix(".response.json").exists():
+            request = read_sealed_json(prefix.with_suffix(".request.json"))
+            response = read_sealed_json(prefix.with_suffix(".response.json"))
+            if (request.payload != {"preflight_sha256": preflight.sha256, "call": call} or
+                response.payload["request_sha256"] != request.sha256):
+                raise ValueError("stream response binding changed")
+            measurement = response.payload["measurement"]
+            if (measurement["prediction_sha256"] != quote_sha256(measurement["prediction"]) or
+                measurement["messages_sha256"] != identity_sha256(response.payload["messages"]) or
+                response.payload["messages"] != call["messages"] or
+                measurement["messages_sha256"] != call["messages_sha256"]):
+                raise ValueError("streamed prompt or prediction identity changed")
+            results.append((call, response))
+        elif prefix.with_suffix(".reserved").exists() or prefix.with_suffix(".request.json").exists():
+            raise ValueError("unacknowledged streamed call; preserve root and diagnose before any successor")
+    if [c["call_index"] for c, _ in results] != list(range(len(results))):
+        raise ValueError("stream journal contains a gap")
+    return results
+
+
+def answer_rows(observations):
+    return [{"call": c, "response_sha256": r.sha256, "prediction": r.payload["measurement"]["prediction"],
+             "prediction_sha256": r.payload["measurement"]["prediction_sha256"]} for c, r in observations]
+
+
+def run(root, max_calls):
+    preflight = load_preflight(root)
+    completed = recorded(root, preflight)
+    pending = preflight.payload["calls"][len(completed):]
+    if type(max_calls) is not int or not 1 <= max_calls <= len(pending):
+        raise ValueError("call budget must fit the remaining sealed population")
+    # Models and the full namespace are resident before any measured request.
+    setup_started = time.perf_counter()
+    memory = ResidentMemory(Path(preflight.payload["index_root"]), preflight.payload["index_manifest_sha256"],
+        Path(preflight.payload["addresses_root"]), Path(preflight.payload["atoms_path"]),
+        Path(preflight.payload["facets_root"]), preflight.payload["addresses_sha256"],
+        preflight.payload["atoms_sha256"], preflight.payload["facets_sha256"])
+    if memory.source_spine.index.receipt_sha256 != preflight.payload["role_partition_sha256"]:
+        raise ValueError("role partition changed")
+    resident_setup_s = time.perf_counter() - setup_started
+    client = _completion_client("LITELLM_KEY", GATEWAY)
+    try:
+        for call in pending[:max_calls]:
+            prefix = root / "journal" / f'{call["call_index"]:03d}'
+            prefix.parent.mkdir(parents=True, exist_ok=True)
+            with prefix.with_suffix(".reserved").open("x", encoding="utf-8") as handle:
+                handle.write(preflight.sha256 + "\n")
+            request, _ = publish_sealed_json(prefix.with_suffix(".request.json"), {"preflight_sha256": preflight.sha256, "call": call})
+            prepared = {}
+            def prompt():
+                q = call["question"]
+                if call["arm"] in MEMORY_ARMS:
+                    hydrated = memory.retrieve(q["retrieval_query"], ROUTES[call["arm"]], q["prompt_question"])
+                    messages = answer_messages(q, hydrated, policy=call["arm"])
+                    if messages != call["messages"]:
+                        raise ValueError("live retrieval changed the frozen matched-control prompt")
+                else:
+                    hydrated = None
+                    messages = [dict(row) for row in call["messages"]]
+                prepared.update(messages=messages, hydration=hydrated)
+                return messages
+            try:
+                result = measure_streaming_answer(client=client, model=MODEL, prepare_prompt=prompt, max_tokens=256)
+            except Exception as exc:
+                publish_sealed_json(prefix.with_suffix(".failure.json"), {"request_sha256": request.sha256,
+                    "exception_type": type(exc).__name__, "retry_performed": False})
+                raise
+            hydrated = prepared["hydration"]
+            publish_sealed_json(prefix.with_suffix(".response.json"), {"request_sha256": request.sha256,
+                "measurement": result, "messages": prepared["messages"],
+                "resident_setup_s_excluded_from_warm_latency": resident_setup_s,
+                "hydration": hydrated.identity_payload() if hydrated else None})
+            print({"call": call["call_index"], "arm": call["arm"], "ordinal": call["question"]["ordinal"],
+                "prepare_s": result["prepare_s"], "e2e_ttft_s": result["e2e_ttft_s"],
+                "e2e_total_s": result["e2e_total_s"], "hydration_diagnostics": len(hydrated.diagnostics) if hydrated else 0}, flush=True)
+    finally:
+        client.close()
+        memory.encoder.close()
+    observations = recorded(root, preflight)
+    if len(observations) == len(preflight.payload["calls"]):
+        answers, _ = publish_sealed_json(root / "answers.json", {"preflight_sha256": preflight.sha256,
+            "gold_loaded": False, "rows": answer_rows(observations)})
+        print({"answers_sha256": answers.sha256, "answers": len(observations)}, flush=True)
+
+
+def judge(root, enable):
+    from tools.run_hot_reduced30_answer_judge import _load_locked_validation_question_population
+    from tools.evaluate_user_spine_real_pilot import _batch
+    from memory_condense.eval.benchmark import build_judge_prompt
+    from memory_condense.eval._binary_judge_protocol import parse_binary_judge_verdict
+    preflight = load_preflight(root)
+    answers = read_sealed_json(root / "answers.json")
+    observations = recorded(root, preflight)
+    if (answers.payload["preflight_sha256"] != preflight.sha256 or len(observations) != len(preflight.payload["calls"]) or
+        answers.payload["rows"] != answer_rows(observations)):
+        raise ValueError("judge requires the complete sealed answer population")
+    _, questions = _load_locked_validation_question_population(
+        Path("C:/Users/Keytone/Downloads/memory-condense-rig/datasets/longmemeval_s_cleaned.json"),
+        Path("docs/10 - Research Log/data/longmemeval-95-target-split-v2.json"))
+    rows = []
+    for row in answers.payload["rows"]:
+        call = row["call"]
+        if call["arm"] not in MEMORY_ARMS:
+            continue
+        question = questions[call["question"]["ordinal"]]
+        if question.question_id != call["question"]["question_id"]:
+            raise ValueError("judge question binding changed")
+        rows.append({**row, "reference_sha256": quote_sha256(question.answer),
+                     "messages": build_judge_prompt(call["question"]["retrieval_query"], question.answer, row["prediction"])})
+    inputs, _ = publish_sealed_json(root / "judge-preflight.json", {"answers_sha256": answers.sha256, "rows": rows})
+    batch, calls, hits, _ = _batch(root, "judge", [r["messages"] for r in rows], inputs.sha256,
+        "codex_sdk/gpt-5.6-sol", 4096, JUDGE_MAX_TOKENS, GATEWAY, enable)
+    judged = [{**{k: r[k] for k in ("call", "prediction_sha256", "reference_sha256")},
+               "correct": parse_binary_judge_verdict(text), "verdict": text}
+              for r, text in zip(rows, batch.logical_completions, strict=True)]
+    timing = {arm: {metric: latency_distribution([r.payload["measurement"][metric] for c, r in observations if c["arm"] == arm])
+                   for metric in ("prepare_s", "e2e_ttft_s", "e2e_total_s")} for arm in ARMS}
+    counts = {arm: {"correct": sum(r["correct"] for r in judged if r["call"]["arm"] == arm),
+                    "count": sum(r["call"]["arm"] == arm for r in judged)} for arm in MEMORY_ARMS}
+    ratios = {arm: {baseline: {metric: {stat: timing[arm][metric][stat] / timing[baseline][metric][stat]
+                                      for stat in ("median_s", "p95_s")}
+                              for metric in ("e2e_ttft_s", "e2e_total_s")}
+                    for baseline in (short_control(arm), arm + "_api")} for arm in MEMORY_ARMS}
+    artifact, _ = publish_sealed_json(root / "joint-report.json", {"preflight_sha256": preflight.sha256,
+        "judge_preflight_sha256": inputs.sha256, "rows": judged, "accuracy": counts, "latency": timing,
+        "latency_ratios": ratios, "matched_control_prompts_verified_equal": True,
+        "same_streamed_answers_scored": True, "question_count": 10, "full100_target_eligible": False,
+        "response_journal_shas": [r.response_journal_sha256 for r in batch.unique_records]})
+    print({"joint_report_sha256": artifact.sha256, "accuracy": counts, "latency": timing,
+           "new_judge_calls": calls, "judge_replay_hits": hits, "full100_target_eligible": False}, flush=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("phase", choices=("prepare", "run", "judge"))
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--control-root", type=Path)
+    parser.add_argument("--max-calls", type=int)
+    parser.add_argument("--enable-provider", action="store_true")
+    args = parser.parse_args()
+    if args.phase == "prepare":
+        if args.enable_provider or args.control_root is None:
+            parser.error("prepare requires --control-root and makes no provider calls")
+        prepare(args.output_root, args.control_root)
+    elif args.phase == "run":
+        if not args.enable_provider:
+            parser.error("stream execution requires --enable-provider")
+        run(args.output_root, args.max_calls)
+    else:
+        judge(args.output_root, args.enable_provider)
+
+

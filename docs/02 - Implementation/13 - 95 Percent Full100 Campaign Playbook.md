@@ -76,6 +76,95 @@ resumable construction or partially completed provider campaign resumes only
 through its authenticated checkpoint scanner; do not delete checkpoints or
 journals and restart under the same name.
 
+## Parallel hot-memory v3 evaluator profile
+
+The sealed provider-free source-seed assertion hybrid is a separate fast-path
+experiment, not a rewrite of the 95/100 `policy-v5-r3` lineage above. It
+composes the v7 raw address-and-reach specialist with the v2 assertion-density
+specialist in this order: first v7 raw chunk per exact source, bounded
+1,400-token projection prefix, remaining v7 raw chunks, post-selection exact
+chunk-ID deduplication, binary prefix packing, and exact v7 raw fallback when
+the source-seed gate fails. Both arms must use the same authoritative chunk-ID
+namespace. The gate protects one source representative, not every potentially
+answer-bearing chunk in the raw remainder.
+
+The provider-free result is 93/100 complete-source packets, 56/100 literal
+containment, and 0.115009 mean best F1, versus v7's 93/100, 54/100, and
+0.099386. These figures do not establish answer accuracy. Incremental v3
+composition measured 141.25 ms mean and 172.52 ms p95 after its sealed v7 and
+v2 parents; parent retrieval/projection and provider latency are outside that
+boundary.
+
+```powershell
+$hotV3Tool = 'tools\evaluate_hot_retrieval_full100.py'
+$hotV3Root = 'eval_results\longmemeval-1m-hot-retrieval-source-seed-hybrid-v3-full100-validation-20260906'
+$hotV3Selection = '0e8027d3150bdf8335ad7a83d1a8bb4a5551312444fea2d5a4e820ece05eb3b7'
+```
+
+Use evaluator selection profile `source-seed-hybrid-v3`. The loader
+materializes the compact sealed v3 selection into the existing terminal arm
+`a3_protected_union`, so the answer and judge schemas remain compatible while
+their selection policy is explicit.
+
+Do not start this semantic lifecycle under an earlier v7 approval. It requires
+fresh explicit authorization for exactly 100 Terra calls carrying each dated
+locked-validation question plus sealed v3 evidence with no gold, followed by
+exactly 100 Sol calls carrying each question, reference answer, and sealed
+Terra prediction. After that authorization, the evaluator commands are:
+
+```powershell
+& $python $hotV3Tool `
+  --output-root $hotV3Root `
+  --expected-selection-sha256 $hotV3Selection `
+  --selection-profile source-seed-hybrid-v3 `
+  --authorized-provider-calls 100 `
+  answer
+
+& $python $hotV3Tool `
+  --output-root $hotV3Root `
+  --expected-selection-sha256 $hotV3Selection `
+  --selection-profile source-seed-hybrid-v3 `
+  --authorized-provider-calls 100 `
+  judge --dataset $dataset --split-manifest $split
+```
+
+On a resume, authorize only the exact authenticated missing-call count. Seal
+the Terra predictions before the judge opens references, and report the
+provider envelope separately from local retrieval/composition latency.
+
+## Online-graph v4, envelope, and prompt-policy fast-path branch
+
+This later branch is a separate low-latency experiment. It does not replace the
+proof-carrying `policy-v5-r3` lineage or inherit its 95/100 result. The frozen
+sequence and current judged outcomes are:
+
+| Stage | Selection or construction SHA-256 | Answer SHA-256 | Judge SHA-256 | Score |
+|---|---|---|---|---:|
+| User-envelope shadow r2 | `0ba317cefd6860623352078b58804285eaf02f46bc4524dd71e86585df81dbde` | n/a | n/a | structural only |
+| Envelope provider | `7a900be230d6bebf4cf882988ef4f548efb3baedf0264fe66185325982e25150` | `5114f5dfe1f17bcdea4e9b42f16fd885113e0230370830ff32f712a6e05a4909` | `b63414e0918d65d64ebcae0e14615b55cd3d95b7ca65804af90a658966ef8a00` | 69/100 |
+| Operation A, system policy only | `5ddaeb2249aaa3d3b27ee8cd1c513c37889ae8c596ff7c9f73ce578f5e5bf7d1` | `1761e8e7525606d1400092070dc30aa6b4bf3754ac8a0a3d4cf5a24340dff559` | `f1aa5d88750cb80bfaf0db5c620d5b4fb7192755c29906a0bf723fe944b929d5` | 72/100 |
+| Operation B, user-spine rendering | `2f78e015b2a9ccca8b5505ea81d1059e8ceebffa2474ac493bd1f2fae54c6928` | `75240a27db85a59de6e8d2e829b4806fa9935f16b4cb7060fed07717bb32dcdd` | `0bdf3d9d95b4c35c9af623a43c36d94ef33fb3f7d4642053cdeb52762b1b7569` | 73/100 |
+
+Use evaluator selection profiles `user-envelope-shadow-v1`,
+`operation-aware-v1`, and `user-spine-v1` respectively. Operation A must
+preserve the complete user/evidence message byte-for-byte. Operation B must
+preserve the selected evidence population, perform exact-ID deduplication only
+after selection, omit zero unique rows, and remain within the 8,000-token
+workspace cap.
+
+Each fresh answer or judge lifecycle requires an exact 100-call release with
+zero retries. A resume authorizes only the authenticated missing count. The
+answer phase must seal before gold is opened; rerunning a complete phase must
+produce 100 checkpoint hits and zero physical calls. Never reuse the
+un-suffixed envelope shadow root: it predates the backing-chunk fixes and lacks
+canonical replay/evaluation. The canonical shadow root ends in `-r2`.
+
+The envelope is structurally neutral at 99/100 source reach and 57/100 literal
+containment. Operation A's 9:6 and Operation B's 6:5 paired verdict splits are
+screening results, not promotion evidence. Keep all three policies opt-in and
+move the next successor to gold-blind operation-specific synthesis. Full
+analysis is in [Analysis 34](../08%20-%20Analysis/34%20-%20Full100%20envelope%20neutrality%20and%20prompt-policy%20screening%202026-09-07.md).
+
 ## Sealed authority and comparison point
 
 The campaign inherits these frozen parents; changing one starts a different

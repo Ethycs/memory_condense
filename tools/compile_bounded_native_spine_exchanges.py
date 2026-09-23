@@ -1,0 +1,258 @@
+"""Expand native exchanges with authenticated original, recovered and successor caches."""
+import argparse
+from dataclasses import asdict
+from pathlib import Path
+import shutil
+import psutil
+
+from memory_condense.domain._discourse_identity import identity_sha256
+from memory_condense.search.episodes.user_spine_hierarchy import compile_user_spine_exchanges
+from memory_condense.search.native_spine_merges import neutral_key
+from memory_condense.search.section_summary import SectionSummary
+from memory_condense.search.spine_merge_batch import PendingMerge
+from memory_condense.search.spine_summary_reuse import ReusingSpineSummarizer
+from tools import compile_native_spine_exchanges as original
+from tools import compile_reused_native_spine_exchanges as reused
+from tools import compile_recovered_native_spine_exchanges as recovered
+from tools import compile_expanding_native_spine_exchanges as legacy
+from tools.assemble_native_spine_summaries import digest
+from tools import native_spine_bounded_journal as bounded
+from tools.matched_eval.artifacts import publish_sealed_json, read_sealed_json
+from tools.native_qwen_spine_backend import NativeQwenBackend
+from tools.run_hot_reduced30_answer_judge import _phase_lock
+
+
+FORMAT = "native-spine-bounded-exchanges-v1"
+
+
+def implementation():
+    return {**legacy.implementation(), **bounded.implementation(), "tools/compile_bounded_native_spine_exchanges.py": digest(__file__)}
+
+
+def copy_inputs(source, root):
+    """Reuse immutable prepared bodies without retokenizing the raw corpus."""
+    source, root = Path(source).resolve(), Path(root).resolve()
+    with _phase_lock(root, 'bounded-exchange-input-copy'):
+        inputs = read_sealed_json(source/'inputs.json')
+        if inputs.payload['implementation'] != original.implementation():
+            raise ValueError('previous exchange inputs changed implementation')
+        for index, binding in enumerate(inputs.payload['bodies']):
+            old = (source/binding['path']).resolve()
+            old.relative_to(source/'bodies')
+            target = (root/binding['path']).resolve()
+            target.relative_to(root/'bodies')
+            body = read_sealed_json(old)
+            if body.sha256 != binding['sha256']:
+                raise ValueError('previous input body changed')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            for origin, destination in ((old, target),
+                    (old.with_name(old.name+'.sha256'), target.with_name(target.name+'.sha256'))):
+                if destination.exists():
+                    if digest(origin) != digest(destination):
+                        raise ValueError('copied input differs from its original')
+                else:
+                    shutil.copyfile(origin, destination)
+            if (index+1) % 1024 == 0:
+                print({'copied_input_bodies': index+1}, flush=True)
+        result, _ = publish_sealed_json(root/'inputs.json', inputs.payload)
+        if result.sha256 != inputs.sha256:
+            raise ValueError('copy changed the prepared input population')
+        return result
+
+
+def previous_journal(source, backend, inputs_sha, ancestors):
+    """Import accepted values and exhausted-attempt records from a retired stage."""
+    source = Path(source).resolve()
+    started = read_sealed_json(source.parent/'stages/exchanges.started.json')
+    terminal = read_sealed_json(source.parent/'stages/exchanges.exit.json')
+    if terminal.payload['returncode'] == 0 or terminal.payload['policy_sha256'] != started.payload['policy_sha256']:
+        raise ValueError('previous exchange stage must have a bound unsuccessful exit')
+    try:
+        process = psutil.Process(started.payload['pid'])
+        if process.create_time() == started.payload['create_time']:
+            raise ValueError('previous exchange stage is still live')
+    except psutil.NoSuchProcess:
+        pass
+    plan = read_sealed_json(source/'preflight.json')
+    inputs = read_sealed_json(source/'inputs.json')
+    p = plan.payload
+    if (p.get('producer_format') != legacy.FORMAT or p['producer_implementation'] != legacy.implementation()
+            or p['implementation'] != original.implementation() or p['inputs_sha256'] != inputs_sha
+            or inputs.sha256 != inputs_sha or p['backend_sha256'] != backend.identity_sha256
+            or p['reuse_roots'] != ancestors or p['raw_inputs_to_qwen'] is not False):
+        raise ValueError('retired exchange journal source or method changed')
+    journal = original.NeutralJournal(source, plan, backend, 0)
+    journal.replay()
+    files = {str(path.resolve()): read_sealed_json(path).sha256
+        for directory in ('requests', 'responses') for path in (source/directory).glob('*.json')}
+    receipt = {'root': str(source), 'preflight_sha256': plan.sha256,
+        'started_sha256': started.sha256, 'exit_sha256': terminal.sha256,
+        'journal_files_sha256': identity_sha256(files), 'accepted_merge_count': len(journal.cache.values),
+        'merge_cache_sha256': identity_sha256(journal.cache.values),
+        'attempted_sha256': identity_sha256(sorted(journal.attempted))}
+    return dict(journal.cache.values), set(journal.attempted), receipt
+
+
+def reusable_merges(roots, backend, sources_sha256, chain):
+    values, receipts, seen = {}, [], set()
+    for source in roots:
+        source = Path(source).resolve()
+        if source in seen or source in chain:
+            raise ValueError("duplicate or cyclic native exchange reuse root")
+        seen.add(source)
+        plan = read_sealed_json(source/"preflight.json")
+        inputs = read_sealed_json(source/"inputs.json")
+        if inputs.payload["sources_sha256"] != sources_sha256 or plan.payload["backend_sha256"] != backend.identity_sha256:
+            raise ValueError("native exchange reuse changed the source corpus or backend")
+        if plan.payload.get("producer_format") == FORMAT:
+            if plan.payload["producer_implementation"] != implementation():
+                raise ValueError("native exchange reuse producer changed")
+            result, cached = _execute(source, backend, 0, chain=chain)
+        elif plan.payload.get('producer_format') == legacy.FORMAT:
+            if plan.payload['producer_implementation'] != legacy.implementation():
+                raise ValueError('legacy expanded exchange producer changed')
+            result, cached = legacy._execute(source, backend, 0, chain=chain)
+        elif plan.payload.get("producer_format") == recovered.FORMAT:
+            if plan.payload["producer_implementation"] != recovered.implementation():
+                raise ValueError("recovered native exchange reuse producer changed")
+            result, cached = recovered._execute(source, backend, 0)
+        elif plan.payload.get("producer_format") == reused.FORMAT:
+            if plan.payload["producer_implementation"] != reused.implementation():
+                raise ValueError("earlier native exchange reuse producer changed")
+            result, cached = reused._execute(source, backend, 0, chain=chain)
+        elif "producer_format" not in plan.payload:
+            result = original.execute(source, backend, 0)
+            journal = original.NeutralJournal(source, plan, backend, 0)
+            journal.replay()
+            cached = journal.cache.values
+        else:
+            raise ValueError("unsupported native exchange reuse producer")
+        if result.payload["complete_available_body_exchanges"] is not True:
+            raise ValueError("native reuse requires completed source exchanges")
+        for key, value in cached.items():
+            if key in values and values[key] != value:
+                raise ValueError("conflicting accepted native exchange merge")
+            values[key] = value
+        receipts.append({"root": str(source), "preflight_sha256": plan.sha256,
+                         "result_sha256": result.sha256, "accepted_merge_count": len(cached),
+                         "merge_cache_sha256": identity_sha256(cached)})
+    return values, receipts
+
+
+def _execute(root, backend, budget=0, *, reuse_roots=None, previous_root=None, chain=()):
+    if type(budget) is not int or not 0 <= budget <= 128:
+        raise ValueError("native exchange compilation allows at most 128 new local jobs per invocation")
+    root = Path(root).resolve()
+    if root in chain:
+        raise ValueError("native exchange reuse roots form a cycle")
+    chain = (*chain, root)
+    with _phase_lock(root, "native-exchange-compilation"):
+        inputs = read_sealed_json(root / "inputs.json")
+        p = inputs.payload
+        if (p["implementation"] != original.implementation() or p["raw_text_included"] is not False
+                or p["question_or_gold_inputs"] is not False):
+            raise ValueError("native exchange source inputs changed")
+        saved = read_sealed_json(root/"preflight.json") if (root/"preflight.json").exists() else None
+        if reuse_roots is None:
+            reuse_roots = [Path(r["root"]) for r in saved.payload["reuse_roots"]] if saved else []
+        seed, reused = reusable_merges(reuse_roots, backend, p["sources_sha256"], chain)
+        if previous_root is None and saved and saved.payload.get('previous_journal'):
+            previous_root = saved.payload['previous_journal']['root']
+        attempted, previous = set(), None
+        if previous_root is not None:
+            if Path(previous_root).resolve() in chain:
+                raise ValueError('retired journal cannot form a reuse cycle')
+            accepted, attempted, previous = previous_journal(previous_root, backend, inputs.sha256, reused)
+            for key, value in accepted.items():
+                if key in seed and seed[key] != value:
+                    raise ValueError('retired journal conflicts with an accepted ancestor')
+                seed[key] = value
+        preflight, _ = publish_sealed_json(root / "preflight.json", {
+            "inputs_sha256": inputs.sha256, "backend": backend.identity,
+            "backend_sha256": backend.identity_sha256, "max_channel_tokens": 128,
+            "max_prompt_tokens": 2048, "maximum_new_local_jobs_per_invocation": 128,
+            "maximum_recovery_attempts": 2, "bounded_recovery_variants": list(bounded.VARIANTS), "automatic_retries": 0,
+            "raw_inputs_to_qwen": False, "timestamp_metadata_in_model_inputs": False,
+            "implementation": original.implementation(),
+            "producer_format": FORMAT, "producer_implementation": implementation(),
+            "reuse_roots": reused, "reused_merge_keys": len(seed),
+            "reused_merge_cache_sha256": identity_sha256(seed),
+            "previous_journal": previous,
+        })
+        groups, population = {}, []
+        for binding in p["bodies"]:
+            path = (root / binding["path"]).resolve()
+            path.relative_to((root / "bodies").resolve())
+            body = read_sealed_json(path)
+            b = body.payload
+            if (body.sha256 != binding["sha256"] or b["summary_body_store_sha256"] != p["summary_body_store_sha256"]
+                    or b["source"]["body_sha256"] != binding["body_sha256"] or b["raw_text_included"] is not False
+                    or binding["body_sha256"] in groups):
+                raise ValueError("native summary body input changed")
+            atoms = tuple(SectionSummary.from_dict(a) for a in b["atoms"])
+            groups[binding["body_sha256"]] = (body, atoms)
+            population.extend(s.receipt_sha256 for a in atoms for s in a.spans)
+        if len(groups) != p["body_count"] or len(population) != p["atom_count"] or len(set(population)) != len(population):
+            raise ValueError("native exchange atomic population changed")
+        journal = bounded.BoundedJournal(root, preflight, backend, budget)
+        journal.cache.values.update(seed)
+        journal.attempted.update(attempted)
+        journal.replay()
+        summarize = ReusingSpineSummarizer(journal.cache)
+        done, exchange_count = {}, 0
+        while len(done) < len(groups):
+            pending = {}
+            for sha, (body, atoms) in groups.items():
+                if sha in done:
+                    continue
+                try:
+                    exchanges = compile_user_spine_exchanges(atoms, summarize=summarize,
+                        summarizer_identity=preflight.sha256, max_channel_tokens=128, max_prompt_tokens=2048)
+                except PendingMerge as missing:
+                    pending.setdefault(neutral_key(missing.request), missing.request)
+                    continue
+                expected = tuple(s for atom in atoms for s in atom.spans)
+                if tuple(s for e in exchanges for s in e.section.spans) != expected:
+                    raise ValueError("native exchange compilation changed exact raw coverage")
+                artifact, _ = publish_sealed_json(root / "exchanges" / f"{sha}.json", {
+                    "preflight_sha256": preflight.sha256, "body_input_sha256": body.sha256,
+                    "body_sha256": sha, "exchanges": [asdict(e) for e in exchanges],
+                    "raw_span_population_sha256": identity_sha256([s.receipt_sha256 for s in expected]),
+                    "raw_inputs_to_qwen": False,
+                })
+                done[sha] = {"path": str(artifact.path.relative_to(root)), "sha256": artifact.sha256}
+                exchange_count += len(exchanges)
+            print({"complete_body_exchanges": len(done), "pending_merge_jobs": len(pending)}, flush=True)
+            before = len(journal.cache.values)
+            if pending and not journal.resolve(pending) and len(journal.cache.values) == before:
+                break
+            if not pending:
+                break
+        payload = {"preflight_sha256": preflight.sha256, "body_count": len(done),
+                   "prepared_body_count": len(groups), "exchange_count": exchange_count,
+                   "compiled_bodies": [done[sha] for sha in sorted(done)],
+                   "complete_available_body_exchanges": len(done) == len(groups),
+                   "complete_source_compilation": p["complete_source_compilation"],
+                   "raw_span_population_sha256": identity_sha256(population),
+                   "raw_inputs_to_qwen": False, "remote_provider_calls": 0,
+                   "hierarchies_compiled": False, "full100_target_passed": False}
+        filename = "result.json" if len(done) == len(groups) else f"partial-{identity_sha256(payload)}.json"
+        result, _ = publish_sealed_json(root / filename, payload)
+        print({"result_sha256": result.sha256, "complete_body_exchanges": len(done),
+               "exchanges": exchange_count, "new_local_jobs": journal.jobs, "new_local_batches": journal.calls}, flush=True)
+        return result, dict(journal.cache.values)
+
+
+def execute(root, backend, budget=0, *, reuse_roots=None, previous_root=None):
+    return _execute(root, backend, budget, reuse_roots=reuse_roots, previous_root=previous_root)[0]
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--reuse-root", type=Path, action="append")
+    parser.add_argument("--budget", type=int, default=0)
+    args = parser.parse_args()
+    backend = NativeQwenBackend(Path("eval_results/local-qwen-parent-summary-probe-20260910-r1"),
+        Path(".cache/local-qwen-runtime/site-packages"), Path("../../.cache/models/Qwen3-8B"))
+    execute(args.root, backend, args.budget, reuse_roots=args.reuse_root)

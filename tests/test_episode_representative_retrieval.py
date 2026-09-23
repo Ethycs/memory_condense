@@ -26,11 +26,18 @@ from memory_condense.search.closure.compiler import compile_query_program
 from memory_condense.search.closure.results import completion, obligation_results
 from memory_condense.search.closure.semantics import unit_obligation_ids
 from memory_condense.search.episodes import (
+    EpisodeRepresentativePrefilterPolicy,
     EpisodeRepresentativeRetrievalPolicy,
     EpisodeSourceCandidate,
     EpisodeSourceCandidateScope,
     episode_source_candidates_from_results,
     retrieve_episode_representatives,
+)
+from memory_condense.search.episodes.descriptor_index import (
+    EpisodeDescriptorScore,
+    EpisodeDescriptorScoreReceipt,
+    EpisodeDescriptorScoreResult,
+    EpisodeDescriptorScoreTiming,
 )
 
 
@@ -296,6 +303,189 @@ def test_empty_unattested_source_input_is_never_globally_exhaustive() -> None:
     assert plan.source_scope_receipt_sha256 is None
     assert plan.source_universe_exhaustive is False
     assert plan.candidate_scope_exhaustive is False
+
+
+def test_shadow_prefilter_preserves_exact_legacy_plan_and_qwen_groups() -> None:
+    rows = tuple(_episode(index, "source-a") for index in range(4))
+    store = _Store(rows)
+    vectors = {
+        rows[0][0].evidence[0].chunk_id: (1.0, 0.0),
+        rows[1][0].evidence[0].chunk_id: (0.8, 0.6),
+        rows[2][0].evidence[0].chunk_id: (0.0, 1.0),
+        rows[3][0].evidence[0].chunk_id: (-1.0, 0.0),
+    }
+    for episode, _ in rows:
+        chunk_id = episode.evidence[0].chunk_id
+        vector = vectors[chunk_id]
+        store.representatives[episode.episode_id] = (
+            EpisodeRepresentative(
+                episode_id=episode.episode_id,
+                chunk_id=chunk_id,
+                rank=0,
+                vector_identity_sha256=identity_sha256(
+                    {
+                        "method": "ordinary_embedding",
+                        "chunk_id": chunk_id,
+                        "vector": list(vector),
+                    }
+                ),
+            ),
+        )
+    source = (EpisodeSourceCandidate("source-a", 1.0),)
+    policy = EpisodeRepresentativeRetrievalPolicy(
+        artifact_id=ARTIFACT,
+        max_episodes_per_source=4,
+        max_total_episodes=4,
+        group_size=2,
+        top_k=1,
+    )
+    selected = rows[0][0].episode_id
+    legacy_linker = _Linker(selected)
+    shadow_linker = _Linker(selected)
+    legacy = retrieve_episode_representatives(
+        "find source A",
+        source,
+        store,
+        store.hydrate,
+        legacy_linker,
+        policy=policy,
+    )
+    observed = []
+    shadow = retrieve_episode_representatives(
+        "find source A",
+        source,
+        store,
+        store.hydrate,
+        shadow_linker,
+        policy=policy,
+        prefilter_policy=EpisodeRepresentativePrefilterPolicy(
+            mode="shadow",
+            cap=2,
+            top_k=1,
+            cutoff_margin=0.0,
+        ),
+        query_vector=(1.0, 0.0),
+        representative_embedding_loader=lambda chunk_ids: {
+            chunk_id: vectors[chunk_id] for chunk_id in chunk_ids
+        },
+        embedding_identity={"backend": "fixture", "dimension": 2},
+        prefilter_observer=observed.append,
+    )
+
+    assert shadow == legacy
+    assert shadow.receipt_sha256 == legacy.receipt_sha256
+    assert shadow_linker.calls == legacy_linker.calls
+    assert len(observed) == 1
+    assert observed[0].status == "shadow"
+    assert observed[0].proposal_ids == tuple(
+        episode.episode_id for episode, _ in rows[:2]
+    )
+    assert observed[0].output_ids == tuple(
+        episode.episode_id for episode, _ in rows
+    )
+
+
+def test_shadow_prefilter_completeness_bypass_never_loads_vectors() -> None:
+    row = _episode(0, "source-a")
+    store = _Store((row,))
+    observed = []
+
+    def fail_if_called(_chunk_ids):  # pragma: no cover - assertion is no call
+        raise AssertionError("completeness bypass touched descriptor storage")
+
+    plan = retrieve_episode_representatives(
+        "List all evidence",
+        (EpisodeSourceCandidate("source-a", 1.0),),
+        store,
+        store.hydrate,
+        _Linker(row[0].episode_id),
+        policy=EpisodeRepresentativeRetrievalPolicy(
+            artifact_id=ARTIFACT,
+            top_k=1,
+        ),
+        prefilter_policy=EpisodeRepresentativePrefilterPolicy(
+            mode="shadow",
+            cap=1,
+            top_k=1,
+        ),
+        representative_embedding_loader=fail_if_called,
+        embedding_identity={"backend": "fixture", "dimension": 2},
+        requires_complete_frontier=True,
+        prefilter_observer=observed.append,
+    )
+
+    assert plan.seeds[0].episode_id == row[0].episode_id
+    assert observed[0].reason == "requires_complete_frontier"
+
+
+def test_shadow_prefilter_uses_catalog_digest_bound_to_score_result() -> None:
+    rows = tuple(_episode(index, "source-a") for index in range(2))
+    store = _Store(rows)
+    catalog_digest = "c" * 64
+    embedding_identity = {"backend": "fixture", "dimension": 2}
+
+    class _DescriptorIndex:
+        @property
+        def receipt(self):  # pragma: no cover - assertion is no access
+            raise AssertionError("score binding must not reread mutable catalog state")
+
+        def score(self, query_vector, episode_ids, **_kwargs):
+            scores = tuple(
+                EpisodeDescriptorScore(episode_id, 1.0 - index)
+                for index, episode_id in enumerate(episode_ids)
+            )
+            receipt = EpisodeDescriptorScoreReceipt(
+                catalog_receipt_sha256=catalog_digest,
+                query_feature_sha256="a" * 64,
+                max_representatives=1,
+                offered_episode_ids=tuple(episode_ids),
+                ranked_scores=scores,
+            )
+            return EpisodeDescriptorScoreResult(
+                scores=scores,
+                receipt=receipt,
+                timing=EpisodeDescriptorScoreTiming(
+                    elapsed_ms=0.1,
+                    offered_count=len(scores),
+                    representative_count=len(scores),
+                    semantic_receipt_sha256=receipt.receipt_sha256,
+                ),
+            )
+
+    observed = []
+    plan = retrieve_episode_representatives(
+        "find source A",
+        (EpisodeSourceCandidate("source-a", 1.0),),
+        store,
+        store.hydrate,
+        _Linker(rows[0][0].episode_id),
+        policy=EpisodeRepresentativeRetrievalPolicy(
+            artifact_id=ARTIFACT,
+            max_episodes_per_source=2,
+            max_total_episodes=2,
+            top_k=1,
+        ),
+        prefilter_policy=EpisodeRepresentativePrefilterPolicy(
+            mode="shadow",
+            cap=1,
+            top_k=1,
+            cutoff_margin=0.0,
+        ),
+        query_vector=(1.0, 0.0),
+        representative_descriptor_index=_DescriptorIndex(),
+        embedding_identity=embedding_identity,
+        prefilter_observer=observed.append,
+    )
+
+    assert plan.seeds[0].episode_id == rows[0][0].episode_id
+    assert observed[0].status == "shadow"
+    assert (
+        observed[0].semantic_receipt.descriptor_catalog_receipt_sha256
+        == catalog_digest
+    )
+    assert observed[0].semantic_receipt.embedding_identity_sha256 == identity_sha256(
+        embedding_identity
+    )
 
 
 def test_source_and_episode_caps_are_explicit_and_order_deterministic() -> None:

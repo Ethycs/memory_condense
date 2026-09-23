@@ -42,6 +42,9 @@ from memory_condense.eval.recall_guarded_cumulative_provider_synthesis_runtime i
     CENTRAL_DEV_GATEWAY_URL,
     _gateway_model,
 )
+from memory_condense.eval.recall_guarded_cumulative_validation_retrieval import (
+    VALIDATION_SHARD_RETRIEVAL_FORMAT,
+)
 from memory_condense.eval.recall_guarded_cumulative_semantic_judge_runtime import (
     DEFAULT_JUDGE_MODEL,
     SEMANTIC_JUDGE_RUNTIME_FORMAT,
@@ -55,6 +58,12 @@ FINAL_ANSWER_SEMANTIC_JUDGE_FORMAT = (
 )
 FINAL_ANSWER_SEMANTIC_JUDGE_CAMPAIGN_FORMAT = (
     "memory-condense-fixed-stage-final-answer-semantic-judge-campaign-v1"
+)
+RETENTION_ASSAY_SEMANTIC_JUDGE_FORMAT = (
+    "memory-condense-validation10-fixed-stage-retention-assay-score-v1"
+)
+RETENTION_ASSAY_SEMANTIC_JUDGE_CAMPAIGN_FORMAT = (
+    "memory-condense-validation10-fixed-stage-retention-assay-campaign-v1"
 )
 LOCKED_JUDGE_MODEL = DEFAULT_JUDGE_MODEL
 LOCKED_JUDGE_GATEWAY_MODEL = "codex_sdk/gpt-5.6-sol"
@@ -100,6 +109,37 @@ FINAL_ANSWER_SEMANTIC_JUDGE_POLICY = {
 FINAL_ANSWER_SEMANTIC_JUDGE_POLICY_SHA256 = identity_sha256(
     FINAL_ANSWER_SEMANTIC_JUDGE_POLICY
 )
+
+
+def final_answer_semantic_judge_policy_identity(
+    fixed_stage_id: str = FIXED_STAGE_ID,
+    *,
+    retention_assay: bool = False,
+) -> tuple[dict[str, Any], str]:
+    """Return a stage-bound judge policy, retaining the historical S1 seal."""
+
+    if not retention_assay and fixed_stage_id == FIXED_STAGE_ID:
+        return (
+            dict(FINAL_ANSWER_SEMANTIC_JUDGE_POLICY),
+            FINAL_ANSWER_SEMANTIC_JUDGE_POLICY_SHA256,
+        )
+    policy = dict(FINAL_ANSWER_SEMANTIC_JUDGE_POLICY)
+    policy["fixed_stage_id"] = fixed_stage_id
+    if retention_assay:
+        policy.update(
+            {
+                "format": (
+                    "memory-condense-validation10-fixed-stage-retention-"
+                    "assay-semantic-judge-policy-v1"
+                ),
+                "gate_unit": "fresh sealed 10Q fixed-stage retention assay",
+                "minimum_questions": 10,
+                "claim_scope": (
+                    "retention assay only; not terminal-v5-r3 or confirmation200"
+                ),
+            }
+        )
+    return policy, identity_sha256(policy)
 
 
 class FinalAnswerSemanticJudgeRuntime(Protocol):
@@ -208,17 +248,25 @@ def _validate_answer_rows_before_gold(
     artifact_sha256: str,
     retrieval_sha256: str,
     sample: BenchmarkSample,
+    fixed_stage_id: str = FIXED_STAGE_ID,
 ) -> list[_BoundQuestion]:
     """Validate all answer/retrieval state before reading ``question.answer``."""
 
     # This validator is deliberately the first operation.  In particular,
     # no question answer is hashed, formatted, or otherwise observed above it.
-    validate_final_answer_artifact(
-        artifact,
-        retrieval=retrieval,
-        artifact_sha256=artifact_sha256,
-        retrieval_sha256=retrieval_sha256,
-    )
+    validator_kwargs = {
+        "retrieval": retrieval,
+        "artifact_sha256": artifact_sha256,
+        "retrieval_sha256": retrieval_sha256,
+    }
+    if fixed_stage_id == FIXED_STAGE_ID:
+        validate_final_answer_artifact(artifact, **validator_kwargs)
+    else:
+        validate_final_answer_artifact(
+            artifact,
+            fixed_stage_id=fixed_stage_id,
+            **validator_kwargs,
+        )
     _attest_responder_runtime(artifact)
     responder_identity = artifact["runtime_identity"]
     responder_identity_sha256 = _require_sha256(
@@ -268,7 +316,7 @@ def _validate_answer_rows_before_gold(
         or artifact.get("retrieval_sha256") != retrieval_sha256
         or artifact.get("population_identity_sha256")
         != retrieval.get("population_identity_sha256")
-        or artifact.get("fixed_stage_id") != FIXED_STAGE_ID
+        or artifact.get("fixed_stage_id") != fixed_stage_id
         or artifact.get("gold_fields_present") is not False
     ):
         raise ValueError("fixed-stage answer/retrieval binding changed")
@@ -286,9 +334,16 @@ def _validate_answer_rows_before_gold(
 
     bound: list[_BoundQuestion] = []
     seen: set[str] = set()
-    for ordinal, (source, retrieval_row, question) in enumerate(
+    ordinal_base = 0
+    if retrieval.get("format") == VALIDATION_SHARD_RETRIEVAL_FORMAT:
+        shard_offset = retrieval.get("shard_offset")
+        if type(shard_offset) is not int or shard_offset < 0:
+            raise ValueError("validation shard retrieval omitted its offset")
+        ordinal_base = shard_offset
+    for local_ordinal, (source, retrieval_row, question) in enumerate(
         zip(rows, retrieval_rows, sample_questions, strict=True)
     ):
+        ordinal = ordinal_base + local_ordinal
         if not isinstance(source, Mapping) or not isinstance(
             retrieval_row, Mapping
         ):
@@ -310,7 +365,7 @@ def _validate_answer_rows_before_gold(
             or retrieval_row.get("question_sha256") != question_sha
             or source.get("dated_question_sha256") != dated_sha
             or retrieval_row.get("dated_question_sha256") != dated_sha
-            or source.get("fixed_stage_id") != FIXED_STAGE_ID
+            or source.get("fixed_stage_id") != fixed_stage_id
             or source.get("prompt_token_cap") != RESPONDER_PROMPT_CAP
             or source.get("output_token_reserve")
             != RESPONDER_OUTPUT_TOKEN_RESERVE
@@ -390,6 +445,7 @@ def _plan_judgments(
     artifact_sha256: str,
     retrieval_sha256: str,
     sample: BenchmarkSample,
+    fixed_stage_id: str = FIXED_STAGE_ID,
 ) -> list[_PlannedJudgment]:
     bound = _validate_answer_rows_before_gold(
         artifact,
@@ -397,6 +453,7 @@ def _plan_judgments(
         artifact_sha256=artifact_sha256,
         retrieval_sha256=retrieval_sha256,
         sample=sample,
+        fixed_stage_id=fixed_stage_id,
     )
     planned: list[_PlannedJudgment] = []
     # Gold access begins here, after the complete answer artifact, retrieval,
@@ -468,6 +525,8 @@ def build_final_answer_semantic_judge_campaign_binding(
     artifact_sha256: str,
     retrieval_sha256: str,
     authorized_unique_calls: int,
+    fixed_stage_id: str = FIXED_STAGE_ID,
+    retention_assay: bool = False,
 ) -> dict[str, Any]:
     """Preflight the complete fixed-stage judge population without calls."""
 
@@ -480,6 +539,11 @@ def build_final_answer_semantic_judge_campaign_binding(
         artifact_sha256=artifact_sha256,
         retrieval_sha256=retrieval_sha256,
         sample=sample,
+        fixed_stage_id=fixed_stage_id,
+    )
+    policy, policy_sha256 = final_answer_semantic_judge_policy_identity(
+        fixed_stage_id,
+        retention_assay=retention_assay,
     )
     unique = _unique_prompts(planned)
     if authorized_unique_calls != len(unique):
@@ -489,7 +553,11 @@ def build_final_answer_semantic_judge_campaign_binding(
             f"{len(unique)})"
         )
     binding = {
-        "format": FINAL_ANSWER_SEMANTIC_JUDGE_CAMPAIGN_FORMAT,
+        "format": (
+            RETENTION_ASSAY_SEMANTIC_JUDGE_CAMPAIGN_FORMAT
+            if retention_assay
+            else FINAL_ANSWER_SEMANTIC_JUDGE_CAMPAIGN_FORMAT
+        ),
         "final_answer_artifact_sha256": artifact_sha256,
         "responder_runtime_identity_sha256": artifact[
             "runtime_identity_sha256"
@@ -504,7 +572,7 @@ def build_final_answer_semantic_judge_campaign_binding(
         "population_identity_sha256": artifact["population_identity_sha256"],
         "gold_scoring_population_sha256": _gold_population_sha256(planned),
         "question_count": len(planned),
-        "fixed_stage_id": FIXED_STAGE_ID,
+        "fixed_stage_id": fixed_stage_id,
         "ordered_judgment_population_sha256": identity_sha256(
             [
                 {
@@ -540,12 +608,10 @@ def build_final_answer_semantic_judge_campaign_binding(
             default=0,
         ),
         "authorized_unique_judge_calls": authorized_unique_calls,
-        "semantic_judge_policy_sha256": (
-            FINAL_ANSWER_SEMANTIC_JUDGE_POLICY_SHA256
-        ),
+        "semantic_judge_policy_sha256": policy_sha256,
         "semantic_judge_implementation_sha256": implementation,
         "target_accuracy": TARGET_ACCURACY,
-        "minimum_questions": MINIMUM_GATE_QUESTIONS,
+        "minimum_questions": int(policy["minimum_questions"]),
         "responder_model": LOCKED_RESPONDER_MODEL,
         "responder_max_new_tokens": RESPONDER_OUTPUT_TOKEN_RESERVE,
         "responder_prompt_cap": RESPONDER_PROMPT_CAP,
@@ -558,17 +624,22 @@ def build_final_answer_semantic_judge_campaign_binding(
     return binding
 
 
-def _accuracy_status(correct: int, questions: int) -> dict[str, Any]:
+def _accuracy_status(
+    correct: int,
+    questions: int,
+    *,
+    minimum_questions: int = MINIMUM_GATE_QUESTIONS,
+) -> dict[str, Any]:
     accuracy = correct / questions if questions else 0.0
     accuracy_met = accuracy >= TARGET_ACCURACY
-    population_met = questions >= MINIMUM_GATE_QUESTIONS
+    population_met = questions >= minimum_questions
     return {
         "questions": questions,
         "correct": correct,
         "incorrect": questions - correct,
         "binary_accuracy": accuracy,
         "target_accuracy": TARGET_ACCURACY,
-        "minimum_questions": MINIMUM_GATE_QUESTIONS,
+        "minimum_questions": minimum_questions,
         "minimum_correct_at_observed_population": math.ceil(
             TARGET_ACCURACY * questions
         ),
@@ -625,6 +696,8 @@ def judge_recall_guarded_cumulative_final_answers(
     artifact_sha256: str,
     retrieval_sha256: str,
     runtime: FinalAnswerSemanticJudgeRuntime,
+    fixed_stage_id: str = FIXED_STAGE_ID,
+    retention_assay: bool = False,
 ) -> dict[str, Any]:
     """Judge one fixed-stage answer per question and apply the locked gate."""
 
@@ -635,7 +708,13 @@ def judge_recall_guarded_cumulative_final_answers(
         artifact_sha256=artifact_sha256,
         retrieval_sha256=retrieval_sha256,
         sample=sample,
+        fixed_stage_id=fixed_stage_id,
     )
+    policy, policy_sha256 = final_answer_semantic_judge_policy_identity(
+        fixed_stage_id,
+        retention_assay=retention_assay,
+    )
+    minimum_questions = int(policy["minimum_questions"])
     unique = _unique_prompts(planned)
     runtime_identity = _runtime_identity(runtime)
     _attest_judge_runtime(runtime_identity)
@@ -652,6 +731,8 @@ def judge_recall_guarded_cumulative_final_answers(
         artifact_sha256=artifact_sha256,
         retrieval_sha256=retrieval_sha256,
         authorized_unique_calls=authorized,
+        fixed_stage_id=fixed_stage_id,
+        retention_assay=retention_assay,
     )
     runtime_identity_sha256 = identity_sha256(runtime_identity)
     campaign_binding_sha256 = identity_sha256(campaign)
@@ -733,7 +814,7 @@ def judge_recall_guarded_cumulative_final_answers(
                 "dated_question_sha256": row.dated_question_sha256,
                 "gold_answer_sha256": row.gold_answer_sha256,
                 "prediction_sha256": row.prediction_sha256,
-                "fixed_stage_id": FIXED_STAGE_ID,
+                "fixed_stage_id": fixed_stage_id,
                 "answer_call_key_sha256": row.answer_call_key_sha256,
                 "answer_response_journal_sha256": (
                     row.answer_response_journal_sha256
@@ -743,17 +824,29 @@ def judge_recall_guarded_cumulative_final_answers(
                 **outcome,
             }
         )
-    aggregate = _accuracy_status(sum(verdicts), len(verdicts))
+    aggregate = _accuracy_status(
+        sum(verdicts),
+        len(verdicts),
+        minimum_questions=minimum_questions,
+    )
     category_aggregates = [
         {
             "category": category,
-            **_accuracy_status(sum(values), len(values)),
+            **_accuracy_status(
+                sum(values),
+                len(values),
+                minimum_questions=minimum_questions,
+            ),
         }
         for category, values in sorted(category_values.items())
     ]
     reports = [outcome["completion_report"] for outcome in outcomes.values()]
     result = {
-        "format": FINAL_ANSWER_SEMANTIC_JUDGE_FORMAT,
+        "format": (
+            RETENTION_ASSAY_SEMANTIC_JUDGE_FORMAT
+            if retention_assay
+            else FINAL_ANSWER_SEMANTIC_JUDGE_FORMAT
+        ),
         "final_answer_artifact_sha256": artifact_sha256,
         "responder_runtime_identity_sha256": artifact[
             "runtime_identity_sha256"
@@ -770,15 +863,13 @@ def judge_recall_guarded_cumulative_final_answers(
         "question_count": len(planned),
         "gold_loaded_posthoc": True,
         "independent_llm_judge": True,
-        "fixed_stage_id": FIXED_STAGE_ID,
+        "fixed_stage_id": fixed_stage_id,
         "responder_model": LOCKED_RESPONDER_MODEL,
         "judge_model": LOCKED_JUDGE_MODEL,
         "judge_runtime_identity": runtime_identity,
         "judge_runtime_identity_sha256": identity_sha256(runtime_identity),
-        "semantic_judge_policy": dict(FINAL_ANSWER_SEMANTIC_JUDGE_POLICY),
-        "semantic_judge_policy_sha256": (
-            FINAL_ANSWER_SEMANTIC_JUDGE_POLICY_SHA256
-        ),
+        "semantic_judge_policy": policy,
+        "semantic_judge_policy_sha256": policy_sha256,
         "semantic_judge_implementation_sha256": implementation,
         "campaign_binding": campaign,
         "campaign_binding_sha256": identity_sha256(campaign),
@@ -803,8 +894,8 @@ def judge_recall_guarded_cumulative_final_answers(
         "aggregate": aggregate,
         "target_gate": {
             **aggregate,
-            "gate_unit": "one preregistered fixed retrieval stage",
-            "fixed_stage_id": FIXED_STAGE_ID,
+            "gate_unit": policy["gate_unit"],
+            "fixed_stage_id": fixed_stage_id,
         },
     }
     if implementation_sha256() != implementation:
@@ -821,7 +912,10 @@ __all__ = [
     "LOCKED_JUDGE_MAX_NEW_TOKENS",
     "LOCKED_JUDGE_MODEL",
     "MINIMUM_GATE_QUESTIONS",
+    "RETENTION_ASSAY_SEMANTIC_JUDGE_CAMPAIGN_FORMAT",
+    "RETENTION_ASSAY_SEMANTIC_JUDGE_FORMAT",
     "TARGET_ACCURACY",
     "build_final_answer_semantic_judge_campaign_binding",
+    "final_answer_semantic_judge_policy_identity",
     "judge_recall_guarded_cumulative_final_answers",
 ]

@@ -65,6 +65,7 @@ from memory_condense.eval.reproducibility import file_sha256
 from memory_condense.eval.schemas import EvalConfig
 from memory_condense.ingest.chunker import Chunker
 from memory_condense.persistence.db import CURRENT_SCHEMA_VERSION, Database
+from memory_condense.persistence.pending_ingest_store import PendingIngestManifest
 from memory_condense.search.indexes.lexical import term_frequencies
 
 
@@ -92,6 +93,14 @@ _BASE_DERIVED_TABLES = (
     "hebbian_chunk_nodes",
     "memory_items",
     "memory_provenance",
+    "memory_identity_retirements",
+    "memory_successor_redirects",
+    "pending_corrections",
+    "pending_enrichment_dispositions",
+    "pending_enrichment_legacy_quarantine",
+    "pending_enrichment_state",
+    "pending_enrichments",
+    "pending_ingest_attempts",
 )
 
 # A deterministic base ingests the complete sample through one ``ingest_many``
@@ -659,8 +668,120 @@ def _audit_store(
             (_BASE_INDEX_REVISION_KEY, _BASE_INDEX_REVISION),
             ("next_hnsw_label", str(len(labels))),
             ("schema_version", str(CURRENT_SCHEMA_VERSION)),
+            ("v15_legacy_retirement_boundary", "0"),
         ]:
             raise DiffuseBaseArtifactError("base SQLite metadata is not pristine")
+        expected_manifest_chunks: dict[
+            str, list[tuple[str, int, int, int, str]]
+        ] = {turn_id: [] for turn_id in turn_text}
+        for (
+            chunk_id,
+            turn_id,
+            text,
+            start_char,
+            end_char,
+            token_count,
+        ) in expected_chunks:
+            expected_manifest_chunks[turn_id].append(
+                (
+                    chunk_id,
+                    start_char,
+                    end_char,
+                    token_count,
+                    hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                )
+            )
+        ingest_receipt_rows = db.execute(
+            "SELECT p.turn_id, p.manifest_sha256, p.manifest_json, p.status, "
+            "p.created_at, p.indexed_at FROM pending_ingests AS p "
+            "JOIN turns AS t ON t.turn_id = p.turn_id ORDER BY t.ordinal"
+        ).fetchall()
+        ingest_receipts: list[list[str]] = []
+        if [str(row[0]) for row in ingest_receipt_rows] != list(turn_text):
+            raise DiffuseBaseArtifactError(
+                "base ingest receipts differ from the source turns"
+            )
+        for row in ingest_receipt_rows:
+            turn_id = str(row[0])
+            try:
+                manifest = PendingIngestManifest.from_json(str(row[2]))
+            except ValueError as exc:
+                raise DiffuseBaseArtifactError(
+                    "base ingest receipt manifest is invalid"
+                ) from exc
+            manifest_chunks = tuple(
+                (
+                    chunk.chunk_id,
+                    chunk.start_char,
+                    chunk.end_char,
+                    chunk.token_count,
+                    chunk.text_sha256,
+                )
+                for chunk in manifest.chunks
+            )
+            if (
+                manifest.turn_id != turn_id
+                or manifest.sha256 != str(row[1])
+                or manifest_chunks != tuple(expected_manifest_chunks[turn_id])
+                or str(row[3]) != "indexed"
+                or not str(row[4])
+                or row[5] is None
+                or not str(row[5])
+            ):
+                raise DiffuseBaseArtifactError(
+                    "base ingest receipts are not pristine indexed receipts"
+                )
+            ingest_receipts.append([turn_id, manifest.sha256, "indexed"])
+        reservation_rows = [
+            (
+                str(row[0]),
+                str(row[1]),
+                int(row[2]),
+                int(row[3]),
+                int(row[4]),
+                str(row[5]),
+            )
+            for row in db.execute(
+                "SELECT r.chunk_id, r.turn_id, r.start_char, r.end_char, "
+                "r.token_count, r.text_sha256 "
+                "FROM ingest_chunk_reservations AS r "
+                "JOIN turns AS t ON t.turn_id = r.turn_id "
+                "ORDER BY t.ordinal, r.start_char, r.end_char, r.chunk_id"
+            ).fetchall()
+        ]
+        expected_reservations = [
+            (
+                chunk_id,
+                turn_id,
+                start_char,
+                end_char,
+                token_count,
+                hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            )
+            for (
+                chunk_id,
+                turn_id,
+                text,
+                start_char,
+                end_char,
+                token_count,
+            ) in expected_chunks
+        ]
+        if reservation_rows != expected_reservations:
+            raise DiffuseBaseArtifactError(
+                "base ingest reservations differ from deterministic chunks"
+            )
+        pending_work_schedule = [
+            (str(stage), int(prefer_retry))
+            for stage, prefer_retry in db.execute(
+                "SELECT stage, prefer_retry FROM pending_work_schedule "
+                "ORDER BY stage"
+            ).fetchall()
+        ]
+        if pending_work_schedule != [("enrichment", 1), ("ingest", 1)]:
+            raise DiffuseBaseArtifactError(
+                "base pending-work schedule is not pristine"
+            )
         source_ids, streams_sha256 = _source_stream_identity(db)
         derived_counts = {
             table: int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
@@ -684,7 +805,14 @@ def _audit_store(
             {
                 "derived_row_counts": derived_counts,
                 "discourse_revision_state": list(revision[0]),
+                "ingest_receipts": ingest_receipts,
+                "ingest_reservations_sha256": canonical_sha256(
+                    [list(row) for row in reservation_rows]
+                ),
                 "meta": [list(row) for row in meta_rows],
+                "pending_work_schedule": [
+                    list(row) for row in pending_work_schedule
+                ],
             }
         )
     index = hnswlib.Index(

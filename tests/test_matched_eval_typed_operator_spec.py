@@ -6,6 +6,7 @@ from tools.matched_eval.typed_operator_spec import (
     AnswerShape,
     SlotKind,
     TemporalMode,
+    canonicalize_question_text,
     compile_typed_operator_spec,
 )
 
@@ -24,6 +25,8 @@ Q75 = """[Question asked at 2023/05/25 (Thu) 15:52]
 How much more did I spend on accommodations per night in Hawaii compared to Tokyo?"""
 Q97 = """[Question asked at 2023/05/30 (Tue) 16:15]
 Did I receive a higher percentage discount on my first order from HelloFresh, compared to my first UberEats order?"""
+Q93 = """[Question asked at 2023/03/28 (Tue) 20:35]
+What was the significant buisiness milestone I mentioned four weeks ago?"""
 
 
 def test_question_only_api_cannot_accept_posthoc_fields() -> None:
@@ -66,6 +69,15 @@ def test_q77_has_event_boundary_participant_and_implicit_query_time_end() -> Non
         and row.relation_constraint == "participant_singular"
         for row in spec.required_slots
     )
+
+
+def test_q93_canonicalizes_bounded_typo_before_question_only_routing() -> None:
+    spec = compile_typed_operator_spec(Q93)
+    canonical = canonicalize_question_text(Q93)
+
+    assert spec.temporal_mode is TemporalMode.RELATIVE_SELECT
+    assert "business milestone" in canonical
+    assert "buisiness" not in canonical
 
 
 def test_q16_has_residence_state_and_interval_boundary_slots() -> None:

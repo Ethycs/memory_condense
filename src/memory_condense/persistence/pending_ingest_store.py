@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
 from memory_condense.domain.schemas import Chunk, Turn
@@ -14,6 +14,28 @@ from memory_condense.persistence.db import Database
 
 
 _MANIFEST_FORMAT = "memory-condense-pending-ingest-v1"
+_SQLITE_PARAMETER_BUDGET = 500
+_MAX_FAILURE_KIND_CHARS = 80
+
+
+def _failure_kind(error: BaseException) -> str:
+    """Return a bounded class label without persisting exception payloads."""
+    raw = type(error).__name__
+    safe = "".join(
+        character if character.isascii() and character.isalnum() else "_"
+        for character in raw
+    ).strip("_")
+    return (safe or "Exception")[:_MAX_FAILURE_KIND_CHARS]
+
+
+def _retry_at(previous_attempts: int, now: datetime) -> str:
+    """Retry once immediately, then apply bounded exponential backoff."""
+    delay_seconds = (
+        0.0
+        if previous_attempts == 0
+        else min(60.0, 1.0 * (2 ** min(previous_attempts - 1, 6)))
+    )
+    return (now + timedelta(seconds=delay_seconds)).isoformat()
 
 
 def _sha256_text(value: str) -> str:
@@ -279,57 +301,125 @@ class PendingIngestStore:
         self._db = db
 
     def claim(self, manifest: PendingIngestManifest) -> str:
-        """Insert/adopt an exact manifest and return its durable status."""
+        """Insert/adopt an exact manifest and return its durable status.
+
+        For compatibility, a caller without a transaction gets one opened and
+        still owns the eventual commit. Bulk :meth:`claim_many` requires its
+        caller to establish the transaction explicitly.
+        """
+        connection = self._db.connection
+        started = not connection.in_transaction
+        if started:
+            connection.execute("BEGIN IMMEDIATE")
+        try:
+            return self.claim_many((manifest,))[manifest.turn_id]
+        except BaseException:
+            if started:
+                connection.rollback()
+            raise
+
+    def claim_many(
+        self,
+        manifests: Sequence[PendingIngestManifest],
+    ) -> dict[str, str]:
+        """Atomically adopt exact manifests and return status by turn ID.
+
+        The caller owns the surrounding write transaction. Reads, receipt
+        inserts, and globally unique chunk reservations are set-oriented and
+        split only to remain below SQLite's conservative parameter budget.
+        """
+        by_turn: dict[str, PendingIngestManifest] = {}
+        for manifest in manifests:
+            previous = by_turn.setdefault(manifest.turn_id, manifest)
+            if previous != manifest:
+                raise ValueError("conflicting pending manifests in one claim")
+        if not by_turn:
+            return {}
+        if not self._db.connection.in_transaction:
+            raise RuntimeError("claim_many requires an active caller transaction")
+
+        turn_ids = list(by_turn)
+        records = self._get_records(turn_ids)
+        durable = self._durable_manifests(turn_ids)
         now = datetime.now(timezone.utc).isoformat()
-        record = self._get_record(manifest.turn_id)
-        if record is not None:
-            if record[0] != manifest:
+        pending_rows: list[tuple[object, ...]] = []
+
+        for turn_id, manifest in by_turn.items():
+            record = records.get(turn_id)
+            durable_record = durable.get(turn_id)
+            if record is not None:
+                if record[0] != manifest:
+                    raise ValueError(
+                        "turn already has a different pending chunk manifest"
+                    )
+                if durable_record is not None and durable_record[0] != manifest:
+                    raise ValueError(
+                        "turn durable chunk topology no longer matches its receipt"
+                    )
+                if (
+                    durable_record is None
+                    and record[1] == "indexed"
+                    and manifest.chunks
+                ):
+                    raise ValueError(
+                        "indexed ingest receipt has no durable chunk topology"
+                    )
+                continue
+
+            if durable_record is not None and durable_record[0] != manifest:
+                raise ValueError(
+                    "turn already has a different durable chunk topology"
+                )
+            already_indexed = durable_record is not None and durable_record[1]
+            status = (
+                "indexed" if not manifest.chunks or already_indexed else "pending"
+            )
+            pending_rows.append(
+                (
+                    turn_id,
+                    manifest.sha256,
+                    manifest.canonical_json,
+                    status,
+                    now,
+                    now if status == "indexed" else None,
+                )
+            )
+
+        self._insert_rows(
+            "INSERT INTO pending_ingests "
+            "(turn_id, manifest_sha256, manifest_json, status, created_at, indexed_at) "
+            "VALUES ",
+            "(?, ?, ?, ?, ?, ?)",
+            pending_rows,
+            " ON CONFLICT(turn_id) DO NOTHING",
+        )
+
+        # Re-read every row even when it existed before this call. That keeps
+        # exact-manifest adoption fail closed if this connection is ever used
+        # without SQLite's expected BEGIN IMMEDIATE writer serialization.
+        records = self._get_records(turn_ids)
+        for turn_id, manifest in by_turn.items():
+            record = records.get(turn_id)
+            if record is None or record[0] != manifest:
                 raise ValueError(
                     "turn already has a different pending chunk manifest"
                 )
-            self._claim_reservations(manifest)
-            durable = self._durable_manifest(manifest.turn_id)
-            if durable is not None and durable[0] != manifest:
-                raise ValueError(
-                    "turn durable chunk topology no longer matches its receipt"
-                )
-            if durable is None and record[1] == "indexed" and manifest.chunks:
-                raise ValueError(
-                    "indexed ingest receipt has no durable chunk topology"
-                )
-            return record[1]
 
-        durable = self._durable_manifest(manifest.turn_id)
-        if durable is not None and durable[0] != manifest:
-            raise ValueError("turn already has a different durable chunk topology")
-        already_indexed = durable is not None and durable[1]
-        status = (
-            "indexed"
-            if not manifest.chunks or already_indexed
-            else "pending"
-        )
-        self._db.execute(
-            "INSERT INTO pending_ingests "
-            "(turn_id, manifest_sha256, manifest_json, status, created_at, indexed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(turn_id) DO NOTHING",
-            (
-                manifest.turn_id,
-                manifest.sha256,
-                manifest.canonical_json,
-                status,
-                now,
-                now if status == "indexed" else None,
-            ),
-        )
-        record = self._get_record(manifest.turn_id)
-        if record is None or record[0] != manifest:
-            raise ValueError("turn already has a different pending chunk manifest")
-        self._claim_reservations(manifest)
-        return record[1]
+        self._claim_reservations_many(tuple(by_turn.values()))
+        return {turn_id: records[turn_id][1] for turn_id in by_turn}
 
     def get(self, turn_id: str) -> PendingIngestManifest | None:
-        record = self._get_record(turn_id)
-        return record[0] if record is not None else None
+        return self.get_many((turn_id,)).get(turn_id)
+
+    def get_many(
+        self,
+        turn_ids: Sequence[str],
+    ) -> dict[str, PendingIngestManifest]:
+        """Load existing sealed topologies with bounded set queries."""
+        return {
+            turn_id: record[0]
+            for turn_id, record in self._get_records(turn_ids).items()
+        }
 
     def validate_chunk_membership(
         self,
@@ -374,7 +464,8 @@ class PendingIngestStore:
             batch = chunk_ids[start : start + 500]
             placeholders = ",".join("?" for _ in batch)
             rows = self._db.execute(
-                "SELECT chunk_id, embedding, hnsw_label, term_count FROM chunks "
+                "SELECT chunk_id, embedding IS NOT NULL, "
+                "hnsw_label IS NOT NULL, term_count IS NOT NULL FROM chunks "
                 f"WHERE chunk_id IN ({placeholders})",
                 tuple(batch),
             ).fetchall()
@@ -407,35 +498,54 @@ class PendingIngestStore:
                     and receipt_status.get(turn_id) == "indexed"
                 ):
                     state = durable_state.get(chunk.chunk_id)
-                    if state is None or any(value is None for value in state[1:]):
+                    if state is None or not all(bool(value) for value in state[1:]):
                         terminal_turns.add(turn_id)
         if terminal_turns:
             raise PendingIngestAlreadyIndexedError(tuple(terminal_turns))
 
-    def _claim_reservations(self, manifest: PendingIngestManifest) -> None:
-        """Insert or verify one manifest's globally unique chunk ownership."""
-        self._db.executemany(
+    def _claim_reservations_many(
+        self,
+        manifests: Sequence[PendingIngestManifest],
+    ) -> None:
+        """Insert or verify globally unique ownership for many manifests."""
+        expected: dict[str, tuple[str, PendingChunkManifest]] = {}
+        expected_by_turn: dict[str, set[str]] = {
+            manifest.turn_id: set() for manifest in manifests
+        }
+        reservation_rows: list[tuple[object, ...]] = []
+        for manifest in manifests:
+            turn_chunk_ids = expected_by_turn[manifest.turn_id]
+            for row in manifest.chunks:
+                owner = expected.get(row.chunk_id)
+                if owner is not None:
+                    raise ValueError(
+                        "pending manifests reuse one chunk identity"
+                    )
+                expected[row.chunk_id] = (manifest.turn_id, row)
+                turn_chunk_ids.add(row.chunk_id)
+                reservation_rows.append(
+                    (
+                        row.chunk_id,
+                        manifest.turn_id,
+                        row.start_char,
+                        row.end_char,
+                        row.token_count,
+                        row.text_sha256,
+                    )
+                )
+
+        self._insert_rows(
             "INSERT INTO ingest_chunk_reservations "
             "(chunk_id, turn_id, start_char, end_char, token_count, text_sha256) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chunk_id) DO NOTHING",
-            [
-                (
-                    row.chunk_id,
-                    manifest.turn_id,
-                    row.start_char,
-                    row.end_char,
-                    row.token_count,
-                    row.text_sha256,
-                )
-                for row in manifest.chunks
-            ],
+            "VALUES ",
+            "(?, ?, ?, ?, ?, ?)",
+            reservation_rows,
+            " ON CONFLICT(chunk_id) DO NOTHING",
         )
 
-        expected = {row.chunk_id: row for row in manifest.chunks}
         actual: dict[str, tuple] = {}
         chunk_ids = list(expected)
-        for start in range(0, len(chunk_ids), 500):
-            batch = chunk_ids[start : start + 500]
+        for batch in self._batches(chunk_ids):
             placeholders = ",".join("?" for _ in batch)
             rows = self._db.execute(
                 "SELECT chunk_id, turn_id, start_char, end_char, token_count, "
@@ -445,9 +555,9 @@ class PendingIngestStore:
             ).fetchall()
             actual.update((str(row[0]), row) for row in rows)
 
-        for chunk_id, expected_row in expected.items():
+        for chunk_id, (turn_id, expected_row) in expected.items():
             row = actual.get(chunk_id)
-            if row is None or str(row[1]) != manifest.turn_id:
+            if row is None or str(row[1]) != turn_id:
                 raise ValueError(
                     "chunk identity is reserved by a different ingest manifest"
                 )
@@ -459,63 +569,124 @@ class PendingIngestStore:
             ):
                 raise ValueError("ingest chunk reservation is inconsistent")
 
-        owned_ids = {
-            str(row[0])
-            for row in self._db.execute(
-                "SELECT chunk_id FROM ingest_chunk_reservations WHERE turn_id = ?",
-                (manifest.turn_id,),
+        owned_by_turn = {turn_id: set() for turn_id in expected_by_turn}
+        for batch in self._batches(list(expected_by_turn)):
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._db.execute(
+                "SELECT turn_id, chunk_id FROM ingest_chunk_reservations "
+                f"WHERE turn_id IN ({placeholders})",
+                tuple(batch),
             ).fetchall()
-        }
-        if owned_ids != set(expected):
+            for turn_id, chunk_id in rows:
+                owned_by_turn[str(turn_id)].add(str(chunk_id))
+        if owned_by_turn != expected_by_turn:
             raise ValueError("turn has a different reserved chunk topology")
+
+    @staticmethod
+    def _batches(values: Sequence[str]) -> list[Sequence[str]]:
+        return [
+            values[start : start + _SQLITE_PARAMETER_BUDGET]
+            for start in range(0, len(values), _SQLITE_PARAMETER_BUDGET)
+        ]
+
+    def _insert_rows(
+        self,
+        prefix: str,
+        row_placeholder: str,
+        rows: Sequence[tuple[object, ...]],
+        suffix: str,
+    ) -> None:
+        if not rows:
+            return
+        row_width = len(rows[0])
+        if row_width <= 0 or any(len(row) != row_width for row in rows):
+            raise ValueError("batched SQL rows must have one fixed positive width")
+        batch_size = max(1, _SQLITE_PARAMETER_BUDGET // row_width)
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start : start + batch_size]
+            placeholders = ",".join(row_placeholder for _ in batch)
+            parameters = tuple(value for row in batch for value in row)
+            self._db.execute(prefix + placeholders + suffix, parameters)
+
+    def _get_records(
+        self,
+        turn_ids: Sequence[str],
+    ) -> dict[str, tuple[PendingIngestManifest, str]]:
+        records: dict[str, tuple[PendingIngestManifest, str]] = {}
+        for batch in self._batches(list(dict.fromkeys(turn_ids))):
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._db.execute(
+                "SELECT turn_id, manifest_sha256, manifest_json, status "
+                "FROM pending_ingests "
+                f"WHERE turn_id IN ({placeholders})",
+                tuple(batch),
+            ).fetchall()
+            for turn_id, manifest_sha256, manifest_json, status_value in rows:
+                turn_id_value = str(turn_id)
+                manifest = PendingIngestManifest.from_json(str(manifest_json))
+                if (
+                    manifest.turn_id != turn_id_value
+                    or manifest.sha256 != str(manifest_sha256)
+                ):
+                    raise ValueError(
+                        "pending ingest manifest receipt is inconsistent"
+                    )
+                status = str(status_value)
+                if status not in {"pending", "indexed"}:
+                    raise ValueError("pending ingest manifest has an invalid status")
+                records[turn_id_value] = (manifest, status)
+        return records
 
     def _get_record(
         self, turn_id: str
     ) -> tuple[PendingIngestManifest, str] | None:
-        row = self._db.execute(
-            "SELECT manifest_sha256, manifest_json, status FROM pending_ingests "
-            "WHERE turn_id = ?",
-            (turn_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        manifest = PendingIngestManifest.from_json(str(row[1]))
-        if manifest.turn_id != turn_id or manifest.sha256 != str(row[0]):
-            raise ValueError("pending ingest manifest receipt is inconsistent")
-        status = str(row[2])
-        if status not in {"pending", "indexed"}:
-            raise ValueError("pending ingest manifest has an invalid status")
-        return manifest, status
+        return self._get_records((turn_id,)).get(turn_id)
+
+    def _durable_manifests(
+        self,
+        turn_ids: Sequence[str],
+    ) -> dict[str, tuple[PendingIngestManifest, bool]]:
+        grouped: dict[str, list[tuple]] = {}
+        for batch in self._batches(list(dict.fromkeys(turn_ids))):
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._db.execute(
+                "SELECT turn_id, chunk_id, text, start_char, end_char, token_count, "
+                "embedding IS NOT NULL, hnsw_label IS NOT NULL, "
+                "term_count IS NOT NULL FROM chunks "
+                f"WHERE turn_id IN ({placeholders}) "
+                "ORDER BY turn_id, start_char, end_char, chunk_id",
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                grouped.setdefault(str(row[0]), []).append(row)
+
+        output: dict[str, tuple[PendingIngestManifest, bool]] = {}
+        for turn_id, rows in grouped.items():
+            rows.sort(key=lambda row: (int(row[3]), int(row[4]), str(row[1])))
+            manifest = PendingIngestManifest(
+                turn_id=turn_id,
+                chunks=tuple(
+                    PendingChunkManifest(
+                        chunk_id=str(row[1]),
+                        start_char=int(row[3]),
+                        end_char=int(row[4]),
+                        token_count=int(row[5]),
+                        text_sha256=_sha256_text(str(row[2])),
+                    )
+                    for row in rows
+                ),
+            )
+            complete = all(
+                bool(row[6]) and bool(row[7]) and bool(row[8])
+                for row in rows
+            )
+            output[turn_id] = (manifest, complete)
+        return output
 
     def _durable_manifest(
         self, turn_id: str
     ) -> tuple[PendingIngestManifest, bool] | None:
-        rows = self._db.execute(
-            "SELECT chunk_id, text, start_char, end_char, token_count, "
-            "embedding, hnsw_label, term_count FROM chunks "
-            "WHERE turn_id = ? ORDER BY start_char, end_char, chunk_id",
-            (turn_id,),
-        ).fetchall()
-        if not rows:
-            return None
-        manifest = PendingIngestManifest(
-            turn_id=turn_id,
-            chunks=tuple(
-                PendingChunkManifest(
-                    chunk_id=str(row[0]),
-                    start_char=int(row[2]),
-                    end_char=int(row[3]),
-                    token_count=int(row[4]),
-                    text_sha256=_sha256_text(str(row[1])),
-                )
-                for row in rows
-            ),
-        )
-        complete = all(
-            row[5] is not None and row[6] is not None and row[7] is not None
-            for row in rows
-        )
-        return manifest, complete
+        return self._durable_manifests((turn_id,)).get(turn_id)
 
     def list_pending(self) -> list[PendingIngestManifest]:
         rows = self._db.execute(
@@ -541,6 +712,124 @@ class PendingIngestStore:
             ).fetchone()[0]
         )
 
+    def choose_retry_class(self, now: str) -> bool | None:
+        """Alternate retry/fresh classes when both are currently eligible."""
+        connection = self._db.connection
+        if connection.in_transaction:
+            raise RuntimeError(
+                "choose_retry_class requires no active caller transaction"
+            )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            fresh = bool(
+                connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM pending_ingests AS p "
+                    "LEFT JOIN pending_ingest_attempts AS a "
+                    "ON a.turn_id = p.turn_id "
+                    "WHERE p.status = 'pending' AND a.turn_id IS NULL)"
+                ).fetchone()[0]
+            )
+            retry = bool(
+                connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM pending_ingests AS p "
+                    "JOIN pending_ingest_attempts AS a ON a.turn_id = p.turn_id "
+                    "WHERE p.status = 'pending' AND a.next_attempt_at <= ?)",
+                    (now,),
+                ).fetchone()[0]
+            )
+            if fresh and retry:
+                row = connection.execute(
+                    "SELECT prefer_retry FROM pending_work_schedule "
+                    "WHERE stage = 'ingest'"
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("ingest retry schedule is missing")
+                choice = bool(row[0])
+                connection.execute(
+                    "UPDATE pending_work_schedule "
+                    "SET prefer_retry = 1 - prefer_retry "
+                    "WHERE stage = 'ingest'"
+                )
+            elif retry:
+                choice = True
+            elif fresh:
+                choice = False
+            else:
+                choice = None
+            connection.commit()
+            return choice
+        except BaseException:
+            connection.rollback()
+            raise
+
+    def record_failure(
+        self, turn_ids: Sequence[str], error: BaseException
+    ) -> None:
+        """Persist one failed T1 attempt without consuming its receipt.
+
+        Failed rows sort behind never-attempted work.  This gives later turns
+        a chance to become searchable while retaining every failed manifest
+        for inspection and deterministic repair.
+        """
+        unique_ids = tuple(dict.fromkeys(str(turn_id) for turn_id in turn_ids))
+        if not unique_ids:
+            return
+        kind = _failure_kind(error)
+        now_value = datetime.now(timezone.utc)
+        connection = self._db.connection
+        if connection.in_transaction:
+            connection.rollback()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            previous: dict[str, int] = {}
+            for start in range(0, len(unique_ids), _SQLITE_PARAMETER_BUDGET):
+                batch = unique_ids[start : start + _SQLITE_PARAMETER_BUDGET]
+                placeholders = ",".join("?" for _ in batch)
+                previous.update(
+                    (str(row[0]), int(row[1]))
+                    for row in connection.execute(
+                        "SELECT turn_id, attempt_count "
+                        "FROM pending_ingest_attempts "
+                        f"WHERE turn_id IN ({placeholders})",
+                        tuple(batch),
+                    ).fetchall()
+                )
+            dissolving_failed_cohort = len(unique_ids) > 1 and all(
+                previous.get(turn_id, 0) == 1 for turn_id in unique_ids
+            )
+            connection.executemany(
+                "INSERT INTO pending_ingest_attempts "
+                "(turn_id, attempt_count, last_attempt_at, next_attempt_at, "
+                " last_error_kind) "
+                "SELECT ?, ?, ?, ?, ? WHERE EXISTS "
+                "(SELECT 1 FROM pending_ingests "
+                " WHERE turn_id = ? AND status = 'pending') "
+                "ON CONFLICT(turn_id) DO UPDATE SET "
+                "attempt_count = excluded.attempt_count, "
+                "last_attempt_at = excluded.last_attempt_at, "
+                "next_attempt_at = excluded.next_attempt_at, "
+                "last_error_kind = excluded.last_error_kind",
+                [
+                    (
+                        turn_id,
+                        previous.get(turn_id, 0) + 1,
+                        now_value.isoformat(),
+                        (
+                            now_value.isoformat()
+                            if dissolving_failed_cohort
+                            else _retry_at(previous.get(turn_id, 0), now_value)
+                        ),
+                        kind,
+                        turn_id,
+                    )
+                    for turn_id in unique_ids
+                ],
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
     def finalize(self, manifests: Sequence[PendingIngestManifest]) -> None:
         """Prove complete durable indexing, then seal receipts before commit."""
         by_turn: dict[str, PendingIngestManifest] = {}
@@ -549,9 +838,10 @@ class PendingIngestStore:
             if previous != manifest:
                 raise ValueError("conflicting pending manifests in one finalizer")
 
+        records = self._get_records(tuple(by_turn))
         already_indexed: list[str] = []
         for manifest in by_turn.values():
-            record = self._get_record(manifest.turn_id)
+            record = records.get(manifest.turn_id)
             if record is None:
                 raise RuntimeError("pending ingest completion has no manifest receipt")
             if record[0] != manifest:
@@ -623,14 +913,24 @@ class PendingIngestStore:
                 )
 
         indexed_at = datetime.now(timezone.utc).isoformat()
-        for manifest in by_turn.values():
+        manifest_rows = [
+            (manifest.turn_id, manifest.sha256) for manifest in by_turn.values()
+        ]
+        batch_size = max(1, (_SQLITE_PARAMETER_BUDGET - 1) // 2)
+        for start in range(0, len(manifest_rows), batch_size):
+            batch = manifest_rows[start : start + batch_size]
+            placeholders = ",".join("(?, ?)" for _ in batch)
+            parameters = (indexed_at,) + tuple(
+                value for row in batch for value in row
+            )
             updated = self._db.execute(
                 "UPDATE pending_ingests SET status = 'indexed', "
                 "indexed_at = COALESCE(indexed_at, ?) "
-                "WHERE turn_id = ? AND manifest_sha256 = ?",
-                (indexed_at, manifest.turn_id, manifest.sha256),
+                "WHERE status = 'pending' "
+                f"AND (turn_id, manifest_sha256) IN (VALUES {placeholders})",
+                parameters,
             ).rowcount
-            if updated != 1:
+            if updated != len(batch):
                 raise RuntimeError(
                     "pending ingest completion lost its manifest receipt"
                 )

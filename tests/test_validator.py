@@ -308,6 +308,28 @@ def test_update_existing_mem_id_is_accepted(db):
     assert len(report.accepted.update) == 1
 
 
+def test_mutations_of_retired_mem_id_are_rejected(db):
+    turn = _turn(db)
+    store = MemoryStore(db)
+    item = store.create(_create(turn.turn_id, "I prefer dark mode"))
+    assert store.delete(DeleteOp(mem_id=item.mem_id))
+
+    report = Validator(db).validate(
+        MemoryOps(
+            update=[UpdateOp(mem_id=item.mem_id, content="new content")],
+            delete=[DeleteOp(mem_id=item.mem_id)],
+            pin=[PinOp(mem_id=item.mem_id, pin=PinState.USER)],
+        )
+    )
+
+    assert report.accepted.is_empty()
+    assert {(error.op_kind, error.reason) for error in report.rejected} == {
+        ("update", REASON_INVALID_MEM_STATUS),
+        ("delete", REASON_INVALID_MEM_STATUS),
+        ("pin", REASON_INVALID_MEM_STATUS),
+    }
+
+
 def test_update_with_bad_quote_is_rejected(db):
     """Provenance is optional on an update, but anything supplied must be real."""
     turn = _turn(db)

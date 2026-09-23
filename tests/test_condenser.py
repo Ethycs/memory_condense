@@ -2031,7 +2031,7 @@ class TestIngest:
                 == chunks[0].chunk_id
             )
 
-    def test_generated_turn_embedding_failure_publishes_nothing(self, tmp_path):
+    def test_generated_turn_embedding_failure_leaves_durable_capture(self, tmp_path):
         with MemoryCondenser(
             data_dir=tmp_path / "generated-failure",
             embedder=FailOnceEmbedder(),
@@ -2039,11 +2039,15 @@ class TestIngest:
             chunker_min_tokens=1,
         ) as condenser:
             with pytest.raises(RuntimeError, match="synthetic embedding failure"):
-                condenser.ingest("user", "A generated turn must remain staged.")
+                condenser.ingest("user", "A generated turn must remain captured.")
 
-            assert condenser.transcript.count() == 0
+            assert condenser.transcript.count() == 1
+            assert condenser.pending_ingest_count() == 1
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
 
-    def test_batch_embedding_failure_publishes_no_turns(self, tmp_path):
+    def test_batch_embedding_failure_leaves_durable_captures(self, tmp_path):
         with MemoryCondenser(
             data_dir=tmp_path / "batch-failure",
             embedder=FailOnceEmbedder(),
@@ -2058,7 +2062,11 @@ class TestIngest:
                     ]
                 )
 
-            assert condenser.transcript.count() == 0
+            assert condenser.transcript.count() == 2
+            assert condenser.pending_ingest_count() == 2
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM chunks"
+            ).fetchone()[0] == 0
 
     @pytest.mark.parametrize(
         "first_role,first_text,second_role,second_text",
@@ -2762,7 +2770,7 @@ class TestIngest:
             "unembedded",
         ],
     )
-    def test_ingest_rejects_invalid_embedder_output_before_publication(
+    def test_ingest_rejects_invalid_embedder_output_after_durable_capture(
         self, tmp_path, defect
     ):
         with MemoryCondenser(
@@ -2774,19 +2782,22 @@ class TestIngest:
             with pytest.raises(ValueError, match="embedder"):
                 condenser.ingest(
                     "user",
-                    "No malformed provider result may publish this turn.",
+                    "No malformed provider result may index this turn.",
                     turn_id="invalid-single-turn",
                 )
 
-            assert condenser.transcript.count() == 0
+            assert condenser.transcript.count() == 1
             assert condenser._db.execute(
-                "SELECT COUNT(*) FROM pending_ingests"
-            ).fetchone()[0] == 0
+                "SELECT COUNT(*) FROM pending_ingests WHERE status = 'pending'"
+            ).fetchone()[0] == 1
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM ingest_chunk_reservations"
+            ).fetchone()[0] > 0
             assert condenser._db.execute(
                 "SELECT COUNT(*) FROM chunks"
             ).fetchone()[0] == 0
 
-    def test_ingest_many_rejects_invalid_embedder_output_before_publication(
+    def test_ingest_many_rejects_invalid_embedder_output_after_durable_capture(
         self, tmp_path
     ):
         with MemoryCondenser(
@@ -2798,15 +2809,18 @@ class TestIngest:
             with pytest.raises(ValueError, match="complete chunk identity set"):
                 condenser.ingest_many(
                     [
-                        ("user", "First unpublished provider turn.", "source"),
-                        ("assistant", "Second unpublished provider turn.", "source"),
+                        ("user", "First captured provider turn.", "source"),
+                        ("assistant", "Second captured provider turn.", "source"),
                     ]
                 )
 
-            assert condenser.transcript.count() == 0
+            assert condenser.transcript.count() == 2
             assert condenser._db.execute(
-                "SELECT COUNT(*) FROM pending_ingests"
-            ).fetchone()[0] == 0
+                "SELECT COUNT(*) FROM pending_ingests WHERE status = 'pending'"
+            ).fetchone()[0] == 2
+            assert condenser._db.execute(
+                "SELECT COUNT(*) FROM ingest_chunk_reservations"
+            ).fetchone()[0] > 0
             assert condenser._db.execute(
                 "SELECT COUNT(*) FROM chunks"
             ).fetchone()[0] == 0
@@ -3058,7 +3072,7 @@ class TestIngest:
             assert condenser.pending_ingest_count() == 0
             assert condenser.search_hybrid("silver batch", k=1)
 
-    def test_completed_manifest_rejects_a_different_chunk_topology(
+    def test_completed_manifest_replays_sealed_topology_across_chunker_change(
         self, tmp_path
     ):
         data_dir = tmp_path / "completed-topology"
@@ -3092,13 +3106,15 @@ class TestIngest:
             chunker_min_tokens=1,
             chunker_max_tokens=100,
         ) as wide:
-            with pytest.raises(ValueError, match="different pending chunk manifest"):
-                wide.ingest(
-                    "user",
-                    text,
-                    created_at=source_time,
-                    turn_id="topology-turn",
-                )
+            _retried_turn, retried_chunks = wide.ingest(
+                "user",
+                text,
+                created_at=source_time,
+                turn_id="topology-turn",
+            )
+            assert [chunk.chunk_id for chunk in retried_chunks] == [
+                chunk.chunk_id for chunk in narrow_chunks
+            ]
             assert wide._pending_ingests.get("topology-turn") == receipt
             assert wide._db.execute("SELECT COUNT(*) FROM chunks").fetchone()[
                 0
@@ -3239,13 +3255,15 @@ class TestIngest:
                 "WHERE turn_id = 'migrated-indexed-turn'"
             ).fetchone()[0] == len(indexed_chunks)
             assert migrated._pending_ingests.get("migrated-raw-turn") is None
-            with pytest.raises(ValueError, match="different pending chunk manifest"):
-                migrated.ingest(
-                    "user",
-                    indexed_text,
-                    created_at=source_time,
-                    turn_id="migrated-indexed-turn",
-                )
+            _indexed_turn, replayed_chunks = migrated.ingest(
+                "user",
+                indexed_text,
+                created_at=source_time,
+                turn_id="migrated-indexed-turn",
+            )
+            assert [chunk.chunk_id for chunk in replayed_chunks] == [
+                chunk.chunk_id for chunk in indexed_chunks
+            ]
 
             _raw_turn, raw_chunks = migrated.ingest(
                 "user",

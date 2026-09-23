@@ -3,6 +3,7 @@ import json
 import pytest
 
 from memory_condense.ingest.extractor import (
+    ExtractionUnavailableError,
     MEMORY_OPS_SYSTEM_PROMPT,
     RULES,
     LLMExtractor,
@@ -290,6 +291,67 @@ def test_llm_extractor_swallows_transport_errors():
 
     ops = LLMExtractor(boom).extract([turn("We decided to use Postgres.")])
     assert ops.is_empty()
+
+
+def test_llm_extractor_durable_mode_distinguishes_failure_from_valid_noop():
+    t = turn("A neutral statement with no memory operation.")
+
+    with pytest.raises(ExtractionUnavailableError, match="provider failed"):
+        LLMExtractor(
+            lambda _system, _user: (_ for _ in ()).throw(
+                RuntimeError("provider exploded")
+            )
+        ).extract_durable([t])
+    with pytest.raises(ExtractionUnavailableError, match="invalid operations"):
+        LLMExtractor(lambda _system, _user: "not-json").extract_durable([t])
+    with pytest.raises(ExtractionUnavailableError, match="invalid operations"):
+        LLMExtractor(lambda _system, _user: "{}").extract_durable([t])
+    with pytest.raises(ExtractionUnavailableError, match="invalid operations"):
+        LLMExtractor(
+            lambda _system, _user: '{"error": "rate limit"}'
+        ).extract_durable([t])
+    with pytest.raises(ExtractionUnavailableError, match="invalid operations"):
+        LLMExtractor(
+            lambda _system, _user: (
+                '{"create": [], "update": [], "supersede": [], '
+                '"delete": [], "pin": [], "warning": "partial"}'
+            )
+        ).extract_durable([t])
+
+    valid_empty = (
+        '{"create": [], "update": [], "supersede": [], '
+        '"delete": [], "pin": []}'
+    )
+    assert LLMExtractor(
+        lambda _system, _user: valid_empty
+    ).extract_durable([t]).is_empty()
+
+
+def test_llm_deferred_enrichment_prompt_matches_create_only_authority():
+    t = turn("Actually, I prefer blue now.")
+    observed = []
+    valid_empty = (
+        '{"create": [], "update": [], "supersede": [], '
+        '"delete": [], "pin": []}'
+    )
+
+    def complete(system, _user):
+        observed.append(system)
+        return valid_empty
+
+    LLMExtractor(complete).extract_durable_for_enrichment([t])
+    assert "Deferred-enrichment constraint" in observed[0]
+    assert "REPLACES hard rule 4" in observed[0]
+    assert "Do not emit `supersede`" in observed[0]
+    assert "`Correction` create" in observed[0]
+    assert "explicit target-bound supersede resolves it" in observed[0]
+    assert "Return empty" in observed[0]
+
+
+def test_rule_deferred_enrichment_preserves_unbound_correction_signal():
+    t = turn("Actually the deadline is Thursday.")
+    ops = RuleBasedExtractor().extract_durable_for_enrichment([t])
+    assert [op.type for op in ops.create] == [MemoryType.CORRECTION]
 
 
 def test_llm_extractor_no_turns_means_no_call():

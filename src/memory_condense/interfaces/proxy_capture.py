@@ -14,8 +14,9 @@ account exports.  Responses differ and are handled per provider.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
 from memory_condense.ingest.transcripts import (
@@ -217,6 +218,57 @@ class ExchangeCapture:
     request_sha256: str
     prompt_tokens_estimate: int
 
+    def compact_for_ingest(self) -> ExchangeCapture:
+        """Retain only prompt state that :meth:`ingest_records` can emit."""
+
+        last_user = next(
+            (message for message in reversed(self.prompt) if message.role == "user"),
+            None,
+        )
+        prompt = (
+            ()
+            if last_user is None
+            else (
+                replace(
+                    last_user,
+                    message_id=(
+                        f"{self.conversation_id}:user:"
+                        f"{self.request_sha256}"
+                    ),
+                ),
+            )
+        )
+        if prompt == self.prompt:
+            return self
+        return replace(self, prompt=prompt)
+
+    @property
+    def retained_bytes(self) -> int:
+        """Conservative UTF-8 payload bytes held by this capture.
+
+        This intentionally measures variable-size payloads, not interpreter
+        object headers. Repeated identifiers are counted repeatedly, so the
+        admission budget is deterministic and conservative.
+        """
+
+        values = [
+            self.provider,
+            self.conversation_id,
+            self.model or "",
+            self.reply_text,
+            self.request_sha256,
+        ]
+        for message in self.prompt:
+            values.extend(
+                (
+                    message.role,
+                    message.text,
+                    message.conversation_id,
+                    message.message_id,
+                )
+            )
+        return sum(len(value.encode("utf-8")) for value in values)
+
     def ingest_records(
         self,
     ) -> list[tuple[str, str, str, Any, str]]:
@@ -232,15 +284,29 @@ class ExchangeCapture:
             None,
         )
         if last_user is not None:
-            records.append(last_user.as_ingest_record())
+            records.append(
+                replace(
+                    last_user,
+                    message_id=(
+                        f"{self.conversation_id}:user:"
+                        f"{self.request_sha256}"
+                    ),
+                ).as_ingest_record()
+            )
         if self.reply_text:
+            reply_sha256 = hashlib.sha256(
+                self.reply_text.encode("utf-8")
+            ).hexdigest()
             records.append(
                 (
                     "assistant",
                     self.reply_text,
                     self.conversation_id,
                     None,
-                    f"{self.conversation_id}:reply:{self.request_sha256[:16]}",
+                    (
+                        f"{self.conversation_id}:reply:"
+                        f"{self.request_sha256}:{reply_sha256}"
+                    ),
                 )
             )
         return records

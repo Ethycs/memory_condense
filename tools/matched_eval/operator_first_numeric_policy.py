@@ -80,6 +80,12 @@ _DATED_RE = re.compile(
     r"^\[Question asked at (?P<asked_at>.+?)\]\s*", re.IGNORECASE | re.DOTALL
 )
 _CLAUSE_RE = re.compile(r"[^.!?;\r\n]+(?:[.!?]+|$)")
+_COORDINATE_CLAUSE_RE = re.compile(
+    r",?\s+(?:and|but|while)\s+"
+    r"(?=(?:(?:I|we)\s+)?(?:plan|intend|want|need|hope|expect|going)\b|"
+    r"(?:I|we)\b)",
+    re.IGNORECASE,
+)
 _MONTHS = {
     name.casefold(): ordinal
     for ordinal, name in enumerate(
@@ -796,7 +802,10 @@ def _domain(body: str) -> str:
 
 def _clauses(summary: str) -> tuple[str, ...]:
     result = tuple(
-        match.group(0).strip() for match in _CLAUSE_RE.finditer(summary) if match.group(0).strip()
+        clause.strip()
+        for match in _CLAUSE_RE.finditer(summary)
+        for clause in _COORDINATE_CLAUSE_RE.split(match.group(0))
+        if clause.strip()
     )
     return result or (summary,)
 
@@ -839,7 +848,28 @@ def _effective_actions(
         planned = tuple(dict.fromkeys((*planned, "service")))
     if status == "proposed":
         return planned
+    if status == "completed":
+        return completed
+    if status in {"cancelled", "canceled", "superseded"}:
+        return ()
     return tuple(dict.fromkeys((*completed, *planned)))
+
+
+def _clause_status(clause: str, *, inherited: str) -> str:
+    """Resolve modality at the action-bearing clause, not the source row."""
+
+    if re.search(r"\b(?:cancelled|canceled|abandoned|superseded)\b", clause, re.I):
+        return "cancelled"
+    completed = completed_action_concepts(clause)
+    planned = planned_action_concepts(clause)
+    # A clause such as "planned to buy it and later bought it" contains both
+    # modalities but still supplies a positive completed event.  Coordinate
+    # clauses with separate subjects/planning cues were already split above.
+    if completed:
+        return "completed"
+    if planned:
+        return "proposed"
+    return inherited
 
 
 def _extract_entities(
@@ -936,13 +966,31 @@ def _temporal_witness(
     text: str,
     *,
     item_date: object,
+    temporal_anchor: object = None,
     declared_basis: str | None,
     asked: date | None,
 ) -> _TemporalWitness:
     parsed_item = _parse_datetime(item_date)
+    basis = (declared_basis or "").casefold()
+    # A source timestamp is a reference clock, not an event timestamp.  Trust
+    # it only when the typed adapter declared the authenticated metadata
+    # semantics, and consume it only in the explicit relative-language
+    # branches below.  The final basis cases deliberately use ``parsed_item``
+    # alone, so bare metadata can never become an event witness.
+    parsed_anchor = (
+        _parse_datetime(temporal_anchor)
+        if basis
+        in {
+            "source_created_at",
+            "source_metadata_only_not_event_time",
+        }
+        else None
+    )
     anchor = (
         parsed_item.date()
         if parsed_item is not None
+        else parsed_anchor.date()
+        if parsed_anchor is not None
         else asked
     )
     explicit = _textual_date(text, asked)
@@ -1010,7 +1058,6 @@ def _temporal_witness(
                 relative_days=days,
             )
 
-    basis = (declared_basis or "").casefold()
     if basis in {"textual_event_date", "explicit_event_time"}:
         return _TemporalWitness(
             TemporalEvidenceBasis.TEXTUAL_EVENT_DATE,
@@ -1122,27 +1169,38 @@ def _exclude(
     )
 
 
+def _modality_exclusion(status: str, *, include_proposed: bool) -> str | None:
+    if status in {"cancelled", "canceled", "superseded"}:
+        return "inactive_status"
+    if status == "proposed" and not include_proposed:
+        return "proposed_not_requested"
+    return None
+
+
 def _item_gate(
     item: Mapping[str, Any],
     *,
     handles: tuple[str, ...],
     include_proposed: bool,
     personal: bool,
+    gate_modality: bool = True,
 ) -> tuple[str, str, dict[str, str], frozenset[str], str | None]:
     item_sha = identity_sha256(dict(item))
     relation = item.get("relation")
     attributes, flags = _relation_attributes(relation)
     role = _role(flags, relation)
     status = str(item.get("status", "unknown")).casefold()
+    modality = _modality_exclusion(
+        status,
+        include_proposed=include_proposed,
+    )
     reason: str | None = None
     if item.get("included", True) is not True:
         reason = "not_included"
     elif str(item.get("content_coherence", "match")) != "match":
         reason = "content_not_coherent"
-    elif status in {"cancelled", "superseded"}:
-        reason = "inactive_status"
-    elif status == "proposed" and not include_proposed:
-        reason = "proposed_not_requested"
+    elif gate_modality and modality is not None:
+        reason = modality
     elif personal and role == "assistant":
         reason = "assistant_not_autobiographical_evidence"
     elif attributes.get("numeric_scope", "").casefold() in {
@@ -1327,6 +1385,11 @@ def _count_atoms(
             handles=handles,
             include_proposed=include_proposed,
             personal=personal,
+            # Event-count rows can contain several independent clauses.  A
+            # row-level status remains a fallback, but modality is gated at
+            # the action-bearing clause below.  Active obligations retain
+            # their established whole-item state machine.
+            gate_modality=mode is NumericPolicyMode.ACTION_OBLIGATION_COUNT,
         )
         if gated:
             exclusions.append(_exclude(item_sha, handles, gated))
@@ -1367,19 +1430,51 @@ def _count_atoms(
             continue
 
         structured_actions = _structured_actions(attributes)
-        selected_clauses: list[tuple[str, tuple[str, ...]]] = []
+        selected_clauses: list[tuple[str, tuple[str, ...], str]] = []
+        clause_modality_rejections: list[str] = []
         if structured_actions:
             if query_actions & set(structured_actions):
-                selected_clauses.append((summary, structured_actions))
+                modality = _modality_exclusion(
+                    status,
+                    include_proposed=include_proposed,
+                )
+                if modality is None:
+                    selected_clauses.append(
+                        (summary, structured_actions, status)
+                    )
+                else:
+                    clause_modality_rejections.append(modality)
         else:
             for clause in _clauses(summary):
+                clause_status = _clause_status(clause, inherited=status)
                 actions = _effective_actions(
-                    clause, status=status, structured=structured_actions
+                    clause,
+                    status=clause_status,
+                    structured=structured_actions,
                 )
-                if query_actions & set(actions):
-                    selected_clauses.append((clause, actions))
+                action_matches = bool(query_actions & set(actions))
+                modality = _modality_exclusion(
+                    clause_status,
+                    include_proposed=include_proposed,
+                )
+                if modality is not None:
+                    if action_matches or (
+                        query_actions & set(canonical_action_concepts(clause))
+                    ):
+                        clause_modality_rejections.append(modality)
+                    continue
+                if action_matches:
+                    selected_clauses.append((clause, actions, clause_status))
         if not selected_clauses:
-            exclusions.append(_exclude(item_sha, handles, "predicate_not_satisfied"))
+            exclusions.append(
+                _exclude(
+                    item_sha,
+                    handles,
+                    clause_modality_rejections[0]
+                    if clause_modality_rejections
+                    else "predicate_not_satisfied",
+                )
+            )
             continue
 
         made_atom = False
@@ -1387,10 +1482,11 @@ def _count_atoms(
         structured_members = bool(
             attributes.get("member_keys") or attributes.get("members")
         )
-        for clause_index, (clause, actions) in enumerate(selected_clauses):
+        for clause, actions, clause_status in selected_clauses:
             witness = _temporal_witness(
                 clause,
                 item_date=item.get("date"),
+                temporal_anchor=item.get("temporal_anchor"),
                 declared_basis=attributes.get("date_basis"),
                 asked=asked,
             )
@@ -1448,7 +1544,7 @@ def _count_atoms(
                         contribution_value=1.0,
                         numeric_value=None,
                         unit=None,
-                        status=status,
+                        status=clause_status,
                         source_role=role,
                         event_date=(
                             None

@@ -445,6 +445,120 @@ def test_operator_material_profile_collapses_only_admitted_status_variants(
     )
 
 
+def test_clause_scoped_modality_admits_completed_cuisines_beside_plans(
+    tmp_path: Path,
+) -> None:
+    asked = datetime(2023, 5, 30, 16, 4, tzinfo=timezone.utc)
+    ethiopian = (
+        "I want to try Thai cuisine next month. "
+        "I learned to cook Ethiopian cuisine two weeks ago."
+    )
+    korean = (
+        "I plan to learn French cuisine next year. "
+        "I tried a Korean bibimbap recipe last week."
+    )
+    index = _write_index(
+        tmp_path / "mixed-modality-cuisines.db",
+        [
+            ("kitchen-a", ethiopian, asked),
+            ("kitchen-b", korean, asked),
+        ],
+    )
+    question = (
+        "[Question asked at 2023/05/30 (Tue) 16:04]\n"
+        "How many different cuisines have I learned to cook or tried out "
+        "in the past few months?"
+    )
+    provider = _provider(
+        question,
+        [
+            _item("H001", ethiopian, date=asked.isoformat(), status="proposed"),
+            _item("H002", korean, date=asked.isoformat(), status="proposed"),
+        ],
+    )
+    specialist = scan_numeric_operand_closure(index, question)
+
+    bridge = build_operator_first_numeric_frontier(
+        provider,
+        index=index,
+        specialist_result=specialist,
+        operator_material_status=True,
+    )
+    decision = execute_operator_first_numeric_policy(
+        provider,
+        relevant_frontier=bridge.frontier,
+    )
+
+    assert bridge.closed is True
+    assert bridge.unresolved_candidate_keys == ()
+    assert {row.entity_key for row in bridge.census_atoms} == {
+        "ethiopian",
+        "korean",
+    }
+    assert decision.prediction == "2"
+    assert {row.entity_key for row in decision.candidate_atoms} == {
+        "ethiopian",
+        "korean",
+    }
+
+
+def test_clause_scoped_modality_excludes_planned_jewelry_but_keeps_acquired(
+    tmp_path: Path,
+) -> None:
+    asked = datetime(2023, 5, 30, 15, 43, tzinfo=timezone.utc)
+    necklace = (
+        "I want to buy a diamond brooch next week, but I bought a silver "
+        "necklace on May 15th."
+    )
+    ring = (
+        "I plan to acquire ruby earrings next month, and I got my engagement "
+        "ring a month ago."
+    )
+    index = _write_index(
+        tmp_path / "mixed-modality-jewelry.db",
+        [
+            ("jeweler-a", necklace, asked),
+            ("jeweler-b", ring, asked),
+        ],
+    )
+    question = (
+        "[Question asked at 2023/05/30 (Tue) 15:43]\n"
+        "How many pieces of jewelry did I acquire in the last two months?"
+    )
+    provider = _provider(
+        question,
+        [
+            _item("H001", necklace, date=asked.isoformat(), status="proposed"),
+            _item("H002", ring, date=asked.isoformat(), status="proposed"),
+        ],
+    )
+    specialist = scan_numeric_operand_closure(index, question)
+
+    bridge = build_operator_first_numeric_frontier(
+        provider,
+        index=index,
+        specialist_result=specialist,
+        supported_domains=EXTENDED_SUPPORTED_DOMAINS,
+        operator_material_status=True,
+    )
+    decision = execute_operator_first_numeric_policy(
+        provider,
+        relevant_frontier=bridge.frontier,
+    )
+
+    assert bridge.closed is True
+    assert bridge.unresolved_candidate_keys == ()
+    assert {row.entity_key for row in bridge.census_atoms} == {
+        "engagement_ring",
+        "silver_necklace",
+    }
+    assert decision.prediction == "2"
+    assert {row.entity_key for row in decision.candidate_atoms} == {
+        "engagement_ring",
+        "silver_necklace",
+    }
+
+
 def test_numeric_unit_and_contribution_material_mismatch_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

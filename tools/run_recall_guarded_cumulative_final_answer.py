@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run or replay the locked fixed-S1 Terra final-answer campaign."""
+"""Run or replay a sealed fixed-stage Terra final-answer campaign."""
 
 from __future__ import annotations
 
@@ -12,10 +12,12 @@ from dotenv import load_dotenv
 
 from memory_condense.domain.discourse import identity_sha256
 from memory_condense.eval.recall_guarded_cumulative_1m import (
+    STAGE_IDS,
     _atomic_write_json,
     _read_canonical_json,
 )
 from memory_condense.eval.recall_guarded_cumulative_final_answer import (
+    FIXED_STAGE_ID,
     answer_recall_guarded_cumulative_stage,
     build_final_answer_campaign_binding,
     final_answer_prompt_population,
@@ -28,12 +30,23 @@ from memory_condense.eval.recall_guarded_cumulative_final_answer_runtime import 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Answer exactly the preregistered direct-episode cumulative stage "
+            "Answer exactly one preregistered cumulative retrieval stage "
             "with the zero-retry, 256-token Terra responder"
         )
     )
     parser.add_argument("--retrieval", type=Path, required=True)
+    parser.add_argument(
+        "--expected-retrieval-sha256",
+        default=None,
+        help="Optional external canonical retrieval seal; mismatch fails closed.",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--fixed-stage-id",
+        choices=STAGE_IDS,
+        default=FIXED_STAGE_ID,
+        help="Preregistered cumulative stage; historical default remains S1.",
+    )
     parser.add_argument(
         "--authorized-provider-calls",
         type=int,
@@ -56,12 +69,18 @@ def _parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> tuple[dict[str, object], str]:
     retrieval_path = Path(args.retrieval).resolve()
     retrieval, retrieval_sha = _read_canonical_json(retrieval_path)
+    if (
+        args.expected_retrieval_sha256 is not None
+        and args.expected_retrieval_sha256 != retrieval_sha
+    ):
+        raise ValueError("retrieval does not match --expected-retrieval-sha256")
 
     # This full-population validation happens before output-root or checkpoint
     # creation, so a bad late prompt cannot leave an earlier paid call behind.
     prompts = final_answer_prompt_population(
         retrieval,
         retrieval_sha256=retrieval_sha,
+        fixed_stage_id=args.fixed_stage_id,
     )
     unique_calls = len({identity_sha256(list(prompt)) for prompt in prompts})
     if (
@@ -77,6 +96,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], str]:
         retrieval,
         retrieval_sha256=retrieval_sha,
         authorized_unique_calls=unique_calls,
+        fixed_stage_id=args.fixed_stage_id,
     )
     if args.mode == "preflight":
         return campaign, identity_sha256(campaign)
@@ -90,7 +110,14 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], str]:
             )
 
     output_root = Path(args.output_root).resolve()
+    campaign_sha = identity_sha256(campaign)
     checkpoint_dir = output_root / "final-answer-calls"
+    artifact_name = "final-answers.json"
+    if args.fixed_stage_id != FIXED_STAGE_ID:
+        checkpoint_dir = output_root / (
+            f"final-answer-calls-{args.fixed_stage_id}-{campaign_sha[:16]}"
+        )
+        artifact_name = f"final-answers-{args.fixed_stage_id}.json"
     with RecallGuardedCumulativeFinalAnswerRuntime(
         checkpoint_dir=checkpoint_dir,
         campaign_binding=campaign,
@@ -103,8 +130,9 @@ def run(args: argparse.Namespace) -> tuple[dict[str, object], str]:
             retrieval,
             retrieval_sha256=retrieval_sha,
             runtime=runtime,
+            fixed_stage_id=args.fixed_stage_id,
         )
-    artifact_path = output_root / "final-answers.json"
+    artifact_path = output_root / artifact_name
     digest = _atomic_write_json(artifact_path, artifact)
     _retrieval_after, retrieval_sha_after = _read_canonical_json(retrieval_path)
     if retrieval_sha_after != retrieval_sha:
@@ -119,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.mode == "preflight":
         print(
             "Fixed-stage final-answer preflight passed: "
+            f"stage={args.fixed_stage_id}; "
             f"questions={artifact['question_count']}; "
             f"unique_provider_calls={artifact['unique_provider_prompt_count']}; "
             f"binding={digest}",
@@ -127,7 +156,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     print(
         "Fixed-stage final answers published: "
-        f"{Path(args.output_root).resolve() / 'final-answers.json'} "
+        f"stage={args.fixed_stage_id}; "
+        f"output_root={Path(args.output_root).resolve()} "
         f"({digest}); questions={artifact['question_count']}; "
         f"unique_provider_calls={artifact['unique_provider_prompt_count']}",
         flush=True,

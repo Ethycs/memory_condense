@@ -273,11 +273,53 @@ def _synthetic_merged_retrieval() -> dict[str, Any]:
     return retrieval
 
 
+def test_explicit_s3_has_distinct_policy_and_campaign_without_changing_s1() -> None:
+    retrieval = _retrieval()
+    retrieval_sha = hashlib.sha256(_canonical_json_bytes(retrieval)).hexdigest()
+
+    historical = build_final_answer_campaign_binding(
+        retrieval,
+        retrieval_sha256=retrieval_sha,
+        authorized_unique_calls=1,
+    )
+    explicit_historical = build_final_answer_campaign_binding(
+        retrieval,
+        retrieval_sha256=retrieval_sha,
+        authorized_unique_calls=1,
+        fixed_stage_id=FIXED_STAGE_ID,
+    )
+    s3 = build_final_answer_campaign_binding(
+        retrieval,
+        retrieval_sha256=retrieval_sha,
+        authorized_unique_calls=1,
+        fixed_stage_id="artifact_global_closure_additions",
+    )
+
+    assert explicit_historical == historical
+    assert historical["final_answer_policy_sha256"] == (
+        final_answer.FINAL_ANSWER_POLICY_SHA256
+    )
+    assert s3["fixed_stage_id"] == "artifact_global_closure_additions"
+    assert s3["final_answer_policy_sha256"] != (
+        historical["final_answer_policy_sha256"]
+    )
+    assert s3["selected_stage_population_sha256"] != (
+        historical["selected_stage_population_sha256"]
+    )
+
+
 class _Runtime:
-    def __init__(self, retrieval: Mapping[str, Any], retrieval_sha: str) -> None:
+    def __init__(
+        self,
+        retrieval: Mapping[str, Any],
+        retrieval_sha: str,
+        *,
+        fixed_stage_id: str = FIXED_STAGE_ID,
+    ) -> None:
         prompts = final_answer_prompt_population(
             retrieval,
             retrieval_sha256=retrieval_sha,
+            fixed_stage_id=fixed_stage_id,
         )
         unique = len({identity_sha256(list(row)) for row in prompts})
         prompt_population = preflight_final_answer_prompt_population(
@@ -288,6 +330,7 @@ class _Runtime:
             retrieval,
             retrieval_sha256=retrieval_sha,
             authorized_unique_calls=unique,
+            fixed_stage_id=fixed_stage_id,
         )
         self.identity = {
             "format": FINAL_ANSWER_RUNTIME_FORMAT,
@@ -407,6 +450,37 @@ def test_fixed_stage_answer_is_gold_blind_sealed_and_validatable() -> None:
         retrieval=retrieval,
         artifact_sha256=_digest(artifact),
         retrieval_sha256=retrieval_sha,
+    )
+
+
+def test_explicit_s3_answer_is_sealed_and_validatable() -> None:
+    retrieval = _retrieval()
+    retrieval_sha = _digest(retrieval)
+    stage_id = "artifact_global_closure_additions"
+    runtime = _Runtime(
+        retrieval,
+        retrieval_sha,
+        fixed_stage_id=stage_id,
+    )
+
+    artifact = answer_recall_guarded_cumulative_stage(
+        retrieval,
+        retrieval_sha256=retrieval_sha,
+        runtime=runtime,
+        fixed_stage_id=stage_id,
+    )
+
+    assert artifact["fixed_stage_id"] == stage_id
+    assert artifact["questions"][0]["fixed_stage_id"] == stage_id
+    assert artifact["final_answer_policy_sha256"] != (
+        final_answer.FINAL_ANSWER_POLICY_SHA256
+    )
+    validate_final_answer_artifact(
+        artifact,
+        retrieval=retrieval,
+        artifact_sha256=_digest(artifact),
+        retrieval_sha256=retrieval_sha,
+        fixed_stage_id=stage_id,
     )
 
 

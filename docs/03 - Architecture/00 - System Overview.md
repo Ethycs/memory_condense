@@ -1,19 +1,25 @@
 # memory_condense System Overview (as-built)
 
 **Status**: CURRENT
-**Date**: 2026-08-18
+**Date**: 2026-09-07
 **Supersedes**: the earlier 2026-08-14 "dense-retrieval-only / no condensation yet" version of this document, which described the tree at commit `cd9f423`
 **Applies to**: the current working tree — core memory, compiled Qwen
-association artifacts, bounded associative reads, eval harness, and MCP server.
+association artifacts, incremental conversation graph, user-led conversation
+envelopes, bounded associative reads, eval harness, and MCP server.
 
 ## Executive summary
 
-memory_condense is a local memory manager: transcript → chunker → bge-m3
-dense index plus BM25, a typed `MemoryItem` store with provenance-enforced
-extraction, exponential energy decay, deterministic reranking, and a
-hard-budgeted `ContextPacker`. An optional staged Qwen3 prefix compiler emits
+memory_condense is a local memory manager: a model-free T0 capture commits the
+transcript, exact chunk topology, and text-free obligations for the incremental
+conversation graph and user-led envelope projection. Bounded T1 work makes
+chunks searchable through bge-m3 plus BM25; independent, fail-open post-T1
+workers assign conversation envelopes and compile T1g graph deltas; and
+independently recoverable T2 work extracts typed, provenance-enforced
+`MemoryItem`s. The memory plane adds
+exponential energy decay, deterministic reranking, and a hard-budgeted
+`ContextPacker`. An optional staged Qwen3 prefix compiler emits
 compact CAV signatures and sparse QK/OV association edges into SQLite schema
-v11, whose turns also retain document/session source identity and whose live
+v17, whose turns also retain document/session source identity and whose live
 Hebbian projection learns bounded same-turn chunk co-access. Ordinary
 associative reads do not load Qwen; they traverse only external
 IDs and scalars, then hydrate the selected chunks. The core remains
@@ -61,11 +67,15 @@ provider-agnostic, while public common-benchmark validation remains open.
         │   └─────────────┬─────────────┘      │
         ▼                 ▼                    ▼
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ SQLite — db.py: WAL, foreign_keys=ON, schema_version 13 (v1 migrates up)  │
+│ SQLite — db.py: WAL, foreign_keys=ON, schema_version 17 (v1 migrates up)  │
 │   turns(source_id) · chunks(text, embedding, lexical weights, hnsw label) │
-│   pending_ingests + reservations (sealed topology, pending→indexed)       │
+│   pending_ingests + reservations (T0 topology, pending→indexed at T1)     │
+│   pending_enrichments + staged state (T2 pending→enriched)                │
+│   T1g jobs + immutable graph deltas/checkpoints (v16)                      │
+│   envelope policies + assignments + immutable events (v17)                │
+│   legacy T2 quarantine/dispositions · per-operation correction queue      │
 │   chunk_terms(term, chunk_id, tf)          ← BM25 inverted index          │
-│   memory_items · provenance · successor redirects                         │
+│   memory_items · provenance · successor redirects · retirement ledger     │
 │   CAV/QK/OV + Hebbian + episodic discourse artifacts/coverage/receipts    │
 │   meta(schema_version)                                                    │
 │   + hnsw_index.bin  (cache only — rebuildable via rebuild_index())        │
@@ -85,13 +95,44 @@ provider-agnostic, while public common-benchmark validation remains open.
 - **Hard constraint**: never mutated, never deleted. Every factual payload is
   grounded in it; compact receipts preserve the exact derivation topology.
 
-### Ingest journal — `pending_ingest_store.py`, `ingest_workflow.py`
+### Provider capture scheduler — `proxy_server.py`
 
+- **Priority pipeline**: a bounded admission queue feeds one serialized owner.
+  Already-admitted exchanges are greedily captured up to the configured
+  capture-batch quota; then one maintenance tick may run. Bounded maintenance
+  ticks run T1 before T2. T2 does not compete with a progressing T1 backlog,
+  but gets one bounded attempt when T1 fails, makes no progress, or is observed
+  empty; this keeps already-indexed T2 receipts recoverable from an unrelated
+  T1 poison row. Each scheduling boundary rechecks capture, so maintenance
+  cannot starve durable transcript publication.
+- **Recovery**: startup and ordinary idle draining service pre-existing journal
+  work and repeat only while progress continues. A FIFO stop sentinel follows
+  every accepted exchange and forces exactly one final bounded maintenance
+  tick. Eligible retry and fresh work alternate when both exist, and bounded
+  exponential cooldowns prevent poison work from spinning. T2 failures cannot
+  halt a progressing T1 drain.
+- **Observability**: admission, durable capture, T1, T2, and shutdown failures
+  are distinct counters. The worker publishes an immutable, age-aware journal
+  snapshot for health checks instead of sharing SQLite with the event loop.
+
+### Ingest journals — `pending_ingest_store.py`, `pending_enrichment_store.py`, `ingest_workflow.py`
+
+- **T0 — durable capture**: `capture()` / `capture_many()` publish a turn,
+  its canonical text-free chunk manifest, and all normalized reservations in
+  one transaction before any embedding or indexing call. With automatic
+  extraction enabled, the same transaction also publishes a manifest-bound
+  pending-enrichment receipt. The same transaction claims manifest-bound T1g
+  work and a policy/turn-keyed envelope assignment, but performs neither phrase
+  extraction nor envelope-boundary computation. Capture therefore remains
+  model-free and a
+  failed provider cannot erase an accepted transcript exchange. Batch receipt
+  and reservation claims use bounded set queries rather than rescanning the
+  journals once per turn.
 - **Publication boundary**: a turn and its canonical text-free chunk manifest
   commit together. The manifest seals IDs, spans, token counts, and text hashes;
   normalized `ingest_chunk_reservations` claim each chunk ID globally before a
   chunk row is materialized.
-- **Completion boundary**: status advances `pending -> indexed` only inside the
+- **T1 — searchable completion**: status advances `pending -> indexed` only inside the
   transaction that proves the exact dense/HNSW/BM25 population. A provider must
   return a one-to-one derivative of an immutable deep pre-call source snapshot;
   it receives separate deep copies, so mutation of a nested derived field cannot
@@ -102,13 +143,133 @@ provider-agnostic, while public common-benchmark validation remains open.
   triggers. Supported direct dense/lexical writes may complete only pending
   members; terminal indexed receipts reject reactivation of a missing or retired
   member rather than turning repair into resurrection.
-- **Recovery**: `pending_ingest_count()` exposes incomplete publications and
-  `recover_pending_ingests()` reconstructs exact chunks from the turn. Indexed
-  receipts remain durable; exact retries and stale concurrent workers cannot
-  resurrect intentionally retired evidence.
-- **Legacy rule**: v13 seals every pre-v13 chunked topology as historical
-  `indexed` state. Without an original pending claim, incomplete-looking rows
-  cannot safely be distinguished from legitimate lexical-only or retired rows.
+- **Independent post-T1 ordering**: `capture()` / `capture_many()` stop at T0.
+  After T1, paths that service both derived projections attempt envelope
+  assignment first and T1g graph compilation second; each call catches and
+  records its own failure, so neither can roll back searchable T1 state or stop
+  the other. `ingest_many(auto_extract=False)` immediately services only its
+  selected envelope assignments; its durable graph jobs remain available to
+  the explicit graph drain or the next idle maintenance tick. An idle
+  `drain_pending_ingests()` tick retries at most 32 envelope assignments and 32
+  graph jobs rather than accidentally draining either backlog without bound.
+- **Recovery and scheduling**: `pending_ingest_stats()` exposes backlog count,
+  chunk/token weight, and oldest age. `drain_pending_ingests()` reconstructs
+  exact chunks from the turn and admits FIFO whole manifests under optional
+  manifest/chunk/token bounds (the first oversize manifest is admitted so the
+  queue cannot deadlock); `recover_pending_ingests()` is the compatibility
+  spelling, unbounded by default but accepting the same optional bounds. Fresh
+  T1 work and due retries alternate when both are eligible. A failed bounded
+  cohort is retried once as that same cohort,
+  then isolated to singleton attempts so one poison manifest does not exclude
+  its neighbors; attempts and bounded backoff remain durable. Indexed receipts
+  remain durable; exact retries and stale concurrent workers cannot resurrect
+  intentionally retired evidence. An ordinary retry that supplies
+  an existing turn ID reconstructs the sealed manifest instead of rerunning a
+  possibly changed chunker, including turns whose original ID was generated.
+- **T2 — staged enrichment**: automatic extraction is a separate durable
+  obligation over already-indexed evidence and never re-embeds source chunks.
+  A failure-signaling extractor path raises on transport, parse, or schema
+  failure, leaving the receipt pending; a successfully parsed empty
+  `MemoryOps` is a valid no-op and may seal it. The first validated operation
+  set and live chunk IDs are stored canonically with a digest before apply, so
+  concurrent or crash recovery replays one winner rather than fresh provider
+  prose. T2 extraction has create-only authority and observes drain-time
+  heat/current-turn state rather than synchronous causal visibility.
+- **Corrections are independent work**: an extracted `Correction` create is not
+  published as active memory. Each operation receives its own durable queue
+  entry, while safe creates publish and the parent T2 receipt can finish.
+  Resolution revalidates live evidence and a reviewed target, checks target
+  revision/no-op/collision preconditions under the writer lock, then performs
+  an atomic supersede. Resolution or explicit dismissal is terminal and the
+  original operation remains an immutable audit record.
+- **Source-order retirement safety**: every v15 identity-changing update,
+  delete, supersede, or deduplication records the retired identity and
+  transcript ordinal. Delayed T2 creation from an older/equal source ordinal is
+  suppressed even after the original `memory_items` row changed identity.
+  Pre-v15 terminal rows have no
+  trustworthy order; an operator may bind each one once within the migration
+  boundary, after which both status and retirement chronology are immutable.
+- **Legacy T2 quarantine**: exact T2 receipts pending at migration, plus any
+  receipt later attached to a source turn at or before the recorded v15
+  boundary, are durably quarantined from automatic replay. This is per-receipt,
+  not a global T2 shutdown. Operators can inspect them and explicitly record a
+  `discarded_legacy` disposition only after T1 is indexed; the searchable T1
+  chunks remain intact. The base receipt then reaches its terminal state
+  without falsely claiming that extraction ran.
+- **Upgrade boundary**: v17 writer triggers call a function registered with the
+  current writer version, so an already-open older writer fails closed on its
+  next covered SQLite mutation, including graph and envelope publication. This
+  is a safety fence, not seamless rolling-upgrade support. Stop all writers,
+  migrate once, and restart every process before resuming service. In
+  particular, the external hnswlib graph is process-local; database triggers
+  cannot reconcile an old process's native index state.
+
+### Incremental conversation graph and user-led envelopes — `conversation_graph_store.py`, `conversation_envelope_store.py`
+
+- **T1g incremental graph (schema v16)**: T0 inserts only a
+  manifest-bound `pending_graph_compilations` job. Once its T1 receipt is
+  `indexed`, a worker derives phrase occurrences, source-local story-term
+  memberships, and chunk chronology and commits the whole turn as `ready` or
+  `no_output`. Versioned `graph_artifacts` seal the extraction, story-index,
+  and persistence policies. Delta rows are immutable and durable; each append
+  advances a SHA-256 checkpoint/state chain and the aggregate
+  `conversation_graph_state` monotonically. The graph stores hashes,
+  coordinates, IDs, and bounded canonical terms—not a second copy of raw text.
+- **Resident/restart reads**: the process-local graph pins one persisted target
+  revision, state digest, and checkpoint before hydrating only deltas through
+  that revision. It verifies source chunks, identities, deltas, and the
+  checkpoint chain and fails closed on corruption; a concurrent writer cannot
+  make one read mix revisions or chase an unbounded moving head. Restart
+  restores from the same persisted delta chain rather than replaying the corpus.
+- **Graph bootstrap**: `bootstrap_conversation_graph(max_turns=32)` claims one
+  short transaction of current-artifact work and then compiles only those exact
+  turn IDs. The hard page limit is 512. It is resumable and policy-sensitive,
+  never runs implicitly on open, and counts indexed legacy turns without a
+  canonical `pending_ingests` manifest as unsupported instead of fabricating
+  topology.
+- **User-led envelopes (schema v17)**: T0 claims
+  `(policy_sha256, turn_id)` with source/ordinal, role, actor/authority, and an
+  optional `parent_turn_id`; it stores no raw text. A user turn with a stable,
+  non-NULL source opens a deterministic envelope. Assistant/system turns attach
+  to the latest earlier user opener in that source (or to the valid earlier,
+  same-source parent's opener). A later user opener records the prior
+  `envelope_id` as `predecessor_envelope_id`, deriving closure without updating
+  the earlier event. Current capture still accepts only user/assistant/system;
+  tool actor/authority values and parentage are a persistence seam, not a new
+  captured role.
+- **Envelope ordering and diagnostics**: a same-source lower-ordinal pending
+  assignment is a barrier, so concurrent workers cannot publish later members
+  around unfinished history. Missing source, no earlier user, and invalid,
+  cross-source, or non-earlier parentage terminalize as explicit `no_anchor`
+  receipts. Policies, terminal assignments, and events are durable; event rows
+  are immutable and cannot be deleted. Existing `episodes` remain a separate
+  derived discourse artifact and are not rewritten or reinterpreted as live
+  envelopes.
+- **Envelope recovery/backfill**:
+  `drain_pending_conversation_envelopes(max_turns=32)` and
+  `bootstrap_conversation_envelopes(max_turns=32)` are finite (hard maximum
+  512), exact-replay, current-policy operations. Bootstrap transactionally
+  claims only turns with valid durable ingest manifests, reports legacy turns
+  without them as unsupported, and never rebuilds on open. Because predecessor
+  links are immutable, it fails closed if selected missing history precedes the
+  policy's maximum published event ordinal; such history requires a fresh
+  policy identity rather than an impossible retrofit.
+- **Opt-in envelope read expansion**:
+  `MemoryCondenser.expand_conversation_envelopes(results, *, max_envelopes=4,
+  max_turns_per_envelope=8, max_companion_chunks=16,
+  max_companion_tokens=800)` first seals a text-free plan against the exact
+  ordered raw `(chunk_id, token_count)` footprint, then hydrates selected rows.
+  Each admitted group is emitted in source order with its user opener first;
+  exact-ID collisions retain the caller's original `RetrievalResult` object.
+  Turn, source, and token coordinates are authenticated during hydration, and
+  a missing, stale, mismatched, or over-budget group fails open atomically.
+  The limits apply only to newly hydrated companions, whose
+  `conversation_envelope_member` route prevents recursive anchoring and direct
+  consolidation learning. The API does not run automatically and does not
+  bypass the `ContextPacker`'s independent final prompt ceiling. Callers pass
+  the sealed expansion object itself as `build_context(...,
+  expansion_results=expanded)` to retain the atomic packing contract; passing
+  only `.results` intentionally uses ordinary sequence packing.
 
 ### Chunker — `chunker.py`
 - **Domain**: span segmentation. **Inputs**: one turn. **Outputs**: `Chunk`s with char-span provenance into the turn.
@@ -219,6 +380,21 @@ provider-agnostic, while public common-benchmark validation remains open.
   model. Built-in paths retain zero request-token state; injected strategies
   require their own certification. See
   [`05 - EM-LLM Episodic Discourse Closure for Diffuse Retrieval.md`](../00%20-%20Theory/05%20-%20EM-LLM%20Episodic%20Discourse%20Closure%20for%20Diffuse%20Retrieval.md).
+- **Ingest/startup episode descriptors**: an optional transient
+  `EpisodeDescriptorIndex` validates the already-persisted representative
+  membership, rank, evidence provenance, embedding width/finiteness, and exact
+  representative-selection identity once, then separately binds the routing
+  vectors to the source-store embedding identity and keeps only normalized
+  float32 rows and episode-to-row offsets in memory. It adds no table or sidecar: transcript
+  chunks and their durable embeddings remain authoritative, and discourse or
+  chunk-index revision changes invalidate the catalog. A query performs one
+  exact matrix score and max-pools representatives per offered episode. The
+  current integration is shadow-only: it records a bounded proposal while the
+  complete source-local population still reaches the unchanged Qwen
+  tournament. Missing, stale, corrupt, or completeness-sensitive descriptors
+  fail open to that complete population. Promotion to live narrowing requires
+  sealed recall and latency gates; descriptors are routing keys, never factual
+  evidence or answer provenance.
 
 ### Causal transition policy — `transition_policy.py`
 
@@ -276,6 +452,10 @@ provider-agnostic, while public common-benchmark validation remains open.
   2. **Decay is lazy** — no timer, no background job. Energy is decayed forward from `last_access_turn` to the transcript's current ordinal on read; `last_access_at` is audit-only.
   3. **Retrieval is brute-force exact cosine with numpy**, deliberately **not** a second ANN index: memory items number in the tens-to-low-hundreds, so an exact scan is faster and simpler than maintaining a second hnswlib graph, and it can never return a stale neighbour after a supersede. Cosine is mapped `(cos + 1) / 2` into `[0, 1]` so it composes with the other rank components.
   4. Every item returned by `retrieve` is reheated, so returned items reflect post-reheat energy while their `score` reflects query-time state. The rows are updated with one batched SQLite transaction, and provenance is hydrated for the final top-k with one query rather than once per candidate.
+  5. Every v15 retirement records the old content identity and source-order
+     coordinate in an immutable ledger. Automatic delayed creates consult that
+     ledger before memory-embedding provider work and again under the writer
+     lock.
 
 ### Decay — `decay.py`
 - **Domain**: how hot an item is *now*. Pure functions, no I/O.
@@ -291,7 +471,7 @@ provider-agnostic, while public common-benchmark validation remains open.
 ### Extractor — `extractor.py`
 - **Domain**: proposing candidate memory. **Outputs**: `MemoryOps` — *proposed*, never trusted.
 - **`RuleBasedExtractor`** (the default in `MemoryCondenser`) — ordered regex cue table over sentence splits; first match wins, checked Correction → Decision → Constraint → Preference → Definition → Task. Corrections/decisions/constraints get importance `0.8`, the rest `0.5`. Zero LLM calls, fully offline, fully deterministic. The provenance quote **is** the matched sentence, verbatim.
-- **`LLMExtractor`** — strict-JSON `memory_ops` through an **injected** `complete(system_prompt, user_prompt) -> str` callable. This module imports no LLM SDK. Failure policy: never raise, never invent — transport error, unparsable JSON, or schema mismatch all yield an empty `MemoryOps`. A dropped memory is recoverable next turn; a fabricated one is not.
+- **`LLMExtractor`** — strict-JSON `memory_ops` through an **injected** `complete(system_prompt, user_prompt) -> str` callable. This module imports no LLM SDK. The ordinary interactive `extract()` path remains fail-soft: transport, parse, or schema failure returns an empty `MemoryOps`. Durable T2 uses `extract_durable_for_enrichment()` / `extract_durable()`, where the same failures raise and keep the journal retryable; only a successfully parsed empty object is a valid no-op. The enrichment prompt has create-only authority and routes reversals as deferred `Correction` creates.
 
 ### Validator — `validator.py`
 - **Domain**: the provenance gate between any extractor and the store. **Inputs**: `MemoryOps`. **Outputs**: `ValidationReport` (`accepted` ops + explained `rejected` list).
@@ -331,6 +511,13 @@ provider-agnostic, while public common-benchmark validation remains open.
   `observe_context_access` (optional CAV/QK/OV-weighted update) · `heat_counts`
   · properties `transcript` / `memory` / `retriever` / `associations` /
   `consolidation` / `validator`.
+- Durable derived-work APIs include `pending_graph_compilation_count` /
+  `drain_pending_graph_compilations` / `bootstrap_conversation_graph` and
+  `pending_conversation_envelope_count` /
+  `drain_pending_conversation_envelopes` /
+  `bootstrap_conversation_envelopes`, plus immutable envelope lookups by turn,
+  envelope, and source. `expand_conversation_envelopes` is the explicit,
+  bounded read-side bridge from already selected raw hits to user-led context.
 - Constructor params of note: `extractor`, `budget`, `auto_extract`, and **`embedder`** — injectable so tests substitute a fake and never download bge-m3.
 
 ### Loader — `loader.py`
@@ -368,7 +555,7 @@ provider-agnostic, while public common-benchmark validation remains open.
 1. **Local/API split.** Chunking, embedding, both indexes, the memory state machine, and context packing live locally; the API is generation-only. **No core module imports an LLM SDK at module scope.** `llm_provider.py` is the single seam that binds one, and it does `import litellm` *inside* the function that needs it, so `import memory_condense` still costs nothing and needs no credentials. Everything else takes **injected callables** — `extractor.LLMExtractor(complete=…)`, `benchmark.run_benchmark(answer_fn=…, judge_fn=…)` — so the LLM paths exist without a provider dependency reaching the core.
 
    This was previously stated as "validated by grep", which is validated exactly once, on the day someone runs it. It is now `tests/test_architecture.py`, checked over the AST (so a docstring mentioning litellm is not an offence) plus a subprocess assertion that importing the package pulls no SDK into `sys.modules`.
-2. **Transcript is append-only**; derived state must be reconstructible from it plus sealed configuration/receipts. The v13 ingest manifest and globally unique chunk reservations are authoritative for exact historical chunk topology when ambient chunker settings change. Supported APIs and migrations fail closed at that boundary. Arbitrary raw SQL remains outside the supported trust boundary and can manufacture an initially `indexed` receipt because the completion trigger governs updates, not privileged initial inserts.
+2. **Transcript is append-only**; derived state must be reconstructible from it plus sealed configuration/receipts. The v13 ingest manifest and globally unique chunk reservations are authoritative for exact historical chunk topology when ambient chunker settings change. The v14 enrichment receipt records whether requested automatic extraction remains outstanding; v15 adds durable attempts/staged results, source-order retirement history, exact legacy quarantine/dispositions, and per-operation corrections; v16 adds the manifest-bound incremental graph journal and checkpoint chain; and v17 adds policy-scoped append-only conversation-envelope assignments and events. Supported APIs and migrations fail closed at those boundaries. Arbitrary raw SQL remains outside the supported trust boundary.
 3. **Provenance over trust.** Any LLM-written memory must quote real turn spans. This is now enforced code, not intent: `Validator` is the only path into `MemoryStore.apply` used by `MemoryCondenser.extract_memory`.
 4. **One tokenizer proxy**: cl100k_base (`_tokenizer.py`) for all budgeting, regardless of runtime LLM.
 5. **Baseline and treatment share one code path** in eval (`--k 0` vs `--k N`), never a forked harness. This is why `retrieval.query()` was left byte-for-byte alone when `hybrid_query` was added.
@@ -384,5 +571,5 @@ pixi run python -c "from memory_condense.persistence.db import Database; import 
 git log --oneline -1
 ```
 
-Expect `schema_version 13`. Canonical package ownership and import paths are
+Expect `schema_version 17`. Canonical package ownership and import paths are
 listed in [`03 - Code Package Layout.md`](03%20-%20Code%20Package%20Layout.md).

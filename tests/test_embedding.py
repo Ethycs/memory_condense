@@ -163,9 +163,24 @@ def test_embed_empty_list_without_model():
     assert svc._model is None
 
 
-def test_default_model_load_is_revision_pinned_and_hash_verified(monkeypatch):
+def test_default_model_load_is_revision_pinned_and_hash_verified(monkeypatch, tmp_path):
     calls = []
+    resolution_calls = []
+    verified_paths = []
     module = ModuleType("sentence_transformers")
+    hub = ModuleType("huggingface_hub")
+    snapshot = str(tmp_path / "pinned-snapshot")
+
+    def resolve(**kwargs):
+        resolution_calls.append(kwargs)
+        return snapshot
+
+    def verify(path):
+        verified_paths.append(path)
+        return BGE_M3_CHECKPOINT_SHA256
+
+    hub.snapshot_download = resolve
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
 
     def fake_sentence_transformer(model_name, **kwargs):
         calls.append((model_name, kwargs))
@@ -176,7 +191,7 @@ def test_default_model_load_is_revision_pinned_and_hash_verified(monkeypatch):
     monkeypatch.setattr(
         embedding_module,
         "verify_bge_m3_checkpoint",
-        lambda: BGE_M3_CHECKPOINT_SHA256,
+        verify,
     )
 
     svc = EmbeddingService(device="cpu")
@@ -185,14 +200,15 @@ def test_default_model_load_is_revision_pinned_and_hash_verified(monkeypatch):
     assert isinstance(loaded, FakeModel)
     assert calls == [
         (
-            DEFAULT_MODEL_NAME,
+            snapshot,
             {
                 "device": "cpu",
-                "revision": DEFAULT_MODEL_REVISION,
                 "local_files_only": True,
             },
         )
     ]
+    assert resolution_calls == [{"repo_id": DEFAULT_MODEL_NAME, "revision": DEFAULT_MODEL_REVISION, "local_files_only": True}]
+    assert verified_paths == [snapshot]
     assert svc._verified_checkpoint_sha256 == BGE_M3_CHECKPOINT_SHA256
     svc.close()
     assert svc._verified_checkpoint_sha256 is None

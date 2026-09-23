@@ -7,7 +7,7 @@ import re
 from .typed_operator_spec import normalized_terms
 
 
-_ACTION_VARIANTS: dict[str, frozenset[str]] = {
+_ACTION_SURFACE_VARIANTS: dict[str, frozenset[str]] = {
     "acquire": frozenset(
         {
             "acquire",
@@ -133,7 +133,7 @@ _COMPLETED_ACTION_SURFACES = {
         for variant in variants
         if variant in _COMPLETED_VARIANTS
     )
-    for concept, variants in _ACTION_VARIANTS.items()
+    for concept, variants in _ACTION_SURFACE_VARIANTS.items()
 }
 # Use the exact same lexical normalization as typed slot compilation/evidence
 # parsing (for example, ``purchased`` becomes ``purchas``).
@@ -143,8 +143,32 @@ _ACTION_VARIANTS = {
         for variant in variants
         for term in normalized_terms(variant)
     )
-    for concept, variants in _ACTION_VARIANTS.items()
+    for concept, variants in _ACTION_SURFACE_VARIANTS.items()
 }
+
+
+def action_search_surfaces(text: str) -> tuple[str, ...]:
+    """Return raw lexical variants for action concepts present in ``text``.
+
+    Typed matching uses normalized stems, while classic BM25 intentionally
+    does not stem.  This bridge lets a query containing ``visit`` retrieve an
+    exact witness containing ``visited`` without an embedding or generated
+    query.  It is positive expansion only and confers no completion status.
+    """
+
+    if type(text) is not str:
+        raise TypeError("action search text must be exact")
+    return tuple(
+        sorted(
+            {
+                surface
+                for concept in canonical_action_concepts(text)
+                for surface in _ACTION_SURFACE_VARIANTS[concept]
+            }
+        )
+    )
+
+
 def canonical_action_concepts(text: str) -> tuple[str, ...]:
     if type(text) is not str:
         raise TypeError("action semantic text must be exact")
@@ -279,6 +303,7 @@ def matched_action_concepts(question: str, evidence: str) -> tuple[str, ...]:
 
 
 __all__ = [
+    "action_search_surfaces",
     "canonical_action_proof_terms",
     "canonical_action_concepts",
     "completed_action_concepts",

@@ -3,6 +3,45 @@
 This rig keeps heavy stores and run output outside the repository. Its runtime
 workspace is `C:\Users\Keytone\Downloads\memory-condense-rig`.
 
+## Ingest throughput
+
+`ingest_throughput.py` times the new two-step write path without conflating its
+boundaries. `capture_many()` establishes durable turn/manifests without model
+work; bounded `drain_pending_ingests()` calls make those captures searchable.
+The default deterministic fake embedder is suitable for a quick CI smoke:
+
+```powershell
+pixi run --frozen -e dev python tools/performance_rig/ingest_throughput.py `
+  --embedder fake --turns 64 --tokens-per-turn 500 `
+  --capture-batch-size 2 --drain-max-manifests 16 `
+  --offered-generation-tokens-per-second 100
+```
+
+The opt-in local BGE-M3 assay uses the same report schema:
+
+```powershell
+pixi run --frozen -e dev python tools/performance_rig/ingest_throughput.py `
+  --embedder real --device cuda --turns 64 --tokens-per-turn 500 `
+  --output-json C:\Users\Keytone\Downloads\memory-condense-rig\ingest-speed.json
+```
+
+Use `--enforce-sla` only on a controlled performance host. Ordinary CI should
+verify the metric boundaries and deterministic fake behavior, not fail on
+shared-runner wall-clock noise.
+
+This is deliberately a core capture-first finite-burst assay, not an
+asynchronous proxy load generator or a proxy for sustained load. It reports
+each capture and drain batch's p50/p95/maximum latency. The SLA gates the ratio
+of end-to-end T0-to-T1 chunk-token throughput to the configured offered
+generation rate; the faster drain-only ratio is diagnostic. The
+generation-headroom gate requires at least 2x service capacity. Proxy admission
+loss is explicitly unmeasured.
+
+The public dense verification executes exactly one query embedding after T1
+has completed; the lexical verification is model-free. The report separates
+that post-T1 query call from ingest embedding calls, so T0's zero-model-call
+invariant remains directly auditable.
+
 The two stages are deliberately asymmetric:
 
 1. `start-untouched-compile.ps1` starts one hidden Qwen/embedding pipeline,

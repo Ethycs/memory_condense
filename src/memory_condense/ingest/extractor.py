@@ -34,12 +34,25 @@ from memory_condense.domain.schemas import (
 
 
 class Extractor(Protocol):
-    """Anything that proposes memory operations for a set of turns."""
+    """Anything that declares successful memory operations for a turn set."""
 
     def extract(
         self, turns: list[Turn], chunks: list[Chunk] | None = None
     ) -> MemoryOps:  # pragma: no cover - protocol
         ...
+
+
+class DurableExtractor(Extractor, Protocol):
+    """Provider-backed extractor that distinguishes failure from valid no-op."""
+
+    def extract_durable(
+        self, turns: list[Turn], chunks: list[Chunk] | None = None
+    ) -> MemoryOps:  # pragma: no cover - protocol
+        ...
+
+
+class ExtractionUnavailableError(RuntimeError):
+    """A durable extraction attempt produced no trustworthy result."""
 
 
 # ----------------------------------------------------------------------
@@ -173,6 +186,18 @@ class RuleBasedExtractor:
 
         return ops
 
+    def extract_durable(
+        self, turns: list[Turn], chunks: list[Chunk] | None = None
+    ) -> MemoryOps:
+        """Rules are deterministic and cannot confuse failure with no-op."""
+        return self.extract(turns, chunks)
+
+    def extract_durable_for_enrichment(
+        self, turns: list[Turn], chunks: list[Chunk] | None = None
+    ) -> MemoryOps:
+        """Return grounded creates, including unresolved correction signals."""
+        return self.extract(turns, chunks)
+
     def _match(self, sentence: str) -> tuple[MemoryType, float] | None:
         for pattern, mem_type, importance in self._rules:
             if pattern.search(sentence):
@@ -244,6 +269,17 @@ Hard rules:
    "supersede": [], "delete": [], "pin": []}.
 """
 
+ENRICHMENT_CREATE_ONLY_PROMPT = """
+
+Deferred-enrichment constraint: this mode REPLACES hard rule 4 because this
+call has only a local live evidence window and no versioned view of existing
+memory targets. Do not emit `supersede`. Emit additive facts in `create`, and
+represent a reversal as a `Correction` create so it is durably routed to the
+unresolved-correction queue. It will not be published as an active memory until
+an explicit target-bound supersede resolves it. Return empty arrays for
+`update`, `supersede`, `delete`, and `pin`.
+"""
+
 
 class LLMExtractor:
     """Strict-JSON memory_ops extraction through an injected completion callable.
@@ -252,9 +288,10 @@ class LLMExtractor:
     a provider (litellm, the Anthropic SDK, a local server, a stub in tests) is
     the caller's job — this module imports no LLM library.
 
-    Failure policy: **never raise, never invent.** Any transport error, unparsable
-    response, or schema mismatch yields an empty ``MemoryOps``. A dropped memory
-    is recoverable on a later turn; a fabricated one is not.
+    Ordinary :meth:`extract` remains fail-soft: a transport error, unparsable
+    response, or schema mismatch yields an empty ``MemoryOps``. Durable journal
+    consumers use :meth:`extract_durable`, which raises on those failures so a
+    pending receipt is not confused with a genuine, valid empty operation set.
     """
 
     def __init__(
@@ -270,16 +307,55 @@ class LLMExtractor:
     def extract(
         self, turns: list[Turn], chunks: list[Chunk] | None = None
     ) -> MemoryOps:
+        """Return an empty result on provider or schema failure."""
+        return self._extract(turns, chunks, durable=False)
+
+    def extract_durable(
+        self, turns: list[Turn], chunks: list[Chunk] | None = None
+    ) -> MemoryOps:
+        """Raise when no valid result exists, preserving journal retryability."""
+        return self._extract(turns, chunks, durable=True)
+
+    def extract_durable_for_enrichment(
+        self, turns: list[Turn], chunks: list[Chunk] | None = None
+    ) -> MemoryOps:
+        """Use a create-only prompt matching deferred T2's authority."""
+        return self._extract(
+            turns,
+            chunks,
+            durable=True,
+            system_prompt=self._system_prompt + ENRICHMENT_CREATE_ONLY_PROMPT,
+        )
+
+    def _extract(
+        self,
+        turns: list[Turn],
+        chunks: list[Chunk] | None,
+        *,
+        durable: bool,
+        system_prompt: str | None = None,
+    ) -> MemoryOps:
         if not turns:
             return MemoryOps()
 
         user_prompt = self.build_prompt(turns, chunks)
         try:
-            raw = self._complete(self._system_prompt, user_prompt)
-        except Exception:
+            raw = self._complete(system_prompt or self._system_prompt, user_prompt)
+        except Exception as exc:
+            if durable:
+                raise ExtractionUnavailableError(
+                    "memory extraction provider failed"
+                ) from exc
             return MemoryOps()
 
-        return parse_memory_ops(raw)
+        parsed = _parse_memory_ops(raw, require_complete_shape=durable)
+        if parsed is None:
+            if durable:
+                raise ExtractionUnavailableError(
+                    "memory extraction returned invalid operations"
+                )
+            return MemoryOps()
+        return parsed
 
     def build_prompt(
         self, turns: list[Turn], chunks: list[Chunk] | None = None
@@ -306,17 +382,35 @@ class LLMExtractor:
 
 def parse_memory_ops(raw: str) -> MemoryOps:
     """Coerce a raw model response into ``MemoryOps``; empty on any failure."""
-    if not raw or not raw.strip():
-        return MemoryOps()
+    parsed = _parse_memory_ops(raw)
+    return parsed if parsed is not None else MemoryOps()
+
+
+def _parse_memory_ops(
+    raw: str, *, require_complete_shape: bool = False
+) -> MemoryOps | None:
+    """Distinguish a valid empty operation set from invalid provider output."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
 
     payload = _extract_json_object(raw)
     if payload is None:
-        return MemoryOps()
+        return None
+
+    # Pydantic intentionally supplies empty defaults for the ergonomic public
+    # parser, and ignores unknown fields by default.  Those conveniences are
+    # unsafe at the durable receipt boundary: ``{}`` and provider envelopes
+    # such as ``{"error": "rate limit"}`` would otherwise look exactly like a
+    # genuine no-op and permanently seal the turn.  A durable model response
+    # must acknowledge the complete wire shape, with no unrecognised keys.
+    expected_fields = {"create", "update", "supersede", "delete", "pin"}
+    if require_complete_shape and set(payload) != expected_fields:
+        return None
 
     try:
         return MemoryOps.model_validate(payload)
     except Exception:
-        return MemoryOps()
+        return None
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)

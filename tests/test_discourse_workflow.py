@@ -9,6 +9,10 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from memory_condense.associations.head_memory_models import (
+    MemoryLinkHit,
+    NestedMemoryInspection,
+)
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.domain.discourse import (
     DiscourseArtifact,
@@ -29,6 +33,7 @@ from memory_condense.persistence.discourse_store import (
 )
 from memory_condense.search.episodes import (
     EpisodeBuilder,
+    EpisodeRepresentativePrefilterPolicy,
     EpisodeRepresentativeRetrievalPolicy,
     EpisodeRetrievalPolicy,
     EpisodeSourceCandidate,
@@ -87,6 +92,29 @@ class _BombNestedLinker:
 
     def inspect_nested(self, *_args, **_kwargs):
         raise AssertionError("invalid source scope reached the nested linker")
+
+
+class _SelectNestedEpisode:
+    max_candidates = 8
+
+    def __init__(self, episode_id: str) -> None:
+        self.episode_id = episode_id
+
+    def inspect_nested(self, _query, groups, **_kwargs):
+        return NestedMemoryInspection(
+            hits=(
+                MemoryLinkHit(
+                    episode_id=self.episode_id,
+                    qk_score=1.0,
+                    ov_transport=1.0,
+                    head_weights=(1.0,),
+                ),
+            ),
+            passes=1,
+            max_workspace_candidates=max(len(group) for group in groups),
+            max_workspace_tokens=64,
+            total_candidate_inspections=sum(len(group) for group in groups),
+        )
 
 
 def _artifact() -> DiscourseArtifact:
@@ -319,6 +347,125 @@ def test_representative_retrieval_rejects_scope_after_source_universe_changes(
                 ),
                 source_scope=scope,
             )
+
+
+def test_prepared_episode_descriptors_feed_shadow_without_narrowing_qwen(
+    tmp_path,
+) -> None:
+    artifact = _artifact()
+    embedding_identity = {
+        "backend": "fixture",
+        "model_id": "fixture-embedding",
+        "dimension": 32,
+        "space": "cosine",
+    }
+    with _condenser(tmp_path / "descriptor-shadow") as condenser:
+        chunks = tuple(
+            condenser.ingest(
+                "user",
+                text,
+                source_id="source-a",
+            )[1][0]
+            for text in (
+                "alpha launch badge evidence",
+                "beta restaurant evidence",
+                "gamma travel evidence",
+                "delta meeting evidence",
+            )
+        )
+        chunk_ids = tuple(chunk.chunk_id for chunk in chunks)
+        publication = condenser.build_and_publish_discourse_episodes(
+            artifact,
+            chunk_ids,
+            builder=EpisodeBuilder(min_size=1, max_size=1),
+            embeddings=condenser.discourse_chunk_embeddings(chunk_ids),
+            representative_limit=1,
+        )
+        prepared = condenser.prepare_discourse_episode_descriptors(
+            artifact.artifact_id,
+            embedding_identity=embedding_identity,
+        )
+
+        target = publication.build.episodes[0]
+        plan = condenser.retrieve_discourse_episode_representatives(
+            "alpha launch badge evidence",
+            (EpisodeSourceCandidate("source-a", 1.0),),
+            _SelectNestedEpisode(target.episode_id),
+            policy=EpisodeRepresentativeRetrievalPolicy(
+                artifact_id=artifact.artifact_id,
+                max_episodes_per_source=4,
+                max_total_episodes=4,
+                group_size=2,
+                top_k=1,
+                max_representatives_per_episode=1,
+            ),
+            prefilter_policy=EpisodeRepresentativePrefilterPolicy(
+                mode="shadow",
+                cap=2,
+                top_k=1,
+                cutoff_margin=0.0,
+            ),
+            prefilter_embedding_identity=embedding_identity,
+        )
+
+        assert prepared.receipt.episode_count == 4
+        assert plan.seeds[0].episode_id == target.episode_id
+        report = condenser.last_episode_prefilter_report
+        assert report["descriptor_source"] == "resident_index"
+        assert report["input_count"] == 4
+        assert report["proposal_count"] == 2
+        assert report["output_count"] == 4
+        assert report["proposal_is_narrower"] is True
+        assert len(report["proposal_episode_ids"]) == 2
+        assert report["full_qwen_hit_count"] == 1
+        assert report["full_qwen_hit_recall"] == 1.0
+
+
+def test_descriptor_preparation_rejects_a_concurrent_snapshot_change(
+    tmp_path,
+) -> None:
+    artifact = _artifact()
+    with _condenser(tmp_path / "descriptor-snapshot-race") as condenser:
+        chunk = condenser.ingest(
+            "user",
+            "initial episode content",
+            source_id="initial-source",
+        )[1][0]
+        condenser.build_and_publish_discourse_episodes(
+            artifact,
+            (chunk.chunk_id,),
+            builder=EpisodeBuilder(min_size=1, max_size=1),
+            embeddings=condenser.discourse_chunk_embeddings((chunk.chunk_id,)),
+            representative_limit=1,
+        )
+
+        class _ChangingIndex:
+            invalidated = False
+
+            def ensure(self, *_args, **_kwargs):
+                condenser.ingest(
+                    "user",
+                    "content arriving during descriptor preparation",
+                    source_id="late-source",
+                )
+                return object()
+
+            def invalidate(self):
+                self.invalidated = True
+
+            def release(self):
+                pass
+
+        changing = _ChangingIndex()
+        condenser._episode_descriptor_index = changing
+
+        with pytest.raises(RuntimeError, match="snapshot changed"):
+            condenser.prepare_discourse_episode_descriptors(
+                artifact.artifact_id,
+                embedding_identity={"backend": "fixture", "dimension": 32},
+            )
+
+        assert changing.invalidated is True
 
 
 def test_discourse_workflow_builds_links_closes_and_packs_exact_evidence(

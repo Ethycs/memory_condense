@@ -68,6 +68,20 @@ class TestFreshDatabase:
             "memory_successor_redirects",
             "pending_ingests",
             "ingest_chunk_reservations",
+            "pending_enrichments",
+            "pending_ingest_attempts",
+            "pending_enrichment_state",
+            "pending_enrichment_dispositions",
+            "pending_enrichment_legacy_quarantine",
+            "pending_corrections",
+            "pending_work_schedule",
+            "graph_artifacts",
+            "pending_graph_compilations",
+            "conversation_graph_chunks",
+            "conversation_phrase_occurrences",
+            "conversation_story_term_memberships",
+            "conversation_graph_state",
+            "memory_identity_retirements",
             "association_artifacts",
             "chunk_cav_signatures",
             "chunk_head_edges",
@@ -93,6 +107,10 @@ class TestFreshDatabase:
     def test_chunks_has_term_count(self, tmp_path):
         with Database(tmp_path / "fresh.db") as db:
             assert "term_count" in _column_names(db, "chunks")
+
+    def test_memory_retirement_has_source_order_coordinate(self, tmp_path):
+        with Database(tmp_path / "fresh.db") as db:
+            assert "retired_at_turn" in _column_names(db, "memory_items")
 
     def test_turns_have_source_identity(self, tmp_path):
         with Database(tmp_path / "source.db") as db:
@@ -216,6 +234,12 @@ class TestMigrationFromV1:
             "memory_successor_redirects",
             "pending_ingests",
             "ingest_chunk_reservations",
+            "graph_artifacts",
+            "pending_graph_compilations",
+            "conversation_graph_chunks",
+            "conversation_phrase_occurrences",
+            "conversation_story_term_memberships",
+            "conversation_graph_state",
         } <= tables
 
     def test_term_count_column_added(self, v1_db_path):
@@ -352,6 +376,469 @@ class TestSchemaParity:
             assert db.execute(
                 "SELECT COUNT(*) FROM ingest_chunk_reservations"
             ).fetchone()[0] == 0
+
+    def test_v14_and_v15_migrations_converge_without_inferred_enrichment_receipts(
+        self, tmp_path
+    ):
+        """Historical turns have no claim that automatic extraction was intended."""
+        from memory_condense.persistence.db import _MIGRATIONS
+
+        path = tmp_path / "from_v13.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(_V1_SCHEMA)
+        for target in range(2, 14):
+            conn.executescript(_MIGRATIONS[target])
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(target),),
+            )
+        conn.execute(
+            "INSERT INTO turns "
+            "(turn_id, role, text, source_id, created_at, ordinal) "
+            "VALUES ('legacy-turn', 'user', 'legacy', NULL, '2026-09-03', 1)"
+        )
+        conn.commit()
+        conn.close()
+
+        with Database(tmp_path / "fresh14.db") as fresh_db:
+            fresh = self._shape(fresh_db)
+        with Database(path) as migrated:
+            assert migrated.schema_version == CURRENT_SCHEMA_VERSION
+            assert self._shape(migrated) == fresh
+            assert migrated.execute(
+                "SELECT COUNT(*) FROM pending_enrichments"
+            ).fetchone() == (0,)
+            manifest_sha256 = "a" * 64
+            migrated.execute(
+                "INSERT INTO pending_ingests "
+                "(turn_id, manifest_sha256, manifest_json, status, created_at, "
+                "indexed_at) VALUES (?, ?, '{}', 'indexed', ?, ?)",
+                (
+                    "legacy-turn",
+                    manifest_sha256,
+                    "2026-09-03T00:00:00+00:00",
+                    "2026-09-03T00:00:00+00:00",
+                ),
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                migrated.execute(
+                    "INSERT INTO pending_enrichments "
+                    "(turn_id, ingest_manifest_sha256, status, created_at) "
+                    "VALUES (?, ?, 'pending', ?)",
+                    (
+                        "legacy-turn",
+                        "b" * 64,
+                        "2026-09-03T00:00:00+00:00",
+                    ),
+                )
+            migrated.execute(
+                "INSERT INTO pending_enrichments "
+                "(turn_id, ingest_manifest_sha256, status, created_at) "
+                "VALUES (?, ?, 'pending', ?)",
+                (
+                    "legacy-turn",
+                    manifest_sha256,
+                    "2026-09-03T00:00:00+00:00",
+                ),
+            )
+            migrated.commit()
+            assert migrated.execute(
+                "SELECT COUNT(*) FROM pending_enrichments"
+            ).fetchone() == (1,)
+
+            migrated.execute(
+                "INSERT INTO turns "
+                "(turn_id, role, text, source_id, created_at, ordinal) "
+                "VALUES ('pending-turn', 'user', 'pending', NULL, "
+                "'2026-09-03', 2)"
+            )
+            migrated.execute(
+                "INSERT INTO pending_ingests "
+                "(turn_id, manifest_sha256, manifest_json, status, created_at) "
+                "VALUES ('pending-turn', ?, '{}', 'pending', ?)",
+                ("c" * 64, "2026-09-03T00:00:00+00:00"),
+            )
+            migrated.execute(
+                "INSERT INTO pending_enrichments "
+                "(turn_id, ingest_manifest_sha256, status, created_at) "
+                "VALUES ('pending-turn', ?, 'pending', ?)",
+                ("c" * 64, "2026-09-03T00:00:00+00:00"),
+            )
+            migrated.commit()
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="indexed pending-to-enriched",
+            ):
+                migrated.execute(
+                    "UPDATE pending_enrichments SET status = 'enriched', "
+                    "enriched_at = ? WHERE turn_id = 'pending-turn'",
+                    ("2026-09-03T00:01:00+00:00",),
+                )
+            migrated.connection.rollback()
+
+    def test_concurrent_v14_openers_serialize_the_v15_migration(
+        self, tmp_path, monkeypatch
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        import memory_condense.persistence.db as db_module
+
+        path = tmp_path / "concurrent-v14-open.db"
+        connection = sqlite3.connect(str(path))
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.executescript(_V1_SCHEMA)
+        for target in range(2, 15):
+            connection.executescript(db_module._MIGRATIONS[target])
+            connection.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(target),),
+            )
+        connection.commit()
+        connection.close()
+
+        observed_v14 = threading.Barrier(2)
+        original_read_version = Database._read_version
+
+        def synchronized_read_version(database):
+            version = original_read_version(database)
+            if version == 14:
+                observed_v14.wait(timeout=10)
+            return version
+
+        monkeypatch.setattr(Database, "_read_version", synchronized_read_version)
+
+        def open_and_read(_worker):
+            with Database(path) as database:
+                return database.schema_version
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            versions = list(executor.map(open_and_read, range(2)))
+
+        assert versions == [CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION]
+
+    def test_v15_fences_stale_source_index_and_memory_writers(self, tmp_path):
+        from memory_condense.persistence.db import _MIGRATIONS
+
+        path = tmp_path / "live-v14-writer.db"
+        legacy = sqlite3.connect(str(path))
+        legacy.create_function(
+            "memory_condense_writer_schema_version",
+            0,
+            lambda: 14,
+            deterministic=True,
+        )
+        legacy.execute("PRAGMA foreign_keys = ON")
+        try:
+            legacy.executescript(_V1_SCHEMA)
+            for target in range(2, 15):
+                legacy.executescript(_MIGRATIONS[target])
+                legacy.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                    (str(target),),
+                )
+            for ordinal, turn_id in enumerate(
+                ("legacy-existing", "legacy-adopt", "legacy-unclaimed"), start=1
+            ):
+                legacy.execute(
+                    "INSERT INTO turns "
+                    "(turn_id, role, text, source_id, created_at, ordinal) "
+                    "VALUES (?, 'user', ?, NULL, '2026-09-03', ?)",
+                    (turn_id, turn_id, ordinal),
+                )
+                if turn_id != "legacy-unclaimed":
+                    digest = str(ordinal) * 64
+                    legacy.execute(
+                        "INSERT INTO pending_ingests "
+                        "(turn_id, manifest_sha256, manifest_json, status, "
+                        "created_at, indexed_at) VALUES (?, ?, '{}', 'indexed', "
+                        "'2026-09-03', '2026-09-03')",
+                        (turn_id, digest),
+                    )
+            legacy.execute(
+                "INSERT INTO chunks "
+                "(chunk_id, turn_id, text, start_char, end_char, token_count) "
+                "VALUES ('legacy-chunk', 'legacy-existing', 'legacy', 0, 6, 1)"
+            )
+            legacy.execute(
+                "INSERT INTO pending_enrichments "
+                "(turn_id, ingest_manifest_sha256, status, created_at) "
+                "VALUES ('legacy-existing', ?, 'pending', '2026-09-03')",
+                ("1" * 64,),
+            )
+            legacy.execute(
+                "INSERT INTO memory_items "
+                "(mem_id, type, content, details, status, supersedes, pin, "
+                "energy, half_life_turns, importance, created_at, "
+                "last_access_at, last_access_turn, embedding, content_hash) "
+                "VALUES ('legacy-memory', 'Preference', 'legacy memory', NULL, "
+                "'active', NULL, 'none', 1.0, 30.0, 0.5, '2026-09-03', "
+                "'2026-09-03', 2, NULL, ?)",
+                ("a" * 64,),
+            )
+            legacy.commit()
+
+            with Database(path) as migrated:
+                for statement, parameters in (
+                    (
+                        "UPDATE memory_items SET details = 'old writer' "
+                        "WHERE mem_id = 'legacy-memory'",
+                        (),
+                    ),
+                    (
+                        "INSERT INTO memory_items "
+                        "(mem_id, type, content, status, pin, energy, "
+                        "half_life_turns, importance, created_at, last_access_at, "
+                        "last_access_turn, content_hash) VALUES "
+                        "('legacy-new', 'Preference', 'legacy new', 'active', "
+                        "'none', 1.0, 30.0, 0.5, '2026-09-03', '2026-09-03', "
+                        "2, ?)",
+                        ("b" * 64,),
+                    ),
+                    (
+                        "UPDATE pending_enrichments SET status = 'enriched', "
+                        "enriched_at = '2026-09-04' "
+                        "WHERE turn_id = 'legacy-existing'",
+                        (),
+                    ),
+                    (
+                        "INSERT INTO pending_enrichments "
+                        "(turn_id, ingest_manifest_sha256, status, created_at) "
+                        "VALUES ('legacy-adopt', ?, 'pending', '2026-09-04')",
+                        ("2" * 64,),
+                    ),
+                    (
+                        "INSERT INTO turns "
+                        "(turn_id, role, text, source_id, created_at, ordinal) "
+                        "VALUES ('stale-turn', 'user', 'stale', NULL, "
+                        "'2026-09-04', 4)",
+                        (),
+                    ),
+                    (
+                        "INSERT INTO pending_ingests "
+                        "(turn_id, manifest_sha256, manifest_json, status, "
+                        "created_at) VALUES ('legacy-unclaimed', ?, '{}', "
+                        "'pending', '2026-09-04')",
+                        ("3" * 64,),
+                    ),
+                    (
+                        "INSERT INTO chunks "
+                        "(chunk_id, turn_id, text, start_char, end_char, "
+                        "token_count) VALUES ('stale-chunk', "
+                        "'legacy-existing', 'stale', 0, 5, 1)",
+                        (),
+                    ),
+                    (
+                        "UPDATE chunks SET text = 'rewritten' "
+                        "WHERE chunk_id = 'legacy-chunk'",
+                        (),
+                    ),
+                ):
+                    with pytest.raises(
+                        sqlite3.IntegrityError,
+                        match="writer schema version mismatch",
+                    ):
+                        legacy.execute(statement, parameters)
+                    legacy.rollback()
+
+                migrated.execute(
+                    "INSERT INTO pending_enrichments "
+                    "(turn_id, ingest_manifest_sha256, status, created_at) "
+                    "VALUES ('legacy-adopt', ?, 'pending', '2026-09-04')",
+                    ("2" * 64,),
+                )
+                migrated.commit()
+                assert migrated.execute(
+                    "SELECT turn_id FROM pending_enrichment_legacy_quarantine "
+                    "ORDER BY turn_id"
+                ).fetchall() == [("legacy-adopt",), ("legacy-existing",)]
+                assert migrated.execute(
+                    "SELECT details FROM memory_items "
+                    "WHERE mem_id = 'legacy-memory'"
+                ).fetchone() == (None,)
+                assert migrated.execute(
+                    "SELECT COUNT(*) FROM memory_items "
+                    "WHERE mem_id = 'legacy-new'"
+                ).fetchone() == (0,)
+                assert migrated.execute(
+                    "SELECT COUNT(*) FROM turns WHERE turn_id = 'stale-turn'"
+                ).fetchone() == (0,)
+                assert migrated.execute(
+                    "SELECT COUNT(*) FROM pending_ingests "
+                    "WHERE turn_id = 'legacy-unclaimed'"
+                ).fetchone() == (0,)
+                assert migrated.execute(
+                    "SELECT text FROM chunks WHERE chunk_id = 'legacy-chunk'"
+                ).fetchone() == ("legacy",)
+        finally:
+            legacy.close()
+
+    def test_v15_migration_seeds_retry_schedule_and_staged_constraints(
+        self, tmp_path
+    ):
+        from memory_condense.domain.schemas import (
+            CreateOp,
+            MemoryOps,
+            MemoryStatus,
+            MemoryType,
+            Provenance,
+            content_key,
+        )
+        from memory_condense.persistence.db import _MIGRATIONS
+        from memory_condense.persistence.memory_store import (
+            AmbiguousLegacyRetirementError,
+            MemoryStore,
+        )
+        from memory_condense.persistence.transcript_store import TranscriptStore
+
+        path = tmp_path / "from_v14.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(_V1_SCHEMA)
+        for target in range(2, 15):
+            conn.executescript(_MIGRATIONS[target])
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+                (str(target),),
+            )
+        conn.execute(
+            "INSERT INTO turns "
+            "(turn_id, role, text, source_id, created_at, ordinal) "
+            "VALUES ('legacy-source', 'user', 'legacy reassertable fact', "
+            "'legacy', '2026-09-03T00:00:00+00:00', 1)"
+        )
+        conn.execute(
+            "INSERT INTO memory_items "
+            "(mem_id, type, content, status, created_at, last_access_at, "
+            "content_hash) VALUES (?, ?, ?, 'deleted', ?, ?, ?)",
+            (
+                "legacy-retired",
+                MemoryType.PREFERENCE.value,
+                "legacy reassertable fact",
+                "2026-09-03T00:00:00+00:00",
+                "2026-09-03T00:00:00+00:00",
+                content_key(MemoryType.PREFERENCE, "legacy reassertable fact"),
+            ),
+        )
+        legacy_manifest_sha256 = "0" * 64
+        conn.execute(
+            "INSERT INTO pending_ingests "
+            "(turn_id, manifest_sha256, manifest_json, status, created_at, "
+            "indexed_at) VALUES (?, ?, ?, 'indexed', ?, ?)",
+            (
+                "legacy-source",
+                legacy_manifest_sha256,
+                '{"chunks":[],"format":"legacy-test","turn_id":"legacy-source"}',
+                "2026-09-03T00:00:00+00:00",
+                "2026-09-03T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO pending_enrichments "
+            "(turn_id, ingest_manifest_sha256, status, created_at, enriched_at) "
+            "VALUES (?, ?, 'pending', ?, NULL)",
+            (
+                "legacy-source",
+                legacy_manifest_sha256,
+                "2026-09-03T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        with Database(path) as migrated:
+            assert migrated.schema_version == CURRENT_SCHEMA_VERSION
+            assert {
+            "pending_ingest_attempts",
+            "pending_enrichment_state",
+            "pending_enrichment_dispositions",
+            "pending_enrichment_legacy_quarantine",
+            "pending_corrections",
+            "pending_work_schedule",
+                "memory_identity_retirements",
+            }.issubset(_table_names(migrated))
+            assert migrated.execute(
+                "SELECT stage, prefer_retry FROM pending_work_schedule "
+                "ORDER BY stage"
+            ).fetchall() == [("enrichment", 1), ("ingest", 1)]
+            columns = _column_names(migrated, "pending_enrichment_state")
+            assert {
+                "attempt_count",
+                "next_attempt_at",
+                "last_error_kind",
+                "staged_ops_json",
+                "staged_chunk_ids_json",
+                "staged_result_sha256",
+            }.issubset(columns)
+            assert "retired_at_turn" in _column_names(migrated, "memory_items")
+            assert migrated.execute(
+                "SELECT retired_at_turn FROM memory_items "
+                "WHERE mem_id = 'legacy-retired'"
+            ).fetchone() == (None,)
+            assert migrated.execute(
+                "SELECT COUNT(*) FROM memory_identity_retirements"
+            ).fetchone() == (0,)
+            assert migrated.execute(
+                "SELECT value FROM meta "
+                "WHERE key = 'v15_legacy_retirement_boundary'"
+            ).fetchone() == ("1",)
+            assert migrated.execute(
+                "SELECT turn_id, migration_boundary FROM "
+                "pending_enrichment_legacy_quarantine"
+            ).fetchall() == [("legacy-source", 1)]
+
+            store = MemoryStore(migrated)
+            historical_operation = CreateOp(
+                type=MemoryType.PREFERENCE,
+                content="legacy reassertable fact",
+                provenance=[
+                    Provenance(
+                        turn_id="legacy-source",
+                        quote="legacy reassertable fact",
+                    )
+                ],
+            )
+            with pytest.raises(AmbiguousLegacyRetirementError):
+                store.prepare_create_embeddings(
+                    MemoryOps(create=[historical_operation]), source_ordinal=1
+                )
+
+            later = TranscriptStore(migrated).append(
+                "user", "I now reassert the legacy reassertable fact."
+            )
+            operation = CreateOp(
+                type=MemoryType.PREFERENCE,
+                content="legacy reassertable fact",
+                provenance=[
+                    Provenance(
+                        turn_id=later.turn_id,
+                        quote="legacy reassertable fact",
+                    )
+                ],
+            )
+            # A source appended after the recorded migration boundary is
+            # provably newer and can reassert without fabricating chronology.
+            plan = store.prepare_create_embeddings(
+                MemoryOps(create=[operation]), source_ordinal=2
+            )
+            migrated.connection.execute("BEGIN IMMEDIATE")
+            store.apply(
+                MemoryOps(create=[operation]),
+                _commit=False,
+                _prepared_embeddings=plan,
+            )
+            migrated.commit()
+            assert store.count(status=MemoryStatus.ACTIVE) == 1
+            assert [item.mem_id for item in store.unbound_legacy_retirements()] == [
+                "legacy-retired"
+            ]
+            with pytest.raises(ValueError, match="legacy boundary"):
+                store.bind_legacy_retirement(
+                    "legacy-retired", retired_at_turn=2
+                )
+            assert store.bind_legacy_retirement(
+                "legacy-retired", retired_at_turn=1
+            )
+            assert store.unbound_legacy_retirements() == []
 
 
 def test_v10_historical_graph_receipts_are_retired_to_one_v11_baseline(tmp_path):

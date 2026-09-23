@@ -19,8 +19,10 @@ Three invariants the rest of the system relies on:
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, Optional, Protocol
+from itertools import count
+from typing import Any, Iterable, Optional, Protocol, overload
 
 import numpy as np
 
@@ -96,9 +98,71 @@ _FROM_DB = {
 # Same single-source treatment for the ``memory_provenance`` round-trip
 # (``mem_id`` is the join key, supplied separately on both paths).
 _PROVENANCE_COLUMNS = ("turn_id", "chunk_id", "quote")
+_UNRESOLVED = object()
+_EXPECTED_ACTIVE_DUPLICATE = object()
+_EXPECTED_SUPPRESSING_RETIREMENT = object()
 
 
-def _acquire_write_transaction(connection: sqlite3.Connection) -> None:
+class PreparedMemoryPlanStaleError(RuntimeError):
+    """A provider-free duplicate plan changed before the write lock."""
+
+
+class AmbiguousLegacyRetirementError(RuntimeError):
+    """A pre-v15 retirement has no trustworthy source-order coordinate."""
+
+
+@dataclass(frozen=True)
+class _PreparedMemoryEmbeddings:
+    """Provider results resolved before an atomic SQLite apply begins."""
+
+    create: tuple[Any, ...]
+    source_ordinal: int
+
+
+_WRITE_SAVEPOINT_IDS = count()
+
+
+@dataclass
+class _WriteTransaction:
+    """One mutation's rollback boundary inside an optional caller transaction."""
+
+    connection: sqlite3.Connection
+    owns_transaction: bool
+    savepoint: str | None = None
+    finished: bool = False
+
+    def succeed(self, *, commit: bool) -> None:
+        if self.finished:
+            return
+        if self.savepoint is not None:
+            self.connection.execute(f"RELEASE SAVEPOINT {self.savepoint}")
+            self.savepoint = None
+        if commit:
+            try:
+                self.connection.commit()
+            except BaseException:
+                # RELEASE has merged the method into the caller transaction;
+                # a failed outer commit can only be made safe by rolling the
+                # connection back. Preserve the original commit exception.
+                self.connection.rollback()
+                self.finished = True
+                raise
+        self.finished = True
+
+    def abandon(self) -> None:
+        if self.finished:
+            return
+        if self.owns_transaction:
+            self.connection.rollback()
+        elif self.savepoint is not None:
+            self.connection.execute(f"ROLLBACK TO SAVEPOINT {self.savepoint}")
+            self.connection.execute(f"RELEASE SAVEPOINT {self.savepoint}")
+        self.finished = True
+
+
+def _acquire_write_transaction(
+    connection: sqlite3.Connection,
+) -> _WriteTransaction:
     """Start an immediate transaction or upgrade an existing caller one.
 
     Public memory mutations historically commit the connection, including
@@ -107,11 +171,20 @@ def _acquire_write_transaction(connection: sqlite3.Connection) -> None:
     precondition is read.
     """
     if connection.in_transaction:
-        connection.execute(
-            "UPDATE meta SET value = value WHERE key = 'schema_version'"
-        )
+        savepoint = f"memory_condense_write_{next(_WRITE_SAVEPOINT_IDS)}"
+        connection.execute(f"SAVEPOINT {savepoint}")
+        scope = _WriteTransaction(connection, False, savepoint)
+        try:
+            connection.execute(
+                "UPDATE meta SET value = value WHERE key = 'schema_version'"
+            )
+        except BaseException:
+            scope.abandon()
+            raise
+        return scope
     else:
         connection.execute("BEGIN IMMEDIATE")
+        return _WriteTransaction(connection, True)
 
 
 class Embedder(Protocol):
@@ -137,6 +210,7 @@ class MemoryStore:
     # Create / read
     # ------------------------------------------------------------------
 
+    @overload
     def create(
         self,
         op: CreateOp,
@@ -144,7 +218,38 @@ class MemoryStore:
         half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
         supersedes: str | None = None,
         dedupe: bool = True,
-    ) -> MemoryItem:
+        *,
+        _commit: bool = True,
+        _resolved_embedding: Any = _UNRESOLVED,
+        _source_ordinal: None = None,
+    ) -> MemoryItem: ...
+
+    @overload
+    def create(
+        self,
+        op: CreateOp,
+        embedding: Any = None,
+        half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
+        supersedes: str | None = None,
+        dedupe: bool = True,
+        *,
+        _commit: bool = True,
+        _resolved_embedding: Any = _UNRESOLVED,
+        _source_ordinal: int,
+    ) -> MemoryItem | None: ...
+
+    def create(
+        self,
+        op: CreateOp,
+        embedding: Any = None,
+        half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
+        supersedes: str | None = None,
+        dedupe: bool = True,
+        *,
+        _commit: bool = True,
+        _resolved_embedding: Any = _UNRESOLVED,
+        _source_ordinal: int | None = None,
+    ) -> MemoryItem | None:
         """Insert a new item plus its provenance rows.
 
         Starting energy comes from ``decay.seed_energy(op.importance)`` —
@@ -178,6 +283,8 @@ class MemoryStore:
                 op,
                 embedding=embedding,
                 half_life_turns=half_life_turns,
+                _commit=_commit,
+                _resolved_embedding=_resolved_embedding,
             )
             if replacement is None:
                 raise ValueError(
@@ -186,21 +293,58 @@ class MemoryStore:
                 )
             return replacement
 
+        suppressing_retirement = self._has_suppressing_retirement(
+            op.type, op.content, _source_ordinal
+        )
+        if suppressing_retirement:
+            # This is an internal T2 no-op: explicit work retired the exact
+            # fact at or after the source turn. Public creates never supply a
+            # source ordinal, so their historical recreate contract is intact.
+            return None
+
         if dedupe:
             existing = self.find_by_content(op.type, op.content)
             if existing is not None:
-                merged = self._merge_active_duplicate(op)
+                merged = self._merge_active_duplicate(
+                    op,
+                    _commit=_commit,
+                    _source_ordinal=_source_ordinal,
+                )
                 if merged is not None:
                     return merged
+
+        if _resolved_embedding is _EXPECTED_SUPPRESSING_RETIREMENT:
+            raise PreparedMemoryPlanStaleError(
+                "expected suppressing retirement changed before memory apply"
+            )
+        if _resolved_embedding is _EXPECTED_ACTIVE_DUPLICATE:
+            historical = self.find_latest_by_content(op.type, op.content)
+            if historical is not None:
+                # The active duplicate may have retired while the provider-free
+                # plan waited for the lock. Only a source-ordered retirement
+                # may suppress it; otherwise the plan must be recomputed.
+                suppressing_retirement = self._has_suppressing_retirement(
+                    op.type, op.content, _source_ordinal
+                )
+                if suppressing_retirement:
+                    return None
+            raise PreparedMemoryPlanStaleError(
+                "expected active duplicate changed before memory apply"
+            )
 
         item = self._build_item(
             op,
             embedding=embedding,
             half_life_turns=half_life_turns,
+            _resolved_embedding=_resolved_embedding,
         )
         if dedupe:
-            return self._insert_or_merge_active(item)
-        self._insert(item)
+            return self._insert_or_merge_active(
+                item,
+                _commit=_commit,
+                _source_ordinal=_source_ordinal,
+            )
+        self._insert(item, commit=_commit)
         return item
 
     def find_by_content(
@@ -218,6 +362,17 @@ class MemoryStore:
             (content_key(mem_type, content), MemoryStatus.ACTIVE.value),
         )
         row = cur.fetchone()
+        return self._row_to_item(row) if row is not None else None
+
+    def find_latest_by_content(
+        self, mem_type: MemoryType, content: str
+    ) -> MemoryItem | None:
+        """Newest row with this exact identity, including retired history."""
+        row = self._db.execute(
+            f"SELECT {_ITEM_COLUMNS} FROM memory_items "
+            "WHERE content_hash = ? ORDER BY created_at DESC, mem_id DESC LIMIT 1",
+            (content_key(mem_type, content),),
+        ).fetchone()
         return self._row_to_item(row) if row is not None else None
 
     def get(self, mem_id: str) -> MemoryItem | None:
@@ -318,50 +473,102 @@ class MemoryStore:
     # Mutations
     # ------------------------------------------------------------------
 
-    def update(self, op: UpdateOp) -> MemoryItem | None:
+    def update(
+        self,
+        op: UpdateOp,
+        *,
+        _commit: bool = True,
+        _resolved_embedding: Any = _UNRESOLVED,
+    ) -> MemoryItem | None:
         """Amend content/details in place and append any new provenance.
 
         Timestamps and energy are left alone — an amendment is not an access.
         Use ``supersede`` for semantic reversals.
         """
         self._require_writable()
-        item = self.get(op.mem_id)
-        if item is None:
-            return None
-
-        content = op.content if op.content is not None else item.content
-        details = op.details if op.details is not None else item.details
-
-        embedding_blob = _to_blob(item.embedding)
-        if op.content is not None and op.content != item.content:
-            new_vector = self._resolve_embedding(content, None)
-            if new_vector is not None:
-                embedding_blob = _to_blob(new_vector)
-
         connection = self._db.connection
-        try:
-            _acquire_write_transaction(connection)
-            self._db.execute(
-                "UPDATE memory_items SET content = ?, details = ?, embedding = ?, "
-                "content_hash = ? WHERE mem_id = ?",
-                (
-                    content,
-                    details,
-                    embedding_blob,
-                    # Must move with the content, or an amended item keeps the old
-                    # identity and stops deduplicating against its own new text.
-                    content_key(item.type, content),
-                    op.mem_id,
-                ),
-            )
-            self._insert_provenance(op.mem_id, op.provenance)
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        return self.get(op.mem_id)
+        for _attempt in range(4):
+            item = self.get(op.mem_id)
+            if item is None or item.status is not MemoryStatus.ACTIVE:
+                return None
 
-    def supersede(self, op: SupersedeOp) -> MemoryItem | None:
+            # Resolve provider work only for a raw content change and before
+            # taking the writer lock. A details-only or identical-content
+            # amendment must remain provider-independent.
+            new_vector = _UNRESOLVED
+            if op.content is not None:
+                if _resolved_embedding is not _UNRESOLVED:
+                    new_vector = _resolved_embedding
+                elif op.content != item.content:
+                    new_vector = self._resolve_embedding(op.content, None)
+
+            scope: _WriteTransaction | None = None
+            try:
+                scope = _acquire_write_transaction(connection)
+                current = self.get(op.mem_id)
+                if current is None or current.status is not MemoryStatus.ACTIVE:
+                    scope.abandon()
+                    return None
+                content = op.content if op.content is not None else current.content
+                details = op.details if op.details is not None else current.details
+                content_changed = content != current.content
+                if content_changed and new_vector is _UNRESOLVED:
+                    # The row changed between our provider-free read and the
+                    # lock. Retry from a fresh snapshot so its target content
+                    # is embedded outside the transaction.
+                    if not _commit:
+                        raise PreparedMemoryPlanStaleError(
+                            "memory update changed before its embedding plan"
+                        )
+                    scope.abandon()
+                    continue
+                current_key = content_key(current.type, current.content)
+                target_key = content_key(current.type, content)
+                identity_changed = target_key != current_key
+                if identity_changed:
+                    collision = self._db.execute(
+                        "SELECT 1 FROM memory_items WHERE content_hash = ? "
+                        "AND status = ? AND mem_id <> ? LIMIT 1",
+                        (target_key, MemoryStatus.ACTIVE.value, current.mem_id),
+                    ).fetchone()
+                    if collision is not None:
+                        scope.abandon()
+                        return None
+                embedding_blob = (
+                    _to_blob(new_vector)
+                    if content_changed
+                    else _to_blob(current.embedding)
+                )
+                if identity_changed:
+                    self._record_identity_retirement(
+                        current,
+                        retired_at_turn=self._db.current_turn(),
+                        reason="updated",
+                    )
+                self._db.execute(
+                    "UPDATE memory_items SET content = ?, details = ?, "
+                    "embedding = ?, content_hash = ? WHERE mem_id = ?",
+                    (content, details, embedding_blob, target_key, op.mem_id),
+                )
+                self._insert_provenance(op.mem_id, op.provenance)
+                scope.succeed(commit=_commit)
+                return self.get(op.mem_id)
+            except BaseException:
+                if scope is not None:
+                    scope.abandon()
+                raise
+        raise PreparedMemoryPlanStaleError(
+            "memory update changed repeatedly before its embedding plan"
+        )
+
+    def supersede(
+        self,
+        op: SupersedeOp,
+        *,
+        _commit: bool = True,
+        _resolved_embedding: Any = _UNRESOLVED,
+        _expected_content_hash: str | None = None,
+    ) -> MemoryItem | None:
         """Mark the old item ``superseded`` and create its replacement.
 
         The old row is never removed: ``replacement.supersedes`` points back at
@@ -373,33 +580,53 @@ class MemoryStore:
         it never silently resolves to an unrelated active duplicate.
         """
         self._require_writable()
-        return self._supersede_create(op.mem_id, op.replacement)
+        return self._supersede_create(
+            op.mem_id,
+            op.replacement,
+            _commit=_commit,
+            _resolved_embedding=_resolved_embedding,
+            _expected_content_hash=_expected_content_hash,
+        )
 
-    def delete(self, op: DeleteOp) -> bool:
+    def delete(self, op: DeleteOp, *, _commit: bool = True) -> bool:
         """Soft-delete: status becomes ``deleted``, the row survives."""
         self._require_writable()
-        if self.get(op.mem_id) is None:
-            return False
-        self._set_status(op.mem_id, MemoryStatus.DELETED)
-        return True
+        return self._set_status(
+            op.mem_id, MemoryStatus.DELETED, _commit=_commit
+        )
 
-    def pin(self, op: PinOp) -> MemoryItem | None:
+    def pin(self, op: PinOp, *, _commit: bool = True) -> MemoryItem | None:
         """Pin or unpin an item. Pinned items are exempt from decay."""
         self._require_writable()
-        if self.get(op.mem_id) is None:
-            return None
+        connection = self._db.connection
+        scope: _WriteTransaction | None = None
         try:
-            self._db.execute(
-                "UPDATE memory_items SET pin = ? WHERE mem_id = ?",
-                (op.pin.value, op.mem_id),
+            scope = _acquire_write_transaction(connection)
+            item = self.get(op.mem_id)
+            if item is None or item.status is not MemoryStatus.ACTIVE:
+                scope.abandon()
+                return None
+            changed = self._db.execute(
+                "UPDATE memory_items SET pin = ? WHERE mem_id = ? AND status = ?",
+                (op.pin.value, op.mem_id, MemoryStatus.ACTIVE.value),
             )
-            self._db.commit()
+            if changed.rowcount != 1:
+                scope.abandon()
+                return None
+            scope.succeed(commit=_commit)
         except BaseException:
-            self._db.connection.rollback()
+            if scope is not None:
+                scope.abandon()
             raise
         return self.get(op.mem_id)
 
-    def apply(self, report_or_ops: ValidationReport | MemoryOps) -> dict[str, int]:
+    def apply(
+        self,
+        report_or_ops: ValidationReport | MemoryOps,
+        *,
+        _commit: bool = True,
+        _prepared_embeddings: _PreparedMemoryEmbeddings | None = None,
+    ) -> dict[str, int]:
         """Apply a validated batch in create → update → supersede → delete → pin order.
 
         Accepts either a ``ValidationReport`` (its ``accepted`` ops are used) or
@@ -412,6 +639,20 @@ class MemoryStore:
             if isinstance(report_or_ops, ValidationReport)
             else report_or_ops
         )
+        if not _commit and _prepared_embeddings is None:
+            raise RuntimeError(
+                "atomic memory apply requires precomputed embeddings"
+            )
+        if _prepared_embeddings is not None and (
+            len(_prepared_embeddings.create) != len(ops.create)
+            or ops.update
+            or ops.supersede
+            or ops.delete
+            or ops.pin
+        ):
+            raise ValueError(
+                "prepared atomic memory apply supports create operations only"
+            )
 
         summary = {
             "created": 0,
@@ -423,9 +664,22 @@ class MemoryStore:
             "skipped": 0,
         }
 
-        for create_op in ops.create:
+        for index, create_op in enumerate(ops.create):
             before = self.count()
-            self.create(create_op)
+            self.create(
+                create_op,
+                _commit=_commit,
+                _resolved_embedding=(
+                    _UNRESOLVED
+                    if _prepared_embeddings is None
+                    else _prepared_embeddings.create[index]
+                ),
+                _source_ordinal=(
+                    None
+                    if _prepared_embeddings is None
+                    else _prepared_embeddings.source_ordinal
+                ),
+            )
             # A create that added no row was merged into an existing item.
             # Counted rather than hidden: silent merging looks like extraction
             # producing less than it did.
@@ -434,31 +688,219 @@ class MemoryStore:
             else:
                 summary["duplicate"] += 1
 
-        for update_op in ops.update:
-            if self.update(update_op) is not None:
+        for index, update_op in enumerate(ops.update):
+            if self.update(
+                update_op,
+                _commit=_commit,
+                _resolved_embedding=(
+                    _UNRESOLVED
+                ),
+            ) is not None:
                 summary["updated"] += 1
             else:
                 summary["skipped"] += 1
 
-        for sup_op in ops.supersede:
-            if self.supersede(sup_op) is not None:
+        for index, sup_op in enumerate(ops.supersede):
+            if self.supersede(
+                sup_op,
+                _commit=_commit,
+                _resolved_embedding=(
+                    _UNRESOLVED
+                ),
+            ) is not None:
                 summary["superseded"] += 1
             else:
                 summary["skipped"] += 1
 
         for del_op in ops.delete:
-            if self.delete(del_op):
+            if self.delete(del_op, _commit=_commit):
                 summary["deleted"] += 1
             else:
                 summary["skipped"] += 1
 
         for pin_op in ops.pin:
-            if self.pin(pin_op) is not None:
+            if self.pin(pin_op, _commit=_commit) is not None:
                 summary["pinned"] += 1
             else:
                 summary["skipped"] += 1
 
         return summary
+
+    def prepare_create_embeddings(
+        self, ops: MemoryOps, *, source_ordinal: int
+    ) -> _PreparedMemoryEmbeddings:
+        """Resolve T2 create vectors before a caller takes a write lock.
+
+        Exact active duplicates need no new vector. Their provider-free plan
+        is rechecked under the lock and retried if concurrent state changed.
+        """
+        self._require_writable()
+        if source_ordinal < 1:
+            raise ValueError("source_ordinal must be positive")
+        if ops.update or ops.supersede or ops.delete or ops.pin:
+            raise ValueError("prepared enrichment supports create operations only")
+        by_content: dict[str, Any] = {}
+        prepared: list[Any] = []
+        for op in ops.create:
+            key = content_key(op.type, op.content)
+            value = by_content.get(key, _UNRESOLVED)
+            if value is _UNRESOLVED:
+                if self.find_by_content(op.type, op.content) is not None:
+                    value = _EXPECTED_ACTIVE_DUPLICATE
+                elif self._has_suppressing_retirement(
+                    op.type, op.content, source_ordinal
+                ):
+                    value = _EXPECTED_SUPPRESSING_RETIREMENT
+                elif self._has_ambiguous_legacy_retirement(
+                    op.type, op.content, source_ordinal
+                ):
+                    raise AmbiguousLegacyRetirementError(
+                        "exact retired identity predates source-order metadata; "
+                        "bind its retirement turn before automatic replay"
+                    )
+                else:
+                    value = self._resolve_embedding(op.content, None)
+                by_content[key] = value
+            prepared.append(value)
+        return _PreparedMemoryEmbeddings(
+            create=tuple(prepared), source_ordinal=source_ordinal
+        )
+
+    def _has_suppressing_retirement(
+        self,
+        mem_type: MemoryType,
+        content: str,
+        source_ordinal: int | None,
+    ) -> bool:
+        """A retirement new enough to veto one delayed automatic create."""
+        if source_ordinal is None:
+            return False
+        row = self._db.execute(
+            "SELECT 1 FROM memory_identity_retirements "
+            "WHERE content_hash = ? AND retired_at_turn >= ? LIMIT 1",
+            (
+                content_key(mem_type, content),
+                source_ordinal,
+            ),
+        ).fetchone()
+        return row is not None
+
+    def _has_ambiguous_legacy_retirement(
+        self,
+        mem_type: MemoryType,
+        content: str,
+        source_ordinal: int,
+    ) -> bool:
+        row = self._db.execute(
+            "SELECT 1 FROM memory_items WHERE content_hash = ? "
+            "AND status <> ? AND retired_at_turn IS NULL LIMIT 1",
+            (content_key(mem_type, content), MemoryStatus.ACTIVE.value),
+        ).fetchone()
+        if row is None:
+            return False
+        boundary = self._db.execute(
+            "SELECT value FROM meta "
+            "WHERE key = 'v15_legacy_retirement_boundary'"
+        ).fetchone()
+        # A missing/corrupt boundary cannot prove chronology, so fail closed.
+        try:
+            legacy_boundary = int(boundary[0]) if boundary is not None else None
+        except (TypeError, ValueError):
+            legacy_boundary = None
+        return legacy_boundary is None or source_ordinal <= legacy_boundary
+
+    def bind_legacy_retirement(
+        self, mem_id: str, *, retired_at_turn: int
+    ) -> bool:
+        """Resolve one pre-v15 retirement's otherwise unknowable ordering.
+
+        This is an explicit operator action. Pick the historical transcript
+        ordinal at which the identity was retired. This repairs item-level
+        history; migration-time T2 receipts remain separately quarantined.
+        """
+        self._require_writable()
+        boundary = self.legacy_retirement_boundary()
+        if (
+            boundary is None
+            or type(retired_at_turn) is not int
+            or not (0 <= retired_at_turn <= boundary)
+        ):
+            raise ValueError(
+                "retired_at_turn must be between zero and the recorded v15 "
+                "legacy boundary"
+            )
+        connection = self._db.connection
+        scope: _WriteTransaction | None = None
+        try:
+            scope = _acquire_write_transaction(connection)
+            item = self.get(mem_id)
+            row = self._db.execute(
+                "SELECT retired_at_turn FROM memory_items WHERE mem_id = ?",
+                (mem_id,),
+            ).fetchone()
+            if (
+                item is None
+                or item.status is MemoryStatus.ACTIVE
+                or row is None
+                or row[0] is not None
+            ):
+                scope.abandon()
+                return False
+            self._db.execute(
+                "UPDATE memory_items SET retired_at_turn = ? WHERE mem_id = ? "
+                "AND status <> ? AND retired_at_turn IS NULL",
+                (retired_at_turn, mem_id, MemoryStatus.ACTIVE.value),
+            )
+            self._record_identity_retirement(
+                item,
+                retired_at_turn=retired_at_turn,
+                reason=(
+                    "deleted"
+                    if item.status is MemoryStatus.DELETED
+                    else "superseded"
+                ),
+            )
+            scope.succeed(commit=True)
+            return True
+        except BaseException:
+            if scope is not None:
+                scope.abandon()
+            raise
+
+    def legacy_retirement_boundary(self) -> int | None:
+        """Return v15's last pre-migration source ordinal, or fail-closed None."""
+        row = self._db.execute(
+            "SELECT value FROM meta "
+            "WHERE key = 'v15_legacy_retirement_boundary'"
+        ).fetchone()
+        try:
+            value = int(row[0]) if row is not None else None
+        except (TypeError, ValueError):
+            return None
+        return value if value is not None and value >= 0 else None
+
+    def unbound_legacy_retirements(self) -> list[MemoryItem]:
+        """Discover pre-v15 retired identities whose chronology is unresolved."""
+        rows = self._db.execute(
+            "SELECT mem_id FROM memory_items WHERE status <> ? "
+            "AND retired_at_turn IS NULL ORDER BY created_at, mem_id",
+            (MemoryStatus.ACTIVE.value,),
+        ).fetchall()
+        return [
+            item
+            for (mem_id,) in rows
+            if (item := self.get(str(mem_id))) is not None
+        ]
+
+    def prepare_supersede_embeddings(
+        self, replacements: Iterable[CreateOp]
+    ) -> tuple[Any, ...]:
+        """Resolve explicit correction vectors before taking a writer lock."""
+        self._require_writable()
+        return tuple(
+            self._resolve_embedding(replacement.content, None)
+            for replacement in replacements
+        )
 
     # ------------------------------------------------------------------
     # Energy
@@ -522,6 +964,8 @@ class MemoryStore:
         items: list[MemoryItem],
         now_turn: int | None = None,
         now: datetime | None = None,
+        *,
+        _commit: bool = True,
     ) -> list[MemoryItem]:
         """Batch-update already-loaded items, avoiding reads and commits per row."""
         if not items:
@@ -555,9 +999,11 @@ class MemoryStore:
                 " last_access_turn = ? WHERE mem_id = ?",
                 updates,
             )
-            self._db.commit()
+            if _commit:
+                self._db.commit()
         except BaseException:
-            self._db.connection.rollback()
+            if _commit:
+                self._db.connection.rollback()
             raise
         return refreshed
 
@@ -741,11 +1187,16 @@ class MemoryStore:
         embedding: Any = None,
         half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
         supersedes: str | None = None,
+        _resolved_embedding: Any = _UNRESOLVED,
     ) -> MemoryItem:
         """Resolve fallible inputs before a mutation transaction begins."""
         return MemoryItem.from_create(
             op,
-            embedding=self._resolve_embedding(op.content, embedding),
+            embedding=(
+                self._resolve_embedding(op.content, embedding)
+                if _resolved_embedding is _UNRESOLVED
+                else _resolved_embedding
+            ),
             half_life_turns=half_life_turns,
             supersedes=supersedes,
             # Creation is an access: an item enters the store at the current
@@ -761,6 +1212,9 @@ class MemoryStore:
         *,
         embedding: Any = None,
         half_life_turns: float = DEFAULT_HALF_LIFE_TURNS,
+        _commit: bool = True,
+        _resolved_embedding: Any = _UNRESOLVED,
+        _expected_content_hash: str | None = None,
     ) -> MemoryItem | None:
         """Atomically retire one active row and publish its fresh successor.
 
@@ -783,17 +1237,35 @@ class MemoryStore:
             embedding=embedding,
             half_life_turns=half_life_turns,
             supersedes=predecessor_id,
+            _resolved_embedding=_resolved_embedding,
         )
         content_hash = content_key(replacement.type, replacement.content)
         connection = self._db.connection
+        scope: _WriteTransaction | None = None
 
         try:
-            _acquire_write_transaction(connection)
+            scope = _acquire_write_transaction(connection)
+            locked_predecessor = self.get(predecessor_id)
+            if (
+                locked_predecessor is None
+                or locked_predecessor.status is not MemoryStatus.ACTIVE
+                or (
+                    _expected_content_hash is not None
+                    and content_key(
+                        locked_predecessor.type, locked_predecessor.content
+                    )
+                    != _expected_content_hash
+                )
+            ):
+                scope.abandon()
+                return None
+            retired_at_turn = self._db.current_turn()
             retired = self._db.execute(
-                "UPDATE memory_items SET status = ? "
+                "UPDATE memory_items SET status = ?, retired_at_turn = ? "
                 "WHERE mem_id = ? AND status = ?",
                 (
                     MemoryStatus.SUPERSEDED.value,
+                    retired_at_turn,
                     predecessor_id,
                     MemoryStatus.ACTIVE.value,
                 ),
@@ -802,8 +1274,13 @@ class MemoryStore:
             # produced. Publish no replacement unless this transaction owns
             # the active -> superseded transition.
             if retired.rowcount != 1:
-                connection.rollback()
+                scope.abandon()
                 return None
+            self._record_identity_retirement(
+                locked_predecessor,
+                retired_at_turn=retired_at_turn,
+                reason="superseded",
+            )
 
             duplicate_ids = [
                 row[0]
@@ -829,13 +1306,20 @@ class MemoryStore:
                     (item.mem_id, duplicate_id),
                 )
                 self._db.execute(
-                    "UPDATE memory_items SET status = ? "
+                    "UPDATE memory_items SET status = ?, retired_at_turn = ? "
                     "WHERE mem_id = ? AND status = ?",
                     (
                         MemoryStatus.SUPERSEDED.value,
+                        retired_at_turn,
                         duplicate_id,
                         MemoryStatus.ACTIVE.value,
                     ),
+                )
+                self._record_identity_retirement_hash(
+                    duplicate_id,
+                    content_hash,
+                    retired_at_turn=retired_at_turn,
+                    reason="deduplicated",
                 )
                 self._db.execute(
                     "INSERT INTO memory_successor_redirects "
@@ -843,9 +1327,10 @@ class MemoryStore:
                     "VALUES (?, ?, 'exact_duplicate_merge', ?)",
                     (duplicate_id, item.mem_id, item.created_at.isoformat()),
                 )
-            connection.commit()
+            scope.succeed(commit=_commit)
         except BaseException:
-            connection.rollback()
+            if scope is not None:
+                scope.abandon()
             raise
 
         # Rehydrate after commit so merged provenance is part of the returned
@@ -873,39 +1358,64 @@ class MemoryStore:
                 self._db.connection.rollback()
             raise
 
-    def _merge_active_duplicate(self, op: CreateOp) -> MemoryItem | None:
+    def _merge_active_duplicate(
+        self,
+        op: CreateOp,
+        *,
+        _commit: bool = True,
+        _source_ordinal: int | None = None,
+    ) -> MemoryItem | None:
         """Serialize duplicate adoption and its provenance/heat mutation."""
         connection = self._db.connection
+        scope: _WriteTransaction | None = None
         try:
-            _acquire_write_transaction(connection)
+            scope = _acquire_write_transaction(connection)
+            if self._has_suppressing_retirement(
+                op.type, op.content, _source_ordinal
+            ):
+                scope.abandon()
+                return None
             existing = self.find_by_content(op.type, op.content)
             if existing is None:
-                connection.rollback()
+                scope.abandon()
                 return None
             self._insert_provenance(existing.mem_id, op.provenance)
-            # ``_touch_items`` commits the transaction containing both the
-            # citations and heat update. Reload so the caller sees the newly
-            # merged provenance rather than the pre-transaction snapshot.
-            self._touch_items([existing])
+            self._touch_items([existing], _commit=False)
+            scope.succeed(commit=_commit)
         except BaseException:
-            connection.rollback()
+            if scope is not None:
+                scope.abandon()
             raise
         return self.get(existing.mem_id)
 
-    def _insert_or_merge_active(self, item: MemoryItem) -> MemoryItem:
+    def _insert_or_merge_active(
+        self,
+        item: MemoryItem,
+        *,
+        _commit: bool = True,
+        _source_ordinal: int | None = None,
+    ) -> MemoryItem | None:
         """Atomically recheck exact identity before publishing a new row."""
         connection = self._db.connection
+        scope: _WriteTransaction | None = None
         try:
-            _acquire_write_transaction(connection)
+            scope = _acquire_write_transaction(connection)
+            if self._has_suppressing_retirement(
+                item.type, item.content, _source_ordinal
+            ):
+                scope.abandon()
+                return None
             existing = self.find_by_content(item.type, item.content)
             if existing is not None:
                 self._insert_provenance(existing.mem_id, item.provenance)
-                self._touch_items([existing])
+                self._touch_items([existing], _commit=False)
+                scope.succeed(commit=_commit)
                 return self.get(existing.mem_id) or existing
             self._insert(item, commit=False)
-            connection.commit()
+            scope.succeed(commit=_commit)
         except BaseException:
-            connection.rollback()
+            if scope is not None:
+                scope.abandon()
             raise
         return item
 
@@ -941,8 +1451,10 @@ class MemoryStore:
         self._require_writable()
         connection = self._db.connection
         retired = 0
+        scope: _WriteTransaction | None = None
         try:
-            _acquire_write_transaction(connection)
+            scope = _acquire_write_transaction(connection)
+            retired_at_turn = self._db.current_turn()
             rows = self._db.execute(
                 "SELECT content_hash FROM memory_items "
                 "WHERE status = ? AND content_hash IS NOT NULL "
@@ -967,16 +1479,23 @@ class MemoryStore:
                         (survivor, loser),
                     )
                     changed = self._db.execute(
-                        "UPDATE memory_items SET status = ? "
+                        "UPDATE memory_items SET status = ?, retired_at_turn = ? "
                         "WHERE mem_id = ? AND status = ?",
                         (
                             MemoryStatus.SUPERSEDED.value,
+                            retired_at_turn,
                             loser,
                             MemoryStatus.ACTIVE.value,
                         ),
                     )
                     if changed.rowcount != 1:
                         continue
+                    self._record_identity_retirement_hash(
+                        loser,
+                        str(digest),
+                        retired_at_turn=retired_at_turn,
+                        reason="deduplicated",
+                    )
                     self._db.execute(
                         "INSERT INTO memory_successor_redirects "
                         "(predecessor_mem_id, successor_mem_id, reason, created_at) "
@@ -984,9 +1503,10 @@ class MemoryStore:
                         (loser, survivor, decay.now_utc().isoformat()),
                     )
                     retired += 1
-            connection.commit()
+            scope.succeed(commit=True)
         except BaseException:
-            connection.rollback()
+            if scope is not None:
+                scope.abandon()
             raise
         return retired
 
@@ -995,16 +1515,75 @@ class MemoryStore:
         if self._db.read_only:
             raise sqlite3.OperationalError("attempt to write a readonly database")
 
-    def _set_status(self, mem_id: str, status: MemoryStatus) -> None:
+    def _set_status(
+        self, mem_id: str, status: MemoryStatus, *, _commit: bool = True
+    ) -> bool:
+        connection = self._db.connection
+        scope: _WriteTransaction | None = None
         try:
-            self._db.execute(
-                "UPDATE memory_items SET status = ? WHERE mem_id = ?",
-                (status.value, mem_id),
+            scope = _acquire_write_transaction(connection)
+            current = self.get(mem_id)
+            if current is None or current.status is not MemoryStatus.ACTIVE:
+                scope.abandon()
+                return False
+            retired_at_turn = self._db.current_turn()
+            changed = self._db.execute(
+                "UPDATE memory_items SET status = ?, retired_at_turn = ? "
+                "WHERE mem_id = ? AND status = ?",
+                (
+                    status.value,
+                    retired_at_turn,
+                    mem_id,
+                    MemoryStatus.ACTIVE.value,
+                ),
             )
-            self._db.commit()
+            if changed.rowcount != 1:
+                scope.abandon()
+                return False
+            self._record_identity_retirement(
+                current,
+                retired_at_turn=retired_at_turn,
+                reason=(
+                    "deleted"
+                    if status is MemoryStatus.DELETED
+                    else "superseded"
+                ),
+            )
+            scope.succeed(commit=_commit)
         except BaseException:
-            self._db.connection.rollback()
+            if scope is not None:
+                scope.abandon()
             raise
+        return True
+
+    def _record_identity_retirement(
+        self,
+        item: MemoryItem,
+        *,
+        retired_at_turn: int,
+        reason: str,
+    ) -> None:
+        self._record_identity_retirement_hash(
+            item.mem_id,
+            content_key(item.type, item.content),
+            retired_at_turn=retired_at_turn,
+            reason=reason,
+        )
+
+    def _record_identity_retirement_hash(
+        self,
+        mem_id: str,
+        digest: str,
+        *,
+        retired_at_turn: int,
+        reason: str,
+    ) -> None:
+        """Append one compact, source-ordered identity tombstone."""
+        self._db.execute(
+            "INSERT OR IGNORE INTO memory_identity_retirements "
+            "(mem_id, content_hash, retired_at_turn, reason) VALUES (?, ?, ?, ?)",
+            (mem_id, digest, retired_at_turn, reason),
+        )
 
     def _load_provenance(self, mem_id: str) -> list[Provenance]:
         cur = self._db.execute(

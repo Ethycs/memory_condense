@@ -7,8 +7,20 @@ from typing import Callable
 from memory_condense.persistence.pending_ingest_schema import (
     PENDING_INGEST_SCHEMA_V13,
 )
+from memory_condense.persistence.pending_enrichment_schema import (
+    PENDING_ENRICHMENT_SCHEMA_V14,
+)
+from memory_condense.persistence.pending_work_schema import (
+    PENDING_WORK_STATE_SCHEMA_V15,
+)
+from memory_condense.persistence.conversation_graph_schema import (
+    CONVERSATION_GRAPH_SCHEMA_V16,
+)
+from memory_condense.persistence.conversation_envelope_schema import (
+    CONVERSATION_ENVELOPE_SCHEMA_V17,
+)
 
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 17
 
 #: A chunk's owning source: a turn falls back to its own ID when no source
 #: grouped it.  Expects the ``turns`` table aliased as ``t``.
@@ -46,6 +58,7 @@ def _apply_schema_transaction(
     script: str,
     version: int,
     *,
+    pre: Callable[[sqlite3.Connection], None] | None = None,
     post: Callable[[sqlite3.Connection], None] | None = None,
 ) -> None:
     """Atomically apply DDL, its backfill hook, and version publication.
@@ -57,6 +70,25 @@ def _apply_schema_transaction(
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            locked_version = None if row is None else int(row[0])
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            locked_version = None
+        if locked_version is not None and locked_version >= version:
+            conn.commit()
+            return
+        if locked_version is not None and locked_version != version - 1:
+            raise RuntimeError(
+                "schema migration order changed while waiting for writer lock: "
+                f"expected {version - 1}, found {locked_version}"
+            )
+        if pre is not None:
+            pre(conn)
         _execute_sql_script(conn, script)
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value)"
@@ -749,7 +781,8 @@ CREATE TABLE IF NOT EXISTS memory_items (
     last_access_at   TEXT NOT NULL,
     last_access_turn INTEGER NOT NULL DEFAULT 0,
     embedding        BLOB,
-    content_hash     TEXT
+    content_hash     TEXT,
+    retired_at_turn  INTEGER CHECK(retired_at_turn IS NULL OR retired_at_turn >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_status ON memory_items(status);
@@ -783,6 +816,10 @@ _SCHEMA_SQL = (
     + _V11_REVISION_SCHEMA
     + _V12_MEMORY_SUCCESSOR_REDIRECT_SCHEMA
     + PENDING_INGEST_SCHEMA_V13
+    + PENDING_ENRICHMENT_SCHEMA_V14
+    + PENDING_WORK_STATE_SCHEMA_V15
+    + CONVERSATION_GRAPH_SCHEMA_V16
+    + CONVERSATION_ENVELOPE_SCHEMA_V17
 )
 
 #: Statements that upgrade a database *into* the keyed version.
@@ -864,6 +901,10 @@ CREATE INDEX IF NOT EXISTS idx_turns_source ON turns(source_id, ordinal);
     11: _V11_REVISION_SCHEMA,
     12: _V12_MEMORY_SUCCESSOR_REDIRECT_SCHEMA,
     13: PENDING_INGEST_SCHEMA_V13,
+    14: PENDING_ENRICHMENT_SCHEMA_V14,
+    15: PENDING_WORK_STATE_SCHEMA_V15,
+    16: CONVERSATION_GRAPH_SCHEMA_V16,
+    17: CONVERSATION_ENVELOPE_SCHEMA_V17,
 }
 
 
@@ -1085,6 +1126,18 @@ def _backfill_pending_ingest_receipts(conn: sqlite3.Connection) -> None:
     backfill_legacy_ingest_receipts(conn)
 
 
+def _ensure_retired_at_turn_column(conn: sqlite3.Connection) -> None:
+    """Install v15's column unless a pre-atomic migration already did so."""
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(memory_items)")
+    }
+    if "retired_at_turn" not in columns:
+        conn.execute(
+            "ALTER TABLE memory_items ADD COLUMN retired_at_turn INTEGER "
+            "CHECK(retired_at_turn IS NULL OR retired_at_turn >= 0)"
+        )
+
+
 #: Work that must run *after* the SQL for a version, when SQL alone cannot
 #: express it. Keyed by target version, same as :data:`_MIGRATIONS`.
 #:
@@ -1099,6 +1152,10 @@ _POST_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: _backfill_turn_ordinals,
     11: _backfill_discourse_snapshot_revisions,
     13: _backfill_pending_ingest_receipts,
+}
+
+_PRE_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    15: _ensure_retired_at_turn_column,
 }
 
 
@@ -1139,6 +1196,12 @@ class Database:
             check_same_thread=False,
             uri=self._read_only,
         )
+        self._conn.create_function(
+            "memory_condense_writer_schema_version",
+            0,
+            lambda: CURRENT_SCHEMA_VERSION,
+            deterministic=True,
+        )
         # BEFORE DELETE guards must also observe SQLite's implicit delete in
         # INSERT OR REPLACE; otherwise durable ingest receipts can be replaced
         # without firing their immutability triggers.
@@ -1169,6 +1232,7 @@ class Database:
                         self._conn,
                         sql,
                         target,
+                        pre=_PRE_MIGRATIONS.get(target),
                         post=_POST_MIGRATIONS.get(target),
                     )
 
@@ -1188,6 +1252,12 @@ class Database:
         value._path = Path(path)
         value._read_only = bool(read_only)
         value._conn = connection
+        value._conn.create_function(
+            "memory_condense_writer_schema_version",
+            0,
+            lambda: CURRENT_SCHEMA_VERSION,
+            deterministic=True,
+        )
         value._conn.execute("PRAGMA recursive_triggers=ON")
         return value
 

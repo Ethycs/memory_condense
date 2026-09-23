@@ -72,6 +72,77 @@ def _bounded_unique_candidates(
     return bounded
 
 
+class _CoverageAttentionInputReady(BaseException):
+    """Stop a prefix forward once the selected attention input is available."""
+
+
+def _capture_coverage_attention_input(
+    encoder: Qwen3PrefixEncoder,
+    model_inputs: dict[str, Any],
+    *,
+    layer: int,
+) -> Any:
+    """Return the exact selected-layer QKV input without running that layer.
+
+    ``inspect_coverage`` computes the selected attention layer's QK/OV readout
+    itself.  A complete prefix forward would therefore run that same
+    attention, its following MLP, and the model final norm only to discard
+    their outputs.  The pre-hook fires after the decoder's input norm, so its
+    ``hidden_states`` value is byte-for-byte the value the old complete
+    forward exposed to the coverage scorer.
+
+    The exact-instance control signal is deliberately private and the helper
+    fails closed if the selected hook is skipped or another signal escapes.
+    """
+
+    if not 0 <= layer < encoder.layers:
+        raise IndexError(f"layer must be in [0, {encoder.layers})")
+    attention_module = encoder.model.layers[layer].self_attn
+    missing = object()
+    captured: Any = missing
+    ready = _CoverageAttentionInputReady()
+
+    def stop_at_attention_input(
+        _module: Any,
+        _args: Any,
+        kwargs: dict[str, Any],
+    ) -> None:
+        nonlocal captured
+        if "hidden_states" not in kwargs or kwargs["hidden_states"] is None:
+            raise RuntimeError(
+                "Qwen selected attention did not receive hidden_states"
+            )
+        captured = kwargs["hidden_states"]
+        raise ready
+
+    handle = attention_module.register_forward_pre_hook(
+        stop_at_attention_input,
+        with_kwargs=True,
+    )
+    try:
+        try:
+            forward_inputs = dict(model_inputs)
+            forward_inputs.update(
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+            encoder.model(**forward_inputs)
+        except _CoverageAttentionInputReady as caught:
+            if caught is not ready:
+                raise
+        else:
+            raise RuntimeError("Qwen coverage early-exit hook did not execute")
+        if captured is missing:
+            raise RuntimeError("Qwen coverage early exit captured no hidden state")
+        return captured
+    finally:
+        try:
+            handle.remove()
+        finally:
+            ready.__traceback__ = None
+
+
 class QwenMemoryLinker:
     """Use real QK/OV circuits transiently, retaining only compact links.
 
@@ -315,20 +386,7 @@ class QwenMemoryLinker:
 
         original_padding_side = self.encoder.tokenizer.padding_side
         self.encoder.tokenizer.padding_side = "right"
-        captured: dict[str, Any] = {}
-
-        def save_attention_input(
-            _module: Any,
-            _args: Any,
-            kwargs: dict[str, Any],
-        ) -> None:
-            captured["hidden"] = kwargs["hidden_states"]
-
         attention_module = self.encoder.model.layers[self.layer].self_attn
-        handle = attention_module.register_forward_pre_hook(
-            save_attention_input,
-            with_kwargs=True,
-        )
         try:
             tokenized = self.encoder.tokenizer(
                 texts,
@@ -371,8 +429,11 @@ class QwenMemoryLinker:
                 for key, value in tokenized.items()
             }
             with torch.inference_mode():
-                self.encoder.model(**model_inputs, use_cache=False)
-                hidden = captured["hidden"]
+                hidden = _capture_coverage_attention_input(
+                    self.encoder,
+                    model_inputs,
+                    layer=self.layer,
+                )
                 batch, sequence_length, _width = hidden.shape
                 input_shape = hidden.shape[:-1]
                 head_shape = (*input_shape, -1, attention_module.head_dim)
@@ -478,7 +539,6 @@ class QwenMemoryLinker:
                         )
                     )
         finally:
-            handle.remove()
             self.encoder.tokenizer.padding_side = original_padding_side
 
         hits.sort(

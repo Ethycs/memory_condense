@@ -183,22 +183,34 @@ class EmbeddingService:
             from sentence_transformers import SentenceTransformer
 
             kwargs: dict = {}
+            load_source = self._model_name
             if self._device is not None:
                 kwargs["device"] = self._device
             if self._model_revision is not None:
                 kwargs["revision"] = self._model_revision
             if self._verify_checkpoint:
+                from huggingface_hub import snapshot_download
+
                 # A checksum-pinned production checkpoint must be resolved
                 # entirely from the authenticated local cache.  Besides
                 # preventing mutable network input, this avoids Transformers
                 # probing optional Hugging Face metadata files with retry
                 # backoff before every fresh process.
                 kwargs["local_files_only"] = True
-            model = SentenceTransformer(self._model_name, **kwargs)
+                # Some SentenceTransformers versions do not forward revision
+                # or local_files_only to AutoProcessor. Resolve once and pass
+                # the same local snapshot to every model/processor component.
+                load_source = snapshot_download(
+                    repo_id=self._model_name,
+                    revision=self._model_revision,
+                    local_files_only=True,
+                )
+                kwargs.pop("revision", None)
+            model = SentenceTransformer(load_source, **kwargs)
             verified_checkpoint_sha256: str | None = None
             if self._verify_checkpoint:
                 try:
-                    actual = verify_bge_m3_checkpoint()
+                    actual = verify_bge_m3_checkpoint(load_source)
                 except BaseException:
                     del model
                     raise

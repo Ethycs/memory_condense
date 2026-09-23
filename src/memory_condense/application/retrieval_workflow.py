@@ -6,12 +6,22 @@ from typing import Sequence
 
 import numpy as np
 
+from memory_condense.application.conversation_envelope_retrieval import (
+    CONVERSATION_ENVELOPE_MEMBER_ROUTE,
+    ConversationEnvelopeRetrievalExpansion,
+    hydrate_conversation_envelope_plan,
+)
 from memory_condense.application.query_routing import (
     SAFE_ASSOCIATION_LEXICAL_THRESHOLD,
     SAFE_ASSOCIATION_MAX_TOKEN_INCREASE,
 )
+from memory_condense.application.section_retrieval import (
+    SectionRetrievalResult,
+    hydrate_section_plan,
+)
 from memory_condense.associations.association_store import HebbianUpdate
 from memory_condense.associations.associative_retrieval import expand_associative_results
+from memory_condense.associations.qwen_memory_linker import QwenMemoryLinker
 from memory_condense.associations.hebbian_retrieval import (
     HebbianExpansionReceipt,
     expand_hebbian_results,
@@ -19,11 +29,134 @@ from memory_condense.associations.hebbian_retrieval import (
     retrieval_concept_activations,
 )
 from memory_condense.domain.schemas import RetrievalResult
+from memory_condense.persistence.conversation_envelope_expansion import (
+    DEFAULT_MAX_EXPANSION_COMPANION_CHUNKS,
+    DEFAULT_MAX_EXPANSION_COMPANION_TOKENS,
+    DEFAULT_MAX_EXPANSION_ENVELOPES,
+    DEFAULT_MAX_EXPANSION_TURNS,
+)
 from memory_condense.search.indexes.retrieval import DEFAULT_SPAN_TOKENS
+from memory_condense.search.section_routing import SectionSummaryIndex
+from memory_condense.search.section_attention import route_summary_hierarchy
+from memory_condense.search.summary_reasoning import QwenSummaryReasoner, reason_over_summary_hierarchy
 
 
 class RetrievalWorkflowMixin:
     """Internal workflow methods composed by ``MemoryCondenser``."""
+
+    def search_reasoned_summary_sections(
+        self, query: str, index: SectionSummaryIndex, *, reasoner: QwenSummaryReasoner,
+        max_sections: int = 4, max_depth: int = 32, max_calls: int = 128,
+        group_size: int = 8, max_prompt_tokens: int = 2048,
+        eligible_source_ids: Sequence[str] | None = None,
+        max_raw_spans: int = 32, max_context_tokens: int = 4096,
+    ) -> SectionRetrievalResult:
+        """Full Qwen chooses hierarchical summaries, then exact raw is hydrated."""
+        plan = reason_over_summary_hierarchy(
+            query, index, reasoner=reasoner, max_sections=max_sections, max_depth=max_depth,
+            max_calls=max_calls, group_size=group_size, max_prompt_tokens=max_prompt_tokens,
+            eligible_source_ids=eligible_source_ids,
+        )
+        return hydrate_section_plan(plan, load_turn=self._transcript.get_turn,
+                                    max_raw_spans=max_raw_spans, max_context_tokens=max_context_tokens)
+
+    def search_summary_sections(
+        self, query: str, index: SectionSummaryIndex, *, max_sections: int = 4,
+        eligible_source_ids: Sequence[str] | None = None,
+        max_raw_spans: int = 32, max_context_tokens: int = 4096,
+    ) -> SectionRetrievalResult:
+        """BM25 control: route on summaries, then load exact selected sections.
+
+        Compile/load the immutable summary index before query time. Generated
+        summaries never enter the returned raw context. The result carries
+        atomic budget and stale-section diagnostics for an additive raw fallback.
+        """
+        plan = index.route(query, max_sections=max_sections,
+                           eligible_source_ids=eligible_source_ids)
+        return hydrate_section_plan(
+            plan, load_turn=self._transcript.get_turn,
+            max_raw_spans=max_raw_spans, max_context_tokens=max_context_tokens,
+        )
+
+    def search_attention_summary_sections(
+        self, query: str, index: SectionSummaryIndex, *, linker: QwenMemoryLinker,
+        max_sections: int = 4, max_depth: int = 32,
+        eligible_source_ids: Sequence[str] | None = None,
+        max_raw_spans: int = 32, max_context_tokens: int = 4096,
+    ) -> SectionRetrievalResult:
+        """Qwen reasons over hierarchical summaries; hydrate raw only afterward."""
+        plan = route_summary_hierarchy(
+            query, index, linker=linker, max_sections=max_sections, max_depth=max_depth,
+            eligible_source_ids=eligible_source_ids,
+        )
+        return hydrate_section_plan(
+            plan, load_turn=self._transcript.get_turn,
+            max_raw_spans=max_raw_spans, max_context_tokens=max_context_tokens,
+        )
+
+    def expand_conversation_envelopes(
+        self,
+        results: Sequence[RetrievalResult],
+        *,
+        max_envelopes: int = DEFAULT_MAX_EXPANSION_ENVELOPES,
+        max_turns_per_envelope: int = DEFAULT_MAX_EXPANSION_TURNS,
+        max_companion_chunks: int = DEFAULT_MAX_EXPANSION_COMPANION_CHUNKS,
+        max_companion_tokens: int = DEFAULT_MAX_EXPANSION_COMPANION_TOKENS,
+    ) -> ConversationEnvelopeRetrievalExpansion:
+        """Explicitly hydrate bounded user-led context around raw hits.
+
+        This opt-in operation does not modify retrieval, packing, or the
+        caller's result objects. Chunk/token allowances apply only to newly
+        hydrated companions; the raw lane remains monotonic and the ordinary
+        context packer retains responsibility for the final prompt cap.
+        Already-expanded companions are never used as recursive anchors.
+        """
+
+        originals = tuple(results)
+        anchor_turn_ids = tuple(
+            dict.fromkeys(
+                result.chunk.turn_id
+                for result in originals
+                if result.route != CONVERSATION_ENVELOPE_MEMBER_ROUTE
+            )
+        )
+        try:
+            original_chunk_token_counts: dict[str, int] = {}
+            for result in originals:
+                chunk_id = result.chunk.chunk_id
+                token_count = result.chunk.token_count
+                previous = original_chunk_token_counts.get(chunk_id)
+                if previous is not None and previous != token_count:
+                    raise ValueError("duplicate chunk token footprint disagrees")
+                original_chunk_token_counts.setdefault(chunk_id, token_count)
+            plan = self._conversation_envelopes.plan_retrieval_expansion(
+                anchor_turn_ids,
+                original_chunk_token_counts=original_chunk_token_counts,
+                max_envelopes=max_envelopes,
+                max_turns_per_envelope=max_turns_per_envelope,
+                max_companion_chunks=max_companion_chunks,
+                max_companion_tokens=max_companion_tokens,
+            )
+        except Exception as error:
+            return hydrate_conversation_envelope_plan(
+                originals,
+                plan=None,
+                hydrate_chunk=self._retriever.hydrate_chunk,
+                live_chunk_ids=self._conversation_envelopes.live_chunk_ids,
+                max_companion_chunks=max_companion_chunks,
+                max_companion_tokens=max_companion_tokens,
+                planner_failure_kind=(
+                    f"{type(error).__module__}.{type(error).__qualname__}"
+                ),
+            )
+        return hydrate_conversation_envelope_plan(
+            originals,
+            plan=plan,
+            hydrate_chunk=self._retriever.hydrate_chunk,
+            live_chunk_ids=self._conversation_envelopes.live_chunk_ids,
+            max_companion_chunks=max_companion_chunks,
+            max_companion_tokens=max_companion_tokens,
+        )
 
     def search(
         self, query: str, k: int = 10, ef_search: int = 50

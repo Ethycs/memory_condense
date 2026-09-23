@@ -97,6 +97,90 @@ class _FailingModel(_FakeModel):
         raise RuntimeError("synthetic forward failure")
 
 
+class _VariablePromptTokenizer(_FakeTokenizer):
+    def __call__(self, text, *, add_special_tokens):
+        del add_special_tokens
+        if text in self.choices:
+            return {"input_ids": list(self.choices[text])}
+        width = 3 if "short-only" in text else 5
+        return {"input_ids": list(range(1, width + 1))}
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.templates.append((messages, kwargs))
+        return "\n".join(str(message["content"]) for message in messages)
+
+
+class _ProjectionBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(32, 4)
+        with torch.no_grad():
+            values = torch.arange(128, dtype=torch.float32).reshape(32, 4)
+            self.embedding.weight.copy_(values / 127.0)
+        self.calls = 0
+
+    def forward(self, *, input_ids, attention_mask, use_cache):
+        assert use_cache is False
+        self.calls += 1
+        hidden = self.embedding(input_ids)
+        hidden = hidden + attention_mask.unsqueeze(-1).to(hidden.dtype) * 0.25
+        return SimpleNamespace(last_hidden_state=hidden)
+
+
+class _ProjectionHead(torch.nn.Linear):
+    def __init__(self):
+        super().__init__(4, 32, bias=False)
+        with torch.no_grad():
+            values = torch.arange(128, dtype=torch.float32).reshape(32, 4)
+            self.weight.copy_((values - 64.0) / 91.0)
+        self.input_shapes = []
+
+    def forward(self, inputs):
+        self.input_shapes.append(tuple(inputs.shape))
+        return super().forward(inputs)
+
+
+class Qwen3ForCausalLM(torch.nn.Module):
+    """Small structural double for the audited Transformers wrapper."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="qwen3", vocab_size=32)
+        self.model = _ProjectionBackbone()
+        self.lm_head = _ProjectionHead()
+        self.wrapper_calls = 0
+
+    def get_input_embeddings(self):
+        return self.model.embedding
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def forward(self, *, input_ids, attention_mask, use_cache):
+        self.wrapper_calls += 1
+        hidden = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+        ).last_hidden_state
+        return SimpleNamespace(logits=self.lm_head(hidden))
+
+
+class _ReferenceCausalLM(Qwen3ForCausalLM):
+    """Same math under an unaudited identity, forcing the wrapper path."""
+
+
+class _MalformedBackbone(torch.nn.Module):
+    def __init__(self, embedding):
+        super().__init__()
+        self.embedding = embedding
+        self.calls = 0
+
+    def forward(self, **_kwargs):
+        self.calls += 1
+        return SimpleNamespace()
+
+
 def test_choice_scorer_uses_one_no_cache_forward_and_returns_role_metadata():
     tokenizer = _FakeTokenizer()
     model = _FakeModel([4.0, -3.0])
@@ -227,6 +311,104 @@ def test_choice_scorer_supports_equal_length_full_choice_sequences():
             _FakeTokenizer({" A": [11], " B": [12, 14]}),
             torch_module=torch,
         )
+
+
+def test_single_token_projection_matches_full_wrapper_without_sequence_logits():
+    tokenizer = _VariablePromptTokenizer()
+    optimized_model = Qwen3ForCausalLM()
+    reference_model = _ReferenceCausalLM()
+    optimized = CausalChoiceScorer(
+        optimized_model,
+        tokenizer,
+        torch_module=torch,
+        batch_size=2,
+        max_prompt_tokens=8,
+        max_workspace_tokens=64,
+        strict=True,
+    )
+    reference = CausalChoiceScorer(
+        reference_model,
+        _VariablePromptTokenizer(),
+        torch_module=torch,
+        batch_size=2,
+        max_prompt_tokens=8,
+        max_workspace_tokens=64,
+        strict=True,
+    )
+    candidates = {
+        "short": "short-only",
+        "long": "long-only candidate with a longer prompt",
+    }
+
+    actual = optimized.score_candidates("question", candidates)
+    expected = reference.score_candidates("question", candidates)
+
+    for candidate_id in candidates:
+        assert actual[candidate_id].answerability == pytest.approx(
+            expected[candidate_id].answerability,
+            abs=1e-6,
+        )
+        assert actual[candidate_id].value_evidence_logit == pytest.approx(
+            expected[candidate_id].value_evidence_logit,
+            abs=1e-6,
+        )
+        assert actual[candidate_id].direct_log_likelihood == pytest.approx(
+            expected[candidate_id].direct_log_likelihood,
+            abs=1e-6,
+        )
+        assert actual[candidate_id].indirect_log_likelihood == pytest.approx(
+            expected[candidate_id].indirect_log_likelihood,
+            abs=1e-6,
+        )
+    assert optimized_model.wrapper_calls == 0
+    assert optimized_model.model.calls == 1
+    assert optimized_model.lm_head.input_shapes == [(2, 4)]
+    assert reference_model.wrapper_calls == 1
+    assert reference_model.lm_head.input_shapes == [(2, 5, 4)]
+
+
+def test_audited_single_token_projection_fails_closed_when_backbone_is_malformed():
+    model = Qwen3ForCausalLM()
+    malformed = _MalformedBackbone(model.model.embedding)
+    model.model = malformed
+    scorer = CausalChoiceScorer(
+        model,
+        _FakeTokenizer(),
+        torch_module=torch,
+        max_prompt_tokens=8,
+        max_workspace_tokens=64,
+        strict=True,
+    )
+
+    with pytest.raises(RuntimeError, match="rank-3 last_hidden_state"):
+        scorer.score_candidates("question", {"candidate": "memory"})
+
+    assert malformed.calls == 1
+    assert model.wrapper_calls == 0
+
+
+def test_audited_multi_token_choices_keep_complete_wrapper_path():
+    model = Qwen3ForCausalLM()
+    scorer = CausalChoiceScorer(
+        model,
+        _FakeTokenizer({" direct": [11, 13], " indirect": [12, 14]}),
+        torch_module=torch,
+        direct_choice=" direct",
+        indirect_choice=" indirect",
+        batch_size=1,
+        max_prompt_tokens=8,
+        max_workspace_tokens=64,
+        strict=True,
+    )
+
+    evidence = scorer.score_candidates(
+        "question",
+        {"candidate-1": "memory one", "candidate-2": "memory two"},
+    )
+
+    assert all(row.inspected for row in evidence.values())
+    assert model.wrapper_calls == 2
+    assert model.lm_head.input_shapes == [(2, 5, 4), (2, 5, 4)]
 
 
 def test_choice_scorer_failure_is_neutral_unless_strict():

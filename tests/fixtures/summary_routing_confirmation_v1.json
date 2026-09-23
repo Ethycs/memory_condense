@@ -1,0 +1,46 @@
+{
+  "format": "summary-routing-diagnostic-v1",
+  "purpose": "Fresh synthetic confirmation frozen before full-decoder measurements",
+  "groups": [
+    {
+      "id": "music", "split": "fresh_confirmation",
+      "summaries": [
+        "The cello needed replacement strings and a bridge adjustment at the instrument repair shop.",
+        "The choir moved its weekly singing practice to a room with better acoustics.",
+        "Concert recordings are archived as lossless audio files on a shared drive.",
+        "A composer revised the brass arrangement to soften the final movement."
+      ],
+      "queries": ["Where was the bowed instrument serviced?", "Why did the vocal group change its rehearsal space?", "Where can we find high-quality recordings of the performances?", "Who made the orchestral ending less loud?"]
+    },
+    {
+      "id": "repair", "split": "fresh_confirmation",
+      "summaries": [
+        "The kitchen tap leaked because its worn washer needed replacing.",
+        "A squeaking door hinge was cleaned and lubricated with a small amount of oil.",
+        "The refrigerator seal was replaced to keep cold air from escaping.",
+        "The roof gutter was cleared of leaves so rainwater could drain freely."
+      ],
+      "queries": ["What caused the faucet to drip?", "How was the noisy doorway fixed?", "What repair stopped the appliance losing chilled air?", "How did we restore drainage from the roof?"]
+    },
+    {
+      "id": "outdoors", "split": "fresh_confirmation",
+      "summaries": [
+        "The hiking route follows a marked ridge trail to a summit viewpoint.",
+        "Kayaks are collected beside the lake, with life jackets supplied at pickup.",
+        "The campsite booking includes a tent pitch, drinking water and shared showers.",
+        "Birdwatchers meet near the wetlands before sunrise and bring binoculars."
+      ],
+      "queries": ["Which walk reaches a panoramic mountaintop?", "Where do we get the paddle boats and flotation equipment?", "What facilities come with our overnight tent reservation?", "When and where are we observing wild birds?"]
+    },
+    {
+      "id": "volunteers", "split": "fresh_confirmation",
+      "summaries": [
+        "Food-bank volunteers sort donated tins and prepare grocery parcels for collection.",
+        "The river cleanup team collects litter from the banks and records recyclable waste.",
+        "Reading mentors meet pupils after school to practice pronunciation and comprehension.",
+        "Animal-shelter helpers walk dogs and refresh bedding in the kennels."
+      ],
+      "queries": ["Who organizes donated meals for households?", "Which team removes rubbish beside the water?", "Who helps children understand written stories?", "Where can I volunteer to care for rescued pets?"]
+    }
+  ]
+}

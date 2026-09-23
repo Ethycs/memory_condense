@@ -1,0 +1,13 @@
+{
+  "population_kind": "source-derived development probes, not untouched benchmark validation",
+  "source_turn_population_sha256": "8b5d302f977ad5143aa20ba32a8cbf9b60134fce63c3c7d9b0fb8267dcf91f73",
+  "cases": [
+    {"id": "prior_trail", "answer": "The Dipsea Trail.", "turn_ordinal": 3, "quote": "Dipsea Trail I hiked at Muir Woods"},
+    {"id": "hike_companions", "answer": "My family.", "turn_ordinal": 9, "quote": "a day hike to Muir Woods National Monument with my family today"},
+    {"id": "backpack_trip_length", "answer": "Three to four days.", "turn_ordinal": 7, "quote": "a lightweight backpack that's suitable for 3-4 day trips"},
+    {"id": "tent_requirements", "answer": "A lightweight, waterproof tent for one person.", "turn_ordinal": 11, "quote": "a lightweight and waterproof tent that can fit one person"},
+    {"id": "bear_observations", "answer": "No actual bears; bear tracks near Point Lobos State Natural Reserve and signs of digging near trailheads.", "turn_ordinal": 24, "quote": "We also saw some signs of bears digging near the trailheads, but we didn't actually see any bears."},
+    {"id": "lodging_town", "answer": "Pacific Grove.", "turn_ordinal": 24, "quote": "our Airbnb in Pacific Grove was super cute and cozy."},
+    {"id": "campsite_access", "answer": "By car; the campsites should still be accessible by car.", "turn_ordinal": 29, "quote": "more off-the-beaten-path campsites that are still accessible by car"}
+  ]
+}

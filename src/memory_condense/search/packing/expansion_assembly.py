@@ -19,7 +19,10 @@ from memory_condense.search.packing.derived_scalar import (
 from memory_condense.search.packing.expansion_ordering import (
     _ExpansionOrderingMixin,
 )
-from memory_condense.search.packing.packing_contracts import EXPANSION_PREFIX
+from memory_condense.search.packing.packing_contracts import (
+    EXPANSION_PREFIX,
+    AtomicExpansionContract,
+)
 
 # Sentinel for _trace_row: rows for selector-injected results historically
 # omit the ``selector_output_rejection`` key entirely instead of carrying it
@@ -103,6 +106,14 @@ class _ExpansionPass:
     active_reserved_ids: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True, slots=True)
+class _PackedExpansionRow:
+    """One exact excerpt body retained across atomic envelope insertion."""
+
+    result: RetrievalResult
+    snippet: str
+
+
 class _ExpansionPackingMixin(
     _CoverageClosureMixin,
     _ExpansionOrderingMixin,
@@ -116,6 +127,7 @@ class _ExpansionPackingMixin(
         active_partition_total: int | None = None,
         active_partition_inspected: int | None = None,
         active_partition_scan: Mapping[str, Any] | None = None,
+        atomic_contract: AtomicExpansionContract | None = None,
     ) -> tuple[list[str], list[str], int, int, dict[str, int]]:
         """Verbatim excerpts, each capped, and capped again in aggregate.
 
@@ -124,7 +136,19 @@ class _ExpansionPackingMixin(
         fraction of the fixed budget unused even though more ranked evidence
         was available.
         """
+        if atomic_contract is not None:
+            return self._build_atomic_expansions(
+                expansions,
+                query=query,
+                source_metadata=source_metadata,
+                active_partition_total=active_partition_total,
+                active_partition_inspected=active_partition_inspected,
+                active_partition_scan=active_partition_scan,
+                contract=atomic_contract,
+            )
         self.last_expansion_trace = []
+        self._last_packed_expansion_rows: list[_PackedExpansionRow] = []
+        self._last_expansion_source_timestamps: dict[str, str] = {}
         self.last_closure_report = {
             "applied": False,
             "closure_scope": "",
@@ -144,6 +168,359 @@ class _ExpansionPackingMixin(
         self._plan_coverage_reservations(state)
         self._apply_post_coverage_closure(state)
         return self._pack_expansion_rows(state, len(expansions))
+
+    def _build_atomic_expansions(
+        self,
+        expansions: list[RetrievalResult],
+        *,
+        query: str,
+        source_metadata: dict[str, str] | None,
+        active_partition_total: int | None,
+        active_partition_inspected: int | None,
+        active_partition_scan: Mapping[str, Any] | None,
+        contract: AtomicExpansionContract,
+    ) -> tuple[list[str], list[str], int, int, dict[str, int]]:
+        """Pack originals normally, then admit complete envelope groups only."""
+
+        expansion_by_id: dict[str, RetrievalResult] = {}
+        for result in expansions:
+            chunk_id = result.chunk.chunk_id
+            if chunk_id in expansion_by_id:
+                raise ValueError("atomic expansion inputs must have unique chunk IDs")
+            expansion_by_id[chunk_id] = result
+        contract_ids = set(
+            (*contract.original_chunk_ids, *contract.companion_chunk_ids)
+        )
+        if not contract_ids.issubset(expansion_by_id):
+            raise ValueError("atomic expansion contract references an absent chunk")
+
+        companion_ids = set(contract.companion_chunk_ids)
+        original_ids = set(contract.original_chunk_ids)
+        # Hydration renders groups chronologically, but the receipt separately
+        # retains the caller's raw retrieval order. Apply every ordinary
+        # ranking/selection policy to that raw order before any group rewrite.
+        baseline_candidates = [
+            expansion_by_id[chunk_id]
+            for chunk_id in contract.original_chunk_ids
+        ]
+        baseline_candidates.extend(
+            result
+            for result in expansions
+            if result.chunk.chunk_id not in companion_ids
+            and result.chunk.chunk_id not in original_ids
+        )
+        baseline = self._build_expansions(
+            baseline_candidates,
+            query=query,
+            source_metadata=source_metadata,
+            active_partition_total=active_partition_total,
+            active_partition_inspected=active_partition_inspected,
+            active_partition_scan=active_partition_scan,
+        )
+        (
+            baseline_texts,
+            baseline_chunk_ids,
+            baseline_tokens,
+            _baseline_dropped,
+            baseline_source_tokens,
+        ) = baseline
+        if not contract.groups:
+            return (
+                baseline_texts,
+                baseline_chunk_ids,
+                baseline_tokens,
+                len(expansions) - len(baseline_chunk_ids),
+                baseline_source_tokens,
+            )
+
+        baseline_rows = list(self._last_packed_expansion_rows)
+        baseline_snippets = {
+            row.result.chunk.chunk_id: row.snippet for row in baseline_rows
+        }
+        baseline_ids = set(baseline_snippets)
+        baseline_trace = [dict(row) for row in self.last_expansion_trace]
+        source_timestamps = dict(self._last_expansion_source_timestamps)
+        current_rows = baseline_rows
+        rendered: tuple[
+            list[_PackedExpansionRow],
+            list[str],
+            list[str],
+            int,
+            dict[str, int],
+        ] | None = None
+        admitted_group_indexes: set[int] = set()
+
+        for group_index, group in enumerate(contract.groups):
+            group_original_ids = set(group.original_chunk_ids)
+            surviving_group_originals = group_original_ids.intersection(
+                baseline_ids
+            )
+            if not surviving_group_originals:
+                continue
+            current_by_id = {
+                row.result.chunk.chunk_id: row.result for row in current_rows
+            }
+            insertion_index = min(
+                index
+                for index, row in enumerate(current_rows)
+                if row.result.chunk.chunk_id in surviving_group_originals
+            )
+            remaining = [
+                row.result
+                for row in current_rows
+                if row.result.chunk.chunk_id not in group_original_ids
+            ]
+            ordered_group = [
+                current_by_id.get(chunk_id, expansion_by_id[chunk_id])
+                for chunk_id in group.ordered_chunk_ids
+            ]
+            proposed = [
+                *remaining[:insertion_index],
+                *ordered_group,
+                *remaining[insertion_index:],
+            ]
+            proposed_companion_count = sum(
+                result.chunk.chunk_id in companion_ids for result in proposed
+            )
+            if proposed_companion_count > contract.max_companion_chunks:
+                continue
+            proposed_direct_count = sum(
+                result.chunk.chunk_id not in companion_ids
+                and result.route != "live_consolidation"
+                for result in proposed
+            )
+            proposed_consolidation_count = sum(
+                result.chunk.chunk_id not in companion_ids
+                and result.route == "live_consolidation"
+                for result in proposed
+            )
+            if (
+                proposed_direct_count > self.budget.max_expansions
+                or proposed_consolidation_count
+                > self.budget.max_consolidation_expansions
+            ):
+                continue
+            trial = self._fit_atomic_expansion_rows(
+                proposed,
+                query=query,
+                source_timestamps=source_timestamps,
+                baseline_snippets=baseline_snippets,
+                additive_ids=contract_ids - baseline_ids,
+            )
+            if trial is None:
+                continue
+            current_rows = trial[0]
+            rendered = trial
+            admitted_group_indexes.add(group_index)
+
+        if rendered is None:
+            self._finalize_atomic_expansion_trace(
+                expansions,
+                baseline_rows,
+                baseline_trace=baseline_trace,
+                source_timestamps=source_timestamps,
+                contract=contract,
+                admitted_group_indexes=admitted_group_indexes,
+            )
+            return (
+                baseline_texts,
+                baseline_chunk_ids,
+                baseline_tokens,
+                len(expansions) - len(baseline_chunk_ids),
+                baseline_source_tokens,
+            )
+
+        rows, texts, chunk_ids, used, source_tokens = rendered
+        self._last_packed_expansion_rows = list(rows)
+        self._finalize_atomic_expansion_trace(
+            expansions,
+            rows,
+            baseline_trace=baseline_trace,
+            source_timestamps=source_timestamps,
+            contract=contract,
+            admitted_group_indexes=admitted_group_indexes,
+        )
+        return (
+            texts,
+            chunk_ids,
+            used,
+            len(expansions) - len(chunk_ids),
+            source_tokens,
+        )
+
+    def _fit_atomic_expansion_rows(
+        self,
+        rows: list[RetrievalResult],
+        *,
+        query: str,
+        source_timestamps: Mapping[str, str],
+        baseline_snippets: Mapping[str, str],
+        additive_ids: set[str],
+    ) -> tuple[
+        list[_PackedExpansionRow],
+        list[str],
+        list[str],
+        int,
+        dict[str, int],
+    ] | None:
+        """Fit all rows under one token ceiling without shrinking originals."""
+
+        label_state = _ExpansionPass(
+            query=query,
+            original=[],
+            source_metadata=None,
+            active_partition_total=None,
+            active_partition_inspected=None,
+            active_partition_scan=None,
+        )
+        label_state.source_timestamps = dict(source_timestamps)
+        prepared_additions = {
+            result.chunk.chunk_id: self._prepare_expansion_text(
+                result.chunk.text,
+                query,
+            )
+            for result in rows
+            if result.chunk.chunk_id in additive_ids
+        }
+
+        def render(
+            companion_content_cap: int,
+        ) -> tuple[
+            list[_PackedExpansionRow],
+            list[str],
+            list[str],
+            int,
+            dict[str, int],
+        ] | None:
+            packed_rows: list[_PackedExpansionRow] = []
+            texts: list[str] = []
+            chunk_ids: list[str] = []
+            source_tokens: dict[str, int] = defaultdict(int)
+            used = count_tokens(EXPANSION_PREFIX)
+            for ordinal, result in enumerate(rows, start=1):
+                chunk_id = result.chunk.chunk_id
+                if chunk_id in baseline_snippets:
+                    snippet = baseline_snippets[chunk_id]
+                else:
+                    prepared = prepared_additions.get(chunk_id)
+                    if prepared is None:
+                        raise ValueError(
+                            "atomic expansion row is neither baseline nor companion"
+                        )
+                    snippet = truncate_to_tokens(
+                        prepared,
+                        companion_content_cap,
+                    )
+                if not snippet:
+                    return None
+                label = self._expansion_label(label_state, result, ordinal)
+                entry = label + snippet
+                cost = count_tokens(entry) + 1
+                if used + cost > self.budget.expansion_tokens:
+                    return None
+                packed_rows.append(_PackedExpansionRow(result, snippet))
+                texts.append(entry)
+                chunk_ids.append(chunk_id)
+                used += cost
+                source_tokens[self._result_source_id(result)] += count_tokens(
+                    snippet
+                )
+            return packed_rows, texts, chunk_ids, used, dict(source_tokens)
+
+        maximum = self.budget.max_expansion_tokens
+        fitted = render(maximum)
+        if fitted is not None:
+            return fitted
+        if not prepared_additions or maximum < 1:
+            return None
+        lower = 1
+        upper = maximum - 1
+        best = None
+        while lower <= upper:
+            midpoint = (lower + upper) // 2
+            candidate = render(midpoint)
+            if candidate is None:
+                upper = midpoint - 1
+            else:
+                best = candidate
+                lower = midpoint + 1
+        return best
+
+    def _finalize_atomic_expansion_trace(
+        self,
+        expansions: list[RetrievalResult],
+        packed_rows: list[_PackedExpansionRow],
+        *,
+        baseline_trace: list[dict[str, Any]],
+        source_timestamps: Mapping[str, str],
+        contract: AtomicExpansionContract,
+        admitted_group_indexes: set[int],
+    ) -> None:
+        """Expose text-free atomic decisions while retaining selector detail."""
+
+        trace_by_id = {
+            str(row["chunk_id"]): dict(row)
+            for row in baseline_trace
+            if isinstance(row.get("chunk_id"), str)
+        }
+        group_index_by_id = {
+            chunk_id: group_index
+            for group_index, group in enumerate(contract.groups)
+            for chunk_id in group.ordered_chunk_ids
+        }
+        input_rank = {
+            result.chunk.chunk_id: rank
+            for rank, result in enumerate(expansions, start=1)
+        }
+        for result in expansions:
+            chunk_id = result.chunk.chunk_id
+            diagnostic = trace_by_id.get(chunk_id)
+            if diagnostic is None:
+                diagnostic = self._trace_row(
+                    result,
+                    original_rank=input_rank[chunk_id],
+                    selector_input_rank=None,
+                    post_selector_rank=None,
+                    cutoff_reason="atomic_group_no_fit",
+                    selector_output_rejection=None,
+                )
+                trace_by_id[chunk_id] = diagnostic
+            group_index = group_index_by_id.get(chunk_id)
+            if group_index is not None:
+                diagnostic["atomic_expansion_group"] = group_index
+                diagnostic["atomic_expansion_admitted"] = (
+                    group_index in admitted_group_indexes
+                )
+
+        label_state = _ExpansionPass(
+            query="",
+            original=[],
+            source_metadata=None,
+            active_partition_total=None,
+            active_partition_inspected=None,
+            active_partition_scan=None,
+        )
+        label_state.source_timestamps = dict(source_timestamps)
+        used = count_tokens(EXPANSION_PREFIX)
+        for ordinal, row in enumerate(packed_rows, start=1):
+            chunk_id = row.result.chunk.chunk_id
+            entry = self._expansion_label(
+                label_state,
+                row.result,
+                ordinal,
+            ) + row.snippet
+            cost = count_tokens(entry) + 1
+            used += cost
+            trace_by_id[chunk_id].update(
+                {
+                    "packed_rank": ordinal,
+                    "cutoff_reason": "packed",
+                    "content_tokens": count_tokens(row.snippet),
+                    "rendered_tokens": cost,
+                    "cumulative_tokens": used,
+                }
+            )
+        self.last_expansion_trace = list(trace_by_id.values())
 
     def _order_expansion_candidates(
         self,
@@ -772,6 +1149,7 @@ class _ExpansionPackingMixin(
     ) -> tuple[list[str], list[str], int, int, dict[str, int]]:
         """Phase 6: emit budgeted excerpts and finalize the trace."""
         trace_by_id = state.trace_by_id
+        self._last_expansion_source_timestamps = dict(state.source_timestamps)
         texts: list[str] = []
         chunk_ids: list[str] = []
         used = state.used_tokens
@@ -836,6 +1214,9 @@ class _ExpansionPackingMixin(
                 break
             texts.append(entry)
             chunk_ids.append(result.chunk.chunk_id)
+            self._last_packed_expansion_rows.append(
+                _PackedExpansionRow(result, snippet)
+            )
             if is_consolidation:
                 consolidation_kept += 1
             else:

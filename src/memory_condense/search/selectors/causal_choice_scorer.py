@@ -153,6 +153,20 @@ B = The memory does not; it is only related, indirect, generic, or null.
 Label:"""
 
 
+# These two Transformers causal-LM wrappers have the same audited projection
+# contract in the pinned runtime: the decoder applies its final normalization,
+# then ``lm_head`` is applied directly to ``last_hidden_state``.  Restrict the
+# shortcut to those exact public model identities.  An unknown wrapper keeps
+# using its own ``forward`` method so model-specific logit transforms cannot be
+# skipped accidentally.
+_DIRECT_LAST_HIDDEN_PROJECTION_MODELS = frozenset(
+    {
+        ("llama", "LlamaForCausalLM"),
+        ("qwen3", "Qwen3ForCausalLM"),
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class CausalChoiceEvidence(ReportDumpMixin):
     """One candidate's normalized forced-choice evidence."""
@@ -626,11 +640,6 @@ class CausalChoiceScorer:
             input_ids = input_ids.to(input_device)
             attention_mask = attention_mask.to(input_device)
             with torch.inference_mode():
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                )
                 if single_token_choices:
                     row_indices = torch.arange(
                         len(sequences),
@@ -641,13 +650,12 @@ class CausalChoiceScorer:
                         dtype=torch.long,
                         device=input_device,
                     )
-                    # Cast only one vocabulary row per candidate, not the
-                    # complete [batch, sequence, vocabulary] tensor.
-                    final_logits = outputs.logits[
-                        row_indices,
-                        positions,
-                        :,
-                    ].float()
+                    final_logits = self._single_token_final_logits(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        row_indices=row_indices,
+                        positions=positions,
+                    ).float()
                     normalizers = torch.logsumexp(final_logits, dim=-1)
                     direct = (
                         final_logits[:, self._choice_ids[0][0]] - normalizers
@@ -660,6 +668,13 @@ class CausalChoiceScorer:
                         dim=1,
                     ).reshape(-1)
                 else:
+                    # Multi-token choices need the logits preceding every
+                    # label token, so retain the causal-LM wrapper path.
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                    )
                     likelihood_tensors = []
                     for row_index, (prompt_length, choice_index) in enumerate(
                         zip(prompt_lengths, choice_indices, strict=True)
@@ -694,6 +709,12 @@ class CausalChoiceScorer:
                     likelihood_tensor = torch.stack(likelihood_tensors)
                 # Exactly one device-to-host synchronization per microbatch.
                 likelihoods = likelihood_tensor.detach().cpu().tolist()
+                if single_token_choices:
+                    del final_logits
+                else:
+                    # Do not retain a full [B, L, V] fallback output while the
+                    # next microbatch is being assembled.
+                    del outputs
             forward_passes += 1
 
             for candidate_index, (candidate_id, _text, role) in enumerate(
@@ -716,13 +737,100 @@ class CausalChoiceScorer:
                     direct_log_likelihood=direct,
                     indirect_log_likelihood=indirect,
                 )
-            del outputs, likelihood_tensor, input_ids, attention_mask
+            del likelihood_tensor, input_ids, attention_mask
         return (
             evidence,
             forward_passes,
             peak_workspace_tokens,
             total_sequence_tokens,
         )
+
+    def _single_token_final_logits(
+        self,
+        *,
+        input_ids: Any,
+        attention_mask: Any,
+        row_indices: Any,
+        positions: Any,
+    ) -> Any:
+        """Project only each row's final prompt state for audited wrappers.
+
+        Qwen3/Llama causal wrappers otherwise materialize ``[B, L, V]`` even
+        though a one-token A/B choice consumes only ``B`` positions.  Their
+        pinned forward contract is decoder -> final norm -> ``lm_head``.  The
+        decoder's ``last_hidden_state`` therefore already contains the exact
+        normalized state expected by the (possibly tied) output head.
+
+        Recognized-but-malformed wrappers raise instead of falling back to a
+        potentially different computation.  Unknown wrappers retain their
+        complete forward path.
+        """
+
+        model = self.model
+        if model is None:
+            raise RuntimeError("causal choice scorer is closed")
+        config = getattr(model, "config", None)
+        identity = (
+            str(getattr(config, "model_type", "")).casefold(),
+            type(model).__name__,
+        )
+        if identity not in _DIRECT_LAST_HIDDEN_PROJECTION_MODELS:
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+            logits = getattr(outputs, "logits", None)
+            if logits is None or getattr(logits, "ndim", -1) != 3:
+                raise RuntimeError(
+                    "causal LM did not return rank-3 logits for single-token scoring"
+                )
+            return logits[row_indices, positions, :]
+
+        backbone = getattr(model, "model", None)
+        output_head = getattr(model, "lm_head", None)
+        if not callable(backbone) or not callable(output_head):
+            raise RuntimeError(
+                "audited causal LM projection components are unavailable"
+            )
+        get_output_embeddings = getattr(model, "get_output_embeddings", None)
+        if (
+            callable(get_output_embeddings)
+            and get_output_embeddings() is not output_head
+        ):
+            raise RuntimeError(
+                "audited causal LM output embedding does not match lm_head"
+            )
+
+        outputs = backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        hidden_states = getattr(outputs, "last_hidden_state", None)
+        if hidden_states is None or getattr(hidden_states, "ndim", -1) != 3:
+            raise RuntimeError(
+                "audited causal LM backbone did not return rank-3 last_hidden_state"
+            )
+        if tuple(hidden_states.shape[:2]) != tuple(input_ids.shape):
+            raise RuntimeError(
+                "audited causal LM backbone returned an unexpected sequence shape"
+            )
+        final_hidden = hidden_states[row_indices, positions, :]
+        logits = output_head(final_hidden)
+        if (
+            getattr(logits, "ndim", -1) != 2
+            or logits.shape[0] != input_ids.shape[0]
+        ):
+            raise RuntimeError(
+                "audited causal LM output head did not return rank-2 batch logits"
+            )
+        vocab_size = int(getattr(config, "vocab_size", 0) or 0)
+        if vocab_size and logits.shape[1] != vocab_size:
+            raise RuntimeError(
+                "audited causal LM output head returned an unexpected vocabulary width"
+            )
+        return logits
 
     def score_candidates(
         self,

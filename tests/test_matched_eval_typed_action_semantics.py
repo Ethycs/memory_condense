@@ -1,4 +1,5 @@
 from tools.matched_eval.typed_action_semantics import (
+    action_search_surfaces,
     canonical_action_concepts,
     canonical_action_proof_terms,
     completed_action_concepts,
@@ -6,6 +7,18 @@ from tools.matched_eval.typed_action_semantics import (
     matched_action_concepts,
     planned_action_concepts,
 )
+
+
+def test_action_search_surfaces_bridge_unstemmed_bm25_queries() -> None:
+    assert action_search_surfaces("Which galleries did I visit?") == (
+        "visit",
+        "visited",
+        "visiting",
+    )
+    assert {"buy", "bought", "purchase", "purchased"} <= set(
+        action_search_surfaces("What did I buy?")
+    )
+    assert action_search_surfaces("What color was it?") == ()
 
 
 def test_acquire_cue_links_completed_buy_and_purchase_without_literal_overlap() -> None:

@@ -62,6 +62,31 @@ def test_chunk_text_is_the_exact_authoritative_source_slice():
         assert chunk.token_count == count_tokens(chunk.text)
 
 
+def test_multi_chunk_topology_preserves_exact_source_bytes_and_counts():
+    """Reusing the prospective token count must not alter chunk topology."""
+    chunker = Chunker(min_tokens=3, max_tokens=8)
+    text = (
+        "First  sentence.\nSecond sentence with extra words.\t"
+        "Third sentence. Fourth ending."
+    )
+
+    chunks = chunker.chunk_turn("t1", text)
+
+    assert [
+        (chunk.text, chunk.start_char, chunk.end_char, chunk.token_count)
+        for chunk in chunks
+    ] == [
+        ("First  sentence.", 0, 16, 4),
+        ("Second sentence with extra words.", 17, 50, 6),
+        ("Third sentence. Fourth ending.", 51, 81, 6),
+    ]
+    assert all(
+        chunk.text == text[chunk.start_char : chunk.end_char]
+        and chunk.token_count == count_tokens(chunk.text)
+        for chunk in chunks
+    )
+
+
 def test_token_count_populated():
     chunker = Chunker(min_tokens=5, max_tokens=200)
     text = "This is a simple sentence with several words in it."

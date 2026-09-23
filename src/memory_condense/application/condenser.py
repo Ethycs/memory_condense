@@ -15,9 +15,14 @@ from memory_condense.application.condenser_contracts import (
     SourceCandidateReranker,
     SourceCompanionSelector,
 )
+from memory_condense.application.conversation_envelope_retrieval import (
+    CONVERSATION_ENVELOPE_MEMBER_ROUTE,
+    ConversationEnvelopeRetrievalExpansion,
+)
 from memory_condense.application.discourse_workflow import DiscourseWorkflowMixin
 from memory_condense.application.graph_workflow import GraphWorkflowMixin
 from memory_condense.application.ingest_workflow import IngestWorkflowMixin
+from memory_condense.application.native_spine_workflow import NativeSpineWorkflowMixin
 from memory_condense.application.partition_workflow import PartitionWorkflowMixin
 from memory_condense.application.query_routing import (
     SAFE_ASSOCIATION_LEXICAL_THRESHOLD,
@@ -52,8 +57,15 @@ from memory_condense.ingest.chunker import Chunker
 from memory_condense.ingest.extractor import Extractor, RuleBasedExtractor
 from memory_condense.ingest.validator import Validator
 from memory_condense.modeling.embedding import EmbeddingService
+from memory_condense.persistence.conversation_graph_store import (
+    ConversationGraphStore,
+)
+from memory_condense.persistence.conversation_envelope_store import (
+    ConversationEnvelopeStore,
+)
 from memory_condense.persistence.db import Database
 from memory_condense.persistence.memory_store import MemoryStore
+from memory_condense.persistence.pending_enrichment_store import PendingEnrichmentStore
 from memory_condense.persistence.pending_ingest_store import PendingIngestStore
 from memory_condense.persistence.transcript_store import TranscriptStore
 from memory_condense.search.indexes.retrieval import SimilarityRetriever
@@ -73,6 +85,7 @@ _DIRECT_DATE_QUERY_RE = re.compile(
 
 class MemoryCondenser(
     IngestWorkflowMixin,
+    NativeSpineWorkflowMixin,
     RetrievalWorkflowMixin,
     DiscourseWorkflowMixin,
     PartitionWorkflowMixin,
@@ -211,6 +224,9 @@ class MemoryCondenser(
         self._init_discourse_workflow()
         self._transcript = TranscriptStore(self._db)
         self._pending_ingests = PendingIngestStore(self._db)
+        self._pending_enrichments = PendingEnrichmentStore(self._db)
+        self._conversation_graphs = ConversationGraphStore(self._db)
+        self._conversation_envelopes = ConversationEnvelopeStore(self._db)
         self._chunker = Chunker(
             min_tokens=chunker_min_tokens,
             max_tokens=chunker_max_tokens,
@@ -311,7 +327,11 @@ class MemoryCondenser(
         consolidation_candidates: int = 32,
         consolidation_diffusion_width: int = 32,
         access_event_id: str | None = None,
-        expansion_results: Sequence[RetrievalResult] | None = None,
+        expansion_results: (
+            Sequence[RetrievalResult]
+            | ConversationEnvelopeRetrievalExpansion
+            | None
+        ) = None,
     ) -> PackedContext:
         """Assemble a token-budgeted prompt for ``user_text``.
 
@@ -333,7 +353,24 @@ class MemoryCondenser(
             else []
         )
 
-        expansions: list[RetrievalResult] = list(expansion_results or ())
+        envelope_expansion = (
+            expansion_results
+            if isinstance(
+                expansion_results,
+                ConversationEnvelopeRetrievalExpansion,
+            )
+            else None
+        )
+        expansions: list[RetrievalResult] = list(
+            envelope_expansion.results
+            if envelope_expansion is not None
+            else expansion_results or ()
+        )
+        atomic_expansion_contract = (
+            envelope_expansion.packing_contract()
+            if envelope_expansion is not None
+            else None
+        )
         routing_snapshot: _ActivePartitionRoutingSnapshot | None = None
         candidate_snapshot = self._active_partition_routing_snapshot
         self.last_partition_routing_report.pop(
@@ -413,7 +450,11 @@ class MemoryCondenser(
             )
 
         orphan_metadata_sources: set[str] = set()
-        if self._packer.budget.source_metadata_expansions and expansions:
+        if (
+            self._packer.budget.source_metadata_expansions
+            and expansions
+            and envelope_expansion is None
+        ):
             expansions, orphan_metadata_sources = (
                 self._hydrate_source_metadata_companions(
                     user_text,
@@ -478,6 +519,7 @@ class MemoryCondenser(
             expansions=expansions,
             user_text=user_text,
             source_metadata=source_metadata,
+            atomic_expansion_contract=atomic_expansion_contract,
             **active_partition_kwargs,
         )
         selector_report = getattr(
@@ -508,7 +550,8 @@ class MemoryCondenser(
         direct_chunk_ids = [
             chunk_id
             for chunk_id in packed.expansion_chunk_ids
-            if chunk_by_id[chunk_id].route != "live_consolidation"
+            if chunk_by_id[chunk_id].route
+            not in {"live_consolidation", CONVERSATION_ENVELOPE_MEMBER_ROUTE}
         ]
         event_id = access_event_id or self._context_event_id(
             user_text,
@@ -728,10 +771,14 @@ class MemoryCondenser(
 
     def _close_unowned(self) -> None:
         """Persist index and close database."""
+        self._native_spine_loaded = None
         try:
             if self._persist_index_on_close:
                 self._retriever.save()
         finally:
+            descriptor_index = getattr(self, "_episode_descriptor_index", None)
+            if descriptor_index is not None:
+                descriptor_index.release()
             self._retriever.release()
             self._db.close()
 

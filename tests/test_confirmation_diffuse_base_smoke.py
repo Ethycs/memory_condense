@@ -30,12 +30,33 @@ def test_confirmation_base_store_records_one_index_revision(
             chunk_count = connection.execute(
                 "SELECT COUNT(*) FROM chunks"
             ).fetchone()[0]
+            ingest_receipts = connection.execute(
+                "SELECT status, COUNT(*) FROM pending_ingests GROUP BY status"
+            ).fetchall()
+            reservation_count = connection.execute(
+                "SELECT COUNT(*) FROM ingest_chunk_reservations"
+            ).fetchone()[0]
+            pending_work_schedule = connection.execute(
+                "SELECT stage, prefer_retry FROM pending_work_schedule "
+                "ORDER BY stage"
+            ).fetchall()
+            empty_state_counts = {
+                table: connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in store_module._BASE_DERIVED_TABLES
+            }
 
     assert rows == [
         ("chunk_index_revision", "1"),
         ("next_hnsw_label", str(chunk_count)),
         ("schema_version", str(CURRENT_SCHEMA_VERSION)),
+        ("v15_legacy_retirement_boundary", "0"),
     ]
+    assert ingest_receipts == [("indexed", 2)]
+    assert reservation_count == chunk_count
+    assert pending_work_schedule == [("enrichment", 1), ("ingest", 1)]
+    assert not any(empty_state_counts.values())
 
 
 def test_confirmation_pinned_embedder_is_forced_offline(monkeypatch) -> None:

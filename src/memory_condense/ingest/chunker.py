@@ -179,14 +179,13 @@ class Chunker:
             if prospective_tokens > self.max_tokens and current_sents:
                 # Emit current chunk
                 chunk_text = source_text[current_start : offsets[i - 1][1]]
-                exact_tokens = count_tokens(chunk_text)
                 chunks.append(
                     Chunk(
                         turn_id=turn_id,
                         text=chunk_text,
                         start_char=current_start,
                         end_char=offsets[i - 1][1],
-                        token_count=exact_tokens,
+                        token_count=current_tokens,
                     )
                 )
                 current_sents = []

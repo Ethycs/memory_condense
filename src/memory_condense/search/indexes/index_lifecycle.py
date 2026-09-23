@@ -161,8 +161,36 @@ class IndexLifecycleMixin:
             else -1
         )
 
+    def _reserve_labels(self, count: int) -> list[int]:
+        """Reserve labels inside the caller's existing write transaction."""
+        if count <= 0:
+            return []
+        conn = self._db.connection
+        if not conn.in_transaction:
+            raise RuntimeError("label reservation requires an active transaction")
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) "
+            "SELECT ?, CAST(COALESCE(MAX(hnsw_label), -1) + 1 AS TEXT) "
+            "FROM chunks",
+            (_LABEL_KEY,),
+        )
+        conn.execute(
+            "UPDATE meta SET value = CAST("
+            "  MAX(CAST(value AS INTEGER),"
+            "      (SELECT COALESCE(MAX(hnsw_label), -1) + 1 FROM chunks)) + ?"
+            " AS TEXT) WHERE key = ?",
+            (count, _LABEL_KEY),
+        )
+        end = int(
+            conn.execute(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?",
+                (_LABEL_KEY,),
+            ).fetchone()[0]
+        )
+        return list(range(end - count, end))
+
     def _allocate_labels(self, count: int) -> list[int]:
-        """Reserve `count` labels that no other process can also hand out.
+        """Reserve and commit labels for standalone rebuild callers.
 
         hnswlib labels are persisted in ``chunks.hnsw_label``, which is UNIQUE,
         so they are shared state across every process open on the store. A
@@ -181,32 +209,13 @@ class IndexLifecycleMixin:
 
         conn = self._db.connection
         try:
-            conn.execute(
-                "INSERT OR IGNORE INTO meta (key, value) "
-                "SELECT ?, CAST(COALESCE(MAX(hnsw_label), -1) + 1 AS TEXT) "
-                "FROM chunks",
-                (_LABEL_KEY,),
-            )
-            conn.execute(
-                "UPDATE meta SET value = CAST("
-                "  MAX(CAST(value AS INTEGER),"
-                "      (SELECT COALESCE(MAX(hnsw_label), -1) + 1 FROM chunks)) + ?"
-                " AS TEXT) WHERE key = ?",
-                (count, _LABEL_KEY),
-            )
-            end = int(
-                conn.execute(
-                    "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?",
-                    (_LABEL_KEY,),
-                ).fetchone()[0]
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            labels = self._reserve_labels(count)
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
-
-        start = end - count
-        return list(range(start, end))
+        return labels
 
     def _register(self, chunk_id: str, label: int) -> None:
         self._label_to_chunk_id[label] = chunk_id
@@ -401,8 +410,6 @@ class IndexLifecycleMixin:
                 self._discard_local_index()
                 raise
 
-        allocated = self._allocate_labels(len(new_chunks))
-        labels = list(allocated)
         vectors = [
             np.array(chunk.embedding, dtype=np.float32) for chunk in new_chunks
         ]
@@ -425,12 +432,13 @@ class IndexLifecycleMixin:
             preexisting_ids.update(
                 self._lexical.validate_chunk_identities(chunks)
             )
-            for chunk, label, indexed_chunk in zip(new_chunks, labels, indexed):
+            labels = self._reserve_labels(len(new_chunks))
+            for chunk, label, indexed_chunk, vector in zip(
+                new_chunks, labels, indexed, vectors
+            ):
                 # The row may already exist from a lexical-only publication;
                 # fill its dense columns without replacing source ownership.
-                embedding_blob = np.array(
-                    chunk.embedding, dtype=np.float32
-                ).tobytes()
+                embedding_blob = vector.tobytes()
                 lexical_json = (
                     json.dumps(indexed_chunk.lexical_weights)
                     if indexed_chunk.lexical_weights

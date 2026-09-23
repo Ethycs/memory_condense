@@ -68,6 +68,87 @@ def test_add_and_query(db, retriever):
     assert results[0].score > 0.99  # same vector
 
 
+def test_add_chunks_reserves_labels_and_publishes_with_one_commit(db, retriever):
+    turn = TranscriptStore(db).append("user", "single transaction owner")
+    chunks = [
+        _make_chunk(turn.turn_id, "first transaction member", dim=16),
+        _make_chunk(turn.turn_id, "second transaction member", dim=16),
+    ]
+    statements: list[str] = []
+    db.connection.set_trace_callback(statements.append)
+    try:
+        retriever.add_chunks(chunks)
+    finally:
+        db.connection.set_trace_callback(None)
+
+    transaction_statements = [
+        statement.strip().upper()
+        for statement in statements
+        if statement.strip().upper() in {"BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"}
+    ]
+    assert transaction_statements == ["BEGIN IMMEDIATE", "COMMIT"]
+    assert [
+        db.execute(
+            "SELECT hnsw_label FROM chunks WHERE chunk_id = ?", (chunk.chunk_id,)
+        ).fetchone()[0]
+        for chunk in chunks
+    ] == [0, 1]
+
+
+def test_add_chunks_reuses_float32_vectors_for_durable_blobs(
+    db, retriever, monkeypatch
+):
+    from memory_condense.search.indexes import index_lifecycle
+
+    turn = TranscriptStore(db).append("user", "vector conversion owner")
+    chunks = [
+        _make_chunk(turn.turn_id, "first vector conversion", dim=16),
+        _make_chunk(turn.turn_id, "second vector conversion", dim=16),
+    ]
+    original_array = index_lifecycle.np.array
+    converted_embeddings: list[list[float]] = []
+
+    def tracking_array(values, *args, **kwargs):
+        if any(values is chunk.embedding for chunk in chunks):
+            assert kwargs.get("dtype") == np.float32
+            converted_embeddings.append(values)
+        return original_array(values, *args, **kwargs)
+
+    monkeypatch.setattr(index_lifecycle.np, "array", tracking_array)
+    retriever.add_chunks(chunks)
+
+    assert converted_embeddings == [chunk.embedding for chunk in chunks]
+    for chunk in chunks:
+        stored = db.execute(
+            "SELECT embedding FROM chunks WHERE chunk_id = ?", (chunk.chunk_id,)
+        ).fetchone()[0]
+        assert stored == original_array(chunk.embedding, dtype=np.float32).tobytes()
+
+
+def test_add_chunks_finalizer_failure_rolls_back_label_reservation(db, retriever):
+    turn = TranscriptStore(db).append("user", "rollback transaction owner")
+    chunk = _make_chunk(turn.turn_id, "rolled back transaction member", dim=16)
+
+    def fail_finalizer() -> None:
+        raise RuntimeError("synthetic finalizer failure")
+
+    with pytest.raises(RuntimeError, match="synthetic finalizer failure"):
+        retriever.add_chunks([chunk], finalize=fail_finalizer)
+
+    assert db.execute(
+        "SELECT COUNT(*) FROM chunks WHERE chunk_id = ?", (chunk.chunk_id,)
+    ).fetchone()[0] == 0
+    assert db.execute(
+        "SELECT value FROM meta WHERE key = 'next_hnsw_label'"
+    ).fetchone() is None
+    assert chunk.chunk_id not in retriever._chunk_id_to_label
+
+    retriever.add_chunks([chunk])
+    assert db.execute(
+        "SELECT hnsw_label FROM chunks WHERE chunk_id = ?", (chunk.chunk_id,)
+    ).fetchone()[0] == 0
+
+
 def test_empty_query(retriever):
     query_vec = np.random.randn(16).astype(np.float32)
     results = retriever.query(query_vec, k=5)

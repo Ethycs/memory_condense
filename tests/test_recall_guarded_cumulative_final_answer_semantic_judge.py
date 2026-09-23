@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
@@ -14,7 +15,11 @@ from memory_condense.eval import (
 from memory_condense.eval.recall_guarded_cumulative_final_answer import (
     FINAL_ANSWER_POLICY_SHA256,
 )
+from memory_condense.eval.recall_guarded_cumulative_validation_retrieval import (
+    VALIDATION_SHARD_RETRIEVAL_FORMAT,
+)
 from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
+from tools import run_recall_guarded_cumulative_final_answer_semantic_judge as judge_cli
 
 
 _ARTIFACT_SHA = "a" * 64
@@ -365,6 +370,120 @@ def test_population_below_100_is_insufficient_even_when_perfect() -> None:
     assert result["target_gate"]["minimum_population_met"] is False
     assert result["target_gate"]["gate_passed"] is False
     assert result["target_gate"]["status"] == "insufficient_population"
+
+
+def test_s3_validation10_retention_assay_is_distinct_and_scored() -> None:
+    artifact, retrieval, sample = _inputs(10)
+    stage_id = "artifact_global_closure_additions"
+    artifact["fixed_stage_id"] = stage_id
+    for row in artifact["questions"]:
+        row["fixed_stage_id"] = stage_id
+    campaign = judge.build_final_answer_semantic_judge_campaign_binding(
+        artifact,
+        retrieval=retrieval,
+        sample=sample,
+        artifact_sha256=_ARTIFACT_SHA,
+        retrieval_sha256=_RETRIEVAL_SHA,
+        authorized_unique_calls=10,
+        fixed_stage_id=stage_id,
+        retention_assay=True,
+    )
+    runtime = _FakeJudgeRuntime(campaign, authorized=10, correct=10)
+
+    result = judge.judge_recall_guarded_cumulative_final_answers(
+        artifact,
+        retrieval=retrieval,
+        sample=sample,
+        artifact_sha256=_ARTIFACT_SHA,
+        retrieval_sha256=_RETRIEVAL_SHA,
+        runtime=runtime,
+        fixed_stage_id=stage_id,
+        retention_assay=True,
+    )
+
+    assert campaign["format"] == (
+        judge.RETENTION_ASSAY_SEMANTIC_JUDGE_CAMPAIGN_FORMAT
+    )
+    assert result["format"] == judge.RETENTION_ASSAY_SEMANTIC_JUDGE_FORMAT
+    assert result["fixed_stage_id"] == stage_id
+    assert result["semantic_judge_policy"]["claim_scope"] == (
+        "retention assay only; not terminal-v5-r3 or confirmation200"
+    )
+    assert result["target_gate"]["minimum_questions"] == 10
+    assert result["target_gate"]["status"] == "pass"
+
+
+def test_validation_shard_uses_global_ordinals() -> None:
+    artifact, retrieval, sample = _inputs(10)
+    stage_id = "artifact_global_closure_additions"
+    shard_offset = 30
+    retrieval["format"] = VALIDATION_SHARD_RETRIEVAL_FORMAT
+    retrieval["shard_offset"] = shard_offset
+    artifact["fixed_stage_id"] = stage_id
+    for local_ordinal, (answer, retrieved) in enumerate(
+        zip(artifact["questions"], retrieval["questions"], strict=True)
+    ):
+        global_ordinal = shard_offset + local_ordinal
+        answer["ordinal"] = global_ordinal
+        answer["fixed_stage_id"] = stage_id
+        retrieved["ordinal"] = global_ordinal
+    campaign = judge.build_final_answer_semantic_judge_campaign_binding(
+        artifact,
+        retrieval=retrieval,
+        sample=sample,
+        artifact_sha256=_ARTIFACT_SHA,
+        retrieval_sha256=_RETRIEVAL_SHA,
+        authorized_unique_calls=10,
+        fixed_stage_id=stage_id,
+        retention_assay=True,
+    )
+    runtime = _FakeJudgeRuntime(campaign, authorized=10, correct=10)
+
+    result = judge.judge_recall_guarded_cumulative_final_answers(
+        artifact,
+        retrieval=retrieval,
+        sample=sample,
+        artifact_sha256=_ARTIFACT_SHA,
+        retrieval_sha256=_RETRIEVAL_SHA,
+        runtime=runtime,
+        fixed_stage_id=stage_id,
+        retention_assay=True,
+    )
+
+    assert [row["ordinal"] for row in result["questions"]] == list(
+        range(shard_offset, shard_offset + 10)
+    )
+
+
+def test_validation_shard_cli_requires_external_retrieval_seal_before_io(
+    tmp_path: Path,
+) -> None:
+    args = SimpleNamespace(
+        population="validation-shard-10q",
+        expected_retrieval_sha256=None,
+        answers=tmp_path / "missing-answers.json",
+        retrieval=tmp_path / "missing-retrieval.json",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="requires --expected-retrieval-sha256",
+    ):
+        judge_cli.run(args)  # type: ignore[arg-type]
+
+
+def test_validation_retention_default_output_name_is_stage_bound() -> None:
+    stage_id = "artifact_global_closure_additions"
+    output = judge_cli._default_output_path(
+        Path("final-answers-artifact_global_closure_additions.json"),
+        retention_assay=True,
+        fixed_stage_id=stage_id,
+    )
+
+    assert output.name == (
+        "validation10-retention-assay-"
+        "artifact_global_closure_additions-sol.json"
+    )
 
 
 def test_answer_artifact_validation_precedes_gold_access(

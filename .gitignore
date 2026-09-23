@@ -35,8 +35,11 @@ eval_results/
 /.agent_tmp/
 /.agent_test_tmp/
 /.pytest_cache/
+/.pytest-*/
+/.pytest_*/
 /.test-tmp*/
 /.tmp/
+/.tmp-*/
 /tmp/
 
 # Legacy root-level evaluation staging; canonical runs belong in eval_results/

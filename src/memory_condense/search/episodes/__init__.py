@@ -10,6 +10,22 @@ from .boundaries import (
 )
 from .builder import EpisodeBuildResult, EpisodeBuilder
 from .representatives import select_episode_representatives
+from .representative_prefilter import (
+    EpisodeRepresentativeEmbedding,
+    EpisodeRepresentativePrefilterPolicy,
+    EpisodeRepresentativePrefilterReceipt,
+    EpisodeRepresentativePrefilterResult,
+    EpisodeRepresentativePrefilterTiming,
+    prefilter_episode_representatives,
+    prefilter_prescored_episode_representatives,
+)
+from .descriptor_index import (
+    EpisodeDescriptorCatalogReceipt,
+    EpisodeDescriptorEnsureResult,
+    EpisodeDescriptorIndex,
+    EpisodeDescriptorIndexUnavailable,
+    EpisodeDescriptorScoreResult,
+)
 from .representative_retrieval import (
     EpisodeRepresentativeLookup,
     EpisodeRepresentativeRetrievalPlan,
@@ -48,6 +64,16 @@ from .surprise import (
     lexical_cosine,
     score_surprise_sequence,
 )
+from .user_led import (
+    ORPHAN_PRELUDE_BOUNDARY_METHOD,
+    USER_LED_BOUNDARY_METHOD,
+    USER_LED_EPISODE_FORMAT,
+    UserLedEpisodeBuildResult,
+    UserLedEpisodeBuilder,
+    UserLedEpisodeShard,
+    build_user_led_episodes,
+    make_user_led_exchange_id,
+)
 
 
 __all__ = [
@@ -65,8 +91,18 @@ __all__ = [
     "EPISODIC_SURPRISE_PROBE",
     "EpisodeBuildResult",
     "EpisodeBuilder",
+    "EpisodeDescriptorCatalogReceipt",
+    "EpisodeDescriptorEnsureResult",
+    "EpisodeDescriptorIndex",
+    "EpisodeDescriptorIndexUnavailable",
+    "EpisodeDescriptorScoreResult",
     "EpisodeLookup",
     "EpisodeRepresentativeLookup",
+    "EpisodeRepresentativeEmbedding",
+    "EpisodeRepresentativePrefilterPolicy",
+    "EpisodeRepresentativePrefilterReceipt",
+    "EpisodeRepresentativePrefilterResult",
+    "EpisodeRepresentativePrefilterTiming",
     "EpisodeRepresentativeRetrievalPlan",
     "EpisodeRepresentativeRetrievalPolicy",
     "EpisodeRepresentativeWitness",
@@ -78,17 +114,27 @@ __all__ = [
     "FixedIntervalBoundaryDetector",
     "LexicalEmbeddingChangeScorer",
     "NestedEpisodeLinker",
+    "ORPHAN_PRELUDE_BOUNDARY_METHOD",
     "QwenAttentionHeadSurpriseScorer",
     "ScoredSurpriseSequence",
     "RepresentativeHydrator",
     "SurpriseScorer",
     "SurpriseSequenceScorer",
+    "USER_LED_BOUNDARY_METHOD",
+    "USER_LED_EPISODE_FORMAT",
+    "UserLedEpisodeBuildResult",
+    "UserLedEpisodeBuilder",
+    "UserLedEpisodeShard",
+    "build_user_led_episodes",
     "combine_episode_seeds",
     "dense_cosine",
     "episode_source_candidates_from_results",
     "episode_seed_payload",
     "expand_episode_seeds",
     "lexical_cosine",
+    "make_user_led_exchange_id",
+    "prefilter_episode_representatives",
+    "prefilter_prescored_episode_representatives",
     "retrieve_episode_representatives",
     "score_surprise_sequence",
     "select_episode_representatives",

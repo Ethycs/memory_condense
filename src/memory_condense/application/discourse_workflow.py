@@ -53,6 +53,8 @@ from memory_condense.search.episodes import (
     EpisodeRetrievalPolicy,
     EpisodeRepresentativeRetrievalPlan,
     EpisodeRepresentativeRetrievalPolicy,
+    EpisodeRepresentativePrefilterPolicy,
+    EpisodeRepresentativePrefilterResult,
     EpisodeSourceCandidate,
     EpisodeSourceCandidateScope,
     LexicalEmbeddingChangeScorer,
@@ -65,7 +67,12 @@ from memory_condense.search.episodes import (
     select_episode_representatives,
 )
 from memory_condense.search.episodes.surprise import _owned_qwen_receipt_matches
+from memory_condense.search.episodes.descriptor_index import (
+    EpisodeDescriptorEnsureResult,
+    EpisodeDescriptorIndex,
+)
 from memory_condense.search.packing.evidence_packet import pack_evidence_plan
+from memory_condense.search.selectors.set_program import compile_set_program
 
 
 @runtime_checkable
@@ -291,6 +298,7 @@ class DiscourseWorkflowMixin:
 
     def _init_discourse_workflow(self) -> None:
         self._discourse = DiscourseStore(self._db)
+        self.last_episode_prefilter_report: dict[str, object] = {}
 
     @property
     def discourse(self) -> DiscourseStore:
@@ -429,6 +437,11 @@ class DiscourseWorkflowMixin:
                 for span in spans
             ),
         )
+        descriptor_index = getattr(self, "_episode_descriptor_index", None)
+        if descriptor_index is not None:
+            # Publication is authoritative; a derived cache can only be
+            # invalidated after the transaction succeeds.
+            descriptor_index.invalidate()
         return EpisodePublication(
             build=build,
             representatives=representatives,
@@ -437,6 +450,38 @@ class DiscourseWorkflowMixin:
                 returned_signal_transformer_state_bytes
             ),
         )
+
+    def prepare_discourse_episode_descriptors(
+        self,
+        artifact_id: str,
+        *,
+        embedding_identity: Mapping[str, object],
+    ) -> EpisodeDescriptorEnsureResult:
+        """Validate and normalize episode descriptors outside the read path."""
+
+        selected_artifact = self._resolve_discourse_artifact(artifact_id)
+        if selected_artifact is None:
+            raise ValueError("episode descriptor preparation requires an artifact")
+        snapshot = self._discourse.snapshot()
+        descriptor_index = getattr(self, "_episode_descriptor_index", None)
+        if descriptor_index is None:
+            descriptor_index = EpisodeDescriptorIndex(
+                self._db,
+                dimension=int(self._embedder.dim),
+            )
+            self._episode_descriptor_index = descriptor_index
+        result = descriptor_index.ensure(
+            selected_artifact,
+            snapshot_sha256=snapshot.snapshot_sha256,
+            embedding_identity=embedding_identity,
+        )
+        if self._discourse.snapshot() != snapshot:
+            descriptor_index.invalidate()
+            raise RuntimeError(
+                "discourse snapshot changed during descriptor preparation"
+            )
+        self._episode_descriptor_embedding_identity = dict(embedding_identity)
+        return result
 
     def link_and_publish_discourse(
         self,
@@ -642,6 +687,9 @@ class DiscourseWorkflowMixin:
         *,
         policy: EpisodeRepresentativeRetrievalPolicy,
         source_scope: EpisodeSourceCandidateScope | None = None,
+        prefilter_policy: EpisodeRepresentativePrefilterPolicy | None = None,
+        prefilter_embedding_identity: Mapping[str, object] | None = None,
+        protected_episode_ids: Sequence[str] = (),
     ) -> EpisodeRepresentativeRetrievalPlan:
         """Discover bounded episode seeds beyond the direct chunk hits."""
 
@@ -669,7 +717,43 @@ class DiscourseWorkflowMixin:
             self._discourse,
             selected_artifact,
         )
-        return retrieve_episode_representatives(
+        self.last_episode_prefilter_report = {}
+        requires_complete_frontier = compile_set_program(
+            query
+        ).requires_completeness
+        query_vector = None
+        if (
+            prefilter_policy is not None
+            and prefilter_policy.mode == "shadow"
+            and not requires_complete_frontier
+        ):
+            try:
+                query_vector = self._embedder.embed_query(query)
+            except Exception:
+                # The pure prefilter records a missing-query fail-open result;
+                # the authoritative Qwen route remains unchanged.
+                query_vector = None
+        observed: list[EpisodeRepresentativePrefilterResult] = []
+        embedding_identity = dict(
+            prefilter_embedding_identity
+            or getattr(
+                self,
+                "_episode_descriptor_embedding_identity",
+                None,
+            )
+            or {
+                "backend": (
+                    f"{type(self._embedder).__module__}."
+                    f"{type(self._embedder).__qualname__}"
+                ),
+                "model_id": str(
+                    getattr(self._embedder, "model_name", "unknown")
+                ),
+                "dimension": int(self._embedder.dim),
+                "space": "cosine",
+            }
+        )
+        plan = retrieve_episode_representatives(
             query,
             source_candidates,
             store,
@@ -677,7 +761,59 @@ class DiscourseWorkflowMixin:
             linker,
             policy=policy,
             source_scope=source_scope,
+            prefilter_policy=prefilter_policy,
+            query_vector=query_vector,
+            representative_embedding_loader=self._retriever.stored_embeddings,
+            representative_descriptor_index=getattr(
+                self,
+                "_episode_descriptor_index",
+                None,
+            ),
+            embedding_identity=embedding_identity,
+            protected_episode_ids=protected_episode_ids,
+            requires_complete_frontier=requires_complete_frontier,
+            prefilter_observer=observed.append,
         )
+        if observed:
+            result = observed[-1]
+            hit_ids = tuple(seed.episode_id for seed in plan.seeds)
+            proposal_ids = set(result.proposal_ids)
+            retained_hits = tuple(
+                episode_id for episode_id in hit_ids if episode_id in proposal_ids
+            )
+            self.last_episode_prefilter_report = {
+                "mode": result.mode,
+                "status": result.status,
+                "reason": result.reason,
+                "exhaustive": result.exhaustive,
+                "semantic_receipt_sha256": (
+                    result.semantic_receipt.receipt_sha256
+                ),
+                "policy_sha256": result.semantic_receipt.policy_sha256,
+                "descriptor_catalog_receipt_sha256": (
+                    result.semantic_receipt.descriptor_catalog_receipt_sha256
+                ),
+                "descriptor_source": (
+                    "resident_index"
+                    if result.semantic_receipt.descriptor_catalog_receipt_sha256
+                    else "per_query_vectors"
+                ),
+                "input_count": len(result.population),
+                "proposal_count": len(result.proposal),
+                "output_count": len(result.candidates),
+                "proposal_episode_ids": list(result.proposal_ids),
+                "proposal_is_narrower": (
+                    len(result.proposal) < len(result.population)
+                ),
+                "prefilter_elapsed_ms": result.elapsed_ms,
+                "full_qwen_hit_ids": list(hit_ids),
+                "full_qwen_hit_count": len(hit_ids),
+                "retained_full_qwen_hit_ids": list(retained_hits),
+                "full_qwen_hit_recall": (
+                    None if not hit_ids else len(retained_hits) / len(hit_ids)
+                ),
+            }
+        return plan
 
     def close_discourse_evidence(
         self,

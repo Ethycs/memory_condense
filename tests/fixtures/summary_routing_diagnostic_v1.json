@@ -1,0 +1,86 @@
+{
+  "format": "summary-routing-diagnostic-v1",
+  "purpose": "Synthetic routing mechanism diagnostic, not benchmark evidence or answer accuracy",
+  "groups": [
+    {
+      "id": "trip", "split": "development",
+      "summaries": [
+        "A hotel reservation includes late check-in, breakfast and a quiet room away from the elevator.",
+        "Rail tickets cover an afternoon departure, assigned seats and a change at the central station.",
+        "The restaurant booking requires a vegetarian menu and a table for four near the window.",
+        "Museum admission uses timed entry, with tickets collected at the west entrance."
+      ],
+      "queries": ["Where were we staying overnight?", "How were we traveling by train?", "What arrangements did we make for dinner?", "Where do we collect our exhibition entry passes?"]
+    },
+    {
+      "id": "devices", "split": "development",
+      "summaries": [
+        "The home wireless network was renamed, and the router password was changed after connection failures.",
+        "The printer needed new ink cartridges and a driver update to fix blank pages.",
+        "A backup drive stores weekly copies of family photographs in an encrypted folder.",
+        "The monitor display was adjusted to reduce brightness and increase text size."
+      ],
+      "queries": ["What changed about our Wi-Fi access?", "How did we fix the printing problem?", "Where are the duplicate photo files kept?", "What made the screen easier to read?"]
+    },
+    {
+      "id": "garden", "split": "development",
+      "summaries": [
+        "Tomato seedlings were moved into larger containers with supports for the growing vines.",
+        "Lawn watering was scheduled for early mornings twice a week using an automatic timer.",
+        "Fallen leaves and kitchen vegetable scraps were added to the compost bin.",
+        "The wooden fence was sanded and painted to protect it from rain."
+      ],
+      "queries": ["What did we do with the young tomato plants?", "When should the grass receive water?", "How are our organic leftovers recycled?", "How did we weatherproof the boundary panels?"]
+    },
+    {
+      "id": "project", "split": "development",
+      "summaries": [
+        "The design review moved to Thursday, and the team will bring updated interface mockups.",
+        "The software release is blocked until the failing integration checks are repaired.",
+        "Customer interviews focused on onboarding confusion and missing setup instructions.",
+        "The project budget reserves funds for contractor hours and new testing equipment."
+      ],
+      "queries": ["When are we discussing the revised visual designs?", "Why cannot we ship the application yet?", "What did users struggle with when getting started?", "What expenses are covered by the spending allocation?"]
+    },
+    {
+      "id": "theater", "split": "validation",
+      "summaries": [
+        "Costume fittings are held backstage, with measurements checked before the final rehearsal.",
+        "The lighting operator revised the spotlight sequence for the opening scene.",
+        "Audience ticket collection starts an hour before curtain time at the box office.",
+        "Actors practice dialogue and entrances during the Wednesday evening rehearsal."
+      ],
+      "queries": ["Where do performers try on their stage clothing?", "Who changed the illumination cues?", "When can spectators pick up their admission tickets?", "When does the cast run through their lines?"]
+    },
+    {
+      "id": "workshops", "split": "validation",
+      "summaries": [
+        "The pottery workshop teaches wheel throwing and includes clay plus kiln firing.",
+        "The photography class covers shutter speed, aperture and indoor portrait lighting.",
+        "The cooking lesson demonstrates bread kneading and fermentation before baking.",
+        "The woodworking session covers safe saw operation and joining wooden panels."
+      ],
+      "queries": ["Which class supplies materials for making ceramic bowls?", "Where will I learn camera exposure settings?", "Which lesson explains how dough rises?", "Where can I learn to cut and assemble timber safely?"]
+    },
+    {
+      "id": "library", "split": "validation",
+      "summaries": [
+        "The library lends telescopes for night-sky observation, with pickup at the equipment desk.",
+        "Meeting rooms require advance booking and must be vacated before closing time.",
+        "Digital audiobooks can be borrowed through the mobile app using a library card.",
+        "A volunteer repairs damaged book bindings in the preservation workshop."
+      ],
+      "queries": ["Where can I borrow something to look at the stars?", "How do I reserve a space for our group discussion?", "How can I listen to borrowed books on my phone?", "Who restores worn covers and loose pages?"]
+    },
+    {
+      "id": "deliveries", "split": "validation",
+      "summaries": [
+        "The refrigerated grocery delivery needs an insulated container and a recipient at home.",
+        "A damaged furniture shipment was returned after photographs of the broken leg were submitted.",
+        "The replacement bicycle arrived at a collection locker, with an access code sent by text.",
+        "International parcel tracking paused while the package awaited customs clearance."
+      ],
+      "queries": ["What arrangements keep the delivered food cold?", "Why did we send back the table?", "How can I retrieve the new bike?", "Why is the overseas package delayed at the border?"]
+    }
+  ]
+}

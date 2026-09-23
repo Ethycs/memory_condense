@@ -45,13 +45,25 @@ from memory_condense.eval.recall_guarded_cumulative_final_answer_runtime import 
     LOCKED_FINAL_ANSWER_MODEL,
     preflight_final_answer_prompt_population,
 )
+from memory_condense.eval.recall_guarded_cumulative_population import (
+    LOCKED_LONGMEMEVAL_VALIDATION_PLAN,
+    LOCKED_QUESTIONS_PER_SHARD,
+    validate_locked_cumulative_population_identity,
+    validate_locked_cumulative_shard_identity,
+)
 from memory_condense.eval.recall_guarded_cumulative_provider_synthesis_runtime import (
     CENTRAL_DEV_GATEWAY_URL,
     _gateway_model,
 )
 from memory_condense.eval.recall_guarded_cumulative_validation_retrieval import (
+    VALIDATION_CAMPAIGN_FORMAT,
     VALIDATION_MERGED_RETRIEVAL_FORMAT,
+    VALIDATION_SHARD_QUESTION_FORMAT,
+    VALIDATION_SHARD_RETRIEVAL_FORMAT,
     merged_question_store_receipts,
+)
+from memory_condense.eval.recall_guarded_cumulative_runtime import (
+    CombinedCumulativeStoreReceipt,
 )
 from memory_condense.eval.reproducibility import implementation_sha256
 
@@ -94,6 +106,20 @@ FINAL_ANSWER_POLICY = {
     "persisted_local_transformer_token_state": False,
 }
 FINAL_ANSWER_POLICY_SHA256 = identity_sha256(FINAL_ANSWER_POLICY)
+
+
+def final_answer_policy_identity(
+    fixed_stage_id: str = FIXED_STAGE_ID,
+) -> tuple[dict[str, Any], str]:
+    """Return the stage-bound policy while preserving the historical S1 seal."""
+
+    if fixed_stage_id not in STAGE_IDS:
+        raise ValueError(f"unknown fixed retrieval stage: {fixed_stage_id}")
+    if fixed_stage_id == FIXED_STAGE_ID:
+        return dict(FINAL_ANSWER_POLICY), FINAL_ANSWER_POLICY_SHA256
+    policy = dict(FINAL_ANSWER_POLICY)
+    policy["fixed_stage_id"] = fixed_stage_id
+    return policy, identity_sha256(policy)
 
 
 class FinalAnswerRuntime(Protocol):
@@ -163,6 +189,129 @@ def _validated_messages(value: Any) -> tuple[Mapping[str, str], ...]:
             )
         rows.append({"role": role, "content": content})
     return tuple(rows)
+
+
+_VALIDATION_SHARD_TOP_FIELDS = frozenset(
+    {
+        "format", "campaign_format", "population_identity",
+        "population_identity_sha256", "shard_identity",
+        "shard_identity_sha256", "shard_offset",
+        "validation_policy_attestation",
+        "validation_policy_attestation_sha256",
+        "validation_policy_manifest_sha256", "validation_execution_policy",
+        "validation_execution_policy_sha256", "retrieval_policy_sha256",
+        "retrieval_implementation_sha256", "environment_lock_sha256",
+        "source_embedding_device", "source_timestamp_semantics",
+        "source_store_mode", "source_store_receipt",
+        "source_store_receipt_sha256", "combined_store_mode",
+        "combined_store_receipt", "combined_store_receipt_sha256",
+        "compilation_receipt_sha256", "transcript_tokens", "turn_count",
+        "question_count", "stage_ids", "question_part_sha256s",
+        "questions", "provider_calls", "gold_fields_present",
+    }
+)
+_VALIDATION_SHARD_QUESTION_FIELDS = frozenset(
+    {
+        "format", "population_identity_sha256", "shard_identity_sha256",
+        "shard_offset", "local_ordinal", "ordinal", "question_id",
+        "question_id_sha256", "question_sha256", "dated_question_sha256",
+        "probe_identity_sha256", "validation_policy_manifest_sha256",
+        "validation_policy_attestation_sha256",
+        "validation_execution_policy_sha256", "retrieval_policy_sha256",
+        "retrieval_implementation_sha256", "environment_lock_sha256",
+        "source_store_receipt_sha256", "combined_store_receipt_sha256",
+        "compilation_receipt_sha256", "retrieval_receipt",
+        "predecessor_receipt", "stage_ids", "stages", "elapsed_seconds",
+        "provider_calls",
+    }
+)
+
+
+def _validate_sealed_validation_shard_envelope(
+    retrieval: Mapping[str, Any],
+) -> None:
+    """Validate a gold-blind shard from its embedded seals only.
+
+    Source reconstruction remains the stronger upstream publication check.  This
+    check is intentionally sufficient for a later responder to consume a
+    canonical, externally SHA-bound artifact without reopening benchmark gold.
+    """
+
+    if set(retrieval) != _VALIDATION_SHARD_TOP_FIELDS:
+        raise ValueError("validation shard retrieval fields changed")
+    if (
+        retrieval.get("format") != VALIDATION_SHARD_RETRIEVAL_FORMAT
+        or retrieval.get("campaign_format") != VALIDATION_CAMPAIGN_FORMAT
+        or retrieval.get("provider_calls") != 0
+        or retrieval.get("gold_fields_present") is not False
+        or retrieval.get("question_count") != LOCKED_QUESTIONS_PER_SHARD
+        or tuple(retrieval.get("stage_ids", ())) != STAGE_IDS
+    ):
+        raise ValueError("validation shard retrieval belongs to another protocol")
+    population = validate_locked_cumulative_population_identity(
+        retrieval.get("population_identity", {}),
+        plan=LOCKED_LONGMEMEVAL_VALIDATION_PLAN,
+    )
+    shard = validate_locked_cumulative_shard_identity(
+        retrieval.get("shard_identity", {})
+    )
+    shard_offset = shard["construction"]["sample_offset"]
+    shard_index = tuple(LOCKED_LONGMEMEVAL_VALIDATION_PLAN.shard_offsets).index(
+        shard_offset
+    )
+    if (
+        retrieval.get("population_identity_sha256")
+        != population["population_identity_sha256"]
+        or retrieval.get("shard_identity_sha256")
+        != shard["shard_identity_sha256"]
+        or retrieval.get("shard_offset") != shard_offset
+        or population["ordered_shard_identity_sha256s"][shard_index]
+        != shard["shard_identity_sha256"]
+        or retrieval.get("transcript_tokens") != shard["transcript_tokens"]
+        or retrieval.get("turn_count") != shard["turn_count"]
+    ):
+        raise ValueError("validation shard population binding changed")
+    attestation = retrieval.get("validation_policy_attestation")
+    execution = retrieval.get("validation_execution_policy")
+    if not isinstance(attestation, Mapping) or not isinstance(execution, Mapping):
+        raise ValueError("validation shard policy identity is missing")
+    attestation_body = dict(attestation)
+    embedded_attestation_sha = attestation_body.pop("attestation_sha256", None)
+    attestation_sha = identity_sha256(attestation_body)
+    execution_sha = identity_sha256(dict(execution))
+    if (
+        embedded_attestation_sha != attestation_sha
+        or retrieval.get("validation_policy_attestation_sha256")
+        != attestation_sha
+        or retrieval.get("validation_execution_policy_sha256") != execution_sha
+        or execution.get("validation_policy_attestation_sha256")
+        != attestation_sha
+        or execution.get("resolved_retrieval_policy_sha256")
+        != retrieval.get("retrieval_policy_sha256")
+    ):
+        raise ValueError("validation shard policy seal changed")
+    source = retrieval.get("source_store_receipt")
+    combined_raw = retrieval.get("combined_store_receipt")
+    if not isinstance(source, Mapping) or not isinstance(combined_raw, Mapping):
+        raise ValueError("validation shard store receipt is missing")
+    source_body = dict(source)
+    source_sha = source_body.pop("receipt_sha256", None)
+    combined = CombinedCumulativeStoreReceipt(**dict(combined_raw))
+    if (
+        source_sha != identity_sha256(source_body)
+        or retrieval.get("source_store_receipt_sha256") != source_sha
+        or retrieval.get("combined_store_receipt_sha256")
+        != combined.receipt_sha256
+        or retrieval.get("compilation_receipt_sha256")
+        != combined.compilation_receipt_sha256
+        or combined.source_database_sha256 != source.get("database_sha256")
+        or combined.turn_count != source.get("turn_count")
+        or combined.chunk_count != source.get("chunk_count")
+        or combined.retrieval_policy_sha256
+        != retrieval.get("retrieval_policy_sha256")
+        or combined.retained_request_token_state_bytes != 0
+    ):
+        raise ValueError("validation shard store receipt seal changed")
 
 
 def build_responder_prompt_policy_identity(
@@ -238,14 +387,21 @@ def _plan_answers(
     retrieval: Mapping[str, Any],
     *,
     retrieval_sha256: str,
+    fixed_stage_id: str = FIXED_STAGE_ID,
 ) -> list[_PlannedAnswer]:
     """Validate every sealed prompt before returning any callable work."""
 
+    final_answer_policy_identity(fixed_stage_id)
     merged_validation = (
         retrieval.get("format") == VALIDATION_MERGED_RETRIEVAL_FORMAT
     )
+    validation_shard = (
+        retrieval.get("format") == VALIDATION_SHARD_RETRIEVAL_FORMAT
+    )
     if merged_validation:
         merged_store_receipts = merged_question_store_receipts(retrieval)
+    elif validation_shard:
+        _validate_sealed_validation_shard_envelope(retrieval)
     else:
         # Preserve the historical single-store contract unchanged.  Unknown
         # formats deliberately fail through its exact validator.
@@ -296,9 +452,11 @@ def _plan_answers(
 
     planned: list[_PlannedAnswer] = []
     seen_ids: set[str] = set()
-    for ordinal, (question, part_sha, expected_store_receipt) in enumerate(
+    shard_offset = int(retrieval.get("shard_offset", 0)) if validation_shard else 0
+    for local_ordinal, (question, part_sha, expected_store_receipt) in enumerate(
         zip(questions, part_hashes, expected_store_receipts, strict=True)
     ):
+        ordinal = shard_offset + local_ordinal
         if not isinstance(question, Mapping):
             raise ValueError("retrieval question must be an object")
         question_id = question.get("question_id")
@@ -330,6 +488,34 @@ def _plan_answers(
             or question.get("provider_calls") != 0
         ):
             raise ValueError("retrieval question cross-binding changed")
+        if validation_shard:
+            probes = retrieval["shard_identity"]["ordered_question_probes"]
+            probe = probes[local_ordinal]
+            if (
+                set(question) != _VALIDATION_SHARD_QUESTION_FIELDS
+                or question.get("format") != VALIDATION_SHARD_QUESTION_FORMAT
+                or question.get("local_ordinal") != local_ordinal
+                or question.get("shard_offset") != shard_offset
+                or question.get("shard_identity_sha256")
+                != retrieval.get("shard_identity_sha256")
+                or question.get("probe_identity_sha256")
+                != probe.get("probe_identity_sha256")
+                or question.get("question_id_sha256")
+                != identity_sha256({"question_id": question_id})
+                or question.get("source_store_receipt_sha256")
+                != retrieval.get("source_store_receipt_sha256")
+                or question.get("compilation_receipt_sha256")
+                != retrieval.get("compilation_receipt_sha256")
+                or question.get("validation_policy_attestation_sha256")
+                != retrieval.get("validation_policy_attestation_sha256")
+                or question.get("validation_execution_policy_sha256")
+                != retrieval.get("validation_execution_policy_sha256")
+                or question.get("retrieval_policy_sha256")
+                != retrieval.get("retrieval_policy_sha256")
+                or question.get("environment_lock_sha256")
+                != retrieval.get("environment_lock_sha256")
+            ):
+                raise ValueError("validation shard question binding changed")
         if any(
             name in question
             for name in ("answer", "gold", "gold_answer", "evidence_sources")
@@ -375,7 +561,7 @@ def _plan_answers(
                 or prompt_tokens > RESPONDER_PROMPT_CAP
             ):
                 raise ValueError("retrieval stage violates the frozen responder budget")
-            if expected_stage_id == FIXED_STAGE_ID:
+            if expected_stage_id == fixed_stage_id:
                 selected_stage = stage
                 selected_receipt = typed
         ladder = CumulativeRetrievalLadder(stages=tuple(typed_stages))
@@ -435,6 +621,7 @@ def final_answer_prompt_population(
     retrieval: Mapping[str, Any],
     *,
     retrieval_sha256: str,
+    fixed_stage_id: str = FIXED_STAGE_ID,
 ) -> tuple[tuple[Mapping[str, str], ...], ...]:
     """Return the completely preflighted ordered provider prompt population."""
 
@@ -443,6 +630,7 @@ def final_answer_prompt_population(
         for row in _plan_answers(
             retrieval,
             retrieval_sha256=retrieval_sha256,
+            fixed_stage_id=fixed_stage_id,
         )
     )
 
@@ -452,6 +640,7 @@ def build_final_answer_campaign_binding(
     *,
     retrieval_sha256: str,
     authorized_unique_calls: int,
+    fixed_stage_id: str = FIXED_STAGE_ID,
 ) -> dict[str, Any]:
     """Return the exact gold-free authorization identity for one campaign."""
 
@@ -460,7 +649,9 @@ def build_final_answer_campaign_binding(
     planned = _plan_answers(
         retrieval,
         retrieval_sha256=retrieval_sha256,
+        fixed_stage_id=fixed_stage_id,
     )
+    _policy, policy_sha256 = final_answer_policy_identity(fixed_stage_id)
     unique = _unique_prompts(planned)
     responder_prompt_policy = build_responder_prompt_policy_identity(
         [row.messages for row in planned]
@@ -487,7 +678,7 @@ def build_final_answer_campaign_binding(
                 for row in planned
             ]
         ),
-        "fixed_stage_id": FIXED_STAGE_ID,
+        "fixed_stage_id": fixed_stage_id,
         "selected_stage_population_sha256": identity_sha256(
             [
                 {
@@ -514,7 +705,7 @@ def build_final_answer_campaign_binding(
             ]
         ),
         "authorized_unique_calls": authorized_unique_calls,
-        "final_answer_policy_sha256": FINAL_ANSWER_POLICY_SHA256,
+        "final_answer_policy_sha256": policy_sha256,
         "responder_prompt_policy": responder_prompt_policy,
         "responder_prompt_policy_sha256": identity_sha256(
             responder_prompt_policy
@@ -617,11 +808,17 @@ def answer_recall_guarded_cumulative_stage(
     *,
     retrieval_sha256: str,
     runtime: FinalAnswerRuntime,
+    fixed_stage_id: str = FIXED_STAGE_ID,
 ) -> dict[str, Any]:
     """Answer the preregistered stage after a whole-population preflight."""
 
     implementation = implementation_sha256()
-    planned = _plan_answers(retrieval, retrieval_sha256=retrieval_sha256)
+    planned = _plan_answers(
+        retrieval,
+        retrieval_sha256=retrieval_sha256,
+        fixed_stage_id=fixed_stage_id,
+    )
+    policy, policy_sha256 = final_answer_policy_identity(fixed_stage_id)
     unique = _unique_prompts(planned)
     runtime_identity = _runtime_identity(runtime)
     _attest_runtime(runtime_identity)
@@ -640,6 +837,7 @@ def answer_recall_guarded_cumulative_stage(
         retrieval,
         retrieval_sha256=retrieval_sha256,
         authorized_unique_calls=authorized,
+        fixed_stage_id=fixed_stage_id,
     )
     if runtime_identity.get("campaign_binding") != campaign:
         raise ValueError("final-answer runtime belongs to another campaign")
@@ -715,7 +913,7 @@ def answer_recall_guarded_cumulative_stage(
                 "question_sha256": row.question_sha256,
                 "dated_question_sha256": row.dated_question_sha256,
                 "retrieval_question_part_sha256": row.question_part_sha256,
-                "fixed_stage_id": FIXED_STAGE_ID,
+                "fixed_stage_id": fixed_stage_id,
                 "stage_receipt_sha256": row.stage_receipt_sha256,
                 "evidence_projection_sha256": row.evidence_projection_sha256,
                 "provider_messages_sha256": row.messages_sha256,
@@ -739,9 +937,9 @@ def answer_recall_guarded_cumulative_stage(
         "population_identity_sha256": retrieval["population_identity_sha256"],
         "question_count": len(questions),
         "gold_fields_present": False,
-        "fixed_stage_id": FIXED_STAGE_ID,
-        "final_answer_policy": dict(FINAL_ANSWER_POLICY),
-        "final_answer_policy_sha256": FINAL_ANSWER_POLICY_SHA256,
+        "fixed_stage_id": fixed_stage_id,
+        "final_answer_policy": policy,
+        "final_answer_policy_sha256": policy_sha256,
         "responder_prompt_policy_sha256": campaign[
             "responder_prompt_policy_sha256"
         ],
@@ -793,6 +991,7 @@ def validate_final_answer_artifact(
     retrieval: Mapping[str, Any],
     artifact_sha256: str,
     retrieval_sha256: str,
+    fixed_stage_id: str = FIXED_STAGE_ID,
 ) -> None:
     """Fail closed on a fixed-stage artifact before post-hoc gold loading."""
 
@@ -824,7 +1023,12 @@ def validate_final_answer_artifact(
     }
     if set(artifact) != expected_top_fields:
         raise ValueError("final-answer artifact fields changed")
-    planned = _plan_answers(retrieval, retrieval_sha256=retrieval_sha256)
+    planned = _plan_answers(
+        retrieval,
+        retrieval_sha256=retrieval_sha256,
+        fixed_stage_id=fixed_stage_id,
+    )
+    policy, policy_sha256 = final_answer_policy_identity(fixed_stage_id)
     if (
         artifact.get("format") != FINAL_ANSWER_FORMAT
         or artifact.get("retrieval_sha256") != retrieval_sha256
@@ -832,10 +1036,10 @@ def validate_final_answer_artifact(
         != retrieval.get("population_identity_sha256")
         or artifact.get("question_count") != len(planned)
         or artifact.get("gold_fields_present") is not False
-        or artifact.get("fixed_stage_id") != FIXED_STAGE_ID
-        or artifact.get("final_answer_policy") != FINAL_ANSWER_POLICY
+        or artifact.get("fixed_stage_id") != fixed_stage_id
+        or artifact.get("final_answer_policy") != policy
         or artifact.get("final_answer_policy_sha256")
-        != FINAL_ANSWER_POLICY_SHA256
+        != policy_sha256
     ):
         raise ValueError("final-answer artifact belongs to another protocol")
     runtime_identity = artifact.get("runtime_identity")
@@ -871,6 +1075,7 @@ def validate_final_answer_artifact(
         retrieval,
         retrieval_sha256=retrieval_sha256,
         authorized_unique_calls=len(_unique_prompts(planned)),
+        fixed_stage_id=fixed_stage_id,
     )
     if campaign != expected_campaign:
         raise ValueError("final-answer campaign binding changed")
@@ -966,7 +1171,7 @@ def validate_final_answer_artifact(
             "question_sha256": plan.question_sha256,
             "dated_question_sha256": plan.dated_question_sha256,
             "retrieval_question_part_sha256": plan.question_part_sha256,
-            "fixed_stage_id": FIXED_STAGE_ID,
+            "fixed_stage_id": fixed_stage_id,
             "stage_receipt_sha256": plan.stage_receipt_sha256,
             "evidence_projection_sha256": plan.evidence_projection_sha256,
             "provider_messages_sha256": plan.messages_sha256,
@@ -1039,5 +1244,6 @@ __all__ = [
     "build_final_answer_campaign_binding",
     "build_responder_prompt_policy_identity",
     "final_answer_prompt_population",
+    "final_answer_policy_identity",
     "validate_final_answer_artifact",
 ]

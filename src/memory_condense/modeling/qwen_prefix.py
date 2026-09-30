@@ -442,6 +442,7 @@ class Qwen3PrefixEncoder:
         model_id: str = DEFAULT_MODEL_ID,
         model_revision: str = DEFAULT_MODEL_REVISION,
         expected_checkpoint_sha256: str | None = None,
+        host_embeddings: bool = False,
     ) -> None:
         self.model_dir = Path(model_dir)
         self.layers = int(layers)
@@ -468,6 +469,9 @@ class Qwen3PrefixEncoder:
         ) = _require_torch_stack()
 
         self.device = self._torch.device(device)
+        self.host_embeddings = bool(host_embeddings)
+        if self.host_embeddings and self.device.type != 'cuda':
+            raise ValueError('host embedding placement requires CUDA transformer layers')
         self.dtype = _torch_dtype(self._torch, dtype)
         self.dtype_name = _canonical_dtype_name(dtype)
 
@@ -509,7 +513,7 @@ class Qwen3PrefixEncoder:
                     set_module_tensor_to_device(
                         model,
                         parameter_name,
-                        self.device,
+                        'cpu' if self.host_embeddings and parameter_name == 'embed_tokens.weight' else self.device,
                         value=checkpoint.get_tensor(key),
                         dtype=self.dtype,
                     )
@@ -534,7 +538,12 @@ class Qwen3PrefixEncoder:
         if missing:
             raise RuntimeError(f"prefix parameters were not materialized: {missing[:5]}")
 
-        model.to(self.device)
+        if self.host_embeddings:
+            for name, module in model.named_children():
+                if name != 'embed_tokens':
+                    module.to(self.device)
+        else:
+            model.to(self.device)
         model.requires_grad_(False)
         model.eval()
         self.model = model
@@ -542,6 +551,14 @@ class Qwen3PrefixEncoder:
             self.model_dir, local_files_only=True
         )
         self.loaded_parameter_names = frozenset(loaded)
+
+    def _forward(self, *, input_ids, **kwargs):
+        """Copy selected embedding rows, keeping the vocabulary table in RAM."""
+        if getattr(self, 'host_embeddings', False):
+            kwargs['inputs_embeds'] = self.model.embed_tokens(input_ids.to('cpu')).to(self.device)
+        else:
+            kwargs['input_ids'] = input_ids
+        return self.model(**kwargs)
 
     @property
     def parameter_count(self) -> int:
@@ -636,7 +653,7 @@ class Qwen3PrefixEncoder:
                 device_type="cuda",
                 enabled=False,
             ):
-                self.model(
+                self._forward(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     use_cache=False,
@@ -689,7 +706,7 @@ class Qwen3PrefixEncoder:
             inputs = self.tokenizer(text, return_tensors="pt")
             inputs = {key: value.to(self.device) for key, value in inputs.items()}
             with self._torch.inference_mode():
-                self.model(**inputs, use_cache=False)
+                self._forward(**inputs, use_cache=False)
         finally:
             handle.remove()
         return captured["residual"]
@@ -744,7 +761,7 @@ class Qwen3PrefixEncoder:
                 )
                 inputs = {key: value.to(self.device) for key, value in inputs.items()}
                 with self._torch.inference_mode():
-                    self.model(**inputs, use_cache=False)
+                    self._forward(**inputs, use_cache=False)
                     for layer in selected:
                         vectors = mean_pool_residual(
                             captured[layer], inputs.get("attention_mask")
@@ -845,7 +862,7 @@ class Qwen3PrefixEncoder:
                 # Do not ask every retained layer to return its LxL attention
                 # map. We reconstruct maps only for selected layers below,
                 # keeping the transient linker bounded by its own workspace.
-                self.model(**inputs, use_cache=False, output_attentions=False)
+                self._forward(**inputs, use_cache=False, output_attentions=False)
                 captures: dict[int, QwenHeadCapture] = {}
                 for layer in selected:
                     decoder = self.model.layers[layer]

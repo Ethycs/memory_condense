@@ -1,4 +1,5 @@
 """Keep attention inputs short while independently bounding parent summaries."""
+from concurrent.futures import ThreadPoolExecutor
 from memory_condense.domain._discourse_identity import identity_sha256
 from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.search.episodes.attention_hierarchy import AttentionHierarchySplit, AttentionHierarchyWindow
@@ -14,7 +15,7 @@ from memory_condense.search.spine_summary import SpineSummaryFragment
 def build_parent_budgeted_spine_hierarchy(
     exchanges, *, scorer, summarize, summarizer_identity, leaf_token_cap=512,
     max_leaf_exchanges=2, max_exchange_channel_tokens=128, max_parent_channel_tokens=512,
-    window_exchange_cap=8, max_prompt_tokens=2048,
+    window_exchange_cap=8, max_prompt_tokens=2048, max_workers=1,
 ):
     """Use the original exchange-only attention signal and exact balanced cuts.
 
@@ -28,6 +29,9 @@ def build_parent_budgeted_spine_hierarchy(
                        ("max_parent_channel_tokens", max_parent_channel_tokens), ("max_prompt_tokens", max_prompt_tokens)):
         bound_int(value, name, 1)
     bound_int(window_exchange_cap, "window_exchange_cap", 2)
+    bound_int(max_workers, "max_workers", 1)
+    if max_workers > 3:
+        raise ValueError("hierarchy concurrency cannot exceed three workers")
     exact_text(summarizer_identity, "summarizer_identity")
     if max_parent_channel_tokens < max_exchange_channel_tokens:
         raise ValueError("parent channel budget must also accommodate unchanged exchange channels")
@@ -85,29 +89,60 @@ def build_parent_budgeted_spine_hierarchy(
                             summarize=summarize, cap=max_parent_channel_tokens, prompt_cap=max_prompt_tokens)
             return spine, context
 
-        def build(left, right):
+        plans = []
+
+        def plan(left, right):
             spans = tuple(s for e in group[left:right] for s in e.section.spans)
             section_id = "spine-section-"+identity_sha256([s.receipt_sha256 for s in spans])
-            children = ()
+            children, cut, depth = (), None, 0
             if right-left > 1 and (sum(s.token_count for s in spans) > leaf_token_cap or right-left > max_leaf_exchanges):
                 margin = max(1, (right-left)//4)
                 cut = max(range(left+margin, right-margin+1),
                           key=lambda i: (changes[i], -abs(2*i-left-right), -i))
-                nodes = (build(left, cut), build(cut, right))
+                children = (plan(left, cut), plan(cut, right))
+                depth = 1+max(plans[i]['depth'] for i in children)
+            ordinal = len(plans)
+            plans.append(dict(left=left, right=right, spans=spans, section_id=section_id,
+                              children=children, cut=cut, depth=depth))
+            return ordinal
+
+        root = plan(0, len(group))
+        completed = {}
+
+        def compile_node(ordinal):
+            item = plans[ordinal]
+            left, right, spans = item['left'], item['right'], item['spans']
+            children = ()
+            if item['children']:
+                nodes = tuple(completed[i] for i in item['children'])
                 children = tuple(n[0].section_id for n in nodes)
                 spine, context = merge_channels(nodes)
-                splits.append(AttentionHierarchySplit(section_id, cut, changes[cut],
-                    "user_spine_attention_change_at_exchange_boundary"))
             elif right-left == 1:
                 spine, context = group[left].user_spine, group[left].attached_context
             else:
                 spine, context = merge_channels([(e.section, e.user_spine, e.attached_context) for e in group[left:right]])
-            section = SectionSummary(section_id, source, _render_channels(spine, context, spans),
+            section = SectionSummary(item['section_id'], source, _render_channels(spine, context, spans),
                                      spans, summarizer_identity, child_section_ids=children)
-            sections.append(section)
             return section, spine, context
 
-        roots.append(build(0, len(group))[0].section_id)
+        if max_workers == 1:
+            # Preserve the original depth-first generation order by default.
+            for ordinal in range(len(plans)):
+                completed[ordinal] = compile_node(ordinal)
+        else:
+            # Attention cuts are already fixed. Only independent summary
+            # nodes overlap, and no worker waits on a future from this pool.
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for depth in range(plans[root]['depth']+1):
+                    ready = [i for i, item in enumerate(plans) if item['depth']==depth]
+                    completed.update(zip(ready, pool.map(compile_node, ready), strict=True))
+        # Publication order and receipts are independent of task completion.
+        for ordinal, item in enumerate(plans):
+            sections.append(completed[ordinal][0])
+            if item['cut'] is not None:
+                splits.append(AttentionHierarchySplit(item['section_id'], item['cut'], changes[item['cut']],
+                    "user_spine_attention_change_at_exchange_boundary"))
+        roots.append(completed[root][0].section_id)
     oversized = tuple(e.section.section_id for e in ordered if sum(s.token_count for s in e.section.spans) > leaf_token_cap)
     return UserSpineHierarchy(tuple(sections), tuple(roots), ordered, tuple(windows), tuple(splits), oversized,
                              leaf_token_cap, max_leaf_exchanges, max_parent_channel_tokens, window_exchange_cap)

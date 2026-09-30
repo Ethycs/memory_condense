@@ -69,6 +69,34 @@ def test_parent_allowance_cannot_hide_an_oversized_exchange_attention_input():
     assert not linker.inputs
 
 
+def test_parallel_branches_preserve_attention_receipts_order_and_hydration():
+    from threading import Barrier
+    from datetime import datetime, timezone
+    from memory_condense.domain.schemas import Turn
+    from memory_condense.search.episodes.attention_hierarchy import compile_attention_atoms
+    from memory_condense.search.episodes.user_spine_hierarchy import compile_user_spine_exchanges
+    turns=[Turn(turn_id=str(i),source_id='same',role='user',text=f'RAW_CANARY {i}',
+                created_at=datetime(2026,9,29,tzinfo=timezone.utc)) for i in range(8)]
+    leaves={f'orchard leaf {i}' for i in range(8)}
+    atoms=compile_attention_atoms(turns,summarize_raw=lambda text:'orchard leaf '+text.split()[-1],
+                                   summarizer_identity='fixture',atom_token_cap=32)
+    exchanges=compile_user_spine_exchanges(atoms,summarize=Summarizer(),summarizer_identity='fixture')
+    barrier=Barrier(2)
+    def concurrent(request):
+        if len(request.fragments)==2 and all(f.summary in leaves for f in request.fragments):
+            barrier.wait(timeout=5)
+        return Summarizer()(request)
+    kwargs=dict(summarizer_identity='same',leaf_token_cap=512,max_leaf_exchanges=1,
+                window_exchange_cap=3,max_exchange_channel_tokens=64,max_parent_channel_tokens=128)
+    linker1,signal1=scorer()
+    linker2,signal2=scorer()
+    sequential=build(exchanges,scorer=signal1,summarize=Summarizer(),**kwargs)
+    parallel=build(exchanges,scorer=signal2,summarize=concurrent,max_workers=3,**kwargs)
+    assert parallel==sequential
+    assert parallel.receipt_sha256==sequential.receipt_sha256
+    assert linker1.inputs==linker2.inputs
+
+
 @pytest.mark.parametrize("kwargs", [{"max_exchange_channel_tokens": 128},
                                    {"max_parent_channel_tokens": 16}, {"window_exchange_cap": 4}])
 def test_invalid_input_or_parent_budget_fails_before_attention(kwargs):

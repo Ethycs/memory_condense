@@ -45,9 +45,9 @@ def user_windows(exchanges):
     return windows
 
 
-def cache_method(root):
+def cache_method(root, *, host_embeddings=None, versioned=False):
     # This identity is independent of a corpus/snapshot or occurrence timestamp.
-    return publish_sealed_json(root / "method.json", {
+    payload = {
         "model_id": DEFAULT_MODEL_ID, "model_revision": DEFAULT_MODEL_REVISION,
         "checkpoint_sha256": expected_prefix_checkpoint_sha256(6),
         "device": "cuda", "dtype": "float16", "prefix_layers": 6, "attention_layer": 5,
@@ -55,7 +55,11 @@ def cache_method(root):
         "linker_max_candidates": 8, "linker_max_workspace_tokens": 4096,
         "owned_runtime_binding": True, "raw_inputs_to_qwen": False,
         "implementation": {name: digest(name) for name in FILES},
-    })[0]
+    }
+    if host_embeddings is not None:
+        payload['host_embeddings'] = bool(host_embeddings)
+    name = 'method-' + identity_sha256(payload) + '.json' if versioned else 'method.json'
+    return publish_sealed_json(root / name, payload)[0]
 
 
 def prepare(exchange_root, root, cache_root):

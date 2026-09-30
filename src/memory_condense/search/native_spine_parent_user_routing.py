@@ -1,5 +1,6 @@
 """Append bounded user atoms selected through complete parent user summaries."""
 from dataclasses import dataclass, fields
+import json
 
 from memory_condense.domain._discourse_identity import identity_sha256
 from memory_condense.search.native_spine_additive_lexical import (
@@ -62,8 +63,12 @@ class NativeSpineParentUserRoute(NativeSpineContextRoute):
 class NativeSpineParentUserRouter(NativeSpineAdditiveLexicalRouter):
     def __init__(self, atomic_semantic, hierarchy, parent_semantic):
         super().__init__(atomic_semantic, hierarchy)
+        stable_ids = (type(parent_semantic) is SemanticSectionIndex and bool(parent_semantic.sections)
+                      and json.loads(parent_semantic.sections[0].summarizer_identity).get('format')
+                      == 'native-spine-root-user-summaries-v2')
         if (type(parent_semantic) is not SemanticSectionIndex
-                or parent_semantic.hierarchy.receipt_sha256 != project_parent_users(hierarchy).receipt_sha256
+                or parent_semantic.hierarchy.receipt_sha256 != project_parent_users(
+                    hierarchy, stable_ids=stable_ids, previous=parent_semantic.hierarchy).receipt_sha256
                 or parent_semantic.embedding_identity != atomic_semantic.embedding_identity):
             raise ValueError('parent vectors must match the stored hierarchy and atomic query encoder')
         self.parent_semantic = parent_semantic

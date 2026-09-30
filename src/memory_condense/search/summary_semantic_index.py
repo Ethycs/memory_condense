@@ -51,7 +51,9 @@ class SemanticSectionIndex:
         # The existing dense implementation copies/validates a normalized FP32
         # matrix. Mutating the caller's array cannot mutate resident addresses.
         self._dense = ExactDenseAddressIndex([s.section_id for s in self.sections], matrix)
-        self._lexical = SectionSummaryIndex(self.sections)
+        # A leaf-only hierarchy is already the immutable lexical index we need.
+        # Rebuilding it repeats validation, postings and identity hashing.
+        self._lexical = hierarchy if len(self.sections) == len(hierarchy.sections) else SectionSummaryIndex(self.sections)
         self._metadata = canonical_json({
             "format": "memory-condense-semantic-section-index-v1", "hierarchy_sha256": hierarchy.receipt_sha256,
             "embedding_identity": embedding_identity, "section_ids": [s.section_id for s in self.sections],

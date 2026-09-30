@@ -127,7 +127,8 @@ def _capture_coverage_attention_input(
                 output_attentions=False,
                 output_hidden_states=False,
             )
-            encoder.model(**forward_inputs)
+            forward = getattr(encoder, '_forward', encoder.model)
+            forward(**forward_inputs)
         except _CoverageAttentionInputReady as caught:
             if caught is not ready:
                 raise

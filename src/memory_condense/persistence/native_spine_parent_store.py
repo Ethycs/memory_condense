@@ -23,6 +23,11 @@ def _receipt(p, sha):
 
 def publish(path, *, hierarchy, matrix, native_receipt):
     """Publish once; keep the ingested transcript and original indexes unchanged."""
+    return publish_snapshot(path, hierarchy=hierarchy, matrix=matrix, native_receipt=native_receipt)[1]
+
+
+def publish_snapshot(path, *, hierarchy, matrix, native_receipt):
+    """Return the authenticated resident index as well as its durable receipt."""
     path = Path(path)
     if path.exists():
         raise ValueError('parent summary snapshot publication requires a fresh path')
@@ -38,15 +43,16 @@ def publish(path, *, hierarchy, matrix, native_receipt):
          'projection_sha256': projection.receipt_sha256, 'semantic_sha256': semantic.receipt_sha256,
          'embedding_identity': semantic.embedding_identity, 'matrix_shape': list(matrix.shape),
          'matrix_dtype': 'float32', 'matrix_sha256': hashlib.sha256(raw).hexdigest()}
-    sha = identity_sha256(p)
+    serialized = canonical_json(p)
+    sha = hashlib.sha256(serialized.encode('utf-8')).hexdigest()
     # Exclusive path reservation avoids accidentally overwriting a historical cache.
     with path.open('xb'):
         pass
     with closing(sqlite3.connect(path)) as db, db:
         db.execute('CREATE TABLE snapshot (id INTEGER PRIMARY KEY CHECK(id=1), '
                    'payload TEXT NOT NULL, vectors BLOB NOT NULL, receipt_sha256 TEXT NOT NULL)')
-        db.execute('INSERT INTO snapshot VALUES (1, ?, ?, ?)', (canonical_json(p), raw, sha))
-    return _receipt(p, sha)
+        db.execute('INSERT INTO snapshot VALUES (1, ?, ?, ?)', (serialized, raw, sha))
+    return semantic, _receipt(p, sha)
 
 
 def load(path, *, hierarchy, native_receipt):

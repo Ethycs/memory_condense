@@ -176,34 +176,38 @@ class SectionSummaryIndex:
     relevance. The serialized snapshot binds every summary to its raw section.
     """
 
-    __slots__ = ("sections", "receipt_sha256", "_postings", "_lengths", "_avgdl", "_children", "_roots", "_locked")
+    __slots__ = ("sections", "receipt_sha256", "_postings", "_lengths", "_avgdl", "_children", "_roots",
+                 "_by_id", "_terms", "_section_json", "_locked")
 
     def __setattr__(self, name, value):
         if getattr(self, "_locked", False):
             raise AttributeError("section summary indexes are immutable snapshots")
         object.__setattr__(self, name, value)
 
-    def __init__(self, sections: Sequence[SectionSummary]):
+    def __init__(self, sections: Sequence[SectionSummary], *, previous=None):
+        if previous is not None and type(previous) is not SectionSummaryIndex:
+            raise TypeError("index reuse requires an authenticated section index")
         self.sections = tuple(sorted(sections, key=lambda section: section.section_id))
         if len({section.section_id for section in self.sections}) != len(self.sections):
             raise ValueError("section IDs must be unique")
-        by_id = {section.section_id: i for i, section in enumerate(self.sections)}
+        by_id = {section.section_id: section for section in self.sections}
+        self._by_id = MappingProxyType(by_id)
         children = {}
-        parented: set[int] = set()
-        for i, section in enumerate(self.sections):
+        parented: set[str] = set()
+        for section in self.sections:
             if any(child not in by_id for child in section.child_section_ids):
                 raise ValueError("hierarchy contains a missing child section")
-            child_indexes = tuple(by_id[child] for child in section.child_section_ids)
+            child_indexes = section.child_section_ids
             if child_indexes:
                 if any(child in parented for child in child_indexes):
                     raise ValueError("a section can have only one parent")
                 parented.update(child_indexes)
-                if tuple(span for child in child_indexes for span in self.sections[child].spans) != section.spans:
+                if tuple(span for child in child_indexes for span in by_id[child].spans) != section.spans:
                     raise ValueError("hierarchy children must partition the parent's exact raw spans")
-                children[i] = child_indexes
+                children[section.section_id] = child_indexes
         self._children = MappingProxyType(children)
-        self._roots = tuple(i for i in range(len(self.sections)) if i not in parented)
-        reachable: set[int] = set()
+        self._roots = tuple(s.section_id for s in self.sections if s.section_id not in parented)
+        reachable: set[str] = set()
         pending = list(self._roots)
         while pending:
             i = pending.pop()
@@ -213,24 +217,60 @@ class SectionSummaryIndex:
             pending.extend(children.get(i, ()))
         if len(reachable) != len(self.sections):
             raise ValueError("section hierarchy contains a cycle")
-        postings: dict[str, list[tuple[int, int]]] = {}
-        lengths = []
-        for index, section in enumerate(self.sections):
-            terms = tokenize(section.summary)
-            lengths.append(len(terms))
-            for term, frequency in Counter(terms).items():
-                postings.setdefault(term, []).append((index, frequency))
-        self._postings = MappingProxyType({term: tuple(rows) for term, rows in postings.items()})
-        self._lengths = tuple(lengths)
-        self._avgdl = sum(lengths) / len(lengths) if lengths else 0.0
-        self.receipt_sha256 = identity_sha256(self._body())
+        # Stable section IDs let unchanged postings survive insertions before
+        # existing rows in the canonical sort order. Only changed terms are edited.
+        terms, lengths, serialized = {}, {}, {}
+        changed = set(previous._by_id) - set(by_id) if previous is not None else set()
+        for section in self.sections:
+            sid = section.section_id
+            old = previous._by_id.get(sid) if previous is not None else None
+            if old is not None and old == section:
+                terms[sid], lengths[sid] = previous._terms[sid], previous._lengths[sid]
+                serialized[sid] = previous._section_json[sid]
+            else:
+                tokens = tokenize(section.summary)
+                terms[sid], lengths[sid] = tuple(Counter(tokens).items()), len(tokens)
+                serialized[sid] = canonical_json(section.identity_payload())
+                changed.add(sid)
+        postings = dict(previous._postings) if previous is not None else {}
+        affected = set()
+        for sid in changed:
+            affected.update(t for t, _ in terms.get(sid, ()))
+            if previous is not None:
+                affected.update(t for t, _ in previous._terms.get(sid, ()))
+        additions = {term: [] for term in affected}
+        for sid in changed & by_id.keys():
+            for term, frequency in terms[sid]:
+                additions[term].append((sid, frequency))
+        for term in affected:
+            rows = sorted([*(row for row in postings.get(term, ()) if row[0] not in changed), *additions[term]])
+            if rows:
+                postings[term] = tuple(rows)
+            else:
+                postings.pop(term, None)
+        self._terms, self._section_json = MappingProxyType(terms), MappingProxyType(serialized)
+        self._postings = MappingProxyType(postings)
+        self._lengths = MappingProxyType(lengths)
+        self._avgdl = sum(lengths.values()) / len(lengths) if lengths else 0.0
+        self.receipt_sha256 = quote_sha256(self.body_json())
         self._locked = True
+
+    def updated(self, sections):
+        """Replace the section population, reusing unchanged immutable entries."""
+        return SectionSummaryIndex(sections, previous=self)
+
+    def sections_json(self):
+        return '[' + ','.join(self._section_json[s.section_id] for s in self.sections) + ']'
+
+    def body_json(self):
+        return canonical_json({'format': INDEX_FORMAT})[:-1] + ',"sections":' + self.sections_json() + '}'
 
     def _body(self) -> dict:
         return {"format": INDEX_FORMAT, "sections": [section.identity_payload() for section in self.sections]}
 
     def to_json(self) -> str:
-        return canonical_json({**self._body(), "receipt_sha256": self.receipt_sha256}) + "\n"
+        return (canonical_json({'format': INDEX_FORMAT, 'receipt_sha256': self.receipt_sha256})[:-1]
+                + ',"sections":' + self.sections_json() + '}\n')
 
     @classmethod
     def from_json(cls, text: str) -> SectionSummaryIndex:
@@ -250,13 +290,13 @@ class SectionSummaryIndex:
         if scope is not None and (len(set(scope)) != len(scope) or any(not s for s in scope)):
             raise ValueError("source scope must contain unique nonempty exact IDs")
         source_set = None if scope is None else set(scope)
-        scores: dict[int, float] = {}
-        hits: dict[int, list[str]] = {}
+        scores: dict[str, float] = {}
+        hits: dict[str, list[str]] = {}
         for term in sorted(set(tokenize(query))):
             posting = self._postings.get(term, ())
             idf = log(1 + (len(self.sections) - len(posting) + 0.5) / (len(posting) + 0.5))
             for index, frequency in posting:
-                if source_set is not None and self.sections[index].source_id not in source_set:
+                if source_set is not None and self._by_id[index].source_id not in source_set:
                     continue
                 norm = BM25_K1 * (1 - BM25_B + BM25_B * self._lengths[index] / self._avgdl)
                 scores[index] = scores.get(index, 0.0) + idf * frequency * (BM25_K1 + 1) / (frequency + norm)
@@ -284,8 +324,8 @@ class SectionSummaryIndex:
                 pending.extend(matching_children)
             elif scores.get(i, 0.0) > 0:
                 terminal.append(i)
-        ordered = sorted(terminal, key=lambda i: (-scores[i], self.sections[i].section_id))
-        routes = tuple(SectionRoute(self.sections[i], scores[i], tuple(hits[i]))
+        ordered = sorted(terminal, key=lambda i: (-scores[i], i))
+        routes = tuple(SectionRoute(self._by_id[i], scores[i], tuple(hits[i]))
                        for i in ordered[:max_sections])
         return SectionRoutePlan(self.receipt_sha256, quote_sha256(query), routes,
                                 len(ordered), scope, max_sections)

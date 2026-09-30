@@ -7,10 +7,12 @@ import json
 import math
 import re
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from collections.abc import Mapping
+from typing import Any, Callable, Protocol, Sequence
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_JSON_SCALARS = frozenset((str, int, float, bool, type(None)))
 
 
 class _IdentityPayload(Protocol):
@@ -20,6 +22,8 @@ class _IdentityPayload(Protocol):
 def _plain_json(value: Any) -> Any:
     """Return detached JSON containers from recursively frozen values."""
 
+    if type(value) in _JSON_SCALARS:
+        return value
     if isinstance(value, Mapping):
         return {str(key): _plain_json(child) for key, child in value.items()}
     if isinstance(value, (tuple, list)):
@@ -28,6 +32,8 @@ def _plain_json(value: Any) -> Any:
 
 
 def _freeze_json(value: Any) -> Any:
+    if type(value) in _JSON_SCALARS:
+        return value
     if isinstance(value, Mapping):
         return MappingProxyType(
             {str(key): _freeze_json(child) for key, child in value.items()}

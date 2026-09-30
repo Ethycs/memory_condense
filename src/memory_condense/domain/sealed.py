@@ -9,9 +9,11 @@ order never affects the digest — only field content does.
 from __future__ import annotations
 
 from dataclasses import fields
-from typing import Any, ClassVar, Mapping
+from collections.abc import Mapping
+from typing import Any, ClassVar
 
 from memory_condense.domain._discourse_identity import (
+    _JSON_SCALARS,
     _sha256,
     identity_sha256,
 )
@@ -20,6 +22,8 @@ from memory_condense.domain._discourse_identity import (
 def identity_value(value: Any) -> Any:
     """Return one field value in its canonical identity-payload form."""
 
+    if type(value) in _JSON_SCALARS:
+        return value
     payload = getattr(value, "identity_payload", None)
     if callable(payload):
         return payload()

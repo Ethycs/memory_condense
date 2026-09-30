@@ -85,7 +85,7 @@ def _fold(fragments, *, kind, user_spine, summarize, cap, prompt_cap):
 
 def compile_user_spine_exchanges(
     atoms: Sequence[SectionSummary], *, summarize: Summarize, summarizer_identity: str,
-    max_channel_tokens: int = 64, max_prompt_tokens: int = 2048,
+    max_channel_tokens: int = 64, max_prompt_tokens: int = 2048, max_workers: int = 1,
 ) -> tuple[UserSpineExchange, ...]:
     """Consume ordered atomic summaries, never raw turns, queries or references.
 
@@ -95,6 +95,9 @@ def compile_user_spine_exchanges(
     """
     bound_int(max_channel_tokens, "max_channel_tokens", 1)
     bound_int(max_prompt_tokens, "max_prompt_tokens", 1)
+    bound_int(max_workers, "max_workers", 1)
+    if max_workers > 3:
+        raise ValueError('At most three independent exchange summaries may run at once')
     exact_text(summarizer_identity, "summarizer_identity")
     sources: dict[str, list[SectionSummary]] = {}
     seen, turn_sources = set(), {}
@@ -112,7 +115,7 @@ def compile_user_spine_exchanges(
         sources.setdefault(atom.source_id, []).append(atom)
     for source, rows in sources.items():
         SectionSummary("validate", source, "validate", tuple(a.spans[0] for a in rows), summarizer_identity)
-    output = []
+    jobs = []
     for source, rows in sources.items():
         groups: list[list[SectionSummary]] = []
         for atom in rows:
@@ -120,19 +123,25 @@ def compile_user_spine_exchanges(
             if not groups or (span.role == "user" and groups[-1][-1].spans[0].turn_id != span.turn_id):
                 groups.append([])
             groups[-1].append(atom)
-        for group in groups:
-            fragments = [SpineSummaryFragment(a.spans[0].role, a.spans[0].created_at, a.summary) for a in group]
-            spine = _fold([f for f in fragments if f.role == "user"], kind="user_spine", user_spine=None,
-                          summarize=summarize, cap=max_channel_tokens, prompt_cap=max_prompt_tokens)
-            context = _fold([f for f in fragments if f.role != "user"], kind="attached_context", user_spine=spine,
-                            summarize=summarize, cap=max_channel_tokens, prompt_cap=max_prompt_tokens)
-            spans = tuple(a.spans[0] for a in group)
-            section_id = "spine-exchange-" + identity_sha256([s.receipt_sha256 for s in spans])
-            section = SectionSummary(section_id, source, _render_channels(spine, context, spans),
-                                     spans, summarizer_identity)
-            output.append(UserSpineExchange(section, spine, context,
-                                            spans[0].turn_id if spine is not None else None))
-    return tuple(output)
+        jobs.extend((source, group) for group in groups)
+    def compile_group(job):
+        source, group = job
+        fragments = [SpineSummaryFragment(a.spans[0].role, a.spans[0].created_at, a.summary) for a in group]
+        spine = _fold([f for f in fragments if f.role == "user"], kind="user_spine", user_spine=None,
+                      summarize=summarize, cap=max_channel_tokens, prompt_cap=max_prompt_tokens)
+        context = _fold([f for f in fragments if f.role != "user"], kind="attached_context", user_spine=spine,
+                        summarize=summarize, cap=max_channel_tokens, prompt_cap=max_prompt_tokens)
+        spans = tuple(a.spans[0] for a in group)
+        section_id = "spine-exchange-" + identity_sha256([s.receipt_sha256 for s in spans])
+        section = SectionSummary(section_id, source, _render_channels(spine, context, spans),
+                                 spans, summarizer_identity)
+        return UserSpineExchange(section, spine, context,
+                                 spans[0].turn_id if spine is not None else None)
+    if max_workers == 1:
+        return tuple(map(compile_group, jobs))
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return tuple(pool.map(compile_group, jobs))
 
 
 @dataclass(frozen=True, slots=True)

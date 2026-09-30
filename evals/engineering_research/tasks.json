@@ -1,0 +1,1692 @@
+{
+  "schema": "engineering-research-task-spec-v1",
+  "protocol": {
+    "unit": "20 separately executed artifact-producing checkpoints from 10 session families; checkpoints within a family are correlated",
+    "arms": [
+      "full_context",
+      "memory"
+    ],
+    "answer_model": "same frozen route and version in both arms; default existing Sol gateway route",
+    "context_only_difference": true,
+    "initial_workspace_identical": true,
+    "historical_future_responses_excluded": true,
+    "cache_policy": "Reuse compiled shared prefixes by content and policy hashes; materialize a closed snapshot at each cutoff. Never retrieve later family turns into an earlier task.",
+    "history_policy": "All nonempty original messages strictly before cutoff. Current original user request is common live input. Later original messages are withheld.",
+    "within_task_policy": "Each arm develops its own live tool/action history; memory ingests every new action, observation and final reply, with the same current-turn working window in both arms.",
+    "memory_lifecycle": [
+      "normal ingest_many",
+      "compile existing user-spine summary hierarchy",
+      "persist and close",
+      "separate-process reopen",
+      "native receipt check",
+      "public cap-8 retrieve_native_spine",
+      "exact raw span hydration",
+      "answer/action",
+      "ingest new work"
+    ],
+    "qwen_input_policy": "hierarchical summaries only; raw summarization follows the existing authorized path",
+    "policy": "Current public cap-8, v7-derived engineering actor instructions; lightweight hints are not silently enabled",
+    "first_pilot": "E01 and R05 only; verify lifecycle and grading before running remaining development or validation tasks",
+    "max_actor_calls_per_arm_per_case": 24,
+    "max_output_tokens_per_call": 4096,
+    "max_provider_retries": 0,
+    "full_context_overflow": "Mark unsupported, never truncate or silently summarize; exclude no case silently.",
+    "memory_actor_prompt_cap_tokens": 24576,
+    "answer_concurrency": 1,
+    "latency": "Record cold ingest/reopen separately; compare warm task time, time to first token, per-action latency, tokens and actual provider usage.",
+    "engineering_scoring": "Required artifacts plus executed behavioral checks where specified, then source-grounded semantic rubric; failure must identify a requirement and evidence.",
+    "research_scoring": "Source-supported claim/assumption separation, arithmetic consistency, study design and stated limitations. Citation validation is necessary but not scientific truth validation.",
+    "rubric_score": "Each criterion 0 unmet / 1 partial / 2 met; ambiguous or invalid judgments unresolved. Report domain and case results, not only pooled averages.",
+    "task_success": "All required artifacts, critical behavioral checks and criteria met; unresolved is separate from failure.",
+    "grading": "Blind A/B, identical sources, shuffled stable arm order; adjudicate disagreements and a sample of passes. Historical assistant text is not a gold answer.",
+    "failure_attribution": "For every miss inspect requirement support in source, selected routes, exact hydrated packet and produced artifact; classify delivery gap, reader misuse, implementation error, ambiguity or grader defect.",
+    "reporting": "Report paired wins/ties/losses, task success, criterion scores, unresolved cases and artifact checks by domain and session family. Any uncertainty resampling clusters by family, not 20 independent tasks.",
+    "cost_budget": "No provider work during creation. Seal an explicit ingest, actor and grading call/token budget before the two-case pilot.",
+    "evaluation_scope": "Offline engineering components/design and evidence-grounded research synthesis/planning; not live literature search, missing-repository reconstruction or million-token stress certification."
+  },
+  "cases": [
+    {
+      "id": "E01",
+      "domain": "engineering",
+      "split": "development",
+      "source": "LiteLLM_Jupyter_Kernel_Context_Management_bf7ff52c_2025-07-03T04-18-29-802Z.txt",
+      "cutoff_turn": 8,
+      "request_anchor": "Is it possible to add extra functionality and run this VS code for example the ability to automatica",
+      "title": "Notebook cell context planner",
+      "task_kind": "python_component",
+      "task": "Implement a small, provider-free prototype of the notebook context-management idea developed in this session. In context_planner.py expose build_context(cells, order, current_id), where cells is a list of dicts with id, input, output (string or null), model, and active; order is the current notebook cell-ID order. Return {messages: [{role, content}], model: str} for the current cell. Resolve ambiguous execution details explicitly in design.md. Use only the Python standard library. Add executable unittest tests. Do not call a provider or read real credentials.",
+      "deliverables": [
+        "context_planner.py",
+        "test_context_planner.py",
+        "design.md"
+      ],
+      "criteria": [
+        {
+          "id": "E01-C1",
+          "requirement": "Preserve input/output exchange pairing and use notebook position for the selected context.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "input output pairs and moving cells around"
+            }
+          ]
+        },
+        {
+          "id": "E01-C2",
+          "requirement": "Support reordered and out-of-order execution without silently mixing provider choice with conversation order.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 2,
+              "quote": "allow execution out of order but also to allow execution in order"
+            }
+          ]
+        },
+        {
+          "id": "E01-C3",
+          "requirement": "Route the current call to its selected model while retaining eligible context from different models.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 2,
+              "quote": "share different APIs to different LMS in the same context window"
+            }
+          ]
+        },
+        {
+          "id": "E01-C4",
+          "requirement": "Make pruning explicit and reversible; do not destroy retained cell data or expose API credentials in prompts.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 6,
+              "quote": "API keys in a .env file"
+            },
+            {
+              "turn": 8,
+              "quote": "automatically prune out dialogue that's not useful or relevant"
+            }
+          ]
+        }
+      ],
+      "public_checks": [
+        "For the current cell include its user input but not its stale previous output; eligible earlier active cells contribute their completed pairs.",
+        "Reject duplicate or unknown IDs and invalid order; do not mutate input objects."
+      ],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E02",
+      "domain": "engineering",
+      "split": "development",
+      "source": "LiteLLM_Jupyter_Kernel_Context_Management_bf7ff52c_2025-07-03T04-18-29-802Z.txt",
+      "cutoff_turn": 20,
+      "request_anchor": "Ok so litellm is the backend, .env file for the api keys, how do we manage in order, reordering and.",
+      "title": "Jupyter-native integration and handoff",
+      "task_kind": "engineering_design",
+      "task": "Write an implementation-ready architecture and operator guide for the notebook workflow discussed so far. Separate cell order, execution order, context inclusion, backend model routing, and persistence. Include example magic commands, component responsibilities, a restart/reorder test plan, and a minimal .env.example with placeholders. Treat concrete library integration details that are not established in the archive as items to verify.",
+      "deliverables": [
+        "architecture.md",
+        "acceptance-plan.md",
+        ".env.example"
+      ],
+      "criteria": [
+        {
+          "id": "E02-C1",
+          "requirement": "Retain the Jupyter-native constraint and VS Code integration goal.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 10,
+              "quote": "keep it Jupyter native"
+            },
+            {
+              "turn": 8,
+              "quote": "run this VS code"
+            }
+          ]
+        },
+        {
+          "id": "E02-C2",
+          "requirement": "Keep LiteLLM as the backend and credentials in project .env without logging their values.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 20,
+              "quote": "litellm is the backend, .env file for the api keys"
+            }
+          ]
+        },
+        {
+          "id": "E02-C3",
+          "requirement": "Specify how reordering, in-order/out-of-order execution and context pruning interact.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 2,
+              "quote": "execution out of order"
+            },
+            {
+              "turn": 8,
+              "quote": "automatically prune out dialogue"
+            }
+          ]
+        },
+        {
+          "id": "E02-C4",
+          "requirement": "Distinguish routing several LLM backends from assuming several actual kernels inhabit one notebook; state what needs verification.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 18,
+              "quote": "multiple kernels running in the same notebook"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E03",
+      "domain": "engineering",
+      "split": "validation",
+      "source": "Segmentation_Overlap_Strategy_b0ae76ae_2025-07-26T00-55-38-816Z.txt",
+      "cutoff_turn": 14,
+      "request_anchor": "Is there a series of tricks I should use like always integrate esser into greater, start with most c",
+      "title": "Bounded pairwise graph-contraction scheduler",
+      "task_kind": "python_component",
+      "task": "Implement contraction.py with plan_merges(nodes, edges), where nodes are unique string IDs and edges are (source, target, weight) triples. Return a deterministic list of pairs (left_members, right_members), each member group a list of original IDs, that reduces a nonempty graph to one group using binary merges. Document how cycles, disconnected components, ties, and isolated nodes are handled without pretending that a fallback merge proves semantic relatedness. Add unittest coverage. This is a scheduling prototype, not an LLM rewrite engine.",
+      "deliverables": [
+        "contraction.py",
+        "test_contraction.py",
+        "design.md"
+      ],
+      "criteria": [
+        {
+          "id": "E03-C1",
+          "requirement": "Keep actual operations binary rather than invoking an unrestricted multi-node semantic merge.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 12,
+              "quote": "need to be reduced to binary merges"
+            }
+          ]
+        },
+        {
+          "id": "E03-C2",
+          "requirement": "Handle cyclic and acyclic inputs without losing or repeatedly consuming original nodes.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 14,
+              "quote": "integrate acyclic graphs together"
+            }
+          ]
+        },
+        {
+          "id": "E03-C3",
+          "requirement": "Explain selection priorities and termination for the bounded workload, without claiming an unproved optimal schedule.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 14,
+              "quote": "I'm dealing with at most 40 nodes"
+            }
+          ]
+        },
+        {
+          "id": "E03-C4",
+          "requirement": "Treat semantic connectivity independently of artificial forward/backward duplicate edges.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 8,
+              "quote": "Bi directional graphs aren't really important"
+            }
+          ]
+        }
+      ],
+      "public_checks": [
+        "Empty input returns no merges; a singleton needs no merge. Nonempty inputs must terminate after n-1 legal component merges.",
+        "Support up to 40 nodes, cycles and disconnected inputs; do not mutate caller data."
+      ],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E04",
+      "domain": "engineering",
+      "split": "validation",
+      "source": "Segmentation_Overlap_Strategy_b0ae76ae_2025-07-26T00-55-38-816Z.txt",
+      "cutoff_turn": 24,
+      "request_anchor": "Oh, we should completely remove no relation relation",
+      "title": "Repair semantic-edge pruning",
+      "task_kind": "python_component",
+      "task": "Implement prune_edges(edges, max_degree, threshold) in edge_pruning.py. Edges are dicts with source, target, relation, weight; return retained original edge records for an undirected graph. Implement the latest correction from the session, deterministic tie handling, reverse-edge deduplication, and a hard degree bound at both endpoints. Explain why confidence alone was inadequate for the observed graph. Add unittest tests.",
+      "deliverables": [
+        "edge_pruning.py",
+        "test_edge_pruning.py",
+        "repair-note.md"
+      ],
+      "criteria": [
+        {
+          "id": "E04-C1",
+          "requirement": "Remove NO_RELATION edges even when their confidence exceeds useful relations.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 24,
+              "quote": "completely remove no relation relation"
+            },
+            {
+              "turn": 22,
+              "quote": "NO_RELATION    (30 edges): 0.500-0.840"
+            }
+          ]
+        },
+        {
+          "id": "E04-C2",
+          "requirement": "Actually apply the degree bound, rather than merely reporting an intended pruning policy.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 6,
+              "quote": "prune nodes down to top 3"
+            },
+            {
+              "turn": 22,
+              "quote": "smart edge pruning didn't actually run"
+            }
+          ]
+        },
+        {
+          "id": "E04-C3",
+          "requirement": "Preserve relation types and useful weighted links; avoid discarding all graph information.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 20,
+              "quote": "Throw away the graph information"
+            },
+            {
+              "turn": 22,
+              "quote": "Top edges are semantically meaningful"
+            }
+          ]
+        },
+        {
+          "id": "E04-C4",
+          "requirement": "Use consistent undirected duplicate handling and describe the tradeoff between a degree bound and connectivity.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 8,
+              "quote": "Bi directional graphs aren't really important"
+            },
+            {
+              "turn": 22,
+              "quote": "Degree-Bounded Pruning Results"
+            }
+          ]
+        }
+      ],
+      "public_checks": [
+        "Only retain edges with weight >= threshold; exclude self loops; never increase any original weight.",
+        "A max_degree of zero retains no edges; both endpoints obey the limit."
+      ],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E05",
+      "domain": "engineering",
+      "split": "validation",
+      "source": "Notes condensor/Document_Graph_Reassembly_Strategies_60853ba3_2025-07-26T00-43-11-932Z.txt",
+      "cutoff_turn": 22,
+      "request_anchor": "You know what? We should write an integration report for each pairwise edge.  That guarantees compre",
+      "title": "Formal reassembly algorithm after a design change",
+      "task_kind": "engineering_design",
+      "task": "Write the formal graph-reassembly algorithm requested at this checkpoint, including state, legal contractions, coverage, orphan handling, a termination argument, and explicit limits on semantic preservation. Provide worked examples for a chain, a cycle, and disconnected nodes. Respect the current request about code and the most recent change of approach.",
+      "deliverables": [
+        "algorithm.md",
+        "worked-examples.md"
+      ],
+      "criteria": [
+        {
+          "id": "E05-C1",
+          "requirement": "Use pairwise integration reports, preserving the explicit change away from the snake approach.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 22,
+              "quote": "We stopped using the snake"
+            },
+            {
+              "turn": 22,
+              "quote": "pairwise integration reports"
+            }
+          ]
+        },
+        {
+          "id": "E05-C2",
+          "requirement": "Carry original node provenance and cover orphan segments, not just nodes incident to edges.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 20,
+              "quote": "process orhpan segments at the end of each round"
+            }
+          ]
+        },
+        {
+          "id": "E05-C3",
+          "requirement": "Address cycles and give a real decreasing measure; do not infer guaranteed 2:1 contraction merely by creating an edge report.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 22,
+              "quote": "only thing I'm worried about is shrinking cycles"
+            },
+            {
+              "turn": 22,
+              "quote": "compressing at ratio 2:1"
+            }
+          ]
+        },
+        {
+          "id": "E05-C4",
+          "requirement": "Separate graph termination from unproved semantic associativity or losslessness; provide a formal explanation rather than executable code.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 22,
+              "quote": "Don't write any code for now"
+            },
+            {
+              "turn": 22,
+              "quote": "without loss of detail"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E06",
+      "domain": "engineering",
+      "split": "validation",
+      "source": "Notes condensor/Document_Graph_Reassembly_Strategies_60853ba3_2025-07-26T00-43-11-932Z.txt",
+      "cutoff_turn": 50,
+      "request_anchor": "integration reports for the different styles, loose-threads, technical, and narrativ, each should be",
+      "title": "Style-isolated integration-report planner",
+      "task_kind": "python_component",
+      "task": "Implement plan_reports(edges) in report_planner.py for edges of the form {id, source, target}. Return {leaf_jobs, meta_jobs}; leaf jobs have id, edge_id, style, source_ids, min_sentences, max_sentences; meta jobs have style and input_job_ids. Use style names technical, narrative, loose_threads. This component plans work only and makes no LLM calls. Explain graph reuse, provenance, and the relation to the earlier contraction approach. Add unittest tests.",
+      "deliverables": [
+        "report_planner.py",
+        "test_report_planner.py",
+        "design.md"
+      ],
+      "criteria": [
+        {
+          "id": "E06-C1",
+          "requirement": "Reuse one graph while separating interpretations, rather than recomputing or destructively rewriting topology for every style.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 46,
+              "quote": "allow the same graph to be processed differently for each style"
+            }
+          ]
+        },
+        {
+          "id": "E06-C2",
+          "requirement": "Create the three requested styles and keep each meta report restricted to its own style.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 50,
+              "quote": "each meta report \n  should only see it's own style"
+            }
+          ]
+        },
+        {
+          "id": "E06-C3",
+          "requirement": "Specify 5-7 sentences describing HOW to integrate nodes, not generic summaries of their topics.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 50,
+              "quote": "5-7 sentences detailing HOW to integrate each node"
+            }
+          ]
+        },
+        {
+          "id": "E06-C4",
+          "requirement": "Retain pairwise provenance and the current report-based design instead of reviving the abandoned snake.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 22,
+              "quote": "We stopped using the snake"
+            },
+            {
+              "turn": 22,
+              "quote": "pairwise integration reports"
+            }
+          ]
+        }
+      ],
+      "public_checks": [
+        "Each edge yields one job per style, with unique IDs; a meta job references only matching-style jobs.",
+        "For empty input return empty job lists. Reject duplicate edge IDs and preserve input records."
+      ],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E07",
+      "domain": "engineering",
+      "split": "validation",
+      "source": "Neural_Network_Framework_Design__Photoshop_Layer_Model_582e34fa_2025-07-12T01-31-22-386Z.txt",
+      "cutoff_turn": 40,
+      "request_anchor": "based on a quick glance of the directory there should be: analyzers, metrics, evolvers, network laye",
+      "title": "Component interfaces with experimental contracts",
+      "task_kind": "python_component",
+      "task": "Create interfaces.py defining the five component families requested at this checkpoint and a minimal composition validator. Provide a provider-free runnable example and unittest tests showing one accepted composition, one incompatible composition, and explicit handling of an experimental component whose contract is not established. Keep tensor computation delegated to the model/layer implementation; do not add training dependencies.",
+      "deliverables": [
+        "interfaces.py",
+        "test_interfaces.py",
+        "example.py",
+        "design.md"
+      ],
+      "criteria": [
+        {
+          "id": "E07-C1",
+          "requirement": "Use the latest five-family categorization and distinguish layer metrics from model analyzers.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 40,
+              "quote": "analyzers, metrics, evolvers, network layers, network models"
+            },
+            {
+              "turn": 40,
+              "quote": "analyzers analyze network models, metrics analyze layers"
+            }
+          ]
+        },
+        {
+          "id": "E07-C2",
+          "requirement": "Retain the two-stage validated/experimental contract distinction; unknown compatibility is not silently certified.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 16,
+              "quote": "One is fully validated and the other is experimental"
+            }
+          ]
+        },
+        {
+          "id": "E07-C3",
+          "requirement": "Support ordered compositions rather than flattening the sequence-of-sequences design.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 4,
+              "quote": "The core pattern is a sequence of sequences"
+            },
+            {
+              "turn": 2,
+              "quote": "ordered stacks of operations"
+            }
+          ]
+        },
+        {
+          "id": "E07-C4",
+          "requirement": "Avoid replacing PyTorch layer responsibilities; the added layer is experiment coordination, metrics and evolution.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 8,
+              "quote": "Essentially pytorch handles layers"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E08",
+      "domain": "engineering",
+      "split": "validation",
+      "source": "Neural_Network_Framework_Design__Photoshop_Layer_Model_582e34fa_2025-07-12T01-31-22-386Z.txt",
+      "cutoff_turn": 68,
+      "request_anchor": "Here's my flow   trainer → metrics → analyzers → evolvers → schedulers → orchestrators → trainers\n  ",
+      "title": "Feedback-loop execution and lineage",
+      "task_kind": "python_component",
+      "task": "Implement run_cycle(state, trainer, metrics, analyzers, evolvers, scheduler, orchestrator) in feedback_loop.py. Each callback accepts the preceding stage result and returns the next; invoke the trainer at the start and again with the configuration accepted by the orchestrator, then return the second trainer result. Record a separate stage trace in a demonstration without storing tensors in the trace. Use fake callbacks and unittest tests; document the distinction between proposing, scheduling and authorizing changes.",
+      "deliverables": [
+        "feedback_loop.py",
+        "test_feedback_loop.py",
+        "design.md"
+      ],
+      "criteria": [
+        {
+          "id": "E08-C1",
+          "requirement": "Preserve the complete stated feedback order and return control to training.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 68,
+              "quote": "trainer → metrics → analyzers → evolvers → schedulers → orchestrators → trainers"
+            }
+          ]
+        },
+        {
+          "id": "E08-C2",
+          "requirement": "Keep analyzer interpretations separate from evolver proposals, scheduling and orchestration authority.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 68,
+              "quote": "Orchestrators manage the overall process and decide which changes to apply"
+            }
+          ]
+        },
+        {
+          "id": "E08-C3",
+          "requirement": "Keep logging and preservation observable while delegating tensor/model operations to the proper components.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 8,
+              "quote": "logging metrics and evolution and also models"
+            }
+          ]
+        },
+        {
+          "id": "E08-C4",
+          "requirement": "Document how experimental compatibility is surfaced instead of treating every component as validated.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 16,
+              "quote": "experimental that lets a system know"
+            }
+          ]
+        }
+      ],
+      "public_checks": [
+        "Callbacks execute in the specified order; do not call a later stage after an earlier stage raises.",
+        "No global mutable run state; independent cycles must not share traces or results."
+      ],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E09",
+      "domain": "engineering",
+      "split": "validation",
+      "source": "Notes condensor/Graph_Based_Text_Processing_Pipeline_1a65fdd4_2025-07-17T21-04-51-475Z.txt",
+      "cutoff_turn": 22,
+      "request_anchor": "Make a mermaid graph of our architecture. include all the models",
+      "title": "Architecture reconstruction from a working discussion",
+      "task_kind": "engineering_design",
+      "task": "Deliver the requested Mermaid architecture plus a concise interface and failure-handling design. Include the model roles actually discussed, label proposed alternatives as alternatives, and show what data passes between stages. Include an example of how the system preserves provenance while editing and condensing an LLM conversation. Do not claim that named components have been implemented or benchmarked.",
+      "deliverables": [
+        "architecture.md",
+        "interfaces.md"
+      ],
+      "criteria": [
+        {
+          "id": "E09-C1",
+          "requirement": "Retain segmentation, graph enrichment and LLM reassembly as separate stages.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "Text segmenter model breaks text of notes into graph progressively"
+            },
+            {
+              "turn": 0,
+              "quote": "using an LLM to rewrite and combine the graph"
+            }
+          ]
+        },
+        {
+          "id": "E09-C2",
+          "requirement": "Represent GATv2/node annotations and high-level summaries as navigable information rather than raw text-free magic.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "Gatv2 model annotates those graphs"
+            },
+            {
+              "turn": 2,
+              "quote": "high level summary that can be navigated by the LLM"
+            }
+          ]
+        },
+        {
+          "id": "E09-C3",
+          "requirement": "Preserve the editing/condensation purpose for long LLM dialogues.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 6,
+              "quote": "mostly an editing job"
+            }
+          ]
+        },
+        {
+          "id": "E09-C4",
+          "requirement": "Keep intermediate stages inspectable and tunable to manage large context.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 10,
+              "quote": "so I can fine tune the process"
+            },
+            {
+              "turn": 22,
+              "quote": "Make a mermaid graph of our architecture"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "E10",
+      "domain": "engineering",
+      "split": "validation",
+      "source": "Notes condensor/Graph_Based_Text_Processing_Pipeline_1a65fdd4_2025-07-17T21-04-51-475Z.txt",
+      "cutoff_turn": 48,
+      "request_anchor": "And It can be programmed but natural language right?",
+      "title": "Embedding segmentation with an honest capability boundary",
+      "task_kind": "python_component",
+      "task": "Build a small topic-boundary prototype and a capability note addressing the current question in the context of the earlier pipeline. In segmentation.py expose segment(units, vectors, threshold): units are exact text strings; vectors are same-length lists of nonzero numeric vectors; split before a unit when cosine similarity to its predecessor is below threshold. Return ordered groups of original units. Use the standard library and add unittest tests. Explain what this demonstrates and what would still require evidence before claiming arbitrary natural-language segmentation rules.",
+      "deliverables": [
+        "segmentation.py",
+        "test_segmentation.py",
+        "capability-note.md"
+      ],
+      "criteria": [
+        {
+          "id": "E10-C1",
+          "requirement": "Preserve exact text, order and provenance for later graph reassembly.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "graph is reassembled until it is back into a new condensed document"
+            }
+          ]
+        },
+        {
+          "id": "E10-C2",
+          "requirement": "Use the embedding-model idea without claiming that similarity by itself implements arbitrary instructions.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 40,
+              "quote": "BAAI/bge-en-icl"
+            },
+            {
+              "turn": 46,
+              "quote": "arbitrary text segmentation"
+            },
+            {
+              "turn": 48,
+              "quote": "programmed but natural language"
+            }
+          ]
+        },
+        {
+          "id": "E10-C3",
+          "requirement": "Relate the prototype to topic segmentation and inspectable processing rather than replacing the whole editing pipeline.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 42,
+              "quote": "Can we use it to segment text?"
+            },
+            {
+              "turn": 10,
+              "quote": "so I can fine tune the process"
+            }
+          ]
+        },
+        {
+          "id": "E10-C4",
+          "requirement": "Treat historical assistant capability claims as hypotheses to test, and propose an evaluation with examples and failure cases.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 46,
+              "quote": "It sounds like the BGE model can do arbitrary text segmentation"
+            }
+          ]
+        }
+      ],
+      "public_checks": [
+        "Reject length/dimension mismatch and zero vectors; empty inputs yield an empty result.",
+        "Every input unit appears exactly once in output order; do not download or instantiate a model."
+      ],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R01",
+      "domain": "research",
+      "split": "validation",
+      "source": "Model_Routing_Based_on_Embeddings_6a7fa16e_2026-08-16T22-29-31-399Z.md",
+      "cutoff_turn": 41,
+      "request_anchor": "suppose it's a single task distillation, with graded tasks, so there is a grading over multiple stat",
+      "title": "Finite-outcome model-routing experiment",
+      "task_kind": "research_design",
+      "task": "Design a falsifiable routing evaluation for the finite-outcome single-task setting developed so far. Specify labels, splits, baselines, risk/coverage and cost measurements, and failure escalation. Explain how you would test rather than assume ordering of model competence. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R01-C1",
+          "requirement": "Model the requested binary or finite outcome states explicitly.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 41,
+              "quote": "enumerated in binary or finite number of classes"
+            }
+          ]
+        },
+        {
+          "id": "R01-C2",
+          "requirement": "Use success/failure evidence to choose among the differently sized models; do not assume perfect nested competence from size alone.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "based on if the succeeded or failed with a, b, or c"
+            }
+          ]
+        },
+        {
+          "id": "R01-C3",
+          "requirement": "Keep evaluation separate from the training distribution used to fit routing estimates and account for leakage.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "embedding the inputs or outputs of the training distribution"
+            }
+          ]
+        },
+        {
+          "id": "R01-C4",
+          "requirement": "Report routing quality jointly with cost and a fallback/abstention strategy, rather than only embedding separation.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "know which model to route to"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R02",
+      "domain": "research",
+      "split": "validation",
+      "source": "Model_Routing_Based_on_Embeddings_6a7fa16e_2026-08-16T22-29-31-399Z.md",
+      "cutoff_turn": 58,
+      "request_anchor": "can we calculate fisher here",
+      "title": "Fisher and wavelet routing feasibility",
+      "task_kind": "research_analysis",
+      "task": "Assess the proposed Fisher-information calculation for this routing project. Define precisely which conditional distribution and parameters would make the quantity meaningful, what observations are available, and a minimal estimation experiment. Connect it to the existing wavelet-basis and embedding constraints. Separate formal identities from heuristic proxies and unresolved identification assumptions. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R02-C1",
+          "requirement": "Retain the need for a wavelet basis and state what proposed Fisher geometry would change.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 50,
+              "quote": "We still need a basis for the wavelets"
+            }
+          ]
+        },
+        {
+          "id": "R02-C2",
+          "requirement": "Address the limited ability to train a competitive embedding model without assuming that limitation has disappeared.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 53,
+              "quote": "can't train an embedding model up to stota like BGE3"
+            }
+          ]
+        },
+        {
+          "id": "R02-C3",
+          "requirement": "Tie estimation to the graded finite-outcome task rather than using an undefined Fisher object.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 41,
+              "quote": "graded tasks"
+            },
+            {
+              "turn": 58,
+              "quote": "calculate fisher here"
+            }
+          ]
+        },
+        {
+          "id": "R02-C4",
+          "requirement": "Keep smallest-successful-model routing as the project objective and propose observable validation.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "know which model to route to"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R03",
+      "domain": "research",
+      "split": "validation",
+      "source": "Stratified_Information_Geometry_6a61450f_2026-08-06T05-04-56-820Z.md",
+      "cutoff_turn": 124,
+      "request_anchor": "are we targeting a transformer's inner representation as a circle?",
+      "title": "Interpret topology results without overstating success",
+      "task_kind": "research_analysis",
+      "task": "Answer the current question and write a research decision memo using the latest reported experiment. State what the experiment targeted, what the controls show, which preregistered endpoints failed, and the next discriminating test. Do not turn reported results into a proof about arbitrary transformers. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R03-C1",
+          "requirement": "Describe task-relative representation geometry rather than assuming every transformer representation should be a circle.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 124,
+              "quote": "transformer's inner representation as a circle"
+            },
+            {
+              "turn": 120,
+              "quote": "task’s known target topology"
+            }
+          ]
+        },
+        {
+          "id": "R03-C2",
+          "requirement": "Preserve the failed 80% accuracy endpoint and distinguish it from the topology subclaim.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 120,
+              "quote": "Neither model reached the pre-registered 80% accuracy threshold."
+            }
+          ]
+        },
+        {
+          "id": "R03-C3",
+          "requirement": "Use the time-shuffled loop result as a control against inferring semantic understanding from persistent H1 alone.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 120,
+              "quote": "time-shuffled models often still formed a loop"
+            }
+          ]
+        },
+        {
+          "id": "R03-C4",
+          "requirement": "Retain weak nuisance-shift performance and the unproven transfer/compression/localization claims.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 120,
+              "quote": "25.72% for d6 and 28.19% for d8"
+            },
+            {
+              "turn": 120,
+              "quote": "Nuisance compression, real-sensor transfer, and Whitney/zigzag localization remain unproven."
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R04",
+      "domain": "research",
+      "split": "validation",
+      "source": "Stratified_Information_Geometry_6a61450f_2026-08-06T05-04-56-820Z.md",
+      "cutoff_turn": 131,
+      "request_anchor": "So what did we show",
+      "title": "Synthesize an updated preregistered research result",
+      "task_kind": "research_analysis",
+      "task": "Produce the requested synthesis after the updated task-quotient contrast. Reconcile it with the earlier circle experiment, distinguish successful subclaims from the overall hypothesis, and give a prioritized next-experiment plan with explicit success criteria. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R04-C1",
+          "requirement": "Use the newer matched target intervention and avoid reporting only the older circle experiment.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 127,
+              "quote": "target only: future phase"
+            },
+            {
+              "turn": 127,
+              "quote": "Held matched"
+            }
+          ]
+        },
+        {
+          "id": "R04-C2",
+          "requirement": "Preserve the failed 57.23% versus 60% categorical endpoint; high correlation does not substitute for it.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 127,
+              "quote": "57.23% for both d6 and d8 against a frozen 60% requirement"
+            },
+            {
+              "turn": 127,
+              "quote": "Pearson 0.993"
+            }
+          ]
+        },
+        {
+          "id": "R04-C3",
+          "requirement": "State that the map-aware subclaim is supported while the full hypothesis is not confirmed.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 127,
+              "quote": "MAP-AWARE SUBCLAIM SUPPORTED; FULL HYPOTHESIS NOT CONFIRMED"
+            }
+          ]
+        },
+        {
+          "id": "R04-C4",
+          "requirement": "Avoid upgrading synthetic in-distribution evidence into robust transfer or a universal geometric theorem.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 127,
+              "quote": "Robust invariant semantic-quotient recovery remains unestablished."
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R05",
+      "domain": "research",
+      "split": "development",
+      "source": "NOP Agent/NOP_Framework_Data_Validation_Protocol_3eda6474_2025-07-08T01-19-22-833Z.txt",
+      "cutoff_turn": 6,
+      "request_anchor": "Does this math actually fit or does the new formulation fit everything regardless?\nCan we still have",
+      "title": "Falsifiability audit of a flexible cross-domain formula",
+      "task_kind": "research_analysis",
+      "task": "Audit the concern raised in the current prompt. Specify what would make the proposed NOP formulation falsifiable, what could be fit too flexibly, and an empirical study that remains worthwhile if the universal equation fails. Treat domain-specific numbers in the archive as claims requiring verification. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R05-C1",
+          "requirement": "Address whether parameter flexibility lets the formulation fit almost anything.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 6,
+              "quote": "does the new formulation fit everything regardless"
+            }
+          ]
+        },
+        {
+          "id": "R05-C2",
+          "requirement": "Distinguish domain-specific adaptation from evidence for one universal function.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 2,
+              "quote": "Universal mathematical function or domain-specific adaptation"
+            }
+          ]
+        },
+        {
+          "id": "R05-C3",
+          "requirement": "Preserve predicted-versus-actual testing, effect sizes and uncertainty rather than reporting only correlation or illustrative fit.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "Calculate predicted vs actual"
+            },
+            {
+              "turn": 0,
+              "quote": "Effect size calculation"
+            },
+            {
+              "turn": 0,
+              "quote": "Confidence intervals"
+            }
+          ]
+        },
+        {
+          "id": "R05-C4",
+          "requirement": "Offer a meaningful NOP-versus-action study without assuming the tight empirical validation already exists.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 6,
+              "quote": "NOP vs action agents without this tight emperical validation"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R06",
+      "domain": "research",
+      "split": "development",
+      "source": "NOP Agent/NOP_Framework_Data_Validation_Protocol_3eda6474_2025-07-08T01-19-22-833Z.txt",
+      "cutoff_turn": 18,
+      "request_anchor": "Ok what if we took out the equation as merely illustrative and focused on the statistics",
+      "title": "Revise a paper around statistics rather than an equation",
+      "task_kind": "research_design",
+      "task": "Write a concrete revision plan and revised claims table for the paper under the latest user direction. Separate illustrative mathematics, empirical results, unverified external numbers, and experiments still needed. Include a minimal validation plan and publication claims that could survive a negative result. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R06-C1",
+          "requirement": "Follow the latest instruction to make the equation illustrative and focus on statistics.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 18,
+              "quote": "equation as merely illustrative and focused on the statistics"
+            }
+          ]
+        },
+        {
+          "id": "R06-C2",
+          "requirement": "Retain the earlier falsifiability concern instead of relabeling an unrestricted fit as proof.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 6,
+              "quote": "fit everything regardless"
+            }
+          ]
+        },
+        {
+          "id": "R06-C3",
+          "requirement": "Plan boundary-condition tests, effect sizes and confidence intervals.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 0,
+              "quote": "Test boundary conditions"
+            },
+            {
+              "turn": 0,
+              "quote": "Effect size calculation"
+            },
+            {
+              "turn": 0,
+              "quote": "Confidence intervals"
+            }
+          ]
+        },
+        {
+          "id": "R06-C4",
+          "requirement": "Separate reported/claimed cross-domain numbers from verified measurement and universal-law conclusions.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 2,
+              "quote": "domain-specific adaptation"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R07",
+      "domain": "research",
+      "split": "validation",
+      "source": "AI dialogues/Academic_Preprint_Readiness_Review_547cf588_2025-06-17T03-46-27-602Z.txt",
+      "cutoff_turn": 24,
+      "request_anchor": "We still need to do 20x20 right? this code isn't setup for that",
+      "title": "Repair the experimental design to the requested population",
+      "task_kind": "research_design",
+      "task": "Produce an execution-ready experimental protocol correcting the mismatch identified in the current prompt. Specify the problem/algorithm grid, what a trial and a replicate mean, baselines, seeds, uncertainty estimates, incompatible cases, compute accounting, and stopping criteria. Do not fabricate results or rely on unavailable code attachments. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R07-C1",
+          "requirement": "Retain the requested 20 problems and 20 algorithms instead of silently substituting a small pilot.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 10,
+              "quote": "20 problems and 20 algorithms"
+            },
+            {
+              "turn": 24,
+              "quote": "still need to do 20x20"
+            }
+          ]
+        },
+        {
+          "id": "R07-C2",
+          "requirement": "Define the sampling unit and analysis before execution; distinguish algorithm count from pair count.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 10,
+              "quote": "experiment of decent power"
+            },
+            {
+              "turn": 12,
+              "quote": "someone good at stats"
+            }
+          ]
+        },
+        {
+          "id": "R07-C3",
+          "requirement": "Address the current implementation mismatch explicitly and list what must be supplied or changed.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 24,
+              "quote": "this code isn't setup for that"
+            }
+          ]
+        },
+        {
+          "id": "R07-C4",
+          "requirement": "Present an experiment plan rather than treating an unexecuted population as completed evidence.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 24,
+              "quote": "We still need to do 20x20 right?"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R08",
+      "domain": "research",
+      "split": "validation",
+      "source": "AI dialogues/Academic_Preprint_Readiness_Review_547cf588_2025-06-17T03-46-27-602Z.txt",
+      "cutoff_turn": 64,
+      "request_anchor": "I propose a new autogen paper. Test all the things using those libraries. Have the cream around proo",
+      "title": "Follow-up study with data-structure extension",
+      "task_kind": "research_design",
+      "task": "Draft the follow-up study proposed at this checkpoint. Preserve the unresolved claims from the discussion, define a bounded test matrix using the discussed library approach, and explain how the data-structure extension would be tested fairly. Include a claims/evidence table and explicit conditions under which the central claim would fail. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R08-C1",
+          "requirement": "Include the requested data-structure extension and a bounded library-based test plan.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 64,
+              "quote": "Test all the things using those libraries"
+            },
+            {
+              "turn": 64,
+              "quote": "extension to data structures"
+            }
+          ]
+        },
+        {
+          "id": "R08-C2",
+          "requirement": "Do not assume H(A|P)=0 is a demonstrated universal fact; preserve the user request for evidence.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 50,
+              "quote": "Can we really count on HAP equals zero"
+            },
+            {
+              "turn": 62,
+              "quote": "good results for that zero result"
+            }
+          ]
+        },
+        {
+          "id": "R08-C3",
+          "requirement": "Treat a proposed lower-bound proof separately from empirical performance and articulate its assumptions.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 52,
+              "quote": "Kramer rao lower bound"
+            }
+          ]
+        },
+        {
+          "id": "R08-C4",
+          "requirement": "Apply the stated extraordinary-evidence standard to claims and validation rather than promotional language.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 42,
+              "quote": "Extraordinary claims require extraordinary evidence"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R09",
+      "domain": "research",
+      "split": "validation",
+      "source": "AI_Citation_Relevance_Check_6861fea8_2025-06-30T16-42-10-878Z.md",
+      "cutoff_turn": 94,
+      "request_anchor": "Evaluate these separate arguments about instrumental convergence and orthogonality as a senior colle",
+      "title": "Separate two research arguments and their evidence",
+      "task_kind": "research_analysis",
+      "task": "Write the requested senior-colleague review of the two arguments. Reconstruct the latest user definitions, separate premises from deductions and empirical assumptions, identify missing proof obligations, and propose revisions that preserve useful contributions without inflating their status. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R09-C1",
+          "requirement": "Keep instrumental convergence and orthogonality as separate arguments.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 94,
+              "quote": "separate arguments about instrumental convergence and orthogonality"
+            },
+            {
+              "turn": 92,
+              "quote": "instrumental convergence"
+            }
+          ]
+        },
+        {
+          "id": "R09-C2",
+          "requirement": "Use the user RES/computability idea without treating the earlier assistant formalism as an established theorem.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 39,
+              "quote": "for a relationship to be computable it first has to be global"
+            },
+            {
+              "turn": 35,
+              "quote": "goals require the agent to compute certain operations"
+            }
+          ]
+        },
+        {
+          "id": "R09-C3",
+          "requirement": "Assess the computability/halting argument and state its assumptions and limits.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 79,
+              "quote": "some goals are the Halting problem"
+            }
+          ]
+        },
+        {
+          "id": "R09-C4",
+          "requirement": "Separate mathematical consequence under assumptions from unsupported statements about actual agents.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 4,
+              "quote": "overstating certainty in speculative areas"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    },
+    {
+      "id": "R10",
+      "domain": "research",
+      "split": "validation",
+      "source": "AI_Citation_Relevance_Check_6861fea8_2025-06-30T16-42-10-878Z.md",
+      "cutoff_turn": 150,
+      "request_anchor": "Did we really show that GR is measure zero and not just small?",
+      "title": "Audit a measure-zero claim against earlier discussion",
+      "task_kind": "research_analysis",
+      "task": "Audit whether the discussion actually establishes the measure-zero claim raised now. Identify the underlying space and any defined measure, distinguish cardinality, probability, empirical rarity and measure zero, and state what additional assumptions or proof would be required. Preserve useful weaker conclusions without inventing a theorem or external citation. Deliver analysis.md and claims.json. Each claims.json item must contain claim, status (reported_result, user_requirement, assistant_proposal, inference, or unverified), and evidence entries {turn_id, quote}. Cite exact supplied turn IDs and quotes; do not claim fresh experiments or externally verified literature. Distinguish the archived claim from your own assessment.",
+      "deliverables": [
+        "analysis.md",
+        "claims.json"
+      ],
+      "criteria": [
+        {
+          "id": "R10-C1",
+          "requirement": "Directly distinguish a measure-zero conclusion from a merely small or rare set.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 150,
+              "quote": "measure zero and not just small"
+            }
+          ]
+        },
+        {
+          "id": "R10-C2",
+          "requirement": "Check whether the earlier computability restrictions supply a measure rather than assuming they do.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 39,
+              "quote": "for a relationship to be computable"
+            }
+          ]
+        },
+        {
+          "id": "R10-C3",
+          "requirement": "Keep formal assumptions and speculative interpretations separate; acknowledge missing definitions or proof steps.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 4,
+              "quote": "overstating certainty in speculative areas"
+            }
+          ]
+        },
+        {
+          "id": "R10-C4",
+          "requirement": "Assess the prior discussion critically rather than using assistant endorsement as ground truth.",
+          "weight": 1,
+          "supports": [
+            {
+              "turn": 150,
+              "quote": "Did we really show"
+            }
+          ]
+        }
+      ],
+      "public_checks": [],
+      "structural_checks": [
+        "required_artifacts",
+        "source_exact_citations"
+      ],
+      "failure_classes": [
+        "evidence_delivery",
+        "reader_interpretation",
+        "implementation_or_reasoning",
+        "unsupported_claim",
+        "question_or_grader",
+        "tool_or_runtime"
+      ]
+    }
+  ]
+}

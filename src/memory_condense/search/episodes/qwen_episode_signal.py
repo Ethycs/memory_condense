@@ -578,7 +578,7 @@ def _owned_qwen_runtime_binding(linker: Any) -> bool:
         "head_vote_k",
     }:
         return False
-    if set(vars(encoder)) != {
+    expected_encoder_fields = {
         "model_dir",
         "layers",
         "model_id",
@@ -594,7 +594,12 @@ def _owned_qwen_runtime_binding(linker: Any) -> bool:
         "model",
         "tokenizer",
         "loaded_parameter_names",
-    }:
+    }
+    if hasattr(encoder, 'host_embeddings'):
+        if type(encoder.host_embeddings) is not bool:
+            return False
+        expected_encoder_fields.add('host_embeddings')
+    if set(vars(encoder)) != expected_encoder_fields:
         return False
     inspection = getattr(linker, "inspect_coverage", None)
     function = getattr(inspection, "__func__", None)
@@ -655,6 +660,10 @@ def _attention_head_implementation_sha256(linker: Any) -> str:
     _update_callable_digest(digest, getattr(linker, "inspect_coverage", None))
     _update_callable_digest(digest, _active_transport_normalizer())
     _update_callable_digest(digest, _active_tokenizer_proxy_identity())
+    encoder = getattr(linker, 'encoder', None)
+    if type(encoder) is prefix_module.Qwen3PrefixEncoder:
+        digest.update(b'host-embeddings=' + str(bool(getattr(encoder, 'host_embeddings', False))).encode('ascii'))
+        _update_callable_digest(digest, encoder._forward)
     return digest.hexdigest()
 
 

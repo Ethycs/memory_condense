@@ -1,7 +1,8 @@
 # Ten-session failure patterns and repair priorities
 
 **Status:** CURRENT — measured diagnosis. Priority 1 traced, repaired in code and checked on the 87 misses plus matched controls (27 recovered, 2 controls lost); the full-campaign effect is unmeasured. See [Research Log 245](../10%20-%20Research%20Log/245%20-%202026-09-23%20-%20Earliest%20loss%20trace%20and%20user%20completion%20routing.md).  
-**Date:** 2026-09-23.  
+**Date:** 2026-09-25 (complete classification added; original analysis dated 2026-09-23).
+
 **Applies to:** The completed ten-history, 1,000-question user-spine memory evaluation.  
 **Depends on:** [Research Log 244](../10%20-%20Research%20Log/244%20-%202026-09-22%20-%20Ten%20million-token%20session%20evaluation.md) and the [sealed evaluation artifacts](../../eval_results/native-spine-ten100-20260922-r1/aggregate-report.json).
 
@@ -11,6 +12,109 @@ and selecting among similar episodes. They also include verified grading errors.
 The most useful next work is to repair these boundaries while retaining the
 measured compact context and seconds-level response time.
 
+## Complete classification of the 87 original misses — September 25
+
+All 87 now have a disjoint, repair-oriented classification based on the saved
+original packets and the completed source review in
+[Log 256](../10%20-%20Research%20Log/256%20-%202026-09-25%20-%20Raw%20context%20control%20for%20all%2087%20campaign%20misses.md).
+This is an analyst diagnosis of that review, not another model run or a change
+to the original benchmark grades.
+
+| Primary class | Count | Share of 87 | Evidence |
+| --- | ---: | ---: | --- |
+| Original answer accepted on source review | 40 | 46.0% | The later reviewer accepts the saved memory answer against the original sources; these are not confirmed memory failures. |
+| Evidence delivery gap | 24 | 27.6% | Relevant content is absent from the packet, or the required source conversation was not selected. Some also have reader issues. |
+| Reader-error candidate with cited evidence present | 12 | 13.8% | The source text underlying the complaint is in the packet, but the answer omits, misattributes, or misinterprets it. |
+| Identified grading/question defect | 2 | 2.3% | H9 Q78 has a relative-date question/reference conflict; H10 Q14 is rejected for John/Johns Hopkins spelling normalization. |
+| Ambiguous question | 7 | 8.0% | Multiple source-supported scopes prevent a dependable binary grade. |
+| Invalid source-review response | 2 | 2.3% | Required quotation or prediction/reference anchoring fails validation. |
+| **Total** | **87** | **100%** | Every original campaign miss appears exactly once. |
+
+Source-review acceptance is not independent human adjudication, and several
+reader-candidate judgments remain debatable. This table does not establish a
+revised whole-system accuracy: the 913 original passes were not audited with
+this review method.
+
+### Evidence delivery: 24 cases
+
+**Nineteen** have a relevant source conversation represented in the packet but
+omit necessary content within the selected conversations. **Five** omit the
+reference-origin conversation entirely: H3 Q56/Q60, H7 Q51, H8 Q2/Q91. The latter
+include cabinet-quiz instructions, the farm-budget request, a different book
+recommendation episode, exercise plans, and Pollinations formatting requirements.
+This identifies where evidence is absent; it does not independently locate every
+loss in summarization, ranking, routing, or hydration.
+
+Other examples include the final Garmin/heart-rate-monitor decision (H1 Q66),
+the standalone Wild Magic choice (H8 Q83), technical MIDI requirements (H6 Q51),
+and an itinerary's nearby-place clustering instruction (H9 Q72).
+
+**Twenty-one of these 24 pass with complete raw source conversations.** The
+remaining three—H6 Q51, H9 Q38, H10 Q6—receive additional correct details with
+raw context but still fail on incomplete coverage. A delivery problem can coexist
+with a reader problem; delivery takes precedence in this disjoint repair table.
+
+The number 24 differs from the earlier quote-coverage counts for a specific
+reason. Of 26 historical misses with missing recorded quotes, 20 remain rejected
+under source review; one is accepted and five are unresolved. Four more rejected
+cases have missing required facts outside their recorded support quotes:
+H2 Q30, H3 Q74, H8 Q83, and H10 Q6. Thus **20 + 4 = 24**. The old support checklist
+did not cover every fact needed by the question.
+
+Consequently, the earlier **18/25 raw recoveries from incomplete recorded
+support** becomes **21/25 with an identified material delivery gap** after
+examining the actual complaints. The remaining four recoveries are among the
+12 reader candidates. These are two classifications of the same 25 recoveries,
+not additional recovered questions.
+
+### Reader interpretation: 12 candidates
+
+| Class | Count | Cases and observed issue |
+| --- | ---: | --- |
+| Omitted available detail | 6 | H2 Q5: 100 quiz items; H3 Q15: rooftop/city view; H4 Q59: adapting agile by industry; H7 Q63: English feedback; H9 Q80: repeating the NVC exercise; H10 Q83: long-term effects of Trajan's campaigns. |
+| State, intent or certainty | 3 | H2 Q54: proposed lampshade treated as selected; H6 Q23: earlier tentative council idea chosen over later group-joining plan; H10 Q71: definite non-purchase despite conflicting purchase/consideration statements. |
+| Episode or participant scope | 2 | H3 Q30: individual Space Needle plan attributed to the trip with Emily; H7 Q67: wrong lunch-request episode selected although the intended request is present. |
+| Temporal interpretation | 1 | H2 Q21: email receipt date treated as the date graduation clearance occurred. |
+
+Four pass with raw context; eight still fail. These are **candidates**, not 12
+indisputable capability failures. The NVC repetition requirement, the lamp's
+“leaning toward” wording, the travel participant scope, and inconsistent boots
+statements expose grading or interpretation uncertainty as well.
+
+The later fresh comparison in
+[Log 257](../10%20-%20Research%20Log/257%20-%202026-09-25%20-%20Lightweight%20hints%20on%20reader%20failures%20and%20passing%20controls.md)
+uses these same 12 candidates. Plain answers pass 2/12 and lightweight hints
+pass 5/12, with three recoveries and no binary regressions; all 18 historical
+passing controls pass in both fresh arms. That measures hints on unchanged
+packets, separately from using summary cues to retrieve missing material.
+
+### Remaining review outcomes and reproducibility
+
+The seven ambiguous cases are H1 Q50; H2 Q12/Q42/Q75; H3 Q12; H4 Q50; H7 Q37.
+The invalid pairs are H4 Q75 and H7 Q82. All 40 source-review-accepted cases and
+every other case are individually listed in the
+[87-row CSV](../../eval_results/native-spine-ten100-misses-raw-control-20260925-r1/failure-classification.csv).
+The companion
+[JSON](../../eval_results/native-spine-ten100-misses-raw-control-20260925-r1/failure-classification.json)
+retains the original prediction, review bindings, complaints, and checks of
+whether quoted complaint evidence occurs in the served packet.
+
+The provider-free classifier verifies sealed artifact hashes, exact membership
+in the original 87-miss set, all category totals, and the evidence-presence checks.
+It removes only local C/T source-numbering tags when checking quoted text;
+it does not rewrite transcript content or any historical grade.
+Replay from the repository root:
+
+```powershell
+.pixi/envs/dev/python.exe -X utf8 eval_results/native-spine-ten100-misses-raw-control-20260925-r1/failure_classification.py
+```
+
+Classification JSON SHA-256:
+`be4dde16e700d519cfbc4982af3bee210cbc4c3d3f05a678559e133bd26685b6`.
+CSV SHA-256:
+`a7bba42aa179c88573238ff58e9965f1c98e44025bd52d05a0901b4fd45fb3eb`.
+No new model calls, ingestion, retrieval, or production changes were needed.
+
 ## Measurement boundary
 
 Research Log 244 records the frozen configuration, application ingest/reopen
@@ -18,11 +122,13 @@ lifecycle, and complete accuracy, latency, and token measurements. This analysis
 uses that completed run's saved source turns, answer packets, and judgments;
 it made no new model calls and does not isolate attention's contribution.
 
-All 87 marked question/prediction/reference comparisons were reviewed.
+In the original September 23 analysis below, all 87 marked
+question/prediction/reference comparisons were reviewed.
 Representative cases below were also checked against original source turns,
 served context, or saved judge explanations. The four patterns overlap; they
-are not an exhaustive, disjoint classification of all 87 misses. No adjusted
-accuracy is reported.
+are not themselves an exhaustive, disjoint classification. The September 25
+section above supplies that classification; the original observations below
+remain useful examples. No adjusted accuracy is reported.
 
 ## Quote coverage is useful but incomplete
 

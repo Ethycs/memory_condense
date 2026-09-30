@@ -71,6 +71,12 @@ class NativeSpineSnapshot:
 
 def publish(path, *, atomic_index, hierarchy, matrix, embedding_identity, turns):
     """Commit one complete derived snapshot after raw ingestion has completed."""
+    return publish_snapshot(path, atomic_index=atomic_index, hierarchy=hierarchy,
+        matrix=matrix, embedding_identity=embedding_identity, turns=turns).receipt
+
+
+def publish_snapshot(path, *, atomic_index, hierarchy, matrix, embedding_identity, turns):
+    """Publish and retain the same validated objects for the owning live session."""
     turns = tuple(turns)
     matrix = np.asarray(matrix)
     semantic = SemanticSectionIndex(atomic_index, matrix, embedding_identity=embedding_identity)
@@ -83,13 +89,14 @@ def publish(path, *, atomic_index, hierarchy, matrix, embedding_identity, turns)
         'semantic_sha256': semantic.receipt_sha256, 'hierarchy_sha256': hierarchy.receipt_sha256,
         'transcript_sha256': transcript_identity(turns), 'turn_count': len(turns),
         'body_tokens': sum(count_tokens(t.text) for t in turns)}
-    sha = identity_sha256(payload)
+    serialized = canonical_json(payload)
+    sha = quote_sha256(serialized)
     with closing(sqlite3.connect(path)) as db, db:
         db.execute('CREATE TABLE IF NOT EXISTS snapshot (id INTEGER PRIMARY KEY CHECK(id=1), '
                    'payload TEXT NOT NULL, vectors BLOB NOT NULL, receipt_sha256 TEXT NOT NULL)')
         db.execute('INSERT OR REPLACE INTO snapshot VALUES (1, ?, ?, ?)',
-                   (canonical_json(payload), vector_bytes, sha))
-    return _receipt(payload, sha)
+                   (serialized, vector_bytes, sha))
+    return NativeSpineSnapshot(semantic, hierarchy, _receipt(payload, sha))
 
 
 def _receipt(p, sha):

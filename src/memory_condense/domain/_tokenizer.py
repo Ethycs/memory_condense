@@ -38,6 +38,16 @@ def count_tokens(text: str, encoding: str = DEFAULT_ENCODING) -> int:
     # Corpus text is untrusted data. Strings such as ``<|endoftext|>`` may
     # occur literally in web/chat exports and must be budgeted as ordinary
     # text, never interpreted as tokenizer control input.
+    # Snapshot validation and exact hydration revisit the same short strings.
+    # Cache counts, never token arrays, with a hard bound on both entry count
+    # and source length. Large documents bypass the cache completely.
+    if len(text) <= 4096:
+        return _count_short_text(text, encoding)
+    return len(_get_encoder(encoding).encode(text, disallowed_special=()))
+
+
+@lru_cache(maxsize=8192)
+def _count_short_text(text: str, encoding: str) -> int:
     return len(_get_encoder(encoding).encode(text, disallowed_special=()))
 
 

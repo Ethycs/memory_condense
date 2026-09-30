@@ -9,7 +9,7 @@ from memory_condense.search.section_summary import SectionSummary
 FORMAT = 'native-spine-root-user-summaries-v1'
 
 
-def project_parent_users(hierarchy):
+def project_parent_users(hierarchy, *, stable_ids=False, previous=None):
     """Use every stored root, including singleton groups, without raw reads.
 
     Roots retain exact user-span addresses. Only the stored ``user_spine`` string
@@ -33,6 +33,18 @@ def project_parent_users(hierarchy):
             raise ValueError('a user-containing root has an empty user-spine summary')
         provenance = {'format': FORMAT, 'hierarchy_sha256': hierarchy.receipt_sha256,
                       'original_root_sha256': root.receipt_sha256}
-        projected.append(SectionSummary('native-parent-user-' + identity_sha256(provenance),
+        if stable_ids:
+            # Root identity already binds its exact source spans and summary.
+            # Whole-hierarchy membership is bound by the published manifest.
+            provenance = {'format': 'native-spine-root-user-summaries-v2',
+                          'original_root_sha256': root.receipt_sha256}
+        sid = 'native-parent-user-' + identity_sha256(provenance)
+        old = previous._by_id.get(sid) if previous is not None else None
+        if (old is not None and old.source_id == root.source_id and old.summary == summary
+                and old.spans == spans and old.summarizer_identity == canonical_json(provenance)
+                and not old.child_section_ids):
+            projected.append(old)
+            continue
+        projected.append(SectionSummary(sid,
             root.source_id, summary, spans, canonical_json(provenance)))
-    return SectionSummaryIndex(projected)
+    return SectionSummaryIndex(projected, previous=previous)

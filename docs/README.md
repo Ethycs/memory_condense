@@ -1,11 +1,107 @@
 # memory_condense — documentation tree
 
 **Status**: Living Document
-**Date**: 2026-09-23 (includes the completed ten-session battery and engineering replay)
+**Date**: 2026-09-30 (includes twelve-exchange full-cycle optimization)
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
+
+**Local reader screen:** Llama 3.2 3B Instruct Q4_K_M on the RTX 2070 SUPER
+answered 23/24 saved streaming packets correctly at a mean 1.68 s, compared
+with the historical Haiku control's 24/24 at 3.95 s. Six summary requests
+averaged 0.63 s, but manual review found factual corruption. This is a resident
+replay, not a full-pipeline benchmark; cold startup plus first generation took
+98.74 s. Model defaults remain unchanged. See the local Llama section of
+[Research Log 262](10%20-%20Research%20Log/262%20-%202026-09-29%20-%20Live%20IO%20latency%20diagnosis%20and%20resident%20optimization.md).
+
+**Shared chat I/O:** New chat exchanges and newly prepared engineering runs capture
+inputs, outputs, and tool results through one durable interface. Recall packets
+link their triggering input to exact original memory spans; completed exchanges
+feed those original chunks into the existing Hebbian co-access graph. See
+[Research Log 260](10%20-%20Research%20Log/260%20-%202026-09-29%20-%20Chat%20IO%20links%20inputs%20and%20recalls%20to%20original%20memory.md)
+for the interface, tested lifecycle, and integration limits.
+Every new input, output, and tool result is saved immediately. The live chat
+binding now starts background preparation after each completed exchange, with
+**three bounded jobs and ordered publication**. Recall still runs for each
+question against the last committed index. The reader receives up to **twelve
+recent exchanges plus the current input**, with an 8,192-token recent-context
+budget. Whole committed exchanges are trimmed first; uncommitted messages stay
+available even if they exceed that budget. Attention-guided groups seal at eight
+exchanges, preserving their parent summaries across later appends. Explicit
+batch settings retain the prior six-exchange path for comparisons.
+New fragments under 192 tokens (1.5 times the 128-token raw-summary limit)
+retain their exact text without a raw summarizer call. Flush and
+close drain pending work and finalize partial hierarchy groups; original-source
+learning waits for publication.
+The durable queue survives restart, and eager ingestion remains available for
+diagnostics. See the streaming section of Research Log 262 below.
+
+**Streaming continuation check:** On one existing 1.13M-token memory, 24
+consecutive exchanges scored **24/24**, with memory at most **three completed
+exchanges behind** inside the twelve-exchange context window. All 96 new events
+and 24 learning updates persisted and passed cold-reopen checks. Mean reply was
+**4.83 s**, maximum **9.38 s**; the final drain was **7.87 s**, for **125.55 s**
+across all 24 exchanges, excluding startup. The queue kept up, but this sample
+does not establish faster replies than the prior batch run. It used the Haiku
+reader override and C: active storage. **142 regression tests pass**; see
+[Research Log 262](10%20-%20Research%20Log/262%20-%202026-09-29%20-%20Live%20IO%20latency%20diagnosis%20and%20resident%20optimization.md)
+for the changed grouping policy, timing limits, and complete evidence.
+
+**Chat I/O million-token regression:** One existing **1.115M-token** history and
+**100 fresh answers** scored **94/100**, matching the cap-8 baseline. All source
+pointers, input/output links, and 100 Hebbian updates survived reopening. Median
+answer time was **4.670 s**, or **5.557 s** including the remaining indexing and
+learning drain. Retrieval used the fixed historical snapshot; continuous native
+hierarchy refresh was not exercised. See
+[Research Log 261](10%20-%20Research%20Log/261%20-%202026-09-29%20-%20Single%20million-token%20Chat%20IO%20regression.md).
+
+**Live refresh latency:** Exercising the full summary/hierarchy pipeline exposed
+large overhead in the subprocess adapter. A resident replacement reduced an
+analogous follow-up from **103.43 s to 31.72 s**, with original input/output/tool
+recall and restart equality verified. Full refresh is still above the five-second
+target. The clean million-token re-ingest control was canceled; no equivalence
+claim is made for that unfinished run. See
+[Research Log 262](10%20-%20Research%20Log/262%20-%202026-09-29%20-%20Live%20IO%20latency%20diagnosis%20and%20resident%20optimization.md)
+for timing boundaries, the interrupted worker, tests, and remaining costs.
+
+The follow-up now reuses historical index entries and writes changed native and
+parent rows in one transaction. On a cached 1.126M-token update, combined index
+work fell from 2.377 s to 0.264 s; publication took 2.556 s with fresh-build and
+separate-process receipt equality. Qwen's embedding table stays in CPU RAM while
+its transformer layers and BGE stay on the GPU, removing whole-model transfers
+in the bounded placement test. A subsequent complete eager turn on 1.13M tokens
+returned the correct answer in **16.78 s** and completed ingestion and learning
+in **49.41 s**, excluding startup. The nonblocking six-exchange queue and
+short-text bypass pass 52 focused tests. A revised 12-exchange run returned
+**12/12 correct answers** (eight recalls, four acknowledgements) in **65.93 s**,
+averaging **5.46 s** each. Both ingestion batches and all twelve learning updates
+completed; new original-source facts were recalled after the drain. Background
+summarization took **653.97 s**, and the full cycle **757.57 s** in that baseline.
+Authenticated reuse of recalled evidence and three concurrent compiler calls
+first reduced that full cycle to **125.26 s**. The latest retained configuration
+uses shorter generated parents, exact attributed summary reuse, parallel
+hierarchy compilation, concurrent raw indexing, and committed raw snapshots for
+nonblocking recall. The last push prepares reusable summaries after exchanges
+three and five while keeping publication and learning at six exchanges. A
+bounded exact token-count cache reduces repeated validation work, and optional
+preparation yields when a full batch is ready. With the authorized Haiku reader
+override, the best measured twelve-exchange cycle is **52.27 s**; the latest
+configuration takes **54.93 s**, with **12/12 correct answers**, all twelve
+learning updates, and original-source hydration verified. **The latest run uses
+C: temporary storage for its active memory and chat journal**, following large
+write stalls on F: project storage; the normal project store was not relocated.
+Startup is excluded; the complete final ingestion/learning drain is included.
+The **sub-50 target remains unmet**. Latest mean answer latency is **3.68 s**,
+maximum **4.95 s**; answers finish in **44.64 s**, followed by **10.29 s** of
+draining. Merge calls fall from 28 to seven; repeated raw summarization remains
+at zero. **135 focused tests pass.** Exact JSON fences are accepted for scoring and captured outputs
+remain unchanged. This is one bounded continuation, not a new 100-question or
+engineering-quality result, and the default reader remains Sol outside the
+evaluation override. Two local quantized LFM
+summarizers were tested and not promoted because of factual-association errors
+or missing routing details; the current raw-summary model remains unchanged.
+Details and artifacts are in Research Log 262.
 
 **Ten-session battery complete:** Ten additional histories of **1.06–1.16M eligible
 raw tokens**, with 100 new questions each, scored **913/1,000 (91.3%)** under the
@@ -20,6 +116,14 @@ The [status report](07%20-%20Status%20Reports/2026-09-23_ten-session-battery-and
 records the handoff; [Analysis 35](08%20-%20Analysis/35%20-%20Ten-session%20failure%20patterns%20and%20repair%20priorities%202026-09-23.md)
 holds the failure findings, source examples, and repair priorities.
 
+**Single-history routing ablation:** Removing the active retrieval additions
+reduced the same 100-question score from **94 to 73** on a 1.115M-token history,
+while saving 14.57% of input tokens. See
+[Research Log 246](10%20-%20Research%20Log/246%20-%202026-09-23%20-%20Single%20million-token%20routing%20heuristic%20ablation.md).
+Removing downstream assistant filtering and user-first layout from both variants
+still yields **93 versus 73**; see the
+[compensation check, Log 247](10%20-%20Research%20Log/247%20-%202026-09-23%20-%20Downstream%20compensation%20check%20for%20routing%20ablation.md).
+
 **Priority-1 trace and repair:** The three named missing-turn cases were traced
 to routing (H8 Q83, H6 Q51) and to hydration order (H1 Q66), where late user
 additions lost the shared budget to assistant sections the projection then
@@ -32,6 +136,109 @@ recovers **27 of the 87 misses** while **85 of 87 matched controls** still
 pass, at about 20% more prompt tokens. The full-campaign effect is not yet
 measured: the sampled control loss rate would cost roughly 21 of the 913
 passing answers if it held. See [Research Log 245](10%20-%20Research%20Log/245%20-%202026-09-23%20-%20Earliest%20loss%20trace%20and%20user%20completion%20routing.md).
+
+**Cap-8 full-history check:** All 100 questions on the same 1.115M-token comparison
+history score **94/100**, unchanged from baseline, while recorded-support coverage
+rises from **97 to 100**. Warm median is 4.345 s and mean input is 1,762 tokens
+(+18.69%). See [Research Log 248](10%20-%20Research%20Log/248%20-%202026-09-23%20-%20Cap-eight%20repair%20on%20one%20complete%20million-token%20history.md).
+
+**Cap-8 integrated:** Public native retrieval now uses the tested cap-8 defaults
+when its parent-summary index is installed. A reader-only comparison on the same
+100 saved packets scores **93/100 versus 94/100**, with 190 more input tokens per
+answer; v7 remains the reader. See [Research Log 249](10%20-%20Research%20Log/249%20-%202026-09-23%20-%20Cap-eight%20integration%20and%20reader%20scope%20comparison.md).
+
+**Answer-model comparison:** The available Claude Code Opus route scores
+**91/100 versus Sol's 94/100** on identical cap-8/v7 prompts. Both omit Strava;
+some grade changes penalize source-supported details. The gateway exceeds the
+requested output limit on one passing answer. Sol remains the default. See
+[Research Log 250](10%20-%20Research%20Log/250%20-%202026-09-24%20-%20Answer%20model%20comparison%20on%20unchanged%20cap-eight%20evidence.md).
+
+**Metadata-hint soft test:** Twelve fresh paired questions receive **9/12 plain
+versus 10/12 hinted** source-review labels; all six controls pass in both arms.
+The hinted answer recovers Strava, with about 58% more input tokens. This remains
+an isolated prototype; see [Research Log 251](10%20-%20Research%20Log/251%20-%202026-09-24%20-%20Timestamp%20and%20purpose%20hint%20soft%20test.md).
+
+**DSPy hint optimization:** A bounded COPRO search followed by twelve held-out
+question pairs yields **11/12 plain versus 12/12 in the DSPy arm**, including two
+fallbacks for invalid hints. Reader input rises about 8%, but generating hints
+adds a separate model call. The lone graded gain is a small wording distinction;
+see [Research Log 252](10%20-%20Research%20Log/252%20-%202026-09-24%20-%20DSPy%20optimization%20of%20saved-packet%20hints.md).
+
+**Expanded DSPy test:** All 100 saved questions now have fresh paired answers.
+Among the 82 newly added questions, both arms score **74/78 assessable pairs**,
+with two recoveries and two regressions. Across all 94 questions outside training,
+labels are **83/90 plain versus 86/90 hinted**; three invalid reviews and one
+ambiguous question remain unresolved. All guides validate after the status-alias
+fix, but the extra generation call has not demonstrated a consistent benefit.
+See [Research Log 253](10%20-%20Research%20Log/253%20-%202026-09-25%20-%20Expanded%20DSPy%20hint%20evaluation%20on%20100%20saved%20questions.md).
+
+**Original-context control:** Twenty selected diagnostic questions receive fresh
+answers using memory or complete original source conversations, with the same
+Sol/v7 reader. Labels are **16 correct / 3 incorrect / 1 ambiguous** for memory
+versus **13 / 6 / 1** for original context. All three shared failure labels
+persist; no memory failure is rescued. Several judgments remain debatable.
+This uses complete selected conversations, not the entire 1M-token history.
+Mean answer input is 1,865 versus 10,669 tokens. See
+[Research Log 254](10%20-%20Research%20Log/254%20-%202026-09-25%20-%20Original%20conversation%20control%20for%20reader%20errors.md).
+
+**Full 100-question context control:** The same Sol/v7 reader scores **95 correct,
+4 incorrect, 1 ambiguous** with memory versus **87 / 12 / 1** with complete
+selected raw conversations. **Three of four fresh memory misses (75%)** also
+fail with raw context. Following the earlier plain-memory run's eight misses
+instead gives **four of eight (50%)**; the denominators are different. The
+control retains the previous twenty pairs and adds eighty, with no new ingestion.
+Mean answer input is 1,762 versus 9,288 tokens. This is a source-conversation
+comparison, not a full-1M prompt, and several failure labels remain debatable.
+See [Research Log 255](10%20-%20Research%20Log/255%20-%202026-09-25%20-%20Full%20hundred%20question%20packet%20versus%20raw%20context%20control.md).
+
+**All 87 campaign misses checked:** The raw-context control now covers every
+miss across all ten histories. Raw answers receive **57 correct, 21 incorrect
+(24.1% of the 87) and 9 unresolved** source-review labels. The original memory
+answers are reclassified as 40 correct, 38 incorrect and 9 unresolved; **13 of
+those 38 (34.2%)** also fail with raw context, while 25 recover. Eighteen of the
+25 recoveries come from packets with incomplete recorded support. Some review
+judgments are flawed or debatable, and these diagnostics do not replace the
+913/1,000 benchmark. All 213 recorded support quotes are present in the raw
+inputs. See [Research Log 256](10%20-%20Research%20Log/256%20-%202026-09-25%20-%20Raw%20context%20control%20for%20all%2087%20campaign%20misses.md).
+The updated [Analysis 35](08%20-%20Analysis/35%20-%20Ten-session%20failure%20patterns%20and%20repair%20priorities%202026-09-23.md)
+classifies all 87 individually: among the 38 still rejected, 24 have material
+evidence-delivery gaps, 12 are reader-error candidates, and two have identified
+grading/question defects. The classification includes an auditable 87-row CSV.
+
+**Lightweight hints:** A fresh saved-packet comparison improves 12 reader-error
+candidates from **2/12 to 5/12**, with three recoveries and no binary regressions;
+all **18 historical passing controls pass in both arms**. Four evidence-gap cases
+and two grading diagnostics were separated before calls. Compact labels from
+stored summaries add **245 input tokens (16.07%)** and **no hint-generation call**.
+This selected diagnostic uses original pre-cap-8 packets and remains outside
+production. See [Research Log 257](10%20-%20Research%20Log/257%20-%202026-09-25%20-%20Lightweight%20hints%20on%20reader%20failures%20and%20passing%20controls.md).
+
+**Scoring bands saved:** The ten-history QA campaign averages **95.3% after
+source-review corrections** (913 original passes plus 40 accepted flagged
+answers). The original automated score remains 91.3%; nine reviews remain
+unresolved. See the [scoring-bands note](07%20-%20Status%20Reports/2026-09-25_scoring-bands-and-95-percent-average.md)
+for the per-history arithmetic and scope.
+
+**Engineering/research battery complete:** The local notes archive supplied
+**20 artifact tasks from ten session families**: ten engineering and ten research,
+with four development and sixteen validation cases. Exact chronological prefixes
+span **4,189–98,809 tokens**. All twenty source boundaries and eighty rubric
+criteria pass audit. All **14 generated code implementations pass their own tests**,
+and all **12 fixed-interface implementations pass independent checks**. Memory
+uses **85.7% fewer actor input tokens** across eleven completed matched pairs,
+excluding ingestion and grading. Both arms produce artifacts on **15/20** cases;
+memory finishes 14, full context 15. Research exposes ingestion, hydration and
+definition-routing gaps; seven actor requests time out. See
+[Research Log 258](10%20-%20Research%20Log/258%20-%202026-09-25%20-%20Matched%20engineering%20and%20research%20battery.md)
+for results and the [canonical battery guide](../evals/engineering_research/README.md)
+for the protocol.
+
+**Browsing follow-up:** Public search and page opening are now optional matched
+tools for both evaluation arms. A separate three-case research follow-up checks
+whether they help the completed memory omissions. All six actors finished but
+none browsed or recalled; all three observed memory omissions persisted. The
+original twenty-pair results remain unchanged. See
+[Research Log 259](10%20-%20Research%20Log/259%20-%202026-09-25%20-%20Browsing%20access%20follow-up%20on%20research%20failures.md).
 
 **Engineering artifact comparison:** The original longer session's implementation
 and the preserved memory-generated code were checked with the same behavioral

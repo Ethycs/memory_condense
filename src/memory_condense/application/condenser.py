@@ -772,6 +772,7 @@ class MemoryCondenser(
     def _close_unowned(self) -> None:
         """Persist index and close database."""
         self._native_spine_loaded = None
+        self._native_spine_incremental = None
         try:
             if self._persist_index_on_close:
                 self._retriever.save()

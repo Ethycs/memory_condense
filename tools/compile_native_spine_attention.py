@@ -25,41 +25,10 @@ def implementation():
     return {**exchange_implementation(), **{name: digest(name) for name in FILES}}
 
 
-def user_windows(exchanges):
-    rows = tuple(exchanges)
-    if not rows or any(type(e) is not UserSpineExchange for e in rows):
-        raise TypeError("attention preparation requires typed, complete source exchanges")
-    if len({e.section.source_id for e in rows}) != 1:
-        raise ValueError("attention windows cannot cross source occurrences")
-    SectionSummaryIndex(tuple(e.section for e in rows))
-    texts = tuple(e.user_spine if e.user_spine is not None else "Unowned prelude." for e in rows)
-    if any(count_tokens(t) > 128 for t in texts):
-        raise ValueError("a user summary would be truncated by attention")
-    windows, start = [], 0
-    while start < len(rows):
-        end = min(len(rows), start+8)
-        windows.append({"start_exchange": start, "end_exchange": end, "texts": list(texts[start:end])})
-        if end == len(rows):
-            break
-        start = end-1
-    return windows
+from memory_condense.runtime.attention import user_windows, cache_method
 
 
-def cache_method(root, *, host_embeddings=None, versioned=False):
-    # This identity is independent of a corpus/snapshot or occurrence timestamp.
-    payload = {
-        "model_id": DEFAULT_MODEL_ID, "model_revision": DEFAULT_MODEL_REVISION,
-        "checkpoint_sha256": expected_prefix_checkpoint_sha256(6),
-        "device": "cuda", "dtype": "float16", "prefix_layers": 6, "attention_layer": 5,
-        "head_vote_k": 4, "max_input_spans": 8, "span_token_cap": 128,
-        "linker_max_candidates": 8, "linker_max_workspace_tokens": 4096,
-        "owned_runtime_binding": True, "raw_inputs_to_qwen": False,
-        "implementation": {name: digest(name) for name in FILES},
-    }
-    if host_embeddings is not None:
-        payload['host_embeddings'] = bool(host_embeddings)
-    name = 'method-' + identity_sha256(payload) + '.json' if versioned else 'method.json'
-    return publish_sealed_json(root / name, payload)[0]
+
 
 
 def prepare(exchange_root, root, cache_root):

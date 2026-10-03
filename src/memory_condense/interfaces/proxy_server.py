@@ -1,9 +1,8 @@
-"""A transparent proxy that sees provider traffic before the provider does.
+"""Provider proxy with transparent capture and opt-in native memory.
 
-Point a client's base URL at this server and it forwards every request to the
-real upstream unchanged, while capturing the conversation on the way past.
-That makes memory a property of the transport rather than something each
-client has to integrate.
+Observe mode forwards requests unchanged and captures conversations. Augment
+mode uses the evaluated ChatSession lifecycle: recall, bounded recent context,
+durable I/O, inline summaries when compatible, and background ingestion.
 
 Two rules govern the design:
 
@@ -29,6 +28,7 @@ import hashlib
 import logging
 import math
 import os
+import ssl
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -40,6 +40,7 @@ from starlette.background import BackgroundTask
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+from starlette.concurrency import run_in_threadpool
 
 from memory_condense.interfaces.proxy_capture import (
     ANTHROPIC,
@@ -98,9 +99,8 @@ class ProxyConfig:
         default_factory=lambda: dict(DEFAULT_UPSTREAMS)
     )
     default_provider: str = ANTHROPIC
-    #: ``observe`` forwards request bytes verbatim.  Only this mode exists
-    #: today; ``augment`` is reserved for prompt rewriting and is rejected
-    #: rather than silently behaving like ``observe``.
+    #: ``observe`` forwards verbatim; ``augment`` uses a configured ChatSession
+    #: service to replace older dialogue with authenticated recalled evidence.
     mode: str = "observe"
     timeout_seconds: float = 600.0
     capture_queue_size: int = 256
@@ -123,10 +123,9 @@ class ProxyConfig:
     capture_enrichment_max_turns: int = 1
 
     def __post_init__(self) -> None:
-        if self.mode != "observe":
+        if self.mode not in ("observe", "augment"):
             raise ValueError(
-                "only 'observe' mode is implemented; prompt rewriting is not "
-                "enabled yet"
+                "mode must be 'observe' or 'augment'"
             )
         if (
             isinstance(self.timeout_seconds, bool)
@@ -260,6 +259,7 @@ def build_app(
     sink: CaptureSink | None = None,
     completion: CompletionCallback | None = None,
     client: httpx.AsyncClient | None = None,
+    memory=None,
 ) -> Starlette:
     """Build the proxy application.
 
@@ -272,6 +272,8 @@ def build_app(
     """
 
     settings = config or ProxyConfig()
+    if (settings.mode == 'augment') != (memory is not None):
+        raise ValueError('Augment mode requires a memory service; observe mode does not use one')
     captures = CaptureQueue(
         sink or (lambda capture: None),
         maxsize=settings.capture_queue_size,
@@ -295,13 +297,21 @@ def build_app(
         completion=completion,
     )
     owns_client = client is None
-    upstream = client or httpx.AsyncClient(timeout=settings.timeout_seconds)
+    if client is None:
+        import truststore
+        upstream = httpx.AsyncClient(timeout=settings.timeout_seconds,
+            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+    else:
+        upstream = client
 
     def upstream_url(provider: str | None, path: str, query: str) -> str:
         base = settings.upstreams.get(
             provider or settings.default_provider,
             settings.upstreams[settings.default_provider],
         ).rstrip("/")
+        # Accept either the provider root or the familiar .../v1 base URL.
+        if base.endswith('/v1') and path.startswith('/v1/'):
+            path = path[3:]
         return f"{base}{path}{'?' + query if query else ''}"
 
     async def handle(request: Request) -> Response:
@@ -310,6 +320,38 @@ def build_app(
         provider = provider_for_path(path)
         headers = _forward_headers(request.headers.raw)
         target = upstream_url(provider, path, request.url.query)
+
+        if memory is not None and path.rstrip('/') == '/v1/responses':
+            return JSONResponse({'error':{'type':'unsupported_memory_endpoint',
+                'message':'Memory mode supports /v1/chat/completions and /v1/messages'}},status_code=400)
+        if memory is not None and provider is not None:
+            from memory_condense.interfaces.proxy_memory import MemoryProxyError, WireResponse
+            import anyio
+            if request.method != 'POST':
+                return JSONResponse({'error':{'message':'Chat requests require POST'}},status_code=405)
+            async def send_memory(payload):
+                forwarded = {k:v for k,v in headers.items()
+                             if not k.lower().startswith('x-memory-') and k.lower() != 'x-conversation-id'}
+                reply = await upstream.send(upstream.build_request(request.method,target,
+                    headers=forwarded,content=payload),stream=True)
+                try:
+                    value = await reply.aread()
+                    return WireResponse(reply.status_code,dict(_response_headers(reply.headers)),value)
+                finally:
+                    await reply.aclose()
+            try:
+                reply = await run_in_threadpool(memory.exchange,body,provider,headers,
+                                                lambda value:anyio.from_thread.run(send_memory,value))
+            except MemoryProxyError as exc:
+                return JSONResponse({'error':{'type':'memory_request_error','message':str(exc)}},status_code=exc.status)
+            except Exception:
+                logger.exception('memory request failed before provider completion')
+                return JSONResponse({'error':{'type':'memory_error','message':'Memory request failed; inspect local service logs'}},status_code=503)
+            if reply.headers.get('content-type','').startswith('text/event-stream'):
+                # Inline summaries are validated before any visible bytes leave
+                # the proxy. Native tool streams retain their original framing.
+                return StreamingResponse(iter([reply.body]),status_code=reply.status,headers=reply.headers)
+            return Response(reply.body,status_code=reply.status,headers=reply.headers)
 
         upstream_request = upstream.build_request(
             request.method,
@@ -421,6 +463,9 @@ def build_app(
         )
 
     async def health(_: Request) -> Response:
+        if memory is not None:
+            snapshot = await run_in_threadpool(memory.status)
+            return JSONResponse(dict(mode='augment',status='degraded' if snapshot['failed_sessions'] else 'ok',**snapshot))
         # Pending-ingest/enrichment projections use the condenser's SQLite
         # connection. The serialized worker publishes an immutable snapshot;
         # the event loop reads only that cache and never shares the connection.
@@ -618,12 +663,16 @@ def build_app(
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
-        captures.start()
+        if memory is None:
+            captures.start()
         try:
             yield
         finally:
             try:
-                await captures.stop()
+                if memory is not None:
+                    await run_in_threadpool(memory.close)
+                else:
+                    await captures.stop()
             finally:
                 if owns_client:
                     await upstream.aclose()
@@ -641,6 +690,19 @@ def build_app(
     )
     app.state.captures = captures
     app.state.config = settings
+    app.state.memory = memory
+    if memory is not None:
+        async def flush(request):
+            from memory_condense.interfaces.proxy_memory import MemoryProxyError
+            provider = request.headers.get('x-memory-provider','openai')
+            if provider not in (OPENAI,ANTHROPIC):
+                return JSONResponse({'error':{'message':'Unknown memory provider'}},status_code=400)
+            try:
+                result = await run_in_threadpool(memory.flush,provider,dict(request.headers))
+                return JSONResponse(result)
+            except MemoryProxyError as exc:
+                return JSONResponse({'error':{'message':str(exc)}},status_code=exc.status)
+        app.router.routes.insert(0,Route('/_memory/flush',flush,methods=['POST']))
     return app
 
 
@@ -656,6 +718,13 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--data-dir", default=os.environ.get("MEMORY_DATA_DIR", "data"))
+    parser.add_argument('--mode',choices=('observe','augment'),default='observe')
+    parser.add_argument('--inline-memory',action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument('--memory-max-sessions',type=int,default=8)
+    parser.add_argument('--memory-recent-exchanges',type=int,default=12)
+    parser.add_argument('--memory-recent-token-budget',type=int,default=8192)
+    parser.add_argument('--memory-empty-response-retries',type=int,choices=(0,1,2),default=2)
+    parser.add_argument('--assets-dir',help='Local model/runtime assets (otherwise saved setup configuration)')
     parser.add_argument("--capture-queue-size", type=int, default=256)
     parser.add_argument("--capture-queue-max-waiters", type=int)
     parser.add_argument("--capture-offer-timeout-seconds", type=float, default=1.0)
@@ -703,6 +772,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     args = parser.parse_args(argv)
 
     config = ProxyConfig(
+        mode=args.mode,
         upstreams={
             ANTHROPIC: args.anthropic_base_url,
             OPENAI: args.openai_base_url,
@@ -730,6 +800,24 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
         capture_drain_max_tokens=args.capture_drain_max_tokens,
         capture_enrichment_max_turns=args.capture_enrichment_max_turns,
     )
+    if args.mode == 'augment':
+        from memory_condense.interfaces.proxy_memory import MemoryProxy
+        from memory_condense.runtime.config import RuntimeAssets
+        from memory_condense.runtime.sessions import NativeProxySessions
+        assets = RuntimeAssets.resolve(args.assets_dir)
+        assets.require_files()
+        factory = NativeProxySessions(args.data_dir,recent_exchanges=args.memory_recent_exchanges,
+                                      recent_token_budget=args.memory_recent_token_budget,assets=assets)
+        memory = MemoryProxy(args.data_dir,factory,inline_memory=args.inline_memory,
+            empty_response_retries=args.memory_empty_response_retries,max_sessions=args.memory_max_sessions,
+            recent_token_budget=args.memory_recent_token_budget)
+        try:
+            app = build_app(config=config,memory=memory)
+            uvicorn.run(app,host=args.host,port=args.port,log_level='info')
+        finally:
+            if not memory.closed:
+                memory.close()
+        return 0
     condenser = MemoryCondenser(data_dir=args.data_dir)
     app: Starlette | None = None
     try:

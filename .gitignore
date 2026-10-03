@@ -33,6 +33,7 @@ eval_results/
 
 # Agent/test scratch artifacts
 /.agent_tmp/
+/.claude/worktrees/
 /.agent_test_tmp/
 /.pytest_cache/
 /.pytest-*/

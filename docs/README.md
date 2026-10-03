@@ -1,11 +1,38 @@
 # memory_condense — documentation tree
 
 **Status**: Living Document
-**Date**: 2026-09-30 (includes twelve-exchange full-cycle optimization)
+**Date**: 2026-10-02 (includes native-memory proxy integration)
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
+
+**Native-memory proxy:** the installable `memory-condense proxy` command connects the
+provider proxy to the evaluated resident ChatSession lifecycle: recall, recent
+context, durable input/output, hidden inline summaries, background ingestion,
+and source-linked learning. Both OpenAI Chat Completions and Anthropic Messages
+formats have integration tests, including native tools and retry recovery.
+Two live Sol replies exercised real local memory; the live tool cycle is blocked
+by gateway errors. Memory-mode SSE is buffered until validation completes.
+See [Provider Proxy and Transcript Import](02%20-%20Implementation/06%20-%20Provider%20Proxy%20and%20Transcript%20Import.md)
+for setup, client headers, evidence, and beta limits.
+Version 0.2.0 builds with `pixi build --output-dir dist`; its installed runtime
+does not depend on research scripts or checkout-relative assets. The root
+[installation guide](../README.md) covers the installer, model setup, and diagnostics.
+
+**Combined local runtime / FastEmbed:** FP32 BGE-M3 CPU query embedding improved
+from 0.341 s to **0.125 s** with FastEmbed, with close numerical agreement.
+One existing 1.115M-token memory and 100 live questions then exercised FastEmbed,
+losslessly compressed Qwen, a local Llama 3.2 3B reader, continuous ingestion,
+and learning together. Mean reply was **4.93 s**, but final ingestion drained
+for another **369.4 s**; the full cycle was **872.0 s**. All 100 packets included
+the required support quotes and all 100 learning updates survived reopening.
+The changed local reader regressed: assistant reference review found **64
+adequate / 20 incomplete / 16 incorrect or nonanswers**; its local automatic
+grader was unreliable. This does not replace earlier campaign scores or
+establish local-reader readiness. Details and the proposed shared-Qwen
+generative continuation are in
+[Research Log 262](10%20-%20Research%20Log/262%20-%202026-09-29%20-%20Live%20IO%20latency%20diagnosis%20and%20resident%20optimization.md).
 
 **Local reader screen:** Llama 3.2 3B Instruct Q4_K_M on the RTX 2070 SUPER
 answered 23/24 saved streaming packets correctly at a mean 1.68 s, compared
@@ -21,6 +48,38 @@ link their triggering input to exact original memory spans; completed exchanges
 feed those original chunks into the existing Hebbian co-access graph. See
 [Research Log 260](10%20-%20Research%20Log/260%20-%202026-09-29%20-%20Chat%20IO%20links%20inputs%20and%20recalls%20to%20original%20memory.md)
 for the interface, tested lifecycle, and integration limits.
+The live chat binding now defaults to **inline exchange memory**: its configured
+reader returns the visible answer and separate internal user/assistant summaries
+in one generation. Valid summaries are linked to exact input/output and recall
+IDs and reused during ingestion. `--no-inline-memory` retains the plain reader
+format. Existing benchmark runners keep their explicit reader configuration.
+The follow-up **one-history, 1.115M-token / 100-question Sol run scored 91/100
+automatically**. Assistant source review of all nine rejections identified seven
+grader errors, giving **98/100 adjusted**, with an ambiguous date left uncredited;
+this is not independent adjudication. The run accepted 99 inline summary pairs,
+reused all 198 summaries, and persisted all 100 learning updates. Mean reply was
+**12.01 s**; the **1,241.60 s** cycle included an **18.10 s** final drain and excluded
+startup/grading. The gateway buffers the complete output, so the five-second
+reply goal remains unmet. Long turns retain fragment summarization. See the
+inline-memory section of Research Log 262 for the contract, evidence, and limits.
+The October 1 ten-history/15-engineering campaign stopped after **87 completed
+answers** in its first history when the Sol route returned an empty completion
+for question 88. Grading and engineering execution had not started; 87 is a
+completion count, not an accuracy score. Four separate diagnostic calls succeeded,
+including three exact-request replays, and all 87 answers and learning updates
+survived reopening. Empty completions now have a distinct error and saved stream
+metadata. The upstream cause remains unconfirmed. The follow-up three-history
+run preserved those 87 answers and the failed request, completed history 1, then
+evaluated histories 2 and 3. It scored **94/100, 94/100, and 88/100: 276/300
+(92%) raw automated accuracy**, with required support present for **298/300**
+questions. All **300 learning updates** passed separate-process reopen audits;
+298 inline pairs were accepted and two used fallback. Mean reply was **10.39 s**.
+No new provider errors occurred across 213 new answers, 300 grades and three
+preflights. Its explicit policy permits at most two retries for
+confirmed empty completions; timeouts and ambiguous outcomes are not retried.
+All 100 questions per history remain in the scoring population. These scores
+have no manual grader corrections. Details and sealed evidence are in Research
+Log 262.
 Every new input, output, and tool result is saved immediately. The live chat
 binding now starts background preparation after each completed exchange, with
 **three bounded jobs and ordered publication**. Recall still runs for each

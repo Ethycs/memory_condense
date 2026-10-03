@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import hashlib
+import json
 
 import numpy as np
 
@@ -21,6 +22,43 @@ def summary_embedding_identity(encoder) -> str:
     """Bind the same model/checkpoint/execution controls at compile and query."""
     return canonical_json({"model_id": encoder.model_name, "model_revision": encoder.model_revision,
         "checkpoint_sha256": encoder.checkpoint_sha256, "execution": encoder.execution_identity})
+
+
+def compatible_summary_embedding(encoder, stored_identity: str) -> bool:
+    """Explicitly admit CPU/CUDA FP32 BGE reuse, retaining both real identities.
+
+    Callers must opt in after validating the device transition. This permits
+    floating-point rounding differences, not different models or precisions.
+    Historical vector provenance remains in the immutable seed receipt.
+    """
+    actual = summary_embedding_identity(encoder)
+    if actual == stored_identity:
+        return True
+    if getattr(encoder, 'allow_fp32_device_compatibility', False) is not True:
+        return False
+    # Optional export adapters validate their own export hashes and admission
+    # evidence, and explicitly name the source checkpoint they can query.
+    # This never replaces their real identity in newly written index receipts.
+    source_identity = getattr(encoder, 'validated_source_embedding_identity', None)
+    if source_identity is not None:
+        actual = source_identity
+    from memory_condense.modeling.embedding import (
+        DEFAULT_MODEL_NAME, DEFAULT_MODEL_REVISION, BGE_M3_CHECKPOINT_SHA256)
+    try:
+        current, stored = json.loads(actual), json.loads(stored_identity)
+        for value in (current, stored):
+            if (value['model_id'], value['model_revision'], value['checkpoint_sha256']) != (
+                    DEFAULT_MODEL_NAME, DEFAULT_MODEL_REVISION, BGE_M3_CHECKPOINT_SHA256):
+                return False
+            execution = value['execution']
+            if (execution['backend'] != 'sentence-transformers.encode-v1'
+                    or execution['output_dtype'] != 'float32'
+                    or execution['normalize_embeddings'] is not False):
+                return False
+        devices = {current['execution'].pop('device'), stored['execution'].pop('device')}
+        return devices <= {'cpu', 'cuda', 'cuda:0'} and current == stored
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
 
 
 class SemanticSectionIndex:

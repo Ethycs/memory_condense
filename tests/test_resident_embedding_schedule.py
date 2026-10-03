@@ -6,12 +6,13 @@ import numpy as np
 import pytest
 
 from memory_condense.domain.schemas import Chunk
-from tools.engineering_research_resident import SharedEmbedding
+from tools.engineering_research_resident import RecallPriorityLock, SharedEmbedding
 from tools.evaluate_chat_io_batch12 import answer_json
 
 
-def encoder():
-    return SimpleNamespace(model_name='fixture',model_revision='v1',checkpoint_sha256='test',execution_identity={})
+def encoder(device='cuda'):
+    return SimpleNamespace(model_name='fixture',model_revision='v1',checkpoint_sha256='test',
+                           execution_identity={'device':device})
 
 
 def chunks(count):
@@ -19,37 +20,117 @@ def chunks(count):
             for i in range(count)]
 
 
-def test_query_runs_before_next_background_chunk_batch():
-    base=encoder()
-    entered, query_arrived=Event(),Event()
+def wait_for_queue(lock, *, foreground=0, background=0):
+    # Observe real requests; do not synthesize query priority in the test.
+    with lock._condition:
+        assert lock._condition.wait_for(lambda: len(lock._foreground)==foreground
+                                       and len(lock._background)==background, timeout=5)
+
+
+@pytest.mark.parametrize('device,batch_size', [('cpu',1),('cuda',8)])
+def test_query_runs_before_already_queued_background_jobs(device,batch_size):
+    base=encoder(device)
+    entered, release=Event(),Event()
     order=[]
     def embed(values):
         order.append('batch')
         if len(order)==1:
             entered.set()
-            assert query_arrived.wait(5)
+            assert release.wait(5)
         return [c.model_copy(update={'embedding':[1.,2.]}) for c in values]
     base.embed_chunks=embed
     base.embed_query=lambda text:order.append('query') or np.asarray([1.,2.])
     shared=SharedEmbedding(base)
-    def query():
-        with shared._query_condition:
-            shared._query_waiters+=1
-            query_arrived.set()
+    population=chunks(batch_size*4)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        first=pool.submit(shared.embed_chunks,population[:batch_size*2])
         try:
-            with shared.model_lock:
-                return base.embed_query('question')
+            assert entered.wait(5)
+            second=pool.submit(shared.embed_chunks,population[batch_size*2:batch_size*3])
+            third=pool.submit(shared.embed_chunks,population[batch_size*3:])
+            wait_for_queue(shared.model_lock,background=2)
+            reader=pool.submit(shared.embed_query,'question')
+            wait_for_queue(shared.model_lock,foreground=1,background=2)
         finally:
-            with shared._query_condition:
-                shared._query_waiters-=1
-                shared._query_condition.notify_all()
+            release.set()
+        assert reader.result(timeout=5).tolist()==[1.,2.]
+        assert sum(len(f.result(timeout=5)) for f in (first,second,third))==len(population)
+    assert order==['batch','query','batch','batch','batch']
+    assert shared.metrics['query_calls']==1 and shared.metrics['chunk_batches']==4
+
+
+def test_foreground_exception_releases_model_for_waiting_background():
+    base=encoder()
+    entered,release=Event(),Event()
+    order=[]
+    def fail(query):
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError('encoder failure')
+    base.embed_query=fail
+    base.embed_queries=lambda values:order.append('summary') or np.asarray([[1.,2.] for _ in values])
+    shared=SharedEmbedding(base)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        background=pool.submit(shared.embed_chunks,chunks(16))
-        assert entered.wait(5)
-        reader=pool.submit(query)
+        reader=pool.submit(shared.embed_query,'question')
+        try:
+            assert entered.wait(5)
+            background=pool.submit(shared.embed_queries,['summary'])
+            wait_for_queue(shared.model_lock,background=1)
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError,match='encoder failure'):
+            reader.result(timeout=5)
+        assert background.result(timeout=5).tolist()==[[1.,2.]]
+    assert order==['summary']
+
+
+def test_nested_model_operation_finishes_when_recall_is_waiting():
+    lock=RecallPriorityLock()
+    entered,release=Event(),Event()
+    order=[]
+    def background():
+        with lock:
+            entered.set()
+            assert release.wait(5)
+            with lock:
+                order.append('nested')
+    def query():
+        with lock.foreground(): order.append('query')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        worker=pool.submit(background)
+        try:
+            assert entered.wait(5)
+            reader=pool.submit(query)
+            wait_for_queue(lock,foreground=1)
+        finally:
+            release.set()
+        worker.result(timeout=5)
         reader.result(timeout=5)
-        assert len(background.result(timeout=5))==16
-    assert order==['batch','query','batch']
+    assert order==['nested','query']
+
+
+@pytest.mark.parametrize('device,batch_size', [('cpu',1),('cuda',8),('auto',1)])
+def test_background_batches_preserve_summary_and_chunk_order(device,batch_size):
+    base=encoder(device)
+    calls=[]
+    def embed(values):
+        calls.append(len(values))
+        return np.asarray([[int(t),2.] for t in values],dtype=np.float32)
+    base.embed_queries=embed
+    base.embed_chunks=lambda values:[c.model_copy(update={'embedding':v.tolist()})
+        for c,v in zip(values,embed([c.text.removeprefix('word') for c in values]))]
+    shared=SharedEmbedding(base)
+    expected=[[float(i),2.] for i in range(10)]
+    assert shared.embed_queries([str(i) for i in range(10)]).tolist()==expected
+    assert [c.embedding for c in shared.embed_chunks(chunks(10))]==expected
+    assert max(calls)==batch_size
+    assert base.execution_identity=={'device':device}
+
+
+@pytest.mark.parametrize('size', [0,-1,True,1.5])
+def test_invalid_background_batch_size_rejected(size):
+    with pytest.raises(ValueError,match='positive integer'):
+        SharedEmbedding(encoder(),background_batch_size=size)
 
 
 def test_identical_text_reuses_vector_but_keeps_every_source_coordinate():

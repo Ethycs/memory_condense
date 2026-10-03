@@ -1230,3 +1230,660 @@ first token, which llama.cpp accounts for in prompt processing, and removes an
 inapplicable reader-correctness field from summary statistics. No calls were
 repeated for that reporting correction. `tools/probe_llama32_local.py` is the
 replay entry point. The local server closed and released its GPU allocation.
+
+### Unused Qwen coverage weights, 2026-09-30
+
+The current summary chunker loads six Qwen3-8B blocks and reads attention layer
+5, using zero-based numbering. Blocks 0–4 execute their attention and MLPs to
+produce layer 5's input. Coverage then stops at layer 5's attention pre-hook,
+after input normalization, and explicitly computes its Q/K/V/O readout. Layer
+5's MLP, its post-attention norm, and the synthetic model-final norm are never
+executed by this path, although their weights occupy GPU memory. Earlier MLPs
+and layer 5's value/output projections remain necessary for the current signal.
+K/V caching and gradients are already disabled; there is no generation head.
+
+A local probe replayed three saved-summary batches containing 17 candidates,
+with three measured repetitions per batch in each arm. Hooks rejected any
+baseline execution of the supposedly unused modules. The candidate replaced
+only those modules with parameter-free guards that raise if executed. **Every
+QK score, OV magnitude, head weight, transport-vector element, candidate order,
+and workspace counter matched exactly.** No precision or earlier-layer weights
+changed.
+
+| Allocation, decimal GB | Baseline | Unused weights removed |
+| --- | ---: | ---: |
+| Qwen GPU parameter bytes | 2.315 | 2.013 |
+| Qwen process peak allocated bytes | 2.495 | 2.193 |
+| CPU embedding table bytes | 1.245 | 1.245 |
+| Mean measured coverage call | 106.54 ms | 106.53 ms |
+
+The measured saving was **302,006,272 bytes**, about **302 MB / 288 MiB**:
+301,989,888 bytes in the unused MLP and 8,192 bytes in each unused norm. That
+is approximately 13% of Qwen's GPU parameter allocation. The probe did not load
+BGE or Llama, so its peak is not the complete memory-system footprint. Latency
+was unchanged, consistent with removing resident weights that were already
+skipped during execution. Production construction and defaults remain unchanged;
+any integration must explicitly restrict pruning to coverage use because the
+generic encoder's residual/capture APIs can execute these modules.
+
+The earlier [association layer sweep](03%20-%202026-08-16%20-%20Live%20Qwen%20head%20memory%20smokes.md)
+favored layer 1 for selected-head association links, while layer 5 performed
+better for residual/CAV entry. The [two-layer answer pilot](15%20-%202026-08-18%20-%20Policy-locked%201M-context%20answer%20pilot.md)
+scored 10/10 development questions under its older retrieval policy. These are
+grounds for testing two layers, not evidence that two layers preserve today's
+summary chunking. The first two complete blocks contain 771,785,728 FP16 bytes;
+removing their analogous unused final MLP and post-attention norm would leave
+469,787,648 GPU weight bytes, plus the unchanged CPU embedding table. These
+two-layer figures are parameter counts, not measured runtime or quality results.
+
+Evidence: `eval_results/qwen-unused-memory-20260930-r2/report.json` and its
+sealed before/after outputs; entry point `tools/probe_qwen_unused_memory.py`.
+The first attempt stopped during artifact serialization before pruning; r2
+corrected the output container and completed. The three existing early-exit
+regression tests pass. No provider calls, history rebuilds, answer evaluations,
+or production changes were made. The probe process exited and released GPU
+memory. Llama/Qwen co-residency remains unmeasured.
+
+### Lossless GPU weight window, 2026-09-30
+
+The user clarified that the requested weight window must use **lossless
+compression**, preserving the current FP16 values. An initial quantization
+probe was stopped and its experimental driver removed. No quantization was
+integrated. NVIDIA nvCOMP 5.3.0 was downloaded into an isolated cache, with both
+official wheel hashes verified; the project environment was not modified.
+[nvCOMP](https://docs.nvidia.com/cuda/nvcomp/) provides GPU lossless codecs, and
+its [Python API](https://docs.nvidia.com/cuda/nvcomp/py_api.html) permits reusable
+decompression configurations and decoding into existing device buffers.
+
+The completed probe covers all **39 used linear matrices**: the five full
+blocks and the final attention readout. Norms and CPU token embeddings retain
+their existing representation. ANS-compressed buffers remain on GPU. Each
+linear operation restores its matrix, executes the same FP16 GEMM, and releases
+the expanded matrix. The largest matrix is **100,663,296 bytes**. The optional
+byte-plane layout separates the two bytes of each FP16 value before compression
+and reverses that permutation after decoding; it changes no bits. FP32 attention
+reductions remain unchanged.
+
+| Matched three-batch measurement | Pruned FP16 baseline | ANS plain | ANS byte planes |
+| --- | ---: | ---: | ---: |
+| Linear weight storage, decimal GB | 2.013 | 1.625 | **1.429** |
+| Live allocated GPU memory, decimal GB | 2.022 | 1.640 | **1.439** |
+| Peak tracked allocation, decimal GB | 2.192 | 1.873 | **1.738** |
+| Mean coverage call | 96.78 ms | 119.48 ms | **151.91 ms** |
+| Restored matrices byte-exact | baseline | 39/39 | **39/39** |
+| Linker outputs exactly equal | baseline | 17/17 | **17/17** |
+
+The byte-plane arm saves **584,633,582 weight bytes (29.0%)** and **454,041,600
+peak allocation bytes (20.7%)** against the already-pruned baseline, adding
+**55.13 ms** per measured call. That is **1.34 GiB live / 1.62 GiB peak**.
+All candidate orders, scores, head weights, transport vectors, and workspace
+counters match. Three saved batches and three repetitions per arm were used;
+no histories, answers, or summaries were regenerated. Compression preparation
+and byte checks are excluded from warm call timing. CPU copies exist solely
+as experimental controls between arms; forwards transfer no weight matrices
+from the host. The existing CPU embedding lookup is unchanged.
+
+Two allocation details matter. nvCOMP's DLPack export exposes backing capacity,
+not just compressed length, so compressed buffers are compacted once to their
+actual byte length. Compression also needs more scratch than decoding: the r2
+probe uses separate codecs and releases the setup codec before measurement.
+The r1 probe retained that workspace and therefore understated the saving.
+nvCOMP array allocations use a Torch-backed allocator for tracking. Native
+codec allocations may remain separate, so reports also include device-free
+snapshots. The CUDA allocator reserved about 2.00 GB after the byte-plane arm;
+reserved memory is distinct from the 1.74 GB peak live allocation.
+
+Combined residency is still an estimate. Qwen's measured 1.62 GiB peak plus
+Llama's earlier roughly 3.0 GiB incremental device use gives about **4.6 GiB**.
+GPU-resident BGE adds roughly 2.1 GiB of weights, taking the model budget to
+about **6.7 GiB before desktop and other overhead**. Keeping BGE permanently on
+CPU is a candidate placement, but neither that configuration nor simultaneous
+Llama/Qwen residency was exercised here. No production loader or defaults changed.
+
+Artifacts: `eval_results/qwen-lossless-window-20260930-r2/report.json`, paired
+sealed output files, and `tools/probe_qwen_lossless_window.py`. All restored
+weights and linker outputs passed exact comparisons, sealed artifacts verified,
+and `git diff --check` passed. The probe exited and released its GPU allocations.
+
+### BGE permanently on CPU: measured latency tradeoff, 2026-09-30
+
+The same pinned BGE-M3 checkpoint was replayed in FP32 on the Ryzen 9 3900X
+and RTX 2070 SUPER. Inputs were 24 saved live-IO queries, 17 summaries in three
+batches of 4–8, and 16 raw chunks in two batches of eight. Each workload ran
+twice after warmup: 48 query calls, six summary batches, and four chunk batches.
+No histories were rebuilt and no provider calls were made.
+
+| Mean warm embedding time | GPU | Tuned CPU | Added time |
+| --- | ---: | ---: | ---: |
+| Single recall query | 0.037 s | **0.341 s** | **0.304 s** |
+| Summary batch, 4–8 texts | 0.113 s | **1.795 s** | **1.683 s** |
+| Raw chunk batch, eight texts | 0.304 s | **5.843 s** | **5.539 s** |
+
+CPU query p95 was 0.460 s and maximum was 0.546 s; the longest eight-chunk
+batch took 6.087 s. BGE token lengths were 26–53 for queries, 36–210 for
+summaries, and 11–351 for chunks. These are component measurements excluding
+model loading and queue wait, not end-to-end chat or answer-accuracy results.
+The completed GPU control from r1 was reused after verifying identical input
+texts, sealed metadata, and vector hashes.
+
+CPU thread configuration materially changes the result. This PyTorch build
+uses a native ATen thread pool: setting four ATen threads left MKL at one
+effective thread. The initial attempt to change ATen counts after computation
+was stopped when the runtime rejected those changes. A fresh probe kept ATen
+at four and tested 1, 4, 8, and 12 MKL threads, checking effective counts with
+`torch.__config__.parallel_info()`. It selected 12 using the recorded objective
+of four query calls plus one eight-summary batch. That pilot improved the
+eight-summary batch from 14.298 s with one MKL thread to 3.350 s with twelve.
+The override uses
+[MKL_Set_Num_Threads_Local](https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-c/2024-0/mkl-set-num-threads-local.html),
+which applies to the calling thread; production integration must configure
+the actual embedding worker. No model weights or numerical precision changed.
+
+All 57 compared vectors were finite. Minimum CPU/GPU cosine agreement was
+0.999999999989 and maximum absolute difference was 5.67e-7. Outputs are
+numerically very close, not bit-identical; this does not establish full-index
+ranking or answer equivalence. CPU placement removes **2,271,019,008 bytes
+(2.115 GiB)** of BGE weights from the GPU. The CPU arm had zero Torch GPU
+allocation and about 2.35 GB process RSS.
+
+Foreground recall uses one query embedding, making the isolated 0.304 s
+increase promising. Background ingestion is the concern: the shared model
+lock can hold recall behind an approximately six-second chunk batch. Smaller
+CPU batches of one, two, and four long chunks averaged **0.799, 1.475, and
+2.753 seconds** respectively. Smaller batches plus verified foreground queue
+priority should be tested before adopting CPU placement. Queue contention,
+sustained ingest throughput, and simultaneous Llama/Qwen execution were not
+measured here.
+
+Production remains unchanged. The staged embedding loader currently forces
+CUDA and stored embedding identity includes device placement. Supporting CPU
+against existing GPU-built indexes requires an explicit compatibility decision;
+the probe neither bypassed that check nor rebuilt indexes.
+
+Evidence: `eval_results/bge-cpu-placement-20260930-r2/report.json`, the sealed
+GPU control in `eval_results/bge-cpu-placement-20260930-r1`, and their hashed
+vector files. `tools/probe_bge_cpu_placement.py` reproduces the experiment;
+`--baseline` reuses a compatible sealed GPU control. The r2 directory preserves
+the exact measured driver. Artifact integrity and vector hashes were verified.
+The benchmark process exited and released its allocations.
+
+### Recall admission and CPU ingestion scheduling repair, 2026-09-30
+
+The requested 1M-token evaluation was paused before launch to repair ingestion
+scheduling. The old scheduler checked for waiting queries before acquiring a
+separate model lock. Several background jobs could pass that check and queue
+on the lock before a recall arrived, defeating the intended foreground priority.
+
+`SharedEmbedding` now uses a reentrant admission gate with foreground and
+background FIFO queues under one condition. A running operation completes;
+waiting recalls then precede all waiting background jobs, including earlier
+arrivals. Nested model operations retain ownership and exceptions release the
+gate. Qwen's existing shared model operations use the same admission gate.
+CPU and unresolved-device background batches default to **one text per call**;
+explicit CUDA placement retains batches of eight. Summary embedding and raw
+chunk embedding both yield between batches. Concurrent chunk-cache access is
+also synchronized without holding that cache lock during model execution.
+
+This changes scheduling, not the configured encoder identity, weights, reader,
+or placement defaults. CPU BGE placement and lossless Qwen compression remain
+separate experimental configurations. Small batches bound the amount of work
+ahead of recall, not its wall time for arbitrary text lengths. Sustained
+foreground saturation can still delay ingestion; the recent-context window
+and backlog need end-to-end measurement.
+
+The real CPU contention probe reused the earlier saved inputs: twelve queries,
+sixteen chunks in two background jobs, and seventeen summaries in a third.
+All four calling threads were warmed and configured with twelve MKL threads
+and four ATen threads before measurement. No generation or history rebuild
+occurred.
+
+| Measured CPU contention result | Value |
+| --- | ---: |
+| Mean / maximum query queue wait | **0.563 / 0.883 s** |
+| Mean / maximum query embedding including wait | **0.922 / 1.355 s** |
+| Longest raw chunk / summary model call | **0.887 / 0.740 s** |
+| All twelve query calls finished | **11.077 s** |
+| All 33 background texts and twelve queries drained | **24.487 s** |
+| GPU allocation in the probe | **0 bytes** |
+
+The twelve query vectors exactly match the saved CPU control. Chunk and summary
+vectors remain numerically equivalent: minimum cosine 0.9999999999966 and
+maximum absolute error 2.80e-7. Changed batch padding can change floating-point
+rounding. All work completed with no dropped texts. These are component
+contention results, not answer latency or a sustained chat throughput result;
+the earlier approximately six-second eight-chunk call is not a matched old
+scheduler contention control.
+
+Before the fix, all eleven existing scheduling/resident tests passed after
+redirecting pytest temporary storage into the workspace; the initial default
+temporary directory was inaccessible. After the fix, **26 focused tests pass**,
+covering already-queued background jobs, real foreground admission, exception
+release, reentrancy, CPU/GPU batch order, source ownership, resident publication,
+and streaming persistence. `git diff --check` also passes.
+
+Evidence: `eval_results/bge-recall-schedule-20260930-r1/report.json` and its
+sealed implementation/input plan; entry point `tools/probe_bge_recall_schedule.py`.
+The probe exited successfully. The 1M/100-question evaluation has not started.
+
+### FastEmbed CPU BGE-M3 comparison, 2026-09-30
+
+The requested FastEmbed comparison is complete. FastEmbed 0.8.1 has no built-in
+BGE-M3 entry, so its custom-model API loads a pinned
+[BGE-M3 ONNX export](https://huggingface.co/onnx-community/bge-m3-ONNX)
+at revision `25b9af8e87a38eb120cfe87125383677b9cd309e`. The graph contains
+389 FP32 initializers and no quantization operators. CLS pooling, unit
+normalization, and the 8,192-token tokenizer limit match the measured PyTorch
+behavior. Model and tokenizer file hashes are sealed. Packages are isolated
+under `.cache/experiments/fastembed/package`; the main environment is unchanged.
+
+The same 24 queries, 17 summaries, and 16 raw chunks from the preceding CPU
+experiment were replayed with the same repetition counts. A small 4/8/12-thread
+pilot selected twelve ONNX Runtime threads on the recorded latency objective.
+
+| Mean CPU model time | PyTorch, tuned MKL | FastEmbed / ONNX Runtime |
+| --- | ---: | ---: |
+| Single query, 48 calls | 0.341 s | **0.125 s** |
+| Summary batch, 4–8 texts, six calls | 1.795 s | **1.481 s** |
+| Eight raw chunks, four calls | 5.843 s | **5.130 s** |
+
+Query embedding is **2.72 times as fast** in this component experiment.
+Query p95 is 0.174 s. All 57 vectors agree with the pinned PyTorch CPU
+control to minimum cosine 0.9999999999919 and maximum absolute difference
+4.70e-7. This is numerical agreement, not bit equality or an accuracy result.
+Four individual chunk calls averaged 0.487 s, with a 0.623 s maximum; their
+population differs from the full chunk batches. Small background batches
+remain necessary to keep a long batch from blocking foreground recall.
+
+`tools/fastembed_bge.py` validates this sealed admission and exposes the real
+ONNX backend identity. An explicit opt-in policy permits querying the earlier
+pinned FP32 BGE CPU/CUDA indexes. Historical source receipts retain their
+original provenance, while new receipts name the FastEmbed backend and its
+compatibility evidence. The default legacy application loader is unchanged;
+the new combined local runtime selects FastEmbed. No history was rebuilt and
+no provider inference calls were made in the component comparison.
+
+Evidence: `eval_results/fastembed-bge-cpu-20260930-r1/report.json`,
+`admission.json`, the hashed vector file, and `tools/probe_fastembed_bge_cpu.py`.
+The combined local runtime and compatibility/scheduling changes pass **34
+focused tests**. The following end-to-end evaluation must establish behavior
+under concurrent ingestion, Qwen attention, and local generation separately.
+
+The combined runner is `tools/evaluate_chat_io_local100.py`. It reuses one
+authenticated 1,115,343-token seed and continuously ingests new IO into a C:
+working copy. BGE stays on CPU, compressed Qwen and Llama stay on GPU, and
+generation uses only a loopback llama.cpp server. Historical seed summaries
+retain their earlier model provenance; this is not a fresh local rebuild of
+the million-token source. New local summaries use source-checked extracts,
+with exact-prefix fallbacks recorded separately. Extract validity does not
+establish that the chosen quote contains the most useful information.
+
+Two interrupted attempts are retained transparently. `chat-io-local100-20260930-r1`
+failed before answering because the benchmark adapter omitted the streaming
+published-event count. Its regression test now covers that contract.
+`chat-io-local100-20260930-r2` stopped after 22 answers when the benchmark's v7
+packet envelope was found to bypass authenticated recall-summary reuse. The
+corrected adapter stores the ordinary canonical exact-source envelope, while
+the reader receives the v7 projection of those same delivered spans. All 22
+saved packets passed an offline source-validated alias replay. Local extract
+parsing also accepts JSON arrays and fenced JSON while retaining exact-source
+checks, and generation limits scale with the number of input fragments.
+Neither interruption was selected using accuracy grades. The complete attempt
+is recorded separately under `chat-io-local100-20260930-r3`.
+
+The r3 evaluation completed all 100 answers, continuous native hierarchy
+publication, and all 100 learning updates, using only local inference.
+
+| Combined local runtime result | Measured value |
+| --- | ---: |
+| Cold admission and model warmup, excluded below | 136.68 s |
+| Mean / median reply | **4.928 / 5.070 s** |
+| Reply p95 / maximum | 7.046 / 20.900 s |
+| Replies below five seconds | 48 / 100 |
+| Answer window, including artifact overhead | 502.64 s |
+| Final ingestion and learning drain | **369.40 s** |
+| Full measured cycle | **872.03 s** |
+| Unpublished completed exchanges at the end of answering | 47 |
+| Expected support quotes present | **100 / 100 packets** |
+| Packet text identical to the earlier PyTorch/Sol run | **98 / 100** |
+
+The test meets a five-second **mean reply** target narrowly; it does not meet
+that limit consistently or establish that ingestion keeps pace. New IO is
+retained in recent context while publication lags, so the reader's context
+grows beyond twelve exchanges during this stress test. Mean reader input was
+7,529 model tokens. The largest reply spike was reader prompt processing,
+with negligible GPU admission wait, not CPU query embedding.
+
+BGE's 101 query calls, including warmup, used 11.28 s of compute and 15.25 s
+of queue wait; maximum query wait was 0.550 s. Raw embedding used **574.68 s**
+for 1,570 uncached chunks; summary embedding used 43.89 s. Thirteen Qwen
+attention calls took **6.05 s** total. Llama handled 100 answers and 55 summary
+merges; there were no raw summarizer calls after authenticated recall reuse
+was restored. Eighty-four merge-fragment fallbacks retained exact source
+prefixes. Those fallbacks preserve provenance, not necessarily useful coverage.
+The figures overlap and must not be added as disjoint wall-clock stages.
+
+The main remaining ingestion cost is re-indexing delivered recall copies.
+They account for **260,468 of 268,217 new body tokens (97.1%)** and **1,434 of
+1,734 new raw chunks (82.7%)**. The journal must retain these delivered packets,
+but authenticated original-source pointers provide a candidate route to reuse
+existing index entries. That optimization is not implemented by this experiment.
+
+The separate-process audit recovered all **5,821 events**, including 400 new
+IO/recall/feedback events, 100 packets, 1,627 exact original-source pointers,
+and 100 Hebbian updates. Both native and parent receipts reconstruct exactly;
+the original million-token source remains unchanged. There were no outstanding
+events or feedback after the drain, and no OOM or per-turn model transfers.
+
+Reader quality does **not** preserve the earlier 94/100 result. The local
+Llama grader reported 34/100 but made obvious semantic-equivalence errors.
+Codex's review of all fixed question/reference/prediction triples found **64
+adequate answers, 20 incomplete, and 16 incorrect or nonanswers**. Under that
+stated rubric the local grader falsely rejected 31 adequate answers and
+accepted one incomplete answer. This is an assistant reference review, not
+an independent human adjudication or the earlier Sol grader. It must not
+replace historical campaign scores. Every packet contained the required
+support, so these observed answer failures occur after evidence delivery.
+Examples include omitted multi-part facts, an earlier word-limit correction,
+and answers copied from unrelated recent topics. The changed reader model
+and appended recent-context prompt are both confounded; no ablation establishes
+their individual contributions. FastEmbed is supported by this result, while
+the local Llama reader configuration is not ready to replace the prior reader.
+
+Evidence in the r3 directory includes `report.json`, `cycle.json`,
+`reference-review.json`, `retrieval-comparison.json`, `new-io-cost.json`, and
+`reopen-audit.json`. All 447 measured source files are retained under
+`implementation/` with their original hashes. Subsequent cleanup fixes release
+the compressed Qwen weights when a runtime closes, without changing inference.
+Repeated real-device checks retained exact pre/post-compression score receipts.
+Native allocator buffers still retain 8.125 MiB per runtime lifecycle until
+process exit; full allocator teardown is not claimed. See
+`eval_results/local-runtime-close-20260930-r5/assessment.json`. Earlier cleanup
+checks are retained: two rejected probes added a field to the strictly bound
+encoder identity; the callback now belongs to the runtime wrapper instead.
+The focused integration regression suite passes **46 tests**.
+
+### Shared Qwen prefix with a quantized generative continuation: feasibility
+
+The proposed replacement for the separate Llama reader is architecturally
+possible, but has not been implemented or benchmarked. The current local
+reader is Llama 3.2 **3B**, and the pinned Qwen3-8B has **36 layers**. Attention
+routing can stop at layer 5; generation must restore the omitted layer-5 MLP
+and normalization, run layers 6–35, and apply the final normalization and output
+head. Later quantization cannot retroactively affect the earlier attention
+signal when the prefix input, weights, and computation are unchanged.
+
+The installed llama.cpp quantizer supports per-tensor dtype overrides through
+`--tensor-type` and `--tensor-type-file`, permitting FP16 prefix weights with
+a Q4_K_M remainder. Its
+[quantizer documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md)
+and [Qwen's GGUF model card](https://huggingface.co/Qwen/Qwen3-8B-GGUF)
+support that format choice. This does not provide a ready bridge from our
+PyTorch/nvCOMP attention prefix to a llama.cpp decoder; shared weights and
+intermediate attention access need runtime integration and score validation.
+
+Local safetensors headers contain 1,157,678,592 parameters in the full six-layer
+prefix (**2.156 GiB at FP16**), 5,788,392,960 in the remaining 30 layers, and
+622,329,856 each in the embedding table and output head. A pure Q4_K storage
+lower bound for the tail is 3.032 GiB; Q4_K_M adds some higher-precision tensors.
+Keeping the embedding table on CPU and extending the measured lossless prefix
+compression gives a rough **5–6 GiB GPU weight budget**, before KV cache,
+workspace and desktop use. Fit on this 8GB GPU is therefore not established;
+shorter context or some CPU placement may be needed. Non-thinking generation
+is supported by [Qwen](https://huggingface.co/Qwen/Qwen3-8B).
+
+This proposal shares model weights. Summary-routing inputs and reader prompts
+differ, so their activations are not generally reusable. Every generated token
+still traverses the complete model. Quantization should reduce weight traffic
+relative to full-precision Qwen, but speed relative to the current 3B reader,
+answer quality, and the effect on attention require a measured packet replay.
+It also leaves the separately measured CPU raw-ingestion bottleneck to solve.
+
+### Inline frontier answer and exchange summaries (2026-09-30)
+
+The live JSONL binding now requests one structured generation from its configured
+reader: `answer`, followed by `memory.user` and `memory.assistant`. Each memory
+channel contains a routing summary capped at 128 tokens and one to four exact
+support quotes from its own source. The prompt preserves requests, proposals,
+reported outcomes, negation, and uncertainty; assistant statements do not become
+user assertions. Quote validation establishes source binding, not factual truth
+or semantic entailment of every summary claim.
+
+`ChatIO` returns only the decoded answer and existing provider metrics. It saves
+the full generated envelope internally alongside the exact user/assistant text,
+source hashes, input/output event IDs, recall packet IDs, and model/request
+provenance. An acknowledged retry returns the saved visible response without
+another provider call. Internal summaries do not enter the recent-chat text or
+raw hydration. Ordinary recall learning still records co-access, not correctness.
+
+The compiler consumes valid inline summaries for whole turns that fit its
+existing 2,048-token raw fragment boundary. This also reuses the frontier summary
+for short turns. Larger turns retain normal fragment summarization so retrieval
+granularity is preserved. Later hierarchical merges still run as needed; this
+change removes eligible raw-summary requests, not every compilation operation.
+Already published user turns stay unchanged under eager ingestion. A valid
+answer with missing, oversized, or incorrectly quoted memory is retained and
+uses ordinary ingestion. Truncated or ambiguous response envelopes fail explicitly.
+
+The default is enabled in `tools/engineering_research_chat.py`; the diagnostic
+switch is `--no-inline-memory`. Other readers use `generate_inline` explicitly,
+so existing benchmark runners and their frozen results are not silently changed.
+The current gateway/JSONL transport buffers the entire response. Answer-first
+token streaming has not been implemented, and the shared output cap must cover
+both answer and summary. No visible latency improvement is claimed.
+
+The one-call Sol check is stored in
+`eval_results/inline-memory-sol-smoke-20260930-r1/report.json`. It requested a
+reversible staging deployment plan without execution. Sol returned the plan and
+two accepted summaries in **17.63 seconds**, using **412 input / 283 output
+tokens**, with no reasoning tokens. Both summaries became source-bound atoms
+without an additional raw-summary generation. This is one synthetic protocol
+check, not an accuracy benchmark or a controlled timing comparison.
+
+The probe initially wrote its atom list in the wrong artifact envelope. Offline
+finalization reused the saved generation and wrote `compiled-atoms.json` and
+`report.json`; the failed `atoms.json` is retained for audit and is not an
+authoritative result. No provider retry occurred. Focused tests cover hidden
+output, cached retries, fallback behavior, source/role binding, independent
+caches, fragment boundaries, resident publication, original-text hydration,
+and exact cold reopening.
+
+#### One 1M memory, 100 inline Sol answers: completed evaluation
+
+`eval_results/chat-io-inline-sol100-20260930-r1/` contains the completed run.
+It reused one authenticated **1,115,343-token** history and its 100 questions;
+no history was re-ingested. Sol (`codex_sdk/gpt-5.6-sol`, reasoning disabled)
+generated the answer and hidden summaries in each of 100 calls. Grading began
+after all answers and the final ingestion drain were sealed, using 100 separate
+Sol calls at concurrency three. A single gateway warmup was additional.
+Local compilation retained FastEmbed BGE-M3 on CPU, the losslessly compressed
+six-layer Qwen attention prefix, and Llama extractive hierarchy merges.
+
+| Measure | Result |
+| --- | ---: |
+| Original automatic grade | 91/100; no invalid grades |
+| Required support present in packet | 100/100 |
+| Accepted inline summary pairs | 99/100; one quote-validation fallback |
+| Inline summaries actually reused | 198: 99 user, 99 assistant |
+| Mean / median / p95 reply | 12.010 / 11.216 / 17.826 s |
+| Maximum reply / replies under five seconds | 27.037 s / 0 |
+| Mean reader request | 10.485 s |
+| Mean input / combined answer-and-memory output | 3,784.02 / 126.52 tokens |
+| Answer window / final drain | 1,223.502 / 18.100 s |
+| Complete measured cycle | 1,241.602 s |
+| Cold startup, excluded from cycle | 222.216 s |
+| Maximum ingestion backlog | Three completed exchanges |
+| Separate raw-summary calls / hierarchy merge calls | 0 / 15 |
+
+Assistant source review covered every rejected answer. Five rejections called
+additional facts unsupported even though the delivered user statements explicitly
+contained them: stand-up practice (ordinal 18), abstract-art events (22), nutrition
+requests (45), a proposed painting hobby (62), and Narnia's personification (67).
+Two rejections demanded details the question did not request: the photo inside
+the locket (21), and the physics-summary subject matter when the question asked
+only for format and word count (34). These seven corrections give **98/100
+adjusted**. The original **91/100** is retained unchanged. This is an assistant
+review of misses, not independent human adjudication or a regrade of passing
+answers. The purchase sentence's "last week" scope (53) remains ambiguous and
+uncredited. The road-bike answer (65) omitted the user's existing Strava app.
+`source-review.json` binds every conclusion to exact quotes in the saved packet.
+
+Separate-process reopening reconstructed both index receipts and verified
+**5,821 events, 100 packets, 1,627 original-source pointers, and 100 Hebbian
+updates**, with zero pending ingestion or feedback. The original source store
+was unchanged. All 198 inline atoms were found in the compiler cache. The sole
+invalid summary pair used ordinary ingestion; it did not cause another answer
+generation. The local server stopped after grading and GPU use returned to
+about 2.5 GiB including the desktop.
+
+The gateway's mean first-content time was **10.484 s**, nearly identical to its
+10.485 s total reader time. Output is effectively buffered upstream; changing
+the chat frontend alone cannot provide answer-first delivery through this route.
+This configuration does not meet the five-second reply target. Its shorter
+final drain must not be attributed solely to inline summaries: slower answers
+also give background ingestion more time to catch up.
+
+Compared with the earlier 94/100 Sol run, the question population is identical
+and **98/100 raw evidence packets match exactly**. That earlier run lacked live
+native hierarchy refresh and the recent-chat tail, so this is not a controlled
+inline-on/off comparison. Historical as-of questions exclude the newly generated
+I/O from retrieval. The run validates answer regression and ingestion of inline
+summaries; it does not measure their future recall quality or establish that a
+model understands its own summaries better.
+
+Evidence: `report.json`, `assessment.json`, `source-review.json`,
+`historical-comparison.json`, `reopen-audit.json`, and `verification.json`.
+All **450 frozen implementation files** were archived, and **1,615 sealed JSON
+artifacts** verified before publication of the verification record itself.
+
+## October 1 larger-battery stop and gateway diagnosis
+
+**Status:** Investigation complete; campaign remains stopped; upstream cause
+unconfirmed. The ten existing 1M histories were queued for 100 questions each,
+followed by 15 matched engineering tasks (30 actor arms). The engineering bundle
+contains the ten original engineering checkpoints and five additional checkpoints
+from five further archive families. All fifteen source cutoffs and rubric anchors
+were audited before engineering execution; those tasks have not run.
+
+`eval_results/inline-battery-20261001-r1/` stopped in history 01 after **87
+completed answers**. The next request, ordinal 87 / question 88, returned empty
+content, `finish_reason=stop`, no usage and no first-content timestamp after
+6.069 seconds. The inline parser then reported a JSON-envelope error. No grading
+had begun: neither an 87% accuracy score nor a completed 1,000-question result
+exists. The user-requested operational stop prevented the remaining histories
+and engineering tasks from starting.
+
+The failed prompt was 3,386 project-proxy tokens with a 1,536-token output
+budget. It asked about the planned Arkansas River fishing trip; the previous
+completed inline run answered the same question successfully. Separate diagnostics
+preserved the exact failed prompt and did not replace any benchmark answer:
+
+| Diagnostic | Result | Request time |
+| --- | --- | ---: |
+| Exact request, streaming | Answer and both summaries accepted | 8.785 s |
+| Exact request, non-streaming | Answer and both summaries accepted | 6.106 s |
+| Simple inline-summary control | Answer and both summaries accepted | 6.406 s |
+| Exact request, streaming again | Answer and both summaries accepted | 6.489 s |
+
+All four HTTP responses were 200. For every probe, SDK-assembled text exactly
+matched the saved raw response. All three exact-request replays answered
+"guided float trip" and "brown trout." The non-streaming route returned zero
+input and output usage despite producing text; switching transports is therefore
+not an established reliability or accounting repair.
+
+The older September 25 engineering battery already contains the same
+empty-content/stop/no-usage pattern: **22 E07 memory replies and 16 E07
+full-context replies**, among 123 actor calls overall. These precede the inline
+summary protocol. Together with the successful exact replays, this points toward
+an intermittent no-answer failure on the gateway/provider route. It does not
+identify the internal failing component or establish an empty-response rate.
+The original failed response did not retain raw chunks or the gateway request ID,
+so refusal/tool-only output or an upstream adapter defect cannot be retrospectively
+distinguished with certainty.
+
+A separate-process partial-lifecycle audit verified **5,772 journal events and
+stored turns**, all **87 completed answers**, **88 recall packets**, **1,418 exact
+original-source pointers**, and **87 applied Hebbian updates**, with no pending
+feedback. Both index receipts loaded. The failed input, recall and error are
+durable; there is no invented assistant output for question 88. Of the completed
+answers, 85 had accepted inline pairs and two used ordinary-summary fallback.
+The local server shut down and GPU usage returned to about 2.4 GiB.
+
+The local reporting repair distinguishes empty completed responses from invalid
+JSON, unfinished output, refusal, reasoning-only output and tool-only output.
+Both evaluation gateway adapters now retain parsed stream chunks and allowlisted
+gateway correlation headers. Successful visible text is unchanged, sensitive
+response headers are excluded, and **no automatic retry was added**. Targeted
+validation passed **34 tests**; `git diff --check` passed. The stopped campaign's
+original artifacts and archived implementation remain intact. A continuation
+must explicitly record the new implementation and retain the original failure;
+the diagnostic successes are not replacement benchmark answers.
+
+Evidence: [diagnosis and limitations](../../eval_results/inline-gateway-diagnosis-20261001-r1/assessment.json),
+[partial lifecycle audit](../../eval_results/inline-gateway-diagnosis-20261001-r1/partial-lifecycle-audit.json),
+and the four per-probe `wire.json` / `result.json` records in that directory.
+
+### Three-history continuation
+
+At the user's request, `eval_results/inline-three-20261001-r1` targets three
+completed 1M histories, with 100 questions and an independent persistence audit
+per history. History 1 clones the stopped store and journal, retains all 87
+completed answers byte for byte, and generates only the remaining 13. The
+failed question's original recall/error remain durable; its continuation uses a
+new recall linked to the existing input. Its audit therefore expects 101 packets,
+100 successful learning updates, and two extra operational events. Histories 2
+and 3 use their existing ingested stores and run all 100 questions. There is no
+historical reingestion.
+
+The frozen policy allows two additional attempts only after a confirmed terminal
+empty response. Each attempt retains its request, response, stream and error;
+successful recovery records bind the failed and successful requests. Refusal,
+reasoning-only, unfinished and ambiguous outcomes do not take this retry path.
+Reply timings include retry waits and attempts. The initial failed request and
+the interruption remain separately visible; history 1's cycle timing measures
+only its continuation, while its answer distribution includes the retained 87.
+Automated accuracy and provider reliability are reported separately. Diagnostic
+replays are excluded from benchmark answers.
+
+The continuation and bounded-retry checks, together with inline-memory and stop
+gate regression checks, passed **37 tests**. The campaign completed all three
+histories, grading, and separate-process persistence audits:
+
+| History | Raw body tokens | Automated correct | Required support complete | Mean reply | Accepted inline pairs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1, resumed | 1,115,343 | 94/100 | 100/100 | 10.91 s | 98/100 |
+| 2 | 1,111,235 | 94/100 | 100/100 | 10.04 s | 100/100 |
+| 3 | 1,151,461 | 88/100 | 98/100 | 10.21 s | 100/100 |
+| Total | Three separate histories | **276/300 (92%)** | **298/300 (99.3%)** | **10.39 s** | **298/300** |
+
+These are raw automated grades, with zero invalid grades and no manual score
+corrections. Of the 24 rejected answers, 22 had all recorded support quotes in
+their delivered packet. Complete support does not determine whether those
+rejections are reader failures or grader errors. The two support gaps were both
+in history 3: the requested cabinet-official quiz format (question 56) and the
+farm-finance budget template (question 60). Both answers were rejected.
+
+All 300 learning updates persisted. Audits reconstructed both native and parent
+index receipts, checked every journal event against stored turns, verified
+4,923 exact original-source pointers across 301 packets, and confirmed that all
+original histories were unchanged. The extra packet is the retained failed
+attempt in history 1. All 87 retained answers remained byte-identical, and all
+local model servers shut down after completion.
+
+Histories 2 and 3 took 1,035.63 and 1,046.56 seconds for their full answer,
+ingestion and learning cycles, including final drains of 17.67 and 13.19 seconds.
+These cycle times exclude startup and grading. History 1's remaining 13 answers
+and final drain took 160.38 seconds, including a 19.05-second drain; it has no
+single uninterrupted full-cycle measurement. Mean reply still exceeds the
+five-second target.
+
+There were **zero new provider errors** across 213 new answer requests, 300 judge
+requests and three gateway preflights. The bounded retry path was not needed in
+this campaign. The original empty response remains preserved; this successful
+continuation does not establish that the upstream intermittent fault is fixed.
+The exact evaluated implementation and test files are archived with the run.
+These three tests validate the QA lifecycle; the paused engineering battery is
+separate.
+
+Evidence: [sealed final verification](../../eval_results/inline-three-20261001-r1/final-verification.json),
+[campaign completion](../../eval_results/inline-three-20261001-r1/complete.json), and
+[implementation snapshot](../../eval_results/inline-three-20261001-r1/implementation-snapshot.json).

@@ -4,6 +4,41 @@ name = "memory_condense"
 platforms = ["win-64", "linux-64"]
 preview = ["pixi-build"]
 
+[package]
+name = "memory_condense"
+version = "0.2.0"
+description = "Memory-enabled OpenAI and Anthropic provider proxy"
+
+[package.build]
+backend = { name = "pixi-build-python", version = "*" }
+
+[package.host-dependencies]
+python = "3.12.*"
+hatchling = ">=1.26"
+
+# PyPI-only runtime additions are installed by packaging/install-proxy.ps1.
+[package.run-dependencies]
+python = ">=3.11,<3.13"
+numpy = ">=1.26,<3"
+pytorch-gpu = "2.7.1.*"
+cuda-version = "12.6.*"
+pydantic = ">=2.0,<3"
+sentence-transformers = ">=3.0"
+transformers = "4.57.6.*"
+huggingface_hub = ">=0.30,<1"
+safetensors = ">=0.5"
+accelerate = ">=1.0,<2"
+hnswlib = ">=0.8"
+pysbd = ">=0.3"
+litellm = ">=1.40"
+httpx = ">=0.28,<1"
+openai = ">=2.20,<3"
+truststore = ">=0.10.4,<0.11"
+tiktoken = ">=0.7"
+python-dotenv = ">=1.0"
+starlette = ">=0.40,<2"
+uvicorn = ">=0.30,<1"
+
 [system-requirements]
 cuda = "12.0"
 

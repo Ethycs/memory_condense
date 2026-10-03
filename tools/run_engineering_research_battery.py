@@ -249,7 +249,8 @@ def run_arm(run, record, arm):
         return _run_arm(run, record, arm, chat=chat)
 
 
-def _run_arm(run, record, arm, *, chat=None):
+def _run_arm(run, record, arm, *, chat=None, reader_gateway=None,
+             inline_memory=False, recall_each_action=False):
     arm_root = run / 'cases' / record['id'] / arm
     complete = arm_root / 'result.json'
     if complete.exists():
@@ -259,8 +260,11 @@ def _run_arm(run, record, arm, *, chat=None):
     actor = battery.read_binding(record['actor'])
     web = read(run / 'run-plan.json').get('web', {}).get('enabled', False)
     historical = list(actor['history'])
-    gateway = Gateway(run)
+    gateway = reader_gateway or Gateway(run)
     current = dict(turn_id=actor['current_turn_id'], source_id=actor['source']['family'], role='user', text=actor['original_request'])
+    if inline_memory:
+        # Capture the adapted engineering request that the actor actually sees.
+        current['text'] = source_query(actor)
     if chat is not None:
         from dataclasses import asdict
         from memory_condense.application.chat_io import ChatIO
@@ -302,10 +306,13 @@ def _run_arm(run, record, arm, *, chat=None):
     live = list(events)
     # After a resumed run, rebuild only when earlier working events exceed the cap.
     responses = []
+    inline_failures = invalid_actions = 0
     started = time.perf_counter()
     for index in range(len(prior), 24):
         if finished:
             break
+        if (run/'STOP').exists():
+            raise RuntimeError('Run stopped')
         folder = arm_root / 'actions' / f'{index:03d}'
         folder.mkdir(parents=True, exist_ok=True)
         if count_tokens(battery.render_history(live)) > WORKING_CAP:
@@ -317,6 +324,10 @@ def _run_arm(run, record, arm, *, chat=None):
             elif events:
                 evidence = battery.render_history(historical + events)
             live = []
+        if recall_each_action and arm == 'memory' and index > 0:
+            packet = recalled_packet(source_query(actor), packet_id=f'action-{index:03d}',
+                                     input_event_id=current['turn_id'])
+            evidence = packet['context_text']
         messages = messages_for(actor, evidence, live, web=web)
         cap = 24576 if arm == 'memory' else 131072
         tokens = count_chat_prompt_token_proxy(messages)
@@ -328,6 +339,16 @@ def _run_arm(run, record, arm, *, chat=None):
              history_sha256=identity_sha256(historical), current_work_sha256=identity_sha256(events)))
         request_id = f"{record['id']}:{arm}:A{index:03d}"
         def generate():
+            if inline_memory:
+                from memory_condense.application.inline_memory import generate_inline
+                def serve(kind, served, **kwargs):
+                    actual_tokens = count_chat_prompt_token_proxy(served)
+                    if actual_tokens > cap:
+                        raise ValueError(f'Inline prompt exceeds arm budget: {actual_tokens}>{cap}')
+                    save(folder/'served-prompt.json', dict(messages=served,prompt_tokens_proxy=actual_tokens))
+                    return gateway.call(kind, served, **kwargs)
+                return generate_inline(serve, messages, user_text=current['text'],
+                                       scope=f"{record['id']}/{arm}/{index:03d}", max_tokens=4096)
             return gateway.call('actor', messages, scope=f"{record['id']}/{arm}/{index:03d}")
         if chat is not None:
             response = io.invoke(request_id=request_id, reader=generate,
@@ -339,6 +360,11 @@ def _run_arm(run, record, arm, *, chat=None):
             response = generate()
         save(folder/'response.json', response)
         responses.append(response)
+        if inline_memory and chat is not None:
+            status = chat.event(request_id + ':assistant').metadata['inline_generation']['status']
+            inline_failures = inline_failures + 1 if status == 'fallback' else 0
+            if inline_failures >= 5:
+                raise RuntimeError('Five consecutive rejected inline summary pairs')
         response_row = dict(turn_id=request_id, source_id=actor['source']['family'],
                             role='assistant', text=response['content'])
         if chat is not None and response['content'].strip():
@@ -395,6 +421,10 @@ def _run_arm(run, record, arm, *, chat=None):
         save(folder/'event.json', dict(rows=rows, observation=observation, finished=finished))
         events.extend(rows)
         live.extend(rows)
+        if inline_memory:
+            invalid_actions = invalid_actions + 1 if 'tool_error' in observation else 0
+            if invalid_actions >= 2:
+                raise RuntimeError('Two consecutive malformed or unusable tool actions')
         emit(phase='actor_action', case=record['id'], arm=arm, action=index, kind=action.get('action') if isinstance(action,dict) else 'invalid',
              elapsed_s=response['elapsed_s'], prompt_tokens=tokens)
         if error == 'empty_gateway_response':
@@ -471,7 +501,7 @@ def validate_review(value, rubric, candidates, actor):
     return value
 
 
-def grade_pair(run, record, results):
+def grade_pair(run, record, results, *, gateway=None):
     folder = run / 'cases' / record['id'] / 'grading'
     if (folder/'reviews.json').exists():
         return
@@ -503,7 +533,7 @@ def grade_pair(run, record, results):
         else:
             user_content = json.dumps(payload, ensure_ascii=False)
         messages = [{'role':'system','content':judge_system}, {'role':'user','content':user_content}]
-        response = Gateway(run).call('judge', messages, scope=f"{record['id']}/review/{iteration}")
+        response = (gateway or Gateway(run)).call('judge', messages, scope=f"{record['id']}/review/{iteration}")
         result = dict(mapping=mapping, response=response)
         try:
             result.update(valid=True, review=validate_review(parse_json(response['content']),rubric,candidates,actor))

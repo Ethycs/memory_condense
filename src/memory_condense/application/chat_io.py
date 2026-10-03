@@ -3,6 +3,7 @@ from dataclasses import asdict
 import json
 
 from memory_condense.application.chat_session import ChatEvent
+from memory_condense.application.inline_memory import InlineMemoryResponse
 
 
 class ChatIO:
@@ -12,8 +13,8 @@ class ChatIO:
     def exchange(self, event, *, request_id, reader, query=None):
         """Reader receives a packet; input/output capture cannot be bypassed.
 
-        A reader returns a string or a dictionary with a content string (which
-        may serialize tool calls). Tool execution uses tool_result below. The
+        A reader returns a string, an InlineMemoryResponse, or a dictionary with
+        a content string (which may serialize tool calls). Tool execution uses tool_result below. The
         reader callback owns provider-specific transport/stream assembly.
         """
         with self.session._io_lock, self.session.capture_exchange():
@@ -35,7 +36,7 @@ class ChatIO:
                                 packet_id=packet_id, packet_ids=packet_ids)
 
     def _invoke(self, *, request_id, reader, input_event_id, packet_id, packet_ids):
-        self.session.event(input_event_id)
+        input_event = self.session.event(input_event_id)
         ids = list(dict.fromkeys(([packet_id] if packet_id is not None else []) + list(packet_ids)))
         packets = [self.session.packet(value) for value in ids]
         def record_use():
@@ -59,11 +60,15 @@ class ChatIO:
             return prior.metadata['response']
         try:
             response = reader()
+            internal = {}
+            if isinstance(response, InlineMemoryResponse):
+                internal = response.capture(input_event, output_id, ids)
+                response = response.response
             text = response if isinstance(response, str) else response['content']
             if not isinstance(text, str) or not text.strip():
                 raise ValueError('Provider returned no completed content')
             self.session.ingest(ChatEvent(output_id, 'assistant', text,
-                metadata={'io': metadata, 'response': response}))
+                metadata={'io': metadata, 'response': response, **internal}))
             record_use()
             return response
         except Exception as exc:

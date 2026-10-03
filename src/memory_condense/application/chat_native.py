@@ -16,6 +16,15 @@ def validate_reference(app, reference):
     return span
 
 
+def exact_memory_passage(span, text, role):
+    """Canonical exact evidence envelope shared by recall and summary reuse."""
+    if len(text)!=span.end_char-span.start_char or quote_sha256(text)!=span.span_text_sha256:
+        raise ValueError('Recall passage differs from its exact source span')
+    label=json.dumps(dict(turn_id=span.turn_id,source_id=span.source_id,role=role,
+                          start_char=span.start_char,end_char=span.end_char),ensure_ascii=False)
+    return '<MEMORY '+label+'>\n'+text+'\n</MEMORY>'
+
+
 def native_packet(app, query, dated_question, events, **limits):
     """Only spans which survived packing acquire pointers or learning credit."""
     result = app.retrieve_native_spine(query, dated_question, **limits)
@@ -44,9 +53,7 @@ def native_packet(app, query, dated_question, events, **limits):
             span = evidence.span
             # Keep exact source addresses visible to the reader so engineering
             # artifacts can cite them. Stored routing summaries stay out of it.
-            label = json.dumps(dict(turn_id=span.turn_id, source_id=span.source_id,
-                                    role=event.role, start_char=span.start_char, end_char=span.end_char), ensure_ascii=False)
-            passages.append('<MEMORY ' + label + '>\n' + evidence.text + '\n</MEMORY>')
+            passages.append(exact_memory_passage(span,evidence.text,event.role))
     return dict(text='\n\n'.join(passages), references=references,
                 routing=routing, hydration=result.hydration.identity_payload())
 

@@ -60,23 +60,10 @@ _FALSE_GOLD_SENTINELS = frozenset(
 )
 
 
-class MatchedEvalContractError(ValueError):
-    """Raised when an evaluation-spine invariant is violated."""
+from memory_condense.runtime.artifacts import MatchedEvalContractError, canonical_json_bytes
 
 
-def canonical_json_bytes(value: object) -> bytes:
-    """Return the stable JSON representation used by the tool-only spine."""
 
-    return (
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        + "\n"
-    ).encode("utf-8")
 
 
 def identity_sha256(value: object) -> str:

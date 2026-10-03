@@ -710,6 +710,6 @@ class TestSafety:
         )
         assert conversation_id_for({}, "ab" * 32).startswith("proxy:")
 
-    def test_rewriting_mode_is_refused_until_implemented(self):
-        with pytest.raises(ValueError, match="not enabled yet"):
-            ProxyConfig(mode="augment")
+    def test_rewriting_requires_an_explicit_memory_service(self):
+        with pytest.raises(ValueError, match="requires a memory service"):
+            build_app(config=ProxyConfig(mode="augment"))

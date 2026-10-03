@@ -5409,6 +5409,8 @@ packages:
   - truststore>=0.10.4,<0.11
   - tiktoken>=0.7
   - python-dotenv>=1.0
+  - starlette>=0.40,<2 ; extra == 'proxy'
+  - uvicorn>=0.30,<1 ; extra == 'proxy'
   requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/01/c8/248b201f6d753d69fd5d6506011abbb35a946d9142b2ae311a948fd0be3d/mcp-1.29.0-py3-none-any.whl
   name: mcp

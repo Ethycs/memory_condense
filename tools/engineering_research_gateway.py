@@ -13,47 +13,16 @@ from memory_condense.domain._tokenizer import count_chat_prompt_token_proxy
 from tools.matched_eval.artifacts import publish_sealed_json, read_sealed_json
 
 
-def save(path, value):
-    return publish_sealed_json(path, value)[0]
+from memory_condense.runtime.artifacts import save, read, emit, Gateway
 
 
-def read(path):
-    return read_sealed_json(path).payload
 
 
-def emit(**value):
-    print(json.dumps(value), flush=True)
 
 
-class Gateway:
-    def __init__(self, root):
-        self.root = Path(root)
 
-    def call(self, kind, messages, *, scope, max_tokens=4096, typed_request=None, summary_attempt=0):
-        job = dict(kind=kind, messages=messages, scope=scope, max_tokens=max_tokens,
-                   typed_request=asdict(typed_request) if typed_request is not None else None)
-        if summary_attempt:
-            job['summary_attempt'] = summary_attempt
-        key = identity_sha256(job)
-        folder = self.root / 'gateway'
-        request = save(folder / f'{key}.request.json', job)
-        response = folder / f'{key}.response.json'
-        (folder / f'{key}.ready').touch()
-        deadline = time.monotonic() + 300
-        while not response.with_suffix('.json.sha256').exists():
-            if (self.root / 'STOP').exists():
-                raise RuntimeError('Run stopped; request retained')
-            if time.monotonic() > deadline:
-                raise TimeoutError('Unacknowledged generation; never resend a reserved request')
-            time.sleep(.025)
-        result = read(response)
-        if result['request_sha256'] != request.sha256:
-            raise ValueError('Mismatched generation receipt')
-        if result.get('error_type'):
-            raise RuntimeError(f"Gateway {result['error_type']} (status {result.get('http_status')})")
-        if result['finish_reason'] != 'stop':
-            raise ValueError('Incomplete generation: ' + str(result['finish_reason']))
-        return result
+
+
 
 
 def check_budget(plan, reservations, job):
@@ -72,7 +41,10 @@ def check_budget(plan, reservations, job):
 
 def generate(client, plan, job, request_sha256, tokens):
     """One bounded provider call; reservations remain owned by the dispatcher."""
+    from tools.engineering_research_stream import StreamTrace
     started = time.perf_counter()
+    trace = StreamTrace()
+    content,finish='',None
     try:
         model = plan['models'][job['kind']]
         args = dict(model=model, messages=job['messages'], max_tokens=job['max_tokens'], temperature=0)
@@ -85,7 +57,9 @@ def generate(client, plan, job, request_sha256, tokens):
         if job['kind'] == 'actor':
             chunks, finish, usage, response_model, first = [], None, None, model, None
             with client.chat.completions.create(**args, stream=True, stream_options={'include_usage': True}) as stream:
+                trace.response(stream)
                 for chunk in stream:
+                    trace.record(chunk)
                     response_model = chunk.model or response_model
                     if chunk.usage:
                         usage = chunk.usage.model_dump()
@@ -97,15 +71,20 @@ def generate(client, plan, job, request_sha256, tokens):
             content = ''.join(chunks)
         else:
             result = client.chat.completions.create(**args)
+            trace.record(result)
             choice, = result.choices
             content, finish, response_model, first = choice.message.content or '', choice.finish_reason, result.model, None
             usage = result.usage.model_dump() if result.usage else None
+        trace.require_answer(content,finish)
         return dict(request_sha256=request_sha256, content=content, finish_reason=finish,
                     response_model=response_model, usage=usage, elapsed_s=time.perf_counter()-started,
-                    ttft_s=first, prompt_tokens_proxy=tokens, requested_reasoning_effort=effort)
+                    ttft_s=first, prompt_tokens_proxy=tokens, requested_reasoning_effort=effort,
+                    transport_trace=trace.receipt(content,finish))
     except Exception as exc:
         return dict(request_sha256=request_sha256, error_type=type(exc).__name__,
-                    http_status=getattr(exc, 'status_code', None))
+                    http_status=getattr(exc, 'status_code', None) or trace.http_status,
+                    content=content,finish_reason=finish,elapsed_s=time.perf_counter()-started,
+                    transport_trace=trace.receipt(content,finish))
 
 
 def worker(root):
@@ -141,6 +120,9 @@ def worker(root):
                 if not future.done():
                     continue
                 response = future.result()
+                trace = response.pop('transport_trace',None)
+                if trace is not None:
+                    save(response_path.with_name(response_path.name.replace('.response.json','.stream.json')),trace)
                 save(response_path, response)
                 emit(phase='generation', kind=job['kind'], scope=job['scope'], calls=len(reservations),
                      elapsed_s=response.get('elapsed_s'), error_type=response.get('error_type'))

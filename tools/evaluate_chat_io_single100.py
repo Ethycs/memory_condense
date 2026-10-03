@@ -25,6 +25,7 @@ from memory_condense.application.chat_native import learn_native_packet
 from memory_condense.application.chat_session import ChatEvent, ChatSession
 from memory_condense.application.condenser import MemoryCondenser
 from tools import run_native_spine_user_completion_answers as old
+from tools.engineering_research_resident import SharedEmbedding
 from tools.matched_eval.artifacts import read_sealed_json
 
 ROOT = Path('eval_results/chat-io-single100-20260929-r1')
@@ -34,7 +35,8 @@ save, read = old.publish, read_sealed_json
 
 
 def implementation():
-    paths = [Path(__file__), *Path('src/memory_condense/application').glob('chat_*.py')]
+    paths = [Path(__file__), Path('tools/engineering_research_resident.py'),
+             *Path('src/memory_condense/application').glob('chat_*.py')]
     return {str(p): old.digest(p) for p in paths}
 
 
@@ -59,6 +61,8 @@ def prepare(root):
         model=old.MODEL, history_count=1, question_count=100,
         body_tokens=scope.payload['actual_body_tokens'], max_tokens=256, retries=0,
         answer_calls=100, judge_calls=100, live_native_hierarchy_refresh_exercised=False,
+        embedding_device='cuda', embedding_dtype='float32', recall_priority_scheduler=True,
+        compressed_qwen_exercised=False, qwen_calls=0,
         lifecycle='Historical snapshot reopened once; current ChatIO and ordinary application ingestion on one writable clone; no test-answer feedback into historical evidence',
         source_ingestion_reused=True, new_history_rebuilds=0, references_opened=False)
     save(root/'run.json', plan)
@@ -77,7 +81,7 @@ class HistoricalBackend:
     def open(self):
         if self.live is not None:
             return
-        self.encoder = old.current.frozen.EmbeddingService(device='cuda', batch_size=8)
+        self.encoder = SharedEmbedding(old.current.frozen.EmbeddingService(device='cuda', batch_size=8))
         self.history = MemoryCondenser(SOURCE/'application', embedder=self.encoder, auto_extract=False, read_only=True)
         self.live = MemoryCondenser(self.root/'application', embedder=self.encoder, auto_extract=False)
         original = read(SOURCE/'ingest-complete.json').payload
@@ -124,10 +128,10 @@ class HistoricalBackend:
                 resource.close()
 
 
-def source_events():
+def source_events(source=SOURCE):
     from memory_condense.persistence.db import Database
     from memory_condense.persistence.transcript_store import TranscriptStore
-    with Database(SOURCE/'application/memory.db', read_only=True) as db:
+    with Database(source/'application/memory.db', read_only=True) as db:
         return tuple(ChatEvent(t.turn_id, t.role, t.text, t.created_at.isoformat(), {'source_id': t.source_id})
                      for t in TranscriptStore(db).get_all())
 
@@ -169,7 +173,8 @@ def run(root):
                     io_total_s=wall, drain_s=time.perf_counter()-drained, status=status, **backend.packet))
                 old.emit(phase='answered', ordinal=ordinal, questions=100, io_total_s=round(wall,3),
                          pending=status['pending_events'], packet_refs=len(result['packet']['references']))
-        save(root/'io-complete.json', dict(status=chat.flush(), events=len(chat.events()), worker_pid=os.getpid()))
+        save(root/'io-complete.json', dict(status=chat.flush(), events=len(chat.events()), worker_pid=os.getpid(),
+                                         embedding_metrics=dict(backend.encoder.metrics)))
     old.emit(phase='answers_complete', questions=100, elapsed_s=time.perf_counter()-started)
 
 
@@ -210,6 +215,9 @@ def report(root, enable):
         mean_prompt_tokens=statistics.fmean(r['prompt_tokens'] for r in rows),
         latency={k: old.current.frozen.latency_distribution([r[k] for r in rows]) for k in ('io_total_s','api_total_s','drain_s')},
         live_native_hierarchy_refresh_exercised=False, new_judge_calls=calls, judge_cache_hits=hits,
+        embedding_device=plan.payload['embedding_device'], recall_priority_scheduler=True,
+        embedding_metrics=read(root/'io-complete.json').payload['embedding_metrics'],
+        compressed_qwen_exercised=False, qwen_calls=0,
         plan=old.binding(plan), answers=old.binding(seal),
         lifecycle=read(root/'reopen-audit.json').payload))
     old.emit(phase='report_complete', correct=sum(r['correct'] for r in rows), questions=100)

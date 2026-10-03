@@ -115,43 +115,7 @@ class MergeJournal:
         return True
 
 
-class ScalarAttentionCache:
-    max_spans = 8
-    span_token_cap = 128
-
-    def __init__(self, root, preflight):
-        self.root, self.preflight = root, preflight
-        self.scorer = None
-        self.values = {}
-
-    def score_sequence(self, texts):
-        from memory_condense.search.episodes.surprise_models import AttentionHeadSurpriseReceipt, ScoredSurpriseSequence
-        key = identity_sha256({"preflight_sha256": self.preflight.sha256, "texts": list(texts)})
-        if key not in self.values:
-            path = self.root / "attention" / (key + ".json")
-            if path.exists():
-                artifact = read_sealed_json(path)
-                row = artifact.payload
-                if row["preflight_sha256"] != self.preflight.sha256:
-                    raise ValueError("attention cache belongs to another compilation")
-                signal = ScoredSurpriseSequence(row["scores"], row["similarities"], AttentionHeadSurpriseReceipt(**row["receipt"]))
-            else:
-                if self.scorer is None:
-                    from memory_condense.associations.qwen_memory_linker import QwenMemoryLinker
-                    from memory_condense.modeling.qwen_prefix import Qwen3PrefixEncoder
-                    from memory_condense.search.episodes.qwen_episode_signal import QwenAttentionHeadSurpriseScorer
-                    print("Loading local Qwen for query-independent user-summary attention...", flush=True)
-                    encoder = Qwen3PrefixEncoder(Path("../../.cache/models/Qwen3-8B").resolve(),
-                        layers=6, device="cuda", dtype="float16")
-                    linker = QwenMemoryLinker(encoder, layer=5, max_candidates=8, max_workspace_tokens=4096)
-                    self.scorer = QwenAttentionHeadSurpriseScorer(linker, max_spans=8, span_token_cap=128)
-                signal = self.scorer.score_sequence(texts)
-                publish_sealed_json(path, {"preflight_sha256": self.preflight.sha256,
-                    "scores": signal.scores, "similarities": signal.similarities,
-                    "receipt": signal.receipt.identity_payload()})
-            signal.validate_inputs(texts)
-            self.values[key] = signal
-        return self.values[key]
+from memory_condense.runtime.attention import ScalarAttentionCache
 
 
 def compile_waves(groups, build, journal, phase):

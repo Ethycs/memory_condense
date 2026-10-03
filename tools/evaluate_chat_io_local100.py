@@ -1,4 +1,4 @@
-"""One existing 1M memory, 100 local answers, continuous ingestion and learning."""
+"""One authenticated memory, a fixed question population, live ingestion and learning."""
 from __future__ import annotations
 
 import argparse
@@ -89,7 +89,7 @@ class QuestionBackend(ResidentNativeBackend):
 
 def prepare(root,runtime_root, *, reader_gateway=None, reader_model='qwen3-8b',
             judge_model='codex_sdk/gpt-5.6-sol', inline_memory=False, source_dir=None,
-            stop_on_obvious_problems=False, empty_response_retries=0):
+            stop_on_obvious_problems=False, empty_response_retries=0, question_count=100):
     source_dir=Path(source_dir or SOURCE).resolve()
     if root.exists() or runtime_root.exists():
         raise ValueError('Use fresh evaluation and runtime directories')
@@ -102,12 +102,15 @@ def prepare(root,runtime_root, *, reader_gateway=None, reader_model='qwen3-8b',
         assert historical.old.digest(source_dir/'application'/name)==sha
     questions=[historical.old.current.frozen.question(q)
                for q in read(source_dir/'questions/questions.json')['questions']]
-    assert len(questions)==100 and len({q['question_id'] for q in questions})==100
+    if question_count < 1 or len(questions) != question_count or len({q['question_id'] for q in questions}) != question_count:
+        raise ValueError('Question population differs from the requested count')
+    if len({q['retrieval_query'] for q in questions}) != question_count:
+        raise ValueError('Questions must have distinct retrieval queries')
     campaign=historical.read(historical.old.CAMPAIGN/'campaign.json')
     files=[Path(__file__),Path(historical.__file__),*Path('tools').glob('engineering_research_*.py'),Path('tools/fastembed_bge.py'),
            Path('tools/probe_fastembed_bge_cpu.py'),Path('tools/probe_llama32_local.py'),
            *Path('src/memory_condense').rglob('*.py')]
-    save(root/'run-plan.json',dict(history_count=1,question_count=100,body_tokens=scope['actual_body_tokens'],
+    save(root/'run-plan.json',dict(history_count=1,question_count=question_count,body_tokens=scope['actual_body_tokens'],
         questions=questions,policy=read(historical.old.POLICY),
         reader=historical.old.rebased(campaign.payload['reader_policy']).payload,
         runtime_root=str(runtime_root),history_reingestions=0,source=str(source_dir),
@@ -140,7 +143,7 @@ def prepare(root,runtime_root, *, reader_gateway=None, reader_model='qwen3-8b',
         with chat.capture_exchange():
             chat.ingest_many(historical.source_events(source_dir))
         chat.flush()
-    emit(phase='prepared',history_count=1,questions=100,body_tokens=scope['actual_body_tokens'])
+    emit(phase='prepared',history_count=1,questions=question_count,body_tokens=scope['actual_body_tokens'])
 
 
 def prepare_resume(root, runtime_root, predecessor, *, empty_response_retries=2):
@@ -154,7 +157,7 @@ def prepare_resume(root, runtime_root, predecessor, *, empty_response_retries=2)
         raise ValueError('Resume requires a stopped, incomplete answer phase')
     answers=sorted((predecessor/'answers').glob('*.json'))
     n=len(answers)
-    if not 0<n<100 or [p.name for p in answers]!=[f'{i:03}.json' for i in range(n)]:
+    if not 0<n<len(old['questions']) or [p.name for p in answers]!=[f'{i:03}.json' for i in range(n)]:
         raise ValueError('Completed answers must be a contiguous prefix')
     initial=read(predecessor/'bootstrap.json')['initial_events']
     with closing(sqlite3.connect(previous_runtime/'chat/chat-events.sqlite')) as db:
@@ -186,7 +189,7 @@ def prepare_resume(root, runtime_root, predecessor, *, empty_response_retries=2)
         policy='Keep failed recall and error; fresh recall for unanswered input; retain completed answers verbatim; continuation timing separate')
     save(root/'run-plan.json',dict(old,runtime_root=str(runtime_root),implementation=implementation(),
                                  empty_response_retries=empty_response_retries,resume=resume))
-    emit(phase='resume_prepared',retained_answers=n,remaining_answers=100-n)
+    emit(phase='resume_prepared',retained_answers=n,remaining_answers=len(old['questions'])-n)
 
 
 def live(root):
@@ -266,7 +269,7 @@ def live(root):
                     row['inline_memory_error']=captured.metadata['inline_generation']['error']
                 save(root/'answers'/f'{ordinal:03}.json',row)
                 results.append(row)
-                emit(phase='answered',questions=ordinal+1,total=100,answer_s=elapsed,
+                emit(phase='answered',questions=ordinal+1,total=len(plan['questions']),answer_s=elapsed,
                      backlog_completed_exchanges=lag)
                 if plan.get('stop_on_obvious_problems'):
                     reason=obvious_problem(results)
@@ -277,7 +280,7 @@ def live(root):
             status=chat.flush()
             total=time.perf_counter()-measured
             save(root/'answers-complete.json',dict(answers=[hashlib.sha256(
-                (root/'answers'/f'{i:03}.json').read_bytes()).hexdigest() for i in range(100)]))
+                (root/'answers'/f'{i:03}.json').read_bytes()).hexdigest() for i in range(len(plan['questions']))]))
             timings=backend.timings[first_timing:]
             save(root/'cycle.json',dict(startup_s=startup,answer_window_s=answer_window,
                 final_drain_s=total-answer_window,total_cycle_s=total,status=status,
@@ -315,7 +318,7 @@ def live(root):
                 if len(labels)%10==0:
                     emit(phase='graded',questions=len(labels),correct=sum(r['correct'] is True for r in labels))
         dist=historical.old.current.frozen.latency_distribution
-        save(root/'report.json',dict(history_count=1,question_count=100,body_tokens=plan['body_tokens'],
+        save(root/'report.json',dict(history_count=1,question_count=len(plan['questions']),body_tokens=plan['body_tokens'],
             correct=sum(r['correct'] is True for r in labels),invalid_grades=sum(r['correct'] is None for r in labels),
             accuracy_scope=('Sol grader, reasoning none; source review retained'
                             if plan.get('reader_gateway') else
@@ -331,7 +334,7 @@ def live(root):
             history_reingestions=0,live_hierarchy_refresh=True,resume=resume,
             gateway_recovery=dict(empty_response_retries=plan.get('empty_response_retries',0),
                                   metrics=dict(runtime.metrics))))
-        emit(phase='complete',correct=sum(r['correct'] is True for r in labels),questions=100)
+        emit(phase='complete',correct=sum(r['correct'] is True for r in labels),questions=len(plan['questions']))
     finally:
         runtime.close()
         save(root/'shutdown.json',dict(completed_answers=len(results),local_server_stopped=runtime.process is None
@@ -361,7 +364,7 @@ def audit(root):
         inline_accepted=inline_fallback=0
         if plan.get('inline_memory'):
             from memory_condense.domain.inline_memory import summaries_for_rows
-            for ordinal in range(100):
+            for ordinal in range(len(plan['questions'])):
                 ids=(f'local-q{ordinal:03}',f'local-a{ordinal:03}:assistant')
                 pair=[]
                 for event_id in ids:
@@ -395,8 +398,8 @@ def audit(root):
         feedback=journal.execute('SELECT COUNT(*) FROM feedback WHERE successful=1 AND applied=1').fetchone()[0]
         learned=db.execute("SELECT COUNT(*) FROM consolidation_access_events WHERE event_id LIKE '_chat:feedback:%'").fetchone()[0]
         resume=plan.get('resume',{})
-        assert len(packets)==100+resume.get('extra_packets',0)
-        assert feedback==learned==100
+        assert len(packets)==len(plan['questions'])+resume.get('extra_packets',0)
+        assert feedback==learned==len(plan['questions'])
         assert journal.execute('SELECT COUNT(*) FROM feedback WHERE applied=0').fetchone()[0]==0
         for name,sha in resume.get('retained_answer_sha256',{}).items():
             assert hashlib.sha256((root/'answers'/name).read_bytes()).hexdigest()==sha
@@ -404,7 +407,7 @@ def audit(root):
             assert journal.execute('SELECT COUNT(*) FROM feedback WHERE packet_id=?',
                                    (resume['failed_packet_id'],)).fetchone()[0]==0
         cycle=read(root/'cycle.json')
-        assert len(events)==len(turns)==cycle['initial_events']+400+resume.get('extra_events',0)
+        assert len(events)==len(turns)==cycle['initial_events']+4*len(plan['questions'])+resume.get('extra_events',0)
         from memory_condense.persistence import native_spine_incremental_store
         reopened=native_spine_incremental_store.load(directory/'store/memory'/native_spine_incremental_store.FILENAME,
                                                     turns=TranscriptStore(db).get_all())
@@ -428,6 +431,7 @@ if __name__=='__main__':
     parser.add_argument('--judge-model',default='codex_sdk/gpt-5.6-sol')
     parser.add_argument('--inline-memory',action='store_true')
     parser.add_argument('--source',type=Path)
+    parser.add_argument('--question-count',type=int,default=100)
     parser.add_argument('--stop-on-obvious-problems',action='store_true')
     parser.add_argument('--empty-response-retries',type=int,choices=(0,1,2),default=0)
     parser.add_argument('--predecessor',type=Path)
@@ -437,7 +441,7 @@ if __name__=='__main__':
         prepare(args.root,args.runtime_root,reader_gateway=args.reader_gateway,
                 reader_model=args.reader_model,judge_model=args.judge_model,inline_memory=args.inline_memory,
                 source_dir=args.source,stop_on_obvious_problems=args.stop_on_obvious_problems,
-                empty_response_retries=args.empty_response_retries)
+                empty_response_retries=args.empty_response_retries,question_count=args.question_count)
     elif args.phase=='resume':
         if args.runtime_root is None or args.predecessor is None:
             parser.error('resume requires --runtime-root and --predecessor')

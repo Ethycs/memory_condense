@@ -9,7 +9,7 @@ if (-not (Get-Command pixi -ErrorAction SilentlyContinue)) {
     throw 'Install Pixi from https://pixi.sh/ first, then rerun this installer.'
 }
 if (-not $PackagePath) {
-    $candidates = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'memory_condense-0.2.0-*.conda')
+    $candidates = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'memory_condense-*.conda')
     if ($candidates.Count -ne 1) {
         throw 'Pass -PackagePath with the .conda file produced by pixi build --output-dir dist.'
     }

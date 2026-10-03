@@ -10,7 +10,19 @@ separately or reused from an existing cache; they are not bundled in the package
 
 ## Install using Pixi
 
-Build from the repository with [Pixi](https://pixi.sh/):
+Install [Pixi](https://pixi.sh/), download the Windows ZIP from
+[GitHub Releases](https://github.com/Ethycs/memory_condense/releases), extract it,
+and run:
+
+```powershell
+.\install-proxy.ps1
+```
+
+This installs the application and automatically downloads the pinned models.
+The release ZIP includes checksums and [model asset details](packaging/MODEL_ASSETS.md).
+Qwen uses six layers and downloads only its first upstream shard plus metadata.
+
+To build from the repository instead:
 
 ```powershell
 pixi build --output-dir dist
@@ -55,6 +67,11 @@ delete stored conversations.
 The build follows Pixi's [Python package backend](https://pixi.prefix.dev/latest/build/backends/pixi-build-python/).
 Pixi 0.68.1 accepts `pixi build` and prints its replacement local-build command,
 `pixi publish --target-dir dist`; neither command above uploads the package.
+
+CI runs proxy/lifecycle tests on Linux and Windows, builds the Windows Pixi
+artifact, and installs it in a separate environment without downloading models.
+Version tags publish a beta release only after both test jobs and package
+installation pass. GPU and provider-backed stress tests remain separate from CI.
 
 ## Python package alternative
 

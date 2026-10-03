@@ -28,12 +28,12 @@ To build from the repository instead:
 pixi build --output-dir dist
 ```
 
-The build produces `dist/memory_condense-0.2.0-pyh4616a5c_0.conda`. Install it
+The build produces `dist/memory_condense-0.2.1-pyh4616a5c_0.conda`. Install it
 into a separate application environment:
 
 ```powershell
 .\packaging\install-proxy.ps1 `
-  -PackagePath .\dist\memory_condense-0.2.0-pyh4616a5c_0.conda
+  -PackagePath .\dist\memory_condense-0.2.1-pyh4616a5c_0.conda
 ```
 
 The installer resolves CUDA-enabled PyTorch and the other native dependencies
@@ -43,13 +43,28 @@ fresh machine. To reuse this project's existing assets instead:
 
 ```powershell
 .\packaging\install-proxy.ps1 `
-  -PackagePath .\dist\memory_condense-0.2.0-pyh4616a5c_0.conda `
+  -PackagePath .\dist\memory_condense-0.2.1-pyh4616a5c_0.conda `
   -AssetsDir 'F:\Keytone\Documents\GitHub\memory_condense\.cache'
 ```
 
 In a downloaded release bundle, `install-proxy.ps1` sits beside the package;
 run `.\install-proxy.ps1` there. It copies the package into the application
 directory, so the download folder is not needed after installation.
+
+For an upgrade, stop the existing proxy and install into a new application
+directory; the installer preserves existing environments instead of overwriting
+their manifests. Reuse your verified model cache:
+
+```powershell
+.\install-proxy.ps1 `
+  -InstallDir "$env:LOCALAPPDATA\memory_condense\proxy-0.2.1" `
+  -AssetsDir 'C:\path\to\existing\models'
+```
+
+Start the new directory's `memory-condense.cmd` with the same provider options
+and the absolute `--data-dir` used by the previous installation. Existing native
+snapshots are validated and migrated during startup. Back up the data directory
+before upgrading.
 
 Start the installed proxy from any directory:
 

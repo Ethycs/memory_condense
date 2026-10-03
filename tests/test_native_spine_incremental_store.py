@@ -97,6 +97,34 @@ def test_stable_parent_rejects_forged_content_under_correct_id(tmp_path):
         store.publish(tmp_path/'forged.sqlite', **dict(args, projection=SectionSummaryIndex([forged,*rest])))
 
 
+def test_warm_publication_reuses_raw_validation_and_rejects_changed_prefix(tmp_path, monkeypatch):
+    from memory_condense.persistence import native_source_validation
+    _, args, state, _ = initial(tmp_path)
+    def forbidden(*args):
+        pytest.fail('An unchanged raw prefix must not be retokenized or rehydrated')
+    monkeypatch.setattr(native_source_validation, 'count_tokens', forbidden)
+    monkeypatch.setattr(native_source_validation, 'HydratedSectionSpan', forbidden)
+    same = store.publish(tmp_path/store.FILENAME, previous=state, **args)
+    assert same.manifest == state.manifest
+    changed = args['turns'][0].model_copy(update={'text': 'Edited old source'})
+    with pytest.raises(ValueError, match='authenticated raw prefix'):
+        store.publish(tmp_path/store.FILENAME, previous=same,
+                      **dict(args, turns=[changed, *args['turns'][1:]]))
+
+
+def test_warm_publication_does_not_trust_changed_raw_addresses(tmp_path):
+    from memory_condense.search.section_summary import RawSectionSpan
+    _, args, state, _ = initial(tmp_path)
+    section, *rest = args['atomic_index'].sections
+    span, = section.spans
+    turn = next(t for t in args['turns'] if t.turn_id == span.turn_id)
+    shortened = RawSectionSpan.from_turn(turn, start_char=span.start_char, end_char=span.end_char-1)
+    forged = replace(section, spans=(shortened,), receipt_sha256='')
+    with pytest.raises(ValueError):
+        store.publish(tmp_path/store.FILENAME, previous=state,
+            **dict(args, atomic_index=SectionSummaryIndex([forged, *rest])))
+
+
 @pytest.mark.parametrize('facade', [ParentUserMemoryCondenser, UserCompletionMemoryCondenser])
 def test_explicit_facades_admit_the_incremental_parent_snapshot(tmp_path, facade):
     encoder, _, state, _ = initial(tmp_path)

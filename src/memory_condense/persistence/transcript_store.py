@@ -221,6 +221,26 @@ class TranscriptStore:
         )
         return [self._row_to_turn(r) for r in cur.fetchall()]
 
+    def source_revision(self) -> int:
+        """Database triggers advance this even for out-of-band source edits."""
+        return self._db.execute('SELECT source_revision FROM discourse_revision_state '
+                                'WHERE singleton=1').fetchone()[0]
+
+    def native_snapshot(self) -> tuple[Turn, ...]:
+        """Reuse frozen turns until their durable source revision changes."""
+        revision = self.source_revision()
+        cached = getattr(self, '_native_snapshot_cache', None)
+        if cached is not None and cached[0] == revision:
+            return cached[1]
+        turns = tuple(self.get_all())
+        if self.source_revision() != revision:
+            raise ValueError('Raw transcript changed while reading its snapshot')
+        self._remember_native_snapshot(turns, revision)
+        return turns
+
+    def _remember_native_snapshot(self, turns, revision):
+        self._native_snapshot_cache = (revision, tuple(turns))
+
     def source_metadata(self, source_ids: list[str]) -> dict[str, str]:
         """Return the first system metadata turn for each requested source."""
 

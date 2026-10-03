@@ -43,6 +43,28 @@ class JournalSeed:
     def close(self): pass
 
 
+def bounded_inline(call, messages, *, user_text, scope, max_tokens, retries=0, rejected=None):
+    """Retry invalid protocol envelopes only, never grade or select an answer."""
+    from memory_condense.application.inline_memory import generate_inline
+    if retries not in (0, 1, 2):
+        raise ValueError('Inline envelope retries must be bounded to zero, one, or two')
+    for attempt in range(retries+1):
+        try:
+            result = generate_inline(call, messages, user_text=user_text,
+                scope=scope if attempt==0 else f'{scope}-envelope-retry-{attempt}', max_tokens=max_tokens)
+        except ValueError as exc:
+            if str(exc) not in ('Inline generation did not return a complete JSON envelope',
+                                'Inline generation returned no completed answer'):
+                raise
+            if rejected is not None:
+                rejected(attempt, str(exc))
+            if attempt==retries:
+                raise
+        else:
+            result.response['inline_envelope_attempts'] = attempt+1
+            return result
+
+
 class QuestionBackend(ResidentNativeBackend):
     """Same live backend; retain benchmark question dates and cap-8/v7 rendering."""
     def __init__(self, root, runtime_root, actor, runtime, plan):
@@ -146,12 +168,13 @@ def prepare(root,runtime_root, *, reader_gateway=None, reader_model='qwen3-8b',
     emit(phase='prepared',history_count=1,questions=question_count,body_tokens=scope['actual_body_tokens'])
 
 
-def prepare_resume(root, runtime_root, predecessor, *, empty_response_retries=2):
+def prepare_resume(root, runtime_root, predecessor, *, empty_response_retries=2, inline_envelope_retries=0):
     """Clone one stopped history; retain all completed answers and its failed IO."""
     if root.exists() or runtime_root.exists():
         raise ValueError('Resume requires fresh output and runtime directories')
     predecessor=predecessor.resolve()
     old=read(predecessor/'run-plan.json')
+    prior_resume=old.get('resume',{})
     previous_runtime=Path(old['runtime_root'])
     if (predecessor/'answers-complete.json').exists() or not (predecessor/'shutdown.json').exists():
         raise ValueError('Resume requires a stopped, incomplete answer phase')
@@ -168,11 +191,15 @@ def prepare_resume(root, runtime_root, predecessor, *, empty_response_retries=2)
             event=by_id[f'local-a{i:03}:assistant']
             assert row['ordinal']==i and row['question']==old['questions'][i]
             assert event[2]==row['prediction'] and json.loads(event[3])['response']==row['result']['response']
-        assert len(events)==initial+4*n+3
-        assert events[-3][0]==f'local-q{n:03}' and events[-2][0]==f'_chat:recall:local-a{n:03}'
+        assert len(events)==initial+4*n+prior_resume.get('extra_events',0)+3
+        assert by_id[f'local-q{n:03}'][1:3]==('user',old['questions'][n]['retrieval_query'])
+        assert events[-2][0].startswith('_chat:recall:')
+        failed_packet_id=events[-2][0].removeprefix('_chat:recall:')
+        assert db.execute('SELECT input_event_id FROM packets WHERE packet_id=?',
+                          (failed_packet_id,)).fetchone()[0]==f'local-q{n:03}'
         assert events[-1][0].startswith(f'local-a{n:03}:error:')
         assert f'local-a{n:03}:assistant' not in by_id
-        assert db.execute('SELECT COUNT(*) FROM packets').fetchone()[0]==n+1
+        assert db.execute('SELECT COUNT(*) FROM packets').fetchone()[0]==n+prior_resume.get('extra_packets',0)+1
         assert db.execute('SELECT COUNT(*) FROM feedback WHERE successful=1 AND applied=1').fetchone()[0]==n
     # Copy an already flushed store, never mutate the stopped run or reingest its history.
     shutil.copytree(previous_runtime/'store',runtime_root/'store')
@@ -182,13 +209,18 @@ def prepare_resume(root, runtime_root, predecessor, *, empty_response_retries=2)
         shutil.copytree(predecessor/'cache',root/'cache')
     save(root/'actor.json',read(predecessor/'actor.json'))
     resume=dict(predecessor=str(predecessor),retained_answers=n,original_initial_events=initial,
-        restored_events=len(events),failed_packet_id=f'local-a{n:03}',
-        recovery_packet_id=f'local-a{n:03}-recovery',extra_packets=1,extra_events=2,
+        restored_events=len(events),failed_packet_id=failed_packet_id,
+        failed_packet_ids=[*prior_resume.get('failed_packet_ids',
+            [prior_resume['failed_packet_id']] if prior_resume else []),failed_packet_id],
+        recovery_packet_id=f'local-a{n:03}-recovery-{prior_resume.get("extra_packets",0)+1}',
+        extra_packets=prior_resume.get('extra_packets',0)+1,
+        extra_events=prior_resume.get('extra_events',0)+2,
         predecessor_plan_sha256=hashlib.sha256((predecessor/'run-plan.json').read_bytes()).hexdigest(),
         retained_answer_sha256={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in answers},
         policy='Keep failed recall and error; fresh recall for unanswered input; retain completed answers verbatim; continuation timing separate')
     save(root/'run-plan.json',dict(old,runtime_root=str(runtime_root),implementation=implementation(),
-                                 empty_response_retries=empty_response_retries,resume=resume))
+                                 empty_response_retries=empty_response_retries,
+                                 inline_envelope_retries=inline_envelope_retries,resume=resume))
     emit(phase='resume_prepared',retained_answers=n,remaining_answers=len(old['questions'])-n)
 
 
@@ -243,9 +275,13 @@ def live(root):
                         backend.packet['served_messages']=served
                         return runtime.call(kind,served,**kwargs)
                     if plan.get('inline_memory'):
-                        from memory_condense.application.inline_memory import generate_inline
-                        return generate_inline(call,messages,user_text=q['retrieval_query'],
-                                               scope=f'answer-{ordinal:03}',max_tokens=plan['max_tokens'])
+                        def rejected(attempt, error):
+                            save(root/'envelope-rejections'/f'{ordinal:03}-{attempt}.json',
+                                 dict(ordinal=ordinal,attempt=attempt,error=error))
+                            emit(phase='inline_envelope_rejected',question=ordinal+1,attempt=attempt+1)
+                        return bounded_inline(call,messages,user_text=q['retrieval_query'],
+                            scope=f'answer-{ordinal:03}',max_tokens=plan['max_tokens'],
+                            retries=plan.get('inline_envelope_retries',0),rejected=rejected)
                     return call('actor',messages,scope=f'answer-{ordinal:03}',max_tokens=plan['max_tokens'])
                 if resume and ordinal==retained:
                     with chat.capture_exchange():
@@ -403,9 +439,10 @@ def audit(root):
         assert journal.execute('SELECT COUNT(*) FROM feedback WHERE applied=0').fetchone()[0]==0
         for name,sha in resume.get('retained_answer_sha256',{}).items():
             assert hashlib.sha256((root/'answers'/name).read_bytes()).hexdigest()==sha
-        if resume:
+        for failed_packet_id in resume.get('failed_packet_ids',
+                [resume['failed_packet_id']] if resume else []):
             assert journal.execute('SELECT COUNT(*) FROM feedback WHERE packet_id=?',
-                                   (resume['failed_packet_id'],)).fetchone()[0]==0
+                                   (failed_packet_id,)).fetchone()[0]==0
         cycle=read(root/'cycle.json')
         assert len(events)==len(turns)==cycle['initial_events']+4*len(plan['questions'])+resume.get('extra_events',0)
         from memory_condense.persistence import native_spine_incremental_store
@@ -434,6 +471,7 @@ if __name__=='__main__':
     parser.add_argument('--question-count',type=int,default=100)
     parser.add_argument('--stop-on-obvious-problems',action='store_true')
     parser.add_argument('--empty-response-retries',type=int,choices=(0,1,2),default=0)
+    parser.add_argument('--inline-envelope-retries',type=int,choices=(0,1,2),default=0)
     parser.add_argument('--predecessor',type=Path)
     args=parser.parse_args()
     if args.phase=='prepare':
@@ -446,6 +484,7 @@ if __name__=='__main__':
         if args.runtime_root is None or args.predecessor is None:
             parser.error('resume requires --runtime-root and --predecessor')
         prepare_resume(args.root,args.runtime_root,args.predecessor,
-                       empty_response_retries=args.empty_response_retries)
+                       empty_response_retries=args.empty_response_retries,
+                       inline_envelope_retries=args.inline_envelope_retries)
     else:
         globals()[args.phase](args.root)

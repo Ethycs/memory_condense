@@ -20,6 +20,14 @@ Version 0.2.0 builds with `pixi build --output-dir dist`; its installed runtime
 does not depend on research scripts or checkout-relative assets. The root
 [installation guide](../README.md) covers the installer, model setup, and diagnostics.
 
+The production native writer now captures exact IO and learning chunks without
+embedding new raw turns or maintaining the legacy raw search index. Warm
+publication reuses the authenticated source prefix; learning advances after each
+published prefix. Cold admission still validates the complete memory. The
+production-ingestion correction at the end of
+[Research Log 262](10%20-%20Research%20Log/262%20-%202026-09-29%20-%20Live%20IO%20latency%20diagnosis%20and%20resident%20optimization.md)
+records the regression checks and saved 2M replay, including its measurement limits.
+
 **Combined local runtime / FastEmbed:** FP32 BGE-M3 CPU query embedding improved
 from 0.341 s to **0.125 s** with FastEmbed, with close numerical agreement.
 One existing 1.115M-token memory and 100 live questions then exercised FastEmbed,

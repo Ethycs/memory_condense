@@ -1,12 +1,41 @@
-Memory Condense beta packages the native memory runtime as a local proxy for
-OpenAI Chat Completions and Anthropic Messages. Conversation input, output,
-source-linked recall and learning use the same durable chat lifecycle.
+Memory Condense v0.2.1-beta.1 fixes the production ingestion bottleneck in the
+local memory proxy for OpenAI Chat Completions and Anthropic Messages.
 
-Download `memory-condense-0.2.0-win64.zip`, extract it, and run
-`./install-proxy.ps1` in PowerShell with Pixi installed. The installer downloads
-and verifies the required model assets automatically. Existing users can pass
-`-AssetsDir PATH_TO_CACHE` to reuse verified files. See the bundled README for
-provider URLs, authentication, conversation identifiers and startup commands.
+New chat IO and recalled passages retain exact raw sources and learning links
+without redundant raw embeddings or legacy search-index updates. Warm
+publication reuses validated transcript prefixes and unchanged summary rows.
+Learning commits after each published prefix, including while ingestion is busy.
+Existing full snapshots migrate during cold startup. Failed ingestion now keeps
+phase timings for diagnosis.
+
+The corrected 2.23M-token / 200-question evaluation measured:
+
+- **93.0% automated answer accuracy (186/200)**, without manual score adjustments.
+- **99.5% complete supporting evidence (199/200)**.
+- **11.75 seconds mean reply latency**, 18.36 seconds p95.
+- **3.37 seconds mean warm ingestion update**, plus 0.21 seconds mean learning.
+- **5.61 seconds final drain**, with zero pending events or feedback.
+- All **200 learning updates** survived separate-process cold reopening; all
+  3,609 new raw chunks had zero embeddings and zero HNSW labels.
+
+The benchmark assembly's section/vector alignment was repaired and verified
+against the original stores. The source history reused authenticated compiled
+summaries; cold summarization was not measured. Original question dates were
+preserved, so the eligible history size varies by question. Three malformed
+gateway envelopes required two process resumptions and one in-process retry.
+Completed answers were preserved. Reply timings exclude startup, stopped
+unsuccessful exchanges, restarts and grading; this was not an uninterrupted
+full-cycle run. Bounded malformed-envelope retries are currently in the
+evaluation harness, not the production proxy. The 5M and 10M stages remain
+unevaluated.
+
+Download `memory-condense-0.2.1-win64.zip`, extract it, and run
+`./install-proxy.ps1` in PowerShell with Pixi installed. Setup automatically
+downloads and verifies the pinned model assets. For an upgrade, stop the old
+proxy, install into a new directory with `-InstallDir`, reuse the existing model
+cache with `-AssetsDir`, and start with the same provider options and absolute
+`--data-dir`. Back up the data directory before upgrading. The bundled README
+has full commands.
 
 - Native memory mode requires Windows x64 and an NVIDIA CUDA GPU. The evaluated
   machine has 8 GB VRAM; this is not a guarantee for every host configuration.
@@ -19,14 +48,8 @@ provider URLs, authentication, conversation identifiers and startup commands.
 - Streaming responses are buffered by augment mode. Responses API and multimodal
   requests are not supported by this beta.
 
-Validation includes proxy and lifecycle regression tests, a separate installed
-environment, real local model HTTP acceptance with a controlled upstream, and
-durable source-pointer/learning checks. GitHub CI exercises CPU unit tests and
-Windows package installation; it does not claim GPU or paid-model evaluation.
-The scale stress test reached 2,226,578 stored tokens, then stopped after 29 of
-200 planned answers because background ingestion remained more than twelve
-exchanges behind. Mean reply time over that partial run was 9.95 seconds;
-28 of 29 inline summary pairs were accepted. The queued 5M/500-question and
-10M/1,000-question stages were not started. This identifies a throughput limit
-for sustained large-memory chat; the aborted run does not establish accuracy
-or successful operation at those larger sizes.
+Release CI gates publication on Linux and Windows proxy, lifecycle, persistence,
+recovery and package tests, Python package builds, and installation of the Pixi
+artifact in a separate Windows environment. Hosted CI does not run GPU models
+or paid-provider evaluations. The Linux HNSW extension is rebuilt without
+host-specific CPU instructions to avoid incompatible cached wheels.

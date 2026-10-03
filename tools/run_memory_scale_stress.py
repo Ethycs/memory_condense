@@ -12,6 +12,7 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import time
 
@@ -32,6 +33,24 @@ from tools.run_inline_validation_battery import SOURCE, command
 def digest(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def align_atomic_vectors(index, sections, matrix):
+    """Bind cached rows to section identities after the union index sorts them."""
+    matrix = np.asarray(matrix)
+    if matrix.dtype != np.float32 or matrix.ndim != 2 or len(sections) != len(matrix):
+        raise ValueError('Invalid source section vector matrix')
+    rows = {}
+    for section, vector in zip(sections, matrix, strict=True):
+        if section.section_id in rows:
+            raise ValueError('Duplicate source section identity')
+        rows[section.section_id] = (section.receipt_sha256, vector)
+    if set(rows) != {s.section_id for s in index.sections}:
+        raise ValueError('Combined section population changed')
+    for section in index.sections:
+        if rows[section.section_id][0] != section.receipt_sha256:
+            raise ValueError('Combined source section changed')
+    return np.asarray([rows[s.section_id][1] for s in index.sections], dtype=np.float32)
 
 
 class CachedSourceEmbedding:
@@ -131,7 +150,8 @@ def build(root, million):
         if app.pending_ingest_count() or app.transcript.count() != len(turns):
             raise ValueError('Combined ingestion incomplete')
         native = app.install_native_spine(atomic_index, hierarchy_index,
-            np.concatenate(matrices), embedding_identity=identity)
+            align_atomic_vectors(atomic_index, atoms, np.concatenate(matrices)),
+            embedding_identity=identity)
     parent_receipt = native_spine_parent_store.publish(root/'application'/native_spine_parent_store.FILENAME,
         hierarchy=hierarchy_index, matrix=np.asarray(parent_vectors,dtype=np.float32), native_receipt=native)
     files = {p.name:digest(p) for p in (root/'application').iterdir() if p.name in
@@ -162,6 +182,82 @@ def build(root, million):
     save(root/'questions/references.json',dict(references=references,evaluation_only=True,ingest_use_permitted=False))
     emit(phase='combined_source_complete',body_tokens=native['body_tokens'],questions=len(questions),
          elapsed_s=time.perf_counter()-started)
+
+
+def repair_vectors(root, source):
+    """Repair a cached union in a fresh directory without raw reingestion."""
+    if root.exists():
+        raise ValueError('Repair requires a fresh directory')
+    started = time.perf_counter()
+    old = read(source/'ingest-complete.json')
+    plan = read(source/'ingest-plan.json')
+    for name, sha in old['application_files'].items():
+        if digest(source/'application'/name) != sha:
+            raise ValueError('Combined source changed')
+    sections, matrices = [], []
+    for binding in plan['sources']:
+        original = Path(binding['source'])
+        if digest(original/'ingest-complete.json') != binding['receipt_sha256']:
+            raise ValueError('Original source receipt changed')
+        receipt = read(original/'ingest-complete.json')
+        for name, sha in receipt['application_files'].items():
+            if digest(original/'application'/name) != sha:
+                raise ValueError('Original source changed')
+        with Database(original/'application/memory.db', read_only=True) as db:
+            turns = TranscriptStore(db).get_all()
+        snapshot = native_spine_store.load(original/'application/native-spine.sqlite', turns=turns)
+        if snapshot.receipt != binding['snapshot']:
+            raise ValueError('Original snapshot changed')
+        sections.extend(snapshot.semantic.sections)
+        matrices.append(snapshot.semantic._dense._matrix)
+        emit(phase='repair_source_verified', source=str(original))
+    with Database(source/'application/memory.db', read_only=True) as db:
+        turns = TranscriptStore(db).get_all()
+    snapshot = native_spine_store.load(source/'application/native-spine.sqlite', turns=turns)
+    parents, parent_receipt = native_spine_parent_store.load(
+        source/'application'/native_spine_parent_store.FILENAME,
+        hierarchy=snapshot.hierarchy, native_receipt=snapshot.receipt)
+    if snapshot.receipt != old['snapshot'] or parent_receipt != old['parent_snapshot']:
+        raise ValueError('Combined snapshot receipt changed')
+    matrix = align_atomic_vectors(snapshot.semantic.hierarchy, sections, np.concatenate(matrices))
+    mismatches = sum(a.tobytes() != b.tobytes()
+                     for a, b in zip(matrix, snapshot.semantic._dense._matrix, strict=True))
+    if not mismatches:
+        raise ValueError('No vector alignment defect to repair')
+    (root/'application').mkdir(parents=True)
+    for name in ('memory.db', 'hnsw_index.bin'):
+        shutil.copy2(source/'application'/name, root/'application'/name)
+    native = native_spine_store.publish(root/'application/native-spine.sqlite',
+        atomic_index=snapshot.semantic.hierarchy, hierarchy=snapshot.hierarchy, matrix=matrix,
+        embedding_identity=snapshot.semantic.embedding_identity, turns=turns)
+    parent = native_spine_parent_store.publish(root/'application'/native_spine_parent_store.FILENAME,
+        hierarchy=snapshot.hierarchy, matrix=parents._dense._matrix, native_receipt=native)
+    files = {p.name:digest(p) for p in (root/'application').iterdir()}
+    if any(files[n] != old['application_files'][n] for n in ('memory.db', 'hnsw_index.bin')):
+        raise ValueError('Repair changed the raw application')
+    save(root/'ingest-plan.json', dict(plan, repair_source=str(source),
+        repair='Identity-aligned atomic vectors; raw application copied byte-for-byte',
+        repair_implementation_sha256=digest(__file__)))
+    save(root/'ingest-complete.json', dict(old, snapshot=native, parent_snapshot=parent,
+        application_files=files, elapsed_s=time.perf_counter()-started,
+        original_ingest_elapsed_s=old['elapsed_s'], raw_history_reingestions=0,
+        corrected_vector_rows=mismatches))
+    shutil.copytree(source/'questions', root/'questions')
+    save(root/'scope.json', read(source/'scope.json'))
+    # Independent persisted-row comparison, using the original identity bindings.
+    with closing(sqlite3.connect((root/'application/native-spine.sqlite').as_uri()+'?mode=ro', uri=True)) as db:
+        payload, raw = db.execute('SELECT payload,vectors FROM snapshot WHERE id=1').fetchone()
+    p = json.loads(payload)
+    width = 4*p['matrix_shape'][1]
+    expected = {s.section_id:v.tobytes() for s,v in zip(sections,np.concatenate(matrices),strict=True)}
+    for i, section in enumerate(p['atomic_sections']):
+        if raw[i*width:(i+1)*width] != expected[section['section_id']]:
+            raise ValueError('Persisted vector alignment differs from original sources')
+    save(root/'vector-alignment-audit.json', dict(sections=len(sections),
+        original_mismatches=mismatches, repaired_mismatches=0,
+        raw_application_unchanged=True, questions_unchanged=True, references_unchanged=True,
+        model_calls=0, raw_history_reingestions=0))
+    emit(phase='vector_repair_complete', corrected_rows=mismatches, elapsed_s=time.perf_counter()-started)
 
 
 def gate(report):
@@ -216,14 +312,18 @@ def run(root, runtime_root):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase',choices=('build','run'))
+    parser.add_argument('phase',choices=('build','run','repair-vectors'))
     parser.add_argument('--root',type=Path,required=True)
     parser.add_argument('--runtime-root',type=Path)
     parser.add_argument('--million',type=int,choices=(2,5,10))
+    parser.add_argument('--source',type=Path)
     args=parser.parse_args()
     if args.phase=='build':
         if args.million is None: parser.error('build requires --million')
         build(args.root.resolve(),args.million)
+    elif args.phase=='repair-vectors':
+        if args.source is None: parser.error('repair-vectors requires --source')
+        repair_vectors(args.root.resolve(),args.source.resolve())
     else:
         if args.runtime_root is None: parser.error('run requires --runtime-root')
         run(args.root.resolve(),args.runtime_root.resolve())

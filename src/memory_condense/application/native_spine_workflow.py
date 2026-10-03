@@ -3,6 +3,7 @@ import sqlite3
 import os
 from uuid import uuid4
 
+from memory_condense.domain._discourse_identity import quote_sha256
 from memory_condense.application.native_spine_context_retrieval import ResidentNativeSpineContextMemory
 from memory_condense.application.native_spine_policy import CAP8_LIMITS
 from memory_condense.persistence import native_spine_store, native_spine_parent_store
@@ -14,6 +15,36 @@ class NativeSpineWorkflowMixin:
     # Complete snapshots use the measured cap-8 policy. Historical parent-only
     # evaluators explicitly retain their original routing through their subclass.
     _native_spine_completion_default = True
+
+    def capture_native_many(self, turns):
+        """Store exact IO and learning chunks; native publication indexes summaries."""
+        from memory_condense.application.native_capture import capture_native_many
+        return capture_native_many(self, turns)
+
+    def _native_retrievable_chunks(self, chunk_ids):
+        """Admit Hebbian nodes only after their exact sources are published."""
+        directory = self.database_path.parent
+        if not any((directory / name).exists() for name in
+                   (native_spine_incremental_store.FILENAME, 'native-spine.sqlite')):
+            return set()
+        _, snapshot, _ = self._load_native_spine()
+        cached = getattr(self, '_native_learning_sources', None)
+        if cached is None or cached[0] is not snapshot:
+            cached = (snapshot, {s.spans[0].turn_id: s.spans[0].turn_text_sha256
+                                 for s in snapshot.semantic.sections})
+            self._native_learning_sources = cached
+        admitted = set()
+        for cid in chunk_ids:
+            row = self._db.execute('SELECT turn_id,start_char,end_char,text FROM chunks WHERE chunk_id=?',
+                                   (cid,)).fetchone()
+            if row is None or row[0] not in cached[1]:
+                continue
+            turn = self.transcript.get_turn(row[0])
+            if (turn is not None and 0 <= row[1] < row[2] <= len(turn.text)
+                    and turn.text[row[1]:row[2]] == row[3]
+                    and quote_sha256(turn.text) == cached[1][row[0]]):
+                admitted.add(cid)
+        return admitted
 
     def install_native_spine(self, atomic_index, hierarchy, matrix, *, embedding_identity):
         """Publish compiled summary indexes after normal ``ingest_many`` completes.
@@ -81,13 +112,14 @@ class NativeSpineWorkflowMixin:
         previous = getattr(self, '_native_spine_incremental', None)
         # A fresh connection may append before recalling. Admit the persisted
         # prefix before using its row identities for incremental publication.
-        turns = self.transcript.get_all()
+        turns = self.transcript.native_snapshot()
         if previous is None and destination.exists():
             count = native_spine_incremental_store.saved_turn_count(destination)
             previous = native_spine_incremental_store.load(destination, turns=turns[:count])
         revision = self._db.current_turn()
+        source_revision = self.transcript.source_revision()
         def still_current():
-            if revision != self._db.current_turn():
+            if revision != self._db.current_turn() or source_revision != self.transcript.source_revision():
                 raise ValueError('raw transcript advanced during native publication')
         path = destination if previous is not None else directory / (uuid4().hex + '.live.sqlite')
         try:

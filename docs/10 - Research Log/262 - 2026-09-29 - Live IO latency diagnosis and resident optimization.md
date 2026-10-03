@@ -1887,3 +1887,139 @@ separate.
 Evidence: [sealed final verification](../../eval_results/inline-three-20261001-r1/final-verification.json),
 [campaign completion](../../eval_results/inline-three-20261001-r1/complete.json), and
 [implementation snapshot](../../eval_results/inline-three-20261001-r1/implementation-snapshot.json).
+
+## Production native-ingestion correction (2026-10-03 UTC)
+
+The native proxy had retained the ordinary raw dense/lexical ingestion path even
+though its recall uses summary indexes. Delivered recall copies therefore caused
+new raw embeddings. Incremental SQLite publication also repeated full raw-source
+validation and token counting. These were downstream integration problems; shared
+answer/summary generation did not remove them.
+
+`ResidentNativeBackend` now calls `capture_native_many`. Exact raw turns and their
+deterministic learning chunks commit together with compact native capture
+receipts, without raw embedding, HNSW updates, lexical postings, or legacy pending
+ingest obligations. A capture receipt is not a searchable publication receipt.
+Legacy ingestion remains available through its original API. Existing source
+chunks and graph identities are preserved.
+
+Warm publication reuses immutable, authenticated source prefixes, incrementally
+extends the full transcript hash, and validates changed span partitions and new
+turns. SQLite source-revision triggers invalidate the raw-turn cache on external
+edits. Unchanged summary/vector rows retain their admitted hashes. Cold admission
+and recovery still reconstruct and validate the complete persisted snapshot.
+Whole-index membership checks, dense-array construction for changed snapshots,
+and complete canonical snapshot hashing remain; this is not a claim that every
+publication operation is constant-time.
+
+Older full snapshots migrate to the incremental store during cold admission,
+before interactive updates. The chat writer reads only new journal rows after its
+committed prefix. Learning now runs after each successful publication, even when
+more preparation is ready. Its existing graph accepts unembedded native chunks
+only when the published native index covers their exact raw sources. Capture
+alone does not authorize learning. Successful and failed sync phase timings are
+saved to each conversation's `ingestion-timings.jsonl`.
+
+Verification:
+
+- **239 distinct tests passed** across the expanded proxy/lifecycle/package suite
+  and the final targeted checks. New checks cover atomic capture, conflicting
+  retries, missing chunk topology, rejection of altered raw addresses, avoidance
+  of old-prefix tokenization/reloads/raw embedding, ongoing learning under a
+  backlog, and preserved diagnostics after failed publication. The capture,
+  incremental-store, native-chat, and consolidation tests were added to CI.
+- The **29 recorded exchanges** from the stopped 2M run were replayed through the
+  production resident writer on a private clone. The source starts at
+  **2,226,578 tokens / 10,666 events** and ends at 10,782 events. All 29 Hebbian
+  updates survived, with **zero raw chunk embeddings**. The final incremental
+  native and parent manifests matched a fresh publication exactly and passed
+  full cold reopen.
+- In the final replay, preparation, ingestion, publication, and learning averaged
+  **3.659 seconds per exchange**, with a **7.314-second maximum**. Cold admission,
+  including one-time migration, was **61.912 seconds**, reported separately. A
+  concurrent Pixi package build overlapped early exchanges, so these timings are
+  not an isolated throughput measurement.
+- The replay reused authenticated recorded summaries, attention results, and
+  vectors and made **zero new model calls**. It isolates the repaired downstream
+  work. It does not establish fresh answer accuracy or complete live-model
+  throughput at 2M, 5M, or 10M tokens.
+- A rebuilt Pixi `.conda` artifact also passed the real HTTP proxy probe using
+  the existing dependency environment and real local Qwen, BGE, and Llama. The
+  package payload matched the tested source files and imported no research
+  modules. Four controlled provider calls covered inline replies, older-context
+  recall, a native tool/result cycle, and duplicate replay without another
+  provider request. Final health had zero pending events, pending feedback, or
+  failed sessions. After shutdown, a cold audit verified **44 events, 53 exact
+  source pointers, and three learning updates**. All 73 stored source chunks had
+  **zero raw embeddings and zero HNSW labels**, with no legacy ingest rows. All
+  models stopped. This uses a controlled provider, not fresh answer-quality
+  grading or a fresh dependency-install test.
+
+Evidence: [final replay](../../eval_results/native-ingest-replay-20261003-r3/report.json),
+[phase timings](../../eval_results/native-ingest-replay-20261003-r3/backend-timings.json),
+[expanded regression results](../../eval_results/native-ingest-ci-20261003.xml),
+[final targeted results](../../eval_results/native-ingest-final-20261003.xml),
+[packaged HTTP check](../../eval_results/native-ingest-package-20261003/probe/report.json),
+[packaged cold-reopen audit](../../eval_results/native-ingest-package-20261003/probe/reopen-audit.json).
+The replay report records the exact tested source-file hashes. The original
+stress-test artifacts were not modified.
+
+## Live 2M / 200-question rerun (2026-10-03 UTC)
+
+The corrected run completed **186/200 answers correct (93.0%, automated Sol
+grading, no manual score adjustments)**. Complete reference support quotes were
+delivered in **199/200 packets (99.5%)**. Thirteen of the fourteen graded misses
+had complete support in the packet; the remaining miss lacked full support. This
+does not classify those thirteen as reader errors rather than grader errors.
+
+This is one combined memory containing **2,226,578 stored source tokens**
+(2,210,122 unique role/text tokens), with 200 fresh accepted answers. Historical
+question dates remain unchanged: eligible content varies by date, with a minimum
+of 1,115,343 tokens. Authenticated compiled source summaries were reused; this
+does not measure cold summarization of 2M new tokens.
+
+- Mean reply: **11.747 s**, median **10.679 s**, p95 **18.364 s**. Mean reader
+  call: **10.069 s**. These cover successful exchanges, including in-exchange
+  retries, and exclude startup, stopped unsuccessful exchanges, restarts, and
+  grading. There is no uninterrupted full-cycle timing claim.
+- Across all three corrected-run segments, **205 warm sync updates averaged
+  3.368 s** (maximum 10.633 s). **200 distinct learning updates averaged 0.207 s**.
+  The maximum completed-exchange backlog was **3**, accounting for recovery
+  events. Final drain was **5.613 s**, with **zero pending events or feedback**.
+- **199 inline summary pairs accepted, one fallback**. All **3,609 new raw
+  chunks** had **zero raw embeddings and zero HNSW labels**.
+- Separate-process cold reopening verified **11,470 events**, **202 recall
+  packets** (including two failed attempts), **3,391 exact original-source
+  pointers**, and **200 persisted Hebbian updates**. Native and parent receipts
+  reconstructed exactly. The repaired source remained unchanged. Models stopped.
+
+Two defects were exposed and kept visible in the evidence:
+
+1. The original combined benchmark sorted its atomic sections by ID but simply
+   concatenated source vector matrices. **All 10,746 vectors were consequently
+   attached to the wrong sections.** The first rerun's 61/200 score is marked
+   invalid as an estimate of system accuracy. The original 1M stores were intact.
+   `run_memory_scale_stress.py` now aligns vectors by authenticated section
+   identity. A fresh corrected copy preserved raw data, questions, and references
+   byte-for-byte, made no model calls, and independently verified **zero remaining
+   vector mismatches**. No raw history was reingested.
+2. The gateway returned a completed but malformed inline JSON envelope after
+   138 answers, then again after 147. Recovery preserved all completed answers
+   and failed IO. The evaluation harness now supports repeated recovery and up
+   to two retries for malformed envelopes, without inspecting answer quality.
+   Another malformed envelope at question 148 was recovered in-process. There
+   were **203 actor calls for 200 accepted answers, three malformed envelopes,
+   and two process resumptions**. This retry change is in the evaluation harness;
+   production proxy envelope recovery was not changed by this test.
+
+Seven targeted tests passed for vector identity/routing, invalid source bindings,
+bounded protocol retries, unchanged prompts, and repeated recovery preserving
+answers and failed packets. The repaired ingestion path kept pace with the
+reader in the corrected 2M run. The score remains below the 95% accuracy target;
+5M and 10M have not been rerun.
+
+Evidence: [verified cross-segment summary](../../eval_results/scale-2m-rerun-20261003-r4/verified-summary.json),
+[all 200 grades and latency](../../eval_results/scale-2m-rerun-20261003-r4/report.json),
+[cold-reopen audit](../../eval_results/scale-2m-rerun-20261003-r4/reopen-audit.json),
+[vector alignment audit](../../eval_results/scale-2m-source-aligned-20261003-r1/vector-alignment-audit.json),
+[invalidated first rerun](../../eval_results/scale-2m-rerun-20261003-r1/accuracy-invalidated.json).

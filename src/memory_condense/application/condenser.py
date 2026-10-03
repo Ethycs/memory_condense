@@ -254,7 +254,8 @@ class MemoryCondenser(
             max_elements=retriever_max_elements,
         )
         self._memory = MemoryStore(self._db, embedder=self._embedder)
-        self._consolidation = LiveConsolidationStore(self._db)
+        self._consolidation = LiveConsolidationStore(self._db,
+            native_chunk_validator=self._native_retrievable_chunks)
         self._validator = Validator(self._db)
         self._extractor = extractor if extractor is not None else RuleBasedExtractor()
         self._packer = ContextPacker(budget)
@@ -773,6 +774,7 @@ class MemoryCondenser(
         """Persist index and close database."""
         self._native_spine_loaded = None
         self._native_spine_incremental = None
+        self._native_learning_sources = None
         try:
             if self._persist_index_on_close:
                 self._retriever.save()

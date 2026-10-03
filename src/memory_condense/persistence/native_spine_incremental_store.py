@@ -14,12 +14,12 @@ import sqlite3
 import numpy as np
 
 from memory_condense.domain._discourse_identity import canonical_json, identity_sha256, quote_sha256
-from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.search.section_routing import SectionSummaryIndex
 from memory_condense.search.section_summary import SectionSummary
 from memory_condense.search.summary_semantic_index import SemanticSectionIndex
 from memory_condense.search.native_spine_parent_users import project_parent_users
 from memory_condense.persistence import native_spine_store as native
+from memory_condense.persistence.native_source_validation import validate as validate_sources
 
 
 FILENAME = 'native-spine-live-v1.sqlite'
@@ -35,33 +35,53 @@ class IncrementalSnapshot:
     # Per-row identities avoid comparing/serializing whole matrices on update.
     row_hashes: dict
     write_counts: dict
+    source_validation: object
 
 
-def _entries(index, matrix=None):
+def _entries(index, matrix=None, *, old_index=None, old_matrix=None, old_hashes=None):
     if matrix is not None:
         matrix = np.asarray(matrix)
         if matrix.dtype != np.float32 or matrix.ndim != 2 or len(matrix) != len(index.sections):
             raise ValueError('incremental vectors must be aligned FP32 rows')
+    old_positions = {s.section_id: i for i,s in enumerate(old_index.sections)} if old_index is not None else {}
     for i, section in enumerate(index.sections):
         payload = index._section_json[section.section_id]
+        position = old_positions.get(section.section_id)
+        if (position is not None and payload == old_index._section_json[section.section_id]
+                and (matrix is None or (matrix.shape[1:] == old_matrix.shape[1:]
+                     and np.array_equal(matrix[i].view(np.uint8), old_matrix[position].view(np.uint8))))):
+            # An unchanged row needs no vector copy, serialization or hash.
+            # Its admitted identity is retained; it will not enter SQL upserts.
+            yield section.section_id, payload, None, old_hashes[section.section_id]
+            continue
         vector = None if matrix is None else matrix[i].tobytes(order='C')
         sha = quote_sha256(payload) if vector is None else identity_sha256(
             {'section': section.receipt_sha256, 'vector': hashlib.sha256(vector).hexdigest()})
         yield section.section_id, payload, vector, sha
 
 
-def _assemble(atomic, hierarchy, matrix, projection, parent_matrix, embedding_identity, turns):
-    semantic = SemanticSectionIndex(atomic, matrix, embedding_identity=embedding_identity)
-    parents = SemanticSectionIndex(projection, parent_matrix, embedding_identity=embedding_identity)
-    native.validate_sources(semantic, hierarchy, turns)
+def _assemble(atomic, hierarchy, matrix, projection, parent_matrix, embedding_identity, turns, previous=None):
+    def semantic_index(index, vectors, old):
+        if (old is not None and index is old.hierarchy and old.embedding_identity == embedding_identity
+                and vectors.shape == old._dense._matrix.shape
+                and np.array_equal(vectors.view(np.uint8), old._dense._matrix.view(np.uint8))):
+            return old
+        return SemanticSectionIndex(index, vectors, embedding_identity=embedding_identity)
+    semantic = semantic_index(atomic, matrix, previous.native.semantic if previous else None)
+    parents = semantic_index(projection, parent_matrix, previous.parents if previous else None)
+    sources = validate_sources(semantic, hierarchy, turns, previous)
+    if (previous is not None and semantic is previous.native.semantic and parents is previous.parents
+            and hierarchy.receipt_sha256 == previous.native.hierarchy.receipt_sha256
+            and sources.transcript_sha256 == previous.source_validation.transcript_sha256):
+        return previous.native, parents, previous.parent_receipt, previous.manifest, sources
     raw = np.asarray(matrix).tobytes(order='C')
     # The native receipt remains identical to the v1 full rebuild. Cached
     # canonical section strings avoid reflective serialization of old sections.
     metadata = dict(format=native.FORMAT, embedding_identity=embedding_identity,
         matrix_shape=list(matrix.shape), matrix_sha256=hashlib.sha256(raw).hexdigest(),
         matrix_dtype='float32', semantic_sha256=semantic.receipt_sha256,
-        hierarchy_sha256=hierarchy.receipt_sha256, transcript_sha256=native.transcript_identity(turns),
-        turn_count=len(turns), body_tokens=sum(count_tokens(t.text) for t in turns))
+        hierarchy_sha256=hierarchy.receipt_sha256, transcript_sha256=sources.transcript_sha256,
+        turn_count=len(turns), body_tokens=sources.body_tokens)
     fields = {k: canonical_json(v) for k, v in metadata.items()}
     fields.update(atomic_sections=atomic.sections_json(), hierarchy_sections=hierarchy.sections_json())
     serialized = '{' + ','.join(canonical_json(k)+':'+fields[k] for k in sorted(fields)) + '}'
@@ -75,25 +95,37 @@ def _assemble(atomic, hierarchy, matrix, projection, parent_matrix, embedding_id
         ('native_snapshot_sha256', 'projection_sha256', 'semantic_sha256', 'embedding_identity', 'matrix_shape')})
     manifest = dict(format=FORMAT, native=metadata, native_receipt=receipt,
                     parent=parent_payload, parent_receipt=parent_receipt)
-    return native.NativeSpineSnapshot(semantic, hierarchy, receipt), parents, parent_receipt, manifest
+    return native.NativeSpineSnapshot(semantic, hierarchy, receipt), parents, parent_receipt, manifest, sources
 
 
 def publish(path, *, atomic_index, hierarchy, matrix, projection, parent_matrix, embedding_identity,
             turns, previous=None, before_commit=None):
     """Validate first, then atomically commit both indexes and their manifest."""
     turns = tuple(turns)
-    matrix, parent_matrix = np.asarray(matrix), np.asarray(parent_matrix)
-    expected_projection = project_parent_users(hierarchy, stable_ids=True, previous=projection)
-    if expected_projection.receipt_sha256 != projection.receipt_sha256:
-        raise ValueError('incremental parent projection differs from hierarchy')
-    snapshot, parents, parent_receipt, manifest = _assemble(atomic_index, hierarchy, matrix,
-        projection, parent_matrix, embedding_identity, turns)
+    matrix, parent_matrix = np.ascontiguousarray(matrix), np.ascontiguousarray(parent_matrix)
+    if (previous is None or hierarchy.receipt_sha256 != previous.native.hierarchy.receipt_sha256
+            or projection.receipt_sha256 != previous.parents.hierarchy.receipt_sha256):
+        expected_projection = project_parent_users(hierarchy, stable_ids=True, previous=projection)
+        if expected_projection.receipt_sha256 != projection.receipt_sha256:
+            raise ValueError('incremental parent projection differs from hierarchy')
+    snapshot, parents, parent_receipt, manifest, sources = _assemble(atomic_index, hierarchy, matrix,
+        projection, parent_matrix, embedding_identity, turns, previous)
     populations = {'atomic': (atomic_index, matrix), 'hierarchy': (hierarchy, None),
                    'parents': (projection, parent_matrix)}
     hashes, changed, removed = {}, {}, {}
     for kind, (index, vectors) in populations.items():
         old = previous.row_hashes.get(kind, {}) if previous is not None else {}
-        rows = list(_entries(index, vectors))
+        if previous is not None and manifest is previous.manifest:
+            hashes[kind], changed[kind], removed[kind] = old, [], set()
+            continue
+        if previous is None:
+            old_index = old_matrix = None
+        elif kind == 'hierarchy':
+            old_index, old_matrix = previous.native.hierarchy, None
+        else:
+            semantic = previous.native.semantic if kind == 'atomic' else previous.parents
+            old_index, old_matrix = semantic.hierarchy, semantic._dense._matrix
+        rows = list(_entries(index, vectors, old_index=old_index, old_matrix=old_matrix, old_hashes=old))
         hashes[kind] = {sid: sha for sid, _, _, sha in rows}
         changed[kind] = [(sid, payload, vector, sha) for sid, payload, vector, sha in rows if old.get(sid) != sha]
         removed[kind] = set(old) - set(hashes[kind])
@@ -118,7 +150,7 @@ def publish(path, *, atomic_index, hierarchy, matrix, projection, parent_matrix,
             if before_commit is not None:
                 before_commit()
     return IncrementalSnapshot(snapshot, parents, parent_receipt, manifest, hashes,
-        {k: dict(upserted=len(changed[k]), deleted=len(removed[k])) for k in populations})
+        {k: dict(upserted=len(changed[k]), deleted=len(removed[k])) for k in populations}, sources)
 
 
 def saved_turn_count(path):
@@ -160,9 +192,9 @@ def load(path, *, turns):
     atomic, hierarchy, projection = (SectionSummaryIndex(groups[k]) for k in ('atomic','hierarchy','parents'))
     if project_parent_users(hierarchy, stable_ids=True).receipt_sha256 != projection.receipt_sha256:
         raise ValueError('persisted parent projection changed')
-    snapshot, parents, parent_receipt, reconstructed = _assemble(atomic, hierarchy,
+    snapshot, parents, parent_receipt, reconstructed, sources = _assemble(atomic, hierarchy,
         np.asarray(vectors['atomic']), projection, np.asarray(vectors['parents']),
         manifest['native']['embedding_identity'], tuple(turns))
     if reconstructed != manifest:
         raise ValueError('incremental snapshot differs from its transcript or manifest')
-    return IncrementalSnapshot(snapshot, parents, parent_receipt, manifest, hashes, {})
+    return IncrementalSnapshot(snapshot, parents, parent_receipt, manifest, hashes, {}, sources)

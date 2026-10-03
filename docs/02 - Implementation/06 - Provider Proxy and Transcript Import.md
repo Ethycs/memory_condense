@@ -21,7 +21,7 @@ own provider credential and configured upstream URL.
 
 ### Native memory beta (`--mode augment`)
 
-The proxy is distributed as version 0.2.0 with an installed `memory-condense`
+The proxy is distributed as version 0.2.1 with an installed `memory-condense`
 command and a packaged resident runtime. It no longer imports research tools
 or reads model paths relative to the checkout. See the root
 [installation guide](../../README.md) for the Pixi build, standalone installer,
@@ -69,6 +69,21 @@ and recall links survive into the existing Hebbian co-access learning. A
 completed response records use of a packet, not a guarantee of answer accuracy.
 Tools, structured-output schemas, custom stop sequences, and log probabilities
 retain their native output contract and use background summarization instead.
+Native ingestion stores exact raw IO and stable source chunks for learning,
+then indexes the routing summaries. It does not embed or maintain the legacy
+dense/lexical index for new raw turns or delivered recall copies. Native capture
+receipts are separate from the legacy ingest journal: capture alone does not
+claim that either search index has been published. Learning accepts unembedded
+chunks only after the native snapshot covers their exact original sources.
+
+Warm publication reuses authenticated raw prefixes and checks changed span
+partitions and new turns. Full checks remain on cold admission and recovery;
+compact index membership and complete snapshot receipts still bind the result.
+Older full snapshots migrate to the incremental store during startup. Feedback
+is applied after each committed prefix, including while more ingestion is ready.
+The runtime writes completed and failed sync timings to
+`ingestion-timings.jsonl` in each conversation directory.
+
 `--no-inline-memory` selects that behavior for every request. Inline requests
 reserve 512 additional output tokens (4,096 + 512 when no limit was provided).
 

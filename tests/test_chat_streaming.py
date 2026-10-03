@@ -37,6 +37,28 @@ class StreamingBackend(PublishedBackend):
         self.finalized+=1
 
 
+def test_learning_advances_between_publications_under_a_sustained_backlog(tmp_path):
+    class LearningChecked(StreamingBackend):
+        checked = 0
+        def sync_prepared(self, events, prepared):
+            eligible = {e.event_id for e in self.rows
+                        if e.metadata.get('_chat', {}).get('kind') == 'recall_feedback'}
+            if eligible:
+                assert eligible <= {event_id for _,event_id in self.learned}
+                self.checked += 1
+            super().sync_prepared(events, prepared)
+    backend = LearningChecked()
+    with ChatSession(tmp_path, 's', backend, streaming=True) as chat:
+        seed(chat)
+        # More than the three preparation slots, ready before the forced drain.
+        with chat.capture_exchange():
+            for i in range(1,9):
+                exchange(chat, i)
+        chat.flush()
+        assert backend.checked and len(backend.learned) == 8
+        assert chat.status()['pending_feedback'] == 0
+
+
 def test_out_of_order_preparation_is_bounded_and_publishes_only_contiguous_results(tmp_path):
     backend=StreamingBackend()
     with ChatSession(tmp_path,'s',backend,streaming=True,recent_exchanges=12) as chat:

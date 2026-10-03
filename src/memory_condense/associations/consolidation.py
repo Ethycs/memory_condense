@@ -422,8 +422,9 @@ def _edge_rows(
 class LiveConsolidationStore:
     """SQLite-backed decaying association graph over memories and chunks."""
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, *, native_chunk_validator=None) -> None:
         self._db = db
+        self._native_chunk_validator = native_chunk_validator
 
     def _existing_item_ids(self, query: str, item_ids: Sequence[str]) -> set[str]:
         """Return the subset of ``item_ids`` that ``query`` still admits.
@@ -447,8 +448,8 @@ class LiveConsolidationStore:
         """Reject nodes that no longer point at active, retrievable state.
 
         One lookup per partition: a memory must still be ``active``, and a
-        chunk must still carry both an embedding and an HNSW label, or the
-        association would index something retrieval can never hand back.
+        chunk must have a dense address or be validated against a published
+        native summary index and its exact raw source.
         """
 
         item_ids: dict[ConsolidationNodeKind, list[str]] = {
@@ -469,6 +470,10 @@ class LiveConsolidationStore:
                 item_ids[ConsolidationNodeKind.CHUNK],
             ),
         }
+        missing_chunks = [cid for cid in item_ids[ConsolidationNodeKind.CHUNK]
+                          if cid not in retrievable[ConsolidationNodeKind.CHUNK]]
+        if missing_chunks and self._native_chunk_validator is not None:
+            retrievable[ConsolidationNodeKind.CHUNK].update(self._native_chunk_validator(missing_chunks))
         missing = [
             node.key
             for node in nodes

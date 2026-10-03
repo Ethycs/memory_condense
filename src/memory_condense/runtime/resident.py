@@ -283,6 +283,7 @@ class ResidentNativeBackend:
         self.vectors = {}
         self.last_reopen = None
         self.timings = []
+        self._timing_lock = threading.Lock()
         self._atomic_index = self._hierarchy_index = None
         self._parent_projection = None
         self._published = None
@@ -303,6 +304,11 @@ class ResidentNativeBackend:
             else:
                 snapshot = self.app._load_native_spine()[1]
                 self._stream_base = (snapshot.semantic.hierarchy.sections, snapshot.hierarchy.sections)
+                self._atomic_index = snapshot.semantic.hierarchy
+                self._hierarchy_index = snapshot.hierarchy
+                incremental = getattr(self.app, '_native_spine_incremental', None)
+                if incremental is not None:
+                    self._parent_projection = incremental.parents.hierarchy
             self._stream_originals = self._stream_base[0]
 
     def prepare_exchange(self, events):
@@ -406,7 +412,7 @@ class ResidentNativeBackend:
         return datetime.fromisoformat(self.actor['source']['export_timestamp'])
 
     def _check_raw_prefix(self, rows):
-        existing = self.app.transcript.get_all()
+        existing = self.app.transcript.native_snapshot()
         if len(existing) > len(rows) or any(
             (t.turn_id, t.source_id, t.role, t.text, t.created_at) !=
             (r['turn_id'], r['source_id'], r['role'], r['text'], self._stamp(i))
@@ -443,7 +449,29 @@ class ResidentNativeBackend:
                 self.vectors[text] = vector
         return np.asarray([self.vectors[v] if isinstance(v, str) else v for v in result], dtype=np.float32)
 
+    def _record_timing(self, value):
+        with self._timing_lock:
+            self.timings.append(value)
+            try:
+                self.arm_root.mkdir(parents=True, exist_ok=True)
+                with (self.arm_root/'ingestion-timings.jsonl').open('a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(value, sort_keys=True)+'\n')
+            except OSError as exc:
+                # Diagnostics must not change the durable publication outcome.
+                value['timing_log_error'] = str(exc)
+
     def sync(self, events, *, _compiler=None):
+        started = time.perf_counter()
+        self._sync_details = dict(phase='admission')
+        try:
+            return self._sync_native(events, _compiler=_compiler)
+        except BaseException as exc:
+            self._record_timing(dict(operation='sync_failed', history_turns=len(events),
+                elapsed_s=time.perf_counter()-started, error=f'{type(exc).__name__}: {exc}',
+                **self._sync_details))
+            raise
+
+    def _sync_native(self, events, *, _compiler=None):
         started = time.perf_counter()
         original = [e.row(self.actor['source']['family']) for e in events]
         if len(original) < len(self.rows) or original[:len(self.rows)] != self.rows:
@@ -480,7 +508,27 @@ class ResidentNativeBackend:
             if count == len(rows):
                 snapshot = self.app.native_spine_receipt()
                 parents = self.app.native_parent_user_receipt()
-                self._ack(events, original, snapshot, parents, started, {'cold_admission': True})
+                migration_s = 0.0
+                if not live_path.exists():
+                    # Convert older checkpoints during cold admission. The
+                    # first interactive append must already have warm source
+                    # validation and stable per-section publication receipts.
+                    migration_start = time.perf_counter()
+                    _, admitted, memory = self.app._load_native_spine()
+                    old_parents = memory.router.parent_semantic
+                    by_root = {json.loads(s.summarizer_identity)['original_root_sha256']: vector
+                        for s,vector in zip(old_parents.sections, old_parents._dense._matrix, strict=True)}
+                    projection = project_parent_users(admitted.hierarchy, stable_ids=True)
+                    parent_matrix = np.asarray([by_root[json.loads(s.summarizer_identity)['original_root_sha256']]
+                                                for s in projection.sections], dtype=np.float32)
+                    snapshot = self.app.install_native_spine_incremental(admitted.semantic.hierarchy,
+                        admitted.hierarchy, admitted.semantic._dense._matrix,
+                        embedding_identity=admitted.semantic.embedding_identity,
+                        projection=projection, parent_matrix=parent_matrix)
+                    parents = self.app.native_parent_user_receipt()
+                    migration_s = time.perf_counter()-migration_start
+                self._ack(events, original, snapshot, parents, started,
+                          {'cold_admission': True, 'legacy_migration_s': migration_s})
                 return
             # A crash may leave fully indexed raw turns ahead of the last
             # published pair. Authenticate that *older* prefix before repair;
@@ -495,23 +543,27 @@ class ResidentNativeBackend:
         new = [(r['role'], r['text'], r['source_id'], self._stamp(i), r['turn_id'])
                for i, r in enumerate(rows) if i >= existing_count]
         preparation_start = time.perf_counter()
+        self._sync_details.update(phase='capture_and_compile', new_turns=len(new))
         # Compilation owns no application DB connection. Generation can run
-        # while the single writer captures/indexes raw IO; model kernels share
+        # while the single writer captures exact IO and its learning topology;
         # the existing lock. Publish only after BOTH prerequisites succeed.
         with ThreadPoolExecutor(max_workers=1) as pool:
             compilation = pool.submit(_compiler or self._compile, rows[prefix:])
             ingest_start = time.perf_counter()
             for i in range(0, len(new), 32):
-                self.app.ingest_many(new[i:i+32])
+                self.app.capture_native_many(new[i:i+32])
             if self.app.pending_ingest_count():
                 self.app.recover_pending_ingests()
             raw_ingest_s = time.perf_counter()-ingest_start
+            self._sync_details['raw_ingest_s'] = raw_ingest_s
             atomic, hierarchy, compile_timings = compilation.result()
         prepared = time.perf_counter()
+        self._sync_details.update(phase='summary_embedding', compile_timings=compile_timings)
         matrix = self.matrix(atomic)
         self._parent_projection = project_parent_users(hierarchy, stable_ids=True, previous=self._parent_projection)
         parent_matrix = self.matrix(self._parent_projection)
         embedded = time.perf_counter()
+        self._sync_details.update(phase='publication', summary_embedding_s=embedded-prepared)
         snapshot = self.app.install_native_spine_incremental(atomic, hierarchy, matrix,
             embedding_identity=self.embedding_identity, projection=self._parent_projection, parent_matrix=parent_matrix)
         self._ack(events, original, snapshot, self.app.native_parent_user_receipt(), started,
@@ -526,7 +578,7 @@ class ResidentNativeBackend:
         """Warm summary caches for a durable journal prefix without publication.
 
         Called only by the session's existing single writer. The next sync still
-        indexes every raw event, embeds all summaries, publishes, then learns.
+        captures new raw events, embeds new summaries, publishes, then learns.
         """
         if self.last_reopen is None:
             return  # Initial admission stays on the ordinary synchronization path.
@@ -615,14 +667,14 @@ class ResidentNativeBackend:
         # the application's loaded index cannot change its routing namespace.
         self._publish_read_view()
         timing = dict(operation='sync', history_turns=len(rows), elapsed_s=time.perf_counter()-started, **phases)
-        self.timings.append(timing)
+        self._record_timing(timing)
 
     def _publish_read_view(self):
         # Capture the committed, authenticated prefix once. An active recall
         # never opens the mutable SQLite/WAL files during writer checkpoints.
         # Turn records are frozen; the mapping is read-only and namespace-bound
         # to this exact published index, including after a failed future sync.
-        turns = self.app.transcript.get_all()
+        turns = self.app.transcript.native_snapshot()
         if len(turns) != len(self.events):
             raise ValueError('Published hydration prefix differs from the native index')
         raw = MappingProxyType({t.turn_id: t for t in turns})
@@ -664,7 +716,8 @@ class ResidentNativeBackend:
     def learn(self, packet, *, access_event_id):
         started = time.perf_counter()
         learned = learn_native_packet(self.app, packet, self.events, access_event_id=access_event_id)
-        self.timings.append(dict(operation='learn', elapsed_s=time.perf_counter()-started))
+        self._record_timing(dict(operation='learn', elapsed_s=time.perf_counter()-started,
+                                 access_event_id=access_event_id))
         return dict(learning=asdict(learned) if learned is not None else None)
 
     def close(self):

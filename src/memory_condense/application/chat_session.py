@@ -119,6 +119,7 @@ class ChatSession:
         self._io_lock = threading.RLock()
         self._closed, self._verified = False, False
         self._installed, self._error = 0, None
+        self._committed_events = ()
         self._owner = (self.directory / 'chat-owner.lock').open('a+b')
         try:
             self._lock_owner()
@@ -186,9 +187,22 @@ class ChatSession:
             raise RuntimeError('Chat session is closed')
 
     def events(self) -> tuple[ChatEvent, ...]:
+        return self._event_range()
+
+    def _event_range(self, after=0, through=None):
         with self._connect() as db:
-            rows = db.execute('SELECT event_id, role, text, created_at, metadata FROM events ORDER BY sequence').fetchall()
+            rows = db.execute('SELECT event_id, role, text, created_at, metadata FROM events '
+                'WHERE sequence>? AND sequence<=? ORDER BY sequence',
+                (after, through if through is not None else 9223372036854775807)).fetchall()
         return tuple(ChatEvent(*row[:4], metadata=json.loads(row[4])) for row in rows)
+
+    def _prefix_events(self, target):
+        """Writer-owned immutable prefix plus only the newly committed rows."""
+        old = self._committed_events
+        events = old[:target] if target <= len(old) else (*old, *self._event_range(len(old), target))
+        if len(events) != target:
+            raise ValueError('Ingestion checkpoint exceeds the durable journal')
+        return events
 
     def event(self, event_id):
         with self._connect() as db:
@@ -310,7 +324,7 @@ class ChatSession:
                             end = force_target
                     if end <= after:
                         break
-                    events = self.events()[after:end]
+                    events = self._event_range(after, end)
                     future = self._preparers.submit(self.backend.prepare_exchange, events)
                     self._stream_jobs.append((end, events, future))
                     future.add_done_callback(lambda _: self._schedule_sync())
@@ -338,16 +352,22 @@ class ChatSession:
             target = ready[-1][0]
             with self._connect() as db:
                 db.execute('UPDATE ingestion_state SET target=? WHERE id=1', (target,))
-            self.backend.sync_prepared(self.events()[:target], tuple(value for _, value in ready))
+            events = self._prefix_events(target)
+            self.backend.sync_prepared(events, tuple(value for _, value in ready))
             with self._connect() as db:
                 db.execute('UPDATE ingestion_state SET committed=?,target=NULL WHERE id=1', (target,))
             with self._lock:
                 self._installed = target
+                self._committed_events = events
                 del self._stream_jobs[:len(ready)]
+            # A busy preparer can keep this loop alive indefinitely. Apply
+            # eligible source-linked learning at each committed prefix, not
+            # only after the complete ingestion backlog has drained.
+            self._apply_feedback()
             if force_target is not None and target >= force_target:
                 break
         if force_target is not None:
-            self.backend.finalize_stream(self.events()[:self._installed])
+            self.backend.finalize_stream(self._prefix_events(self._installed))
 
     def _prepare_pending(self):
         if not self.prepare_exchanges:
@@ -357,7 +377,7 @@ class ChatSession:
         if target > max(self._installed, self._prepared):
             # Same writer owns preparation and publication. Preparation changes
             # caches only: committed state, raw indexing and learning stay put.
-            self.backend.prepare(self.events()[:target], should_yield=self._preparation_should_yield)
+            self.backend.prepare(self._prefix_events(target), should_yield=self._preparation_should_yield)
             self._prepared = target
 
     def _preparation_should_yield(self):
@@ -365,7 +385,7 @@ class ChatSession:
             return self._closed or self._batch_end(db, completed_only=True)>self._installed
 
     def _publish_prefix(self, target):
-        events = self.events()[:target]
+        events = self._prefix_events(target)
         if len(events) != target:
             raise ValueError('Ingestion checkpoint exceeds the durable journal')
         with self._connect() as db:
@@ -376,6 +396,7 @@ class ChatSession:
             db.execute('UPDATE ingestion_state SET committed=?, target=NULL WHERE id=1', (target,))
         with self._lock:
             self._installed, self._verified = target, True
+            self._committed_events = events
 
     def _sync(self, *, force=True, allow_batch=False):
         try:
@@ -400,15 +421,7 @@ class ChatSession:
                 self._publish_prefix(target)
                 if force and target >= force_target:
                     break
-            with self._connect() as db:
-                pending = db.execute('SELECT f.packet_id, f.successful, f.event_id FROM feedback f JOIN events e ON e.event_id=f.event_id WHERE f.applied=0 AND e.sequence<=? ORDER BY f.rowid', (self._installed,)).fetchall()
-            for packet_id, successful, event_id in pending:
-                if successful:
-                    self.backend.learn(self.packet(packet_id), access_event_id=event_id)
-                # The backend uses the same stable ID on a crash/retry between
-                # graph commit and acknowledgement here. Applied rows persist.
-                with self._connect() as db:
-                    db.execute('UPDATE feedback SET applied=1 WHERE packet_id=?', (packet_id,))
+            self._apply_feedback()
             if not force and not self.streaming:
                 self._prepare_pending()
             with self._lock:
@@ -417,6 +430,16 @@ class ChatSession:
             with self._lock:
                 self._error = f'{type(exc).__name__}: {exc}'
             raise
+
+    def _apply_feedback(self):
+        with self._connect() as db:
+            pending = db.execute('SELECT f.packet_id, f.successful, f.event_id FROM feedback f JOIN events e ON e.event_id=f.event_id WHERE f.applied=0 AND e.sequence<=? ORDER BY f.rowid', (self._installed,)).fetchall()
+        for packet_id, successful, event_id in pending:
+            if successful:
+                self.backend.learn(self.packet(packet_id), access_event_id=event_id)
+            # Stable IDs make a retry after graph commit idempotent.
+            with self._connect() as db:
+                db.execute('UPDATE feedback SET applied=1 WHERE packet_id=?', (packet_id,))
 
     def _call(self, operation, *, reader=False):
         with self._lock:

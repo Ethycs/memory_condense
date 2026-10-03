@@ -96,7 +96,7 @@ def test_compile_overlaps_raw_indexing_and_failed_compile_keeps_published_prefix
     old_count=len(events)
     indexed=threading.Event()
     compile_original=backend._compile
-    ingest_original=backend.app.ingest_many
+    ingest_original=backend.app.capture_native_many
     def ingest(*args,**kwargs):
         result=ingest_original(*args,**kwargs)
         indexed.set()
@@ -104,7 +104,7 @@ def test_compile_overlaps_raw_indexing_and_failed_compile_keeps_published_prefix
     def fail_after_index(live):
         assert indexed.wait(5), 'Raw indexing must overlap compilation'
         raise RuntimeError('simulated compiler failure')
-    monkeypatch.setattr(backend.app,'ingest_many',ingest)
+    monkeypatch.setattr(backend.app,'capture_native_many',ingest)
     monkeypatch.setattr(backend,'_compile',fail_after_index)
     events.append(ChatEvent('overlap-new','user','Deployment remains a plan.',STAMP))
     try:
@@ -168,6 +168,42 @@ def test_published_hydration_uses_authenticated_snapshot_without_disk_reads(tmp_
             backend._published[3]['foreign']=None
     finally:
         backend.close()
+
+
+def test_native_continuation_never_calls_raw_embedder_or_reloads_all_turns(tmp_path, monkeypatch):
+    from memory_condense.application.chat_session import RecallPacket
+    backend, events, _, actor = setup(tmp_path, monkeypatch)
+    backend.sync(events)
+    try:
+        packet = backend.recall_published('Deployment?')
+        def forbidden(*args, **kwargs):
+            pytest.fail('Native continuation must not maintain the legacy raw index or reload its prefix')
+        monkeypatch.setattr(backend.encoder, 'embed_chunks', forbidden)
+        monkeypatch.setattr(backend.app, 'ingest_many', forbidden)
+        monkeypatch.setattr(backend.app.transcript, 'get_all', forbidden)
+        additions = (ChatEvent('native-u', 'user', 'Continue the deployment plan.', STAMP),
+            ChatEvent('_chat:recall:native-p', 'system', packet['text'], STAMP,
+                {'_chat': dict(kind='recall',packet_id='native-p',references=packet['references'])}),
+            ChatEvent('native-a', 'assistant', 'The deployment remains planned.', STAMP))
+        backend.start_stream()
+        prepared = backend.prepare_exchange(additions)
+        events.extend(additions)
+        backend.sync_prepared(events, (prepared,))
+        recall = RecallPacket('native-p', 'Deployment?', packet['text'], tuple(packet['references']), 'native-u')
+        first = backend.learn(recall, access_event_id='native-feedback')
+        backend.learn(recall, access_event_id='native-feedback')
+        assert first['learning'] is not None
+        rows = backend.app._db.execute("SELECT embedding FROM chunks WHERE turn_id IN ('native-u','native-a')").fetchall()
+        assert rows and all(row[0] is None for row in rows)
+        expected = backend.last_reopen['snapshot']
+    finally:
+        backend.close()
+    reopened = resident.ResidentNativeBackend(tmp_path,tmp_path/'live',actor)
+    try:
+        reopened.sync(events)
+        assert reopened.last_reopen['snapshot'] == expected
+    finally:
+        reopened.close()
 
 
 def setup(tmp_path, monkeypatch):
@@ -289,6 +325,9 @@ def test_failed_publication_never_acknowledges_or_recalls_stale_snapshot(tmp_pat
     try:
         with pytest.raises(RuntimeError, match='publication failure'):
             backend.sync(events)
+        log = [json.loads(line) for line in (backend.arm_root/'ingestion-timings.jsonl').read_text().splitlines()]
+        assert log[-1]['operation'] == 'sync_failed' and log[-1]['phase'] == 'publication'
+        assert 'raw_ingest_s' in log[-1]
         assert backend.last_reopen == previous
         assert [p.read_bytes() for p in paths] == original_bytes
         with pytest.raises(ValueError, match='raw transcript advanced'):

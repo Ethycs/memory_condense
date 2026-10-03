@@ -23,4 +23,10 @@ Validation includes proxy and lifecycle regression tests, a separate installed
 environment, real local model HTTP acceptance with a controlled upstream, and
 durable source-pointer/learning checks. GitHub CI exercises CPU unit tests and
 Windows package installation; it does not claim GPU or paid-model evaluation.
-The 2M/5M/10M stress campaign is separate ongoing evaluation, not a release result.
+The scale stress test reached 2,226,578 stored tokens, then stopped after 29 of
+200 planned answers because background ingestion remained more than twelve
+exchanges behind. Mean reply time over that partial run was 9.95 seconds;
+28 of 29 inline summary pairs were accepted. The queued 5M/500-question and
+10M/1,000-question stages were not started. This identifies a throughput limit
+for sustained large-memory chat; the aborted run does not establish accuracy
+or successful operation at those larger sizes.

@@ -1,0 +1,3 @@
+# These canonical JSON receipts and sidecars are byte authenticated.
+# Windows checkout line-ending conversion must never alter their contents.
+src/memory_condense/runtime/data/bge-admission/* -text

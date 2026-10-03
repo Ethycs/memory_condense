@@ -84,7 +84,7 @@ jobs:
           ./dist/install-proxy.ps1 -InstallDir "$env:RUNNER_TEMP/memory-proxy" -SkipSetup
           & "$env:RUNNER_TEMP/memory-proxy/memory-condense.cmd" proxy --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pixi run --manifest-path "$env:RUNNER_TEMP/memory-proxy/pixi.toml" python -I -c "from memory_condense.runtime.sessions import NativeProxySessions; from memory_condense.interfaces.proxy_server import build_app; print('installed-runtime-import-ok')"
+          pixi run --manifest-path "$env:RUNNER_TEMP/memory-proxy/pixi.toml" python -I -c "from memory_condense.runtime.sessions import NativeProxySessions; from memory_condense.interfaces.proxy_server import build_app; from memory_condense.runtime.artifacts import read; import memory_condense.runtime.embedding as e; from pathlib import Path; [read(Path(e.__file__).parent/'data'/'bge-admission'/n) for n in ('admission.json','plan.json','report.json')]; print('installed-runtime-and-receipts-ok')"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-release

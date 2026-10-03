@@ -58,7 +58,9 @@ jobs:
     timeout-minutes: 45
     env:
       PYTHONUTF8: '1'
-      PIXI_OVERRIDE_CUDA: '12.6'
+      # Hosted runners have no GPU; allow dependency resolution, then exercise
+      # installation/imports only. Actual GPU execution is a separate assay.
+      CONDA_OVERRIDE_CUDA: '12.6'
       RELEASE_REF: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

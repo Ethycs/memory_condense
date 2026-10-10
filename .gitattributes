@@ -1,3 +1,15 @@
 # These canonical JSON receipts and sidecars are byte authenticated.
 # Windows checkout line-ending conversion must never alter their contents.
 src/memory_condense/runtime/data/bge-admission/* -text
+src/memory_condense/runtime/data/tactic-router-v1.json* -text
+src/memory_condense/runtime/data/history-intent-v1.json* -text
+
+# runtime/attention.py hashes the raw bytes of six package sources into the
+# durable attention cache identity, so a CRLF checkout would silently
+# invalidate every cached score the first time a cache crossed hosts.
+*.py text eol=lf
+
+# Executed on Linux, so they must never arrive CRLF from a Windows checkout.
+*.sh text eol=lf
+packaging/Dockerfile text eol=lf
+packaging/docker-entrypoint.sh text eol=lf

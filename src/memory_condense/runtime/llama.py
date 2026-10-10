@@ -3,11 +3,25 @@ from pathlib import Path
 import subprocess
 import time
 
-def gpu():
-    return subprocess.check_output([
-        'nvidia-smi', '--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu',
-        '--format=csv',
-    ], text=True).strip()
+def gpu(*, strict=False):
+    """Driver-reported inventory for the run receipt.
+
+    An absent or failing nvidia-smi is a reporting gap, not a reason to fail an
+    otherwise healthy CUDA run. This is called from CompressedAttention.prepare()
+    on conversation open, which nothing wraps in a tolerant handler, and the tool
+    is routinely missing inside a container that exposes only compute. doctor()
+    passes strict=True so the gap is still reported as its own failed check.
+    The return stays a str either way: it is embedded in sealed JSON receipts.
+    """
+    try:
+        return subprocess.check_output([
+            'nvidia-smi', '--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu',
+            '--format=csv',
+        ], text=True).strip()
+    except (OSError, subprocess.SubprocessError):
+        if strict:
+            raise
+        return 'nvidia-smi unavailable'
 
 def invoke(client, job):
     started = time.perf_counter()

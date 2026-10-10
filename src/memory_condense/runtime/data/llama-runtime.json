@@ -3,6 +3,9 @@
     "name": "llama-b11272-bin-win-cuda-12.4-x64.zip",
     "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11272/llama-b11272-bin-win-cuda-12.4-x64.zip",
     "sha256": "165340cc27fcd5f7335d503e8df1ed52204d9ea00ec2f4c232d672cfc7643af5",
+    "platforms": [
+      "win-amd64"
+    ],
     "files": {
       "ggml-cuda.dll": "24bb1ddaf9a123e4ae6ca6fdabdd01cf8039db3a6802e642ed0f74c038e5a9e5",
       "mtmd.dll": "7892ff639413ce0b66e2b907010cbade789e196e4112865d89583783ef78a5fa",
@@ -62,10 +65,97 @@
     "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
     "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11272/cudart-llama-bin-win-cuda-12.4-x64.zip",
     "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+    "platforms": [
+      "win-amd64"
+    ],
     "files": {
       "cublas64_12.dll": "e40202fe4223c1cd2d2dce7beec59e1ed61c7801bd827309183be9b50e358f4c",
       "cublasLt64_12.dll": "2a896460bef60ed57ef32b0875812f355a6984e671d638bb632f5e8c1d7a831f",
       "cudart64_12.dll": "d28e42265da7462162a54da6b7a99ea4fa2caf8139d862bb500db875d0b32dfc"
+    }
+  },
+  {
+    "name": "llama-b11272-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11272/llama-b11272-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    "sha256": "8dfd42b0ff8ee7295bbe1095b60853e8d6822ad83feb3a4a6daf41178d574f9b",
+    "platforms": [
+      "linux-x86_64"
+    ],
+    "files": {
+      "ggml-rpc-server": "00e81f1930ccda3954c08339b8c5a0069fbcddd1f7e511317ba76cd6e8e9ba85",
+      "libggml-base.so": "ae4326724dd74e02d48155651b6d09069d2fa43ccc44e30cce44d801757ab2ac",
+      "libggml-base.so.0": "ae4326724dd74e02d48155651b6d09069d2fa43ccc44e30cce44d801757ab2ac",
+      "libggml-base.so.0.25.3": "ae4326724dd74e02d48155651b6d09069d2fa43ccc44e30cce44d801757ab2ac",
+      "libggml-cpu-alderlake.so": "ffcf00bf94493bb77f9e0442316dd34364bd978e5fbcfd52dbee3ac4439a9026",
+      "libggml-cpu-cannonlake.so": "2efc6457025e06351bc3235b17e15dc08d4c45b1015277f7ddc69c92c679b7bf",
+      "libggml-cpu-cascadelake.so": "45cf86af2e317a113e0679c8211d356bdbd136aa43aa8d512052e7892dd83f3a",
+      "libggml-cpu-cooperlake.so": "08e4b16928b8a2bfdaf395d93b3efbb97aad35651a7fe08ae32255feae9fa995",
+      "libggml-cpu-haswell.so": "e27b6a5c1ab921c5d0cecb965f05cc05f7611e54d2c963f530f790d521d8faa6",
+      "libggml-cpu-icelake.so": "96779fe0a93835e5c53d68bc132bd1e027825720ea9d0df7c41e1090ec6e74a1",
+      "libggml-cpu-ivybridge.so": "d30c13d5960bcdd30c2674acdc4dc19167ae7b1a2df565e9d4181346c467014a",
+      "libggml-cpu-piledriver.so": "4d4f24d38755283d03172ca81abdcff80cb7b8f28e3aef6d451dabf7616f1c36",
+      "libggml-cpu-sandybridge.so": "fae6e1b5747ca6326a2345cf08d0b51a25a387da7637da32946bf50b33777f7d",
+      "libggml-cpu-sapphirerapids.so": "188f4b6b88745a7c6bf939d90186345a5e421f36902040a6d9f646ca09a3c96b",
+      "libggml-cpu-skylakex.so": "29f8fa40a2641ceffc7eef9c9c247b22927c9784571193123674167968159749",
+      "libggml-cpu-sse42.so": "dbf6d8ab2be18466281379482cf4390766215fe775d1f91ae25d012b41f853ea",
+      "libggml-cpu-x64.so": "d1a02d114e414feeab047061e5facb1f62e07029deaa612cfbecf9e533f80468",
+      "libggml-cpu-zen4.so": "f5db15831610991c0680967f20d8ca6c0deeaa750fa794346e2c25ed0033645c",
+      "libggml-cuda.so": "5e2c550d8b69798480431ebd50cda99d0d110bdd3f6c20ffa293d583851e69c5",
+      "libggml-rpc.so": "00edb40a3cd8c52fd5a7e02f04dd99f3d4bdc52b41e8df6c9ccc8f2bfa3da1cb",
+      "libggml.so": "c267dbbf8bf1a49254c780ab3ed6f5918eb1f0ce2b59d008c866815174765162",
+      "libggml.so.0": "c267dbbf8bf1a49254c780ab3ed6f5918eb1f0ce2b59d008c866815174765162",
+      "libggml.so.0.25.3": "c267dbbf8bf1a49254c780ab3ed6f5918eb1f0ce2b59d008c866815174765162",
+      "libllama-batched-bench-impl.so": "c27d1038e73add8d44a6b7e2b462aeb77665b1f02157c368f890671ed0b03460",
+      "libllama-bench-impl.so": "2cf5bda1d4277f8917e8c5365095f29852a2ab8f6e0cadfda7edf84d70e27924",
+      "libllama-cli-impl.so": "dddb01630094c4f587faf7b38a0207c4d2a1c17b230300ecad800a81082e2a8a",
+      "libllama-common.so": "e5e6516dfc29385b22e7b60d20c08d9320a66bd9a897dee332596e9b229c0a97",
+      "libllama-common.so.0": "e5e6516dfc29385b22e7b60d20c08d9320a66bd9a897dee332596e9b229c0a97",
+      "libllama-common.so.0.5.0": "e5e6516dfc29385b22e7b60d20c08d9320a66bd9a897dee332596e9b229c0a97",
+      "libllama-completion-impl.so": "6841045e3205c6bc9436d9b64bc0b7844a75a0b5ecaca11c588865cbb95a5b82",
+      "libllama-fit-params-impl.so": "144b5ff358b4bb9e98f60b13dcb972edb0f0fc146efe071d85fee3ab88b6fdb2",
+      "libllama-perplexity-impl.so": "d107ff44a8bf3b11a36cae1695e8aa9fb91f9589faa9de0197d299ce535879eb",
+      "libllama-quantize-impl.so": "d410a2ca89fd4cc69727afe5e50a49e7bcb708bc530f5041bb2efaa430e264c6",
+      "libllama-server-impl.so": "eb2732ae6016c784513f374222fb0a9b09c0000ed1f43f1df9338ea69e04a5ef",
+      "libllama.so": "349d321a1bb04166febe3ccb937fe99fc496734f7817ca87dc8a23d1b44d04df",
+      "libllama.so.0": "349d321a1bb04166febe3ccb937fe99fc496734f7817ca87dc8a23d1b44d04df",
+      "libllama.so.0.5.0": "349d321a1bb04166febe3ccb937fe99fc496734f7817ca87dc8a23d1b44d04df",
+      "libmtmd.so": "79b61778dd68fcf36b8f762f637fde87c5c19144c14bf5c2e71a8f97524c5d39",
+      "libmtmd.so.0": "79b61778dd68fcf36b8f762f637fde87c5c19144c14bf5c2e71a8f97524c5d39",
+      "libmtmd.so.0.5.0": "79b61778dd68fcf36b8f762f637fde87c5c19144c14bf5c2e71a8f97524c5d39",
+      "LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+      "llama": "b71a4570aeee01f66005ecce9ec4a72432a3aa16780d6e9111b27c28558b0bba",
+      "llama-batched-bench": "7859f175883f9c37443f6e5f1e07425f4b5885031d90ebacb4c1e97e60d8788c",
+      "llama-bench": "c9bebf750f6d74dbee4e6ca2328afdec6da29f2200e75d4bdea64f1b4bbd92e1",
+      "llama-cli": "788cb49f3310d9286f437fd2d3806954db61e3f66a30a0160e5cafe32f56f498",
+      "llama-completion": "15472995c69d23fd6350f84b1fb73156698bab77b20438b617bcd8e1e9a9a11f",
+      "llama-fit-params": "140a1326c0556d44fb96fad5fed3d1910e28525911c57676f5ff0fd11923265e",
+      "llama-gemma3-cli": "b97e6722bf5d263b68e0f25dd6480d44f2e12ec752fc80204600a82e2d773372",
+      "llama-gguf-split": "d2a649c9622343682b22bbc55c3cd6007304a518031e1970a2ff95b4b9fdaf09",
+      "llama-imatrix": "940210fc5aebd838f92a28f984278e7ecd637b1a157b08b3624864a8c91ee2a9",
+      "llama-llava-cli": "b97e6722bf5d263b68e0f25dd6480d44f2e12ec752fc80204600a82e2d773372",
+      "llama-minicpmv-cli": "b97e6722bf5d263b68e0f25dd6480d44f2e12ec752fc80204600a82e2d773372",
+      "llama-mtmd-cli": "127b0a4506deb5132ef2e15a7b7af6d30559f3cbe7f3256baa99128a99841a95",
+      "llama-mtmd-debug": "a11cb59d47693906aa14000a414ff9f8c6d8a5088812248cc825f8ef44a4cb16",
+      "llama-perplexity": "92594986686a4bbe23a2834695792ce32f8b18b9d57bf3c50e0ac87aba715fdd",
+      "llama-quantize": "c79d37fdee3345443a8b6cc349797259bf39513aa632418a6f961e6d05cd0936",
+      "llama-qwen2vl-cli": "b97e6722bf5d263b68e0f25dd6480d44f2e12ec752fc80204600a82e2d773372",
+      "llama-results": "42c18f8029a3c269507597320e5e343be971fa60a78aa25c99bbc37bfd09e449",
+      "llama-server": "3d24fdc62f50a2bd156c5e713b1595c5ea65008586690d216f7035d6997f251a",
+      "llama-tokenize": "cc24363b8949439abda3075cec81161624c0145f069a98c9b307260db1551dc7",
+      "llama-tts": "92e1716995a0647529ed53e1a6664827c2c669a8eda16101d8e8cdf485450fe0"
+    }
+  },
+  {
+    "name": "cudart-llama-b11272-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11272/cudart-llama-b11272-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    "sha256": "63026fe66284b6a1ca21639f6ed9c220b44fb36067af811395baa472406fed1e",
+    "platforms": [
+      "linux-x86_64"
+    ],
+    "files": {
+      "libcublas.so.12": "18a5df540d156e9aff0363776fefab7884b614f122847b51c3eb1da772048e5c",
+      "libcublasLt.so.12": "974927b9af78cadc0412ea3ab296da791af02c2dd0de5a35b5f0fbb8dc5d0a4d",
+      "libcudart.so.12": "c3a75b33af334a3486d197dbd1584a2985183ba4688d237a2be5f2f679329920"
     }
   }
 ]

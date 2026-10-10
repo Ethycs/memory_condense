@@ -6,7 +6,7 @@ preview = ["pixi-build"]
 
 [package]
 name = "memory_condense"
-version = "0.2.1"
+version = "0.2.2"
 description = "Memory-enabled OpenAI and Anthropic provider proxy"
 
 [package.build]
@@ -16,7 +16,8 @@ backend = { name = "pixi-build-python", version = "*" }
 python = "3.12.*"
 hatchling = ">=1.26"
 
-# PyPI-only runtime additions are installed by packaging/install-proxy.ps1.
+# PyPI-only runtime additions are installed by packaging/install-proxy.ps1
+# and packaging/install-proxy.sh.
 [package.run-dependencies]
 python = ">=3.11,<3.13"
 numpy = ">=1.26,<3"

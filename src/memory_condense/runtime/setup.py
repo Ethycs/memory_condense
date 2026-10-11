@@ -7,6 +7,7 @@ from pathlib import Path
 import platform
 import shutil
 import ssl
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -25,6 +26,12 @@ LLAMA_REVISION = '5ab33fa94d1d04e903623ae72c95d1696f09f9e8'
 #: unknown suffix fails closed so no one can add a .tar.xz or .7z pin without
 #: also teaching the extractor to validate it.
 ARCHIVE_SUFFIXES = ('.zip', '.tar.gz')
+WINDOWS_FILE_ATTRIBUTE_COMPRESSED = 0x800
+
+
+def windows_file_is_compressed(path):
+    attributes = int(getattr(Path(path).stat(), 'st_file_attributes', 0))
+    return bool(attributes & WINDOWS_FILE_ATTRIBUTE_COMPRESSED)
 
 
 def archive_suffix(name):
@@ -84,6 +91,44 @@ def verify_assets(assets):
     if source != read(DATA/'bge-admission'/'plan.json')['model']:
         raise ValueError('BGE source identity differs from the pinned export')
     return checked
+
+
+def prepare_memory_mapped_models(assets, *, windows=None):
+    """Remove transparent NTFS compression from large mmap model files.
+
+    The model payloads are already compressed or dense binary formats, so NTFS
+    compression saves effectively no space.  It can make llama.cpp and the
+    safetensors/ONNX loaders fault compressed filesystem blocks for minutes on
+    a cold start.  Setup performs this conversion once, outside the interactive
+    path; model bytes and their pinned hashes do not change.
+    """
+
+    active = os.name == 'nt' if windows is None else bool(windows)
+    if not active:
+        return 0
+    from memory_condense.modeling.qwen_prefix import FIRST_SHARD
+    paths = (
+        assets.qwen/FIRST_SHARD,
+        assets.bge/'onnx'/'model.onnx',
+        assets.bge/'onnx'/'model.onnx_data',
+        assets.llama_model,
+    )
+    converted = 0
+    for path in paths:
+        path = Path(path)
+        if not path.is_file():
+            continue
+        if not windows_file_is_compressed(path):
+            continue
+        print('Removing NTFS compression from '+str(path), flush=True)
+        subprocess.run(
+            ['compact.exe', '/u', '/i', '/q', str(path)],
+            check=True,
+        )
+        if windows_file_is_compressed(path):
+            raise RuntimeError('NTFS compression remains enabled for '+str(path))
+        converted += 1
+    return converted
 
 
 def archive_members(bundle):
@@ -244,6 +289,7 @@ def download_assets(assets):
                 raise ValueError('Runtime download checksum mismatch: '+str(partial))
             partial.replace(archive)
         extract_archive(archive, directory)
+    prepare_memory_mapped_models(assets)
 
 
 def require_supported_platform():
@@ -261,12 +307,14 @@ def setup(*, assets_dir=None, reuse=None):
     if not reuse:
         download_assets(assets)
     count = verify_assets(assets)
+    uncompressed = prepare_memory_mapped_models(assets)
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.json.tmp')
     temporary.write_text(json.dumps({'version':1,'assets_dir':str(assets.root)}, indent=2)+'\n', encoding='utf-8')
     temporary.replace(path)
-    print(json.dumps({'configured':True,'assets_dir':str(assets.root),'verified_files':count,'config':str(path)}))
+    print(json.dumps({'configured':True,'assets_dir':str(assets.root),'verified_files':count,
+                      'uncompressed_model_files':uncompressed,'config':str(path)}))
     return 0
 
 

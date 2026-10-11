@@ -6,6 +6,12 @@ exact revisions, checks file SHA-256 hashes, and records the verified asset
 directory. Existing valid files are reused. `memory-condense setup --reuse PATH`
 verifies an existing cache without downloading. Runtime startup never downloads
 models implicitly; `memory-condense doctor --verify-models` checks them again.
+On Windows, setup also removes transparent NTFS compression from the large
+GGUF, safetensors, and ONNX payloads after authentication. Their bytes and
+recorded hashes stay unchanged. Keeping these memory-mapped files compressed
+can turn a normal model load into a multi-minute cold-start stall while saving
+effectively no space for already dense model formats. This applies to both new
+downloads and caches registered with `--reuse`.
 
 | Component | Provisioning | Upstream |
 | --- | --- | --- |

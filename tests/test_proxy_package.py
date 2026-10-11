@@ -179,6 +179,26 @@ def test_cold_asset_download_uses_pins_verifies_archives_and_reuses_valid_files(
     assert len(calls)==3 and len(remote)==1
 
 
+def test_windows_setup_uncompresses_only_present_compressed_mmap_models(tmp_path,monkeypatch):
+    assets=RuntimeAssets(tmp_path/'assets',None,'win-amd64')
+    from memory_condense.modeling.qwen_prefix import FIRST_SHARD
+    targets=(assets.qwen/FIRST_SHARD,assets.bge/'onnx/model.onnx',
+             assets.bge/'onnx/model.onnx_data',assets.llama_model)
+    for path in targets:
+        path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'model')
+    compressed={str(path):True for path in targets}
+    calls=[]
+    monkeypatch.setattr(provision,'windows_file_is_compressed',
+                        lambda path:compressed[str(path)])
+    def run(command,check):
+        assert command[:4]==['compact.exe','/u','/i','/q'] and check is True
+        calls.append(command[-1]);compressed[command[-1]]=False
+    monkeypatch.setattr(provision.subprocess,'run',run)
+    assert provision.prepare_memory_mapped_models(assets,windows=True)==4
+    assert calls==[str(path) for path in targets]
+    assert provision.prepare_memory_mapped_models(assets,windows=True)==0
+
+
 def _tarball(path, entries):
     """entries: (name, mode, payload) with payload None meaning a directory."""
     with tarfile.open(path, 'w:gz') as bundle:

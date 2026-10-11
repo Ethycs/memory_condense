@@ -21,6 +21,7 @@ import numpy as np
 from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.domain._discourse_identity import quote_sha256
 from memory_condense.domain._tokenizer import count_tokens
+from memory_condense.domain.schemas import Chunk
 from memory_condense.persistence.db import Database
 from memory_condense.persistence.transcript_store import TranscriptStore
 from memory_condense.persistence import native_spine_store, native_spine_parent_store
@@ -60,11 +61,22 @@ class CachedSourceEmbedding:
     def __init__(self):
         self.chunks = {}
         self.hits = 0
+        self.turns = {}
+        self.topology = {}
+        self.chunk_cache_hits = 0
 
     def add(self, directory):
         with closing(sqlite3.connect((directory/'memory.db').as_uri()+'?mode=ro', uri=True)) as db:
-            for tid, start, end, text, vector, lexical in db.execute(
-                    'SELECT turn_id,start_char,end_char,text,embedding,lexical_weights FROM chunks'):
+            raw = dict(db.execute('SELECT turn_id,text FROM turns'))
+            if self.turns.keys() & raw.keys():
+                raise ValueError('Duplicate source turn identity')
+            self.turns.update({tid:quote_sha256(text) for tid,text in raw.items()})
+            self.topology.update({tid:[] for tid in raw})
+            for cid, tid, start, end, text, tokens, vector, lexical in db.execute(
+                    'SELECT chunk_id,turn_id,start_char,end_char,text,token_count,embedding,lexical_weights '
+                    'FROM chunks ORDER BY turn_id,start_char,end_char,chunk_id'):
+                if tid not in raw or not 0 <= start < end <= len(raw[tid]) or raw[tid][start:end] != text:
+                    raise ValueError('Cached source chunk does not match its raw span')
                 values = np.frombuffer(vector, dtype=np.float32)
                 if values.shape != (self.dim,) or not np.isfinite(values).all():
                     raise ValueError('Invalid cached source chunk embedding')
@@ -72,6 +84,15 @@ class CachedSourceEmbedding:
                 if key in self.chunks:
                     raise ValueError('Duplicate source occurrence')
                 self.chunks[key] = (values, json.loads(lexical) if lexical else None)
+                self.topology[tid].append(Chunk(chunk_id=cid,turn_id=tid,text=text,
+                    start_char=start,end_char=end,token_count=tokens))
+
+    def chunk_turn(self, turn_id, text):
+        """Reuse authenticated source topology without repeating sentence splitting."""
+        if self.turns.get(turn_id) != quote_sha256(text):
+            raise ValueError('Cached source turn changed')
+        self.chunk_cache_hits += 1
+        return list(self.topology[turn_id])
 
     def embed_chunks(self, chunks):
         result = []
@@ -140,8 +161,18 @@ def build(root, million):
     save(root/'ingest-plan.json', dict(nominal_tokens=million*1_000_000,
         sources=bindings, entrypoint='MemoryCondenser.ingest_many',
         compiled_summary_cache_reused=True, exact_chunk_vector_cache_reused=True,
+        exact_source_chunk_topology_reused=True,
+        assembly_sqlite=dict(synchronous='NORMAL',wal_autocheckpoint=0,
+                             final_checkpoint='FULL synchronization, TRUNCATE checkpoint'),
         questions_or_references_loaded=False, source_filter_at_recall=False))
     with MemoryCondenser(root/'application', embedder=encoder, auto_extract=False) as app:
+        # The authenticated source stores already contain this deterministic
+        # topology. Ordinary ingestion still publishes and validates every turn.
+        app._chunker = encoder
+        # This fresh, rebuildable assembly is accepted only after a full durable
+        # checkpoint. Do not change the production writer's durability policy.
+        app._db.connection.execute('PRAGMA synchronous=NORMAL')
+        app._db.connection.execute('PRAGMA wal_autocheckpoint=0')
         for offset in range(0, len(turns), 128):
             app.ingest_many([(t.role, t.text, t.source_id, t.created_at, t.turn_id)
                              for t in turns[offset:offset+128]])
@@ -152,6 +183,11 @@ def build(root, million):
         native = app.install_native_spine(atomic_index, hierarchy_index,
             align_atomic_vectors(atomic_index, atoms, np.concatenate(matrices)),
             embedding_identity=identity)
+        app._db.connection.execute('PRAGMA synchronous=FULL')
+        checkpoint = app._db.connection.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+        if checkpoint != (0, 0, 0):
+            raise ValueError('Cached source assembly checkpoint did not complete')
+        app._db.connection.execute('PRAGMA wal_autocheckpoint=1000')
     parent_receipt = native_spine_parent_store.publish(root/'application'/native_spine_parent_store.FILENAME,
         hierarchy=hierarchy_index, matrix=np.asarray(parent_vectors,dtype=np.float32), native_receipt=native)
     files = {p.name:digest(p) for p in (root/'application').iterdir() if p.name in
@@ -160,7 +196,8 @@ def build(root, million):
         raise ValueError('Combined source size or persistence incomplete')
     save(root/'ingest-complete.json', dict(snapshot=native, parent_snapshot=parent_receipt,
         application_files=files, closed=True, elapsed_s=time.perf_counter()-started,
-        new_qwen_calls=0, questions_or_references_loaded=False, cached_chunk_hits=encoder.hits))
+        new_qwen_calls=0, questions_or_references_loaded=False, cached_chunk_hits=encoder.hits,
+        cached_turn_topology_hits=encoder.chunk_cache_hits, full_checkpoint=list(checkpoint)))
     # Freeze evaluation population only after source ingestion is complete.
     question_parts = [read(p/'questions/questions.json')['questions'] for p in sources]
     questions = [part[i] for i in range(100) for part in question_parts]

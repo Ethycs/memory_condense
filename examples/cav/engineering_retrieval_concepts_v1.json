@@ -1,0 +1,246 @@
+{
+  "version": 1,
+  "purpose": "Controlled, source-independent contrasts for five narrow engineering-memory retrieval concepts. These examples contain no benchmark questions, answers, or transcript excerpts.",
+  "concepts": [
+    {
+      "name": "temporal_revision",
+      "description": "A fact, requirement, relationship, or plan changed over time, and the newer state supersedes or qualifies an older state.",
+      "train": {
+        "positive": [
+          "The timeout was thirty seconds originally, but the October revision raised it to forty-five seconds.",
+          "We replaced the Redis queue with an in-process scheduler after the deployment review.",
+          "The service used to accept anonymous reads; it now requires a signed session.",
+          "Version two deprecated the legacy endpoint and moved clients to the batch endpoint.",
+          "Mira owned the migration last week, and ownership transferred to Dev after the reorganization.",
+          "The initial design stored one snapshot, whereas the approved design retains a revision chain.",
+          "That benchmark was invalidated when the tokenizer configuration changed on Tuesday.",
+          "The release target moved from Friday to Monday because the security audit remained open.",
+          "The old cap of four was superseded by the measured cap of eight.",
+          "We first classified this as a database fault, then corrected the diagnosis to an index rebuild fault."
+        ],
+        "negative": [
+          "The request timeout is forty-five seconds.",
+          "The scheduler runs inside the application process.",
+          "Signed sessions are required for every read.",
+          "Clients send batches through the version two endpoint.",
+          "Dev owns the migration work.",
+          "The approved design retains a revision chain.",
+          "The benchmark uses the production tokenizer configuration.",
+          "The release is scheduled for Monday.",
+          "The configured candidate cap is eight.",
+          "Index rebuilds are recorded in the diagnostic log."
+        ]
+      },
+      "test": {
+        "positive": [
+          "After the memory leak was fixed, the recommended worker count changed from two to six.",
+          "The April policy allowed exports, while the current policy blocks them by default.",
+          "We abandoned the polling approach and adopted event notifications in the final design.",
+          "The first accuracy figure was withdrawn after discovering a grader defect.",
+          "Ownership passed from the platform team to the reliability team this morning.",
+          "The new schema makes the previous foreign-key rule obsolete."
+        ],
+        "negative": [
+          "Six workers are recommended for this service.",
+          "Exports are blocked by default.",
+          "The final design uses event notifications.",
+          "The reported accuracy was checked by a second grader.",
+          "The reliability team owns this service.",
+          "The schema enforces a foreign-key rule."
+        ]
+      }
+    },
+    {
+      "name": "failure_diagnosis",
+      "description": "An observed failure, mistake, regression, or incorrect result is connected to its cause, scope, or repair.",
+      "train": {
+        "positive": [
+          "The test failed because the cache key omitted the model revision.",
+          "The worker stalled when an exception left the write lock held.",
+          "Accuracy dropped after the reader began treating support hints as instructions.",
+          "The migration corrupted three rows due to an off-by-one slice boundary.",
+          "The apparent retrieval miss was actually a grader error in the expected answer.",
+          "The build broke because the generated manifest referenced a deleted asset.",
+          "Requests timed out while every turn rebuilt the same semantic index.",
+          "The release was rolled back after health checks exposed an incompatible schema.",
+          "The incorrect total came from counting duplicate source pointers twice.",
+          "The GPU ran out of memory when both resident models were loaded at full precision."
+        ],
+        "negative": [
+          "The cache key includes the model revision.",
+          "The worker releases the write lock before returning.",
+          "The reader consumes support hints with the supplied context.",
+          "The migration copied all rows within their slice boundaries.",
+          "A second grader confirmed the expected answer.",
+          "The generated manifest references the current asset set.",
+          "The semantic index remains resident between turns.",
+          "Health checks passed against the deployed schema.",
+          "Every source pointer is counted once.",
+          "Both resident models fit within the GPU memory budget."
+        ]
+      },
+      "test": {
+        "positive": [
+          "The flaky result traced back to a nondeterministic ordering of equal scores.",
+          "Recall omitted the decision because its timestamp was parsed in the wrong timezone.",
+          "The patch fixed the crash by validating empty candidate lists before ranking.",
+          "A stale embedding caused the router to select evidence from the previous revision.",
+          "The latency regression began when compilation moved into the request path.",
+          "The report overstated coverage because incomplete quote sets were marked complete."
+        ],
+        "negative": [
+          "Equal scores are ordered by a stable identifier.",
+          "Decision timestamps use a normalized timezone.",
+          "Empty candidate lists return without ranking.",
+          "The router uses embeddings from the active revision.",
+          "Compilation completes before requests are admitted.",
+          "Coverage requires complete quote sets."
+        ]
+      }
+    },
+    {
+      "name": "decision_rationale",
+      "description": "A selected engineering choice is connected to evidence, a constraint, a tradeoff, or a rejected alternative.",
+      "train": {
+        "positive": [
+          "We chose SQLite because one writer and durable local transactions fit the deployment shape.",
+          "Keep the embedding model on CPU so the reader can retain the limited GPU memory.",
+          "The team selected exact hydration to preserve quotations after summary-based routing.",
+          "Use a six-exchange queue because it hides ingestion behind normal reply time.",
+          "We rejected a document database since the bottleneck was index construction rather than row lookup.",
+          "The release uses immutable receipts so cached evidence can be audited later.",
+          "We capped graph traversal at two hops to limit hub drift and latency.",
+          "The proxy returns the provider response first because memory learning is asynchronous.",
+          "The implementation favors an extractive summary when the local generator is uncertain.",
+          "We retained the baseline route because experimental additions sometimes distract the reader."
+        ],
+        "negative": [
+          "SQLite is installed in the application environment.",
+          "The embedding model currently runs on CPU.",
+          "The router hydrates exact quotations from stored spans.",
+          "The queue contains six user-assistant exchanges.",
+          "A document database is available on the test network.",
+          "Each release includes an immutable receipt.",
+          "Graph traversal stops after two hops.",
+          "The proxy returned the provider response.",
+          "The summary contains exact extracts from the source.",
+          "The baseline route appears before experimental additions."
+        ]
+      },
+      "test": {
+        "positive": [
+          "We picked the smaller reader after it matched accuracy while cutting decode time in half.",
+          "Preserve direct semantic scores so diffusion cannot erase a precise query match.",
+          "The design stores pointers instead of raw text in the graph to bound persistent state.",
+          "We postponed quantization because the measured memory saving did not justify its accuracy risk.",
+          "The team chose batched ingestion to reduce repeated model setup across adjacent turns.",
+          "Use the frontier model only for uncertain cases to control operating cost."
+        ],
+        "negative": [
+          "The smaller reader completed the decode.",
+          "Direct semantic scores are present in the result.",
+          "The graph stores source pointers.",
+          "Quantization is disabled in this configuration.",
+          "Adjacent turns are ingested as a batch.",
+          "The frontier model answered the uncertain case."
+        ]
+      }
+    },
+    {
+      "name": "implementation_state",
+      "description": "A concrete implementation, validation, commit, deployment, or release state is distinguished from a proposal, intention, or unverified claim.",
+      "train": {
+        "positive": [
+          "The incremental index is implemented and the regression suite passes.",
+          "The proxy integration was committed on the release branch.",
+          "The new routing policy is deployed in the beta package.",
+          "All twelve end-to-end turns completed with asynchronous ingestion enabled.",
+          "The parser fix is merged and covered by a failing-then-passing test.",
+          "The model assets download automatically during installation.",
+          "The release artifact was built, signed, and uploaded.",
+          "The cache comparison reproduced identical packets after restart.",
+          "The database migration completed successfully on the staging copy.",
+          "The feature flag is enabled for the production proxy."
+        ],
+        "negative": [
+          "We should implement an incremental index next.",
+          "The proxy integration still needs a commit.",
+          "The team plans to deploy the routing policy in beta.",
+          "We want to test twelve end-to-end turns with asynchronous ingestion.",
+          "The proposed parser fix has not been tested yet.",
+          "Installation could download the model assets automatically.",
+          "The release artifact is ready to be built and signed.",
+          "We expect cached packets to match after restart.",
+          "The staging database migration is scheduled for tomorrow.",
+          "The production feature flag remains disabled."
+        ]
+      },
+      "test": {
+        "positive": [
+          "The cap-eight policy is integrated and its targeted tests pass.",
+          "Continuous integration published version 0.4.2 to the package registry.",
+          "The resident worker processed the sample transcript without rebuilding its index.",
+          "The fallback path is wired to the gateway and recorded in the runtime receipt.",
+          "The fix survived a clean installation test on Windows.",
+          "The reader service is running with the validated checkpoint."
+        ],
+        "negative": [
+          "We could integrate the cap-eight policy after testing.",
+          "Version 0.4.2 is waiting for continuous integration.",
+          "The resident worker needs a sample transcript test.",
+          "The gateway fallback remains a design sketch.",
+          "A clean Windows installation test has not run.",
+          "The reader service will use the validated checkpoint."
+        ]
+      }
+    },
+    {
+      "name": "measurement_result",
+      "description": "An observed quantitative result is bound to its measured condition, population, or comparison rather than expressed as a target or estimate.",
+      "train": {
+        "positive": [
+          "Across one hundred questions, ninety-five were scored correct.",
+          "Median recall latency measured 1.08 seconds on the million-token archive.",
+          "The optimized cycle fell from 79.3 seconds to 46.7 seconds in the twelve-turn run.",
+          "Peak GPU allocation was 6.2 gigabytes with both local components resident.",
+          "The treatment recovered eight of the twenty-five previously missed checkpoints.",
+          "The cold backfill processed 783 summaries in 167.9 seconds.",
+          "Five independent runs averaged 94.6 percent accuracy.",
+          "The sparse index occupied 52 kilobytes at degree eight.",
+          "Reader output averaged 620 tokens across the evaluated questions.",
+          "The paired control completed in 1.02 seconds while the treatment took 1.07 seconds."
+        ],
+        "negative": [
+          "The goal is at least ninety-five correct answers.",
+          "Recall latency should remain under five seconds.",
+          "We expect the optimized cycle to finish in under fifty seconds.",
+          "The GPU memory budget is eight gigabytes.",
+          "The treatment might recover several missed checkpoints.",
+          "Cold backfill is expected to process every summary.",
+          "We plan to run five independent accuracy trials.",
+          "A sparse index should use little storage.",
+          "Reader outputs may be several hundred tokens long.",
+          "The treatment is intended to match control latency."
+        ]
+      },
+      "test": {
+        "positive": [
+          "The benchmark produced 87 failures, of which 46 were grading defects.",
+          "Warm index construction took 2.86 seconds and made zero Qwen calls.",
+          "At five million tokens, 438 of 500 questions passed.",
+          "The new reader decoded 41 tokens per second on the same prompt set.",
+          "Packet context used 18 percent of the full transcript token count.",
+          "Three repeated trials had a standard deviation of 1.4 percentage points."
+        ],
+        "negative": [
+          "The benchmark should classify every failure.",
+          "Warm construction is supposed to avoid Qwen calls.",
+          "The five-million-token target is five hundred questions.",
+          "A faster reader needs a high decode rate.",
+          "Packet context is designed to save transcript tokens.",
+          "Three repeated trials would estimate the variance."
+        ]
+      }
+    }
+  ]
+}

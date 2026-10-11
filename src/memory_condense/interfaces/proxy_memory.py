@@ -67,7 +67,7 @@ class MemoryProxy:
     credential headers are never persisted with requests or responses.
     """
     def __init__(self, directory, session_factory, *, inline_memory=True, empty_response_retries=2,
-                 max_sessions=8, recent_token_budget=8192):
+                 max_sessions=8, recent_token_budget=8192, summary_api_fallback=True):
         if type(empty_response_retries) is not int or not 0 <= empty_response_retries <= 2:
             raise ValueError('Empty completion retries must be between zero and two')
         if type(max_sessions) is not int or max_sessions < 1:
@@ -75,6 +75,7 @@ class MemoryProxy:
         self.directory, self.factory = Path(directory), session_factory
         self.inline_memory, self.empty_response_retries = inline_memory, empty_response_retries
         self.max_sessions, self.recent_token_budget = max_sessions, recent_token_budget
+        self.summary_api_fallback = summary_api_fallback
         self.entries, self.lock, self.closed = {}, threading.RLock(), False
 
     @staticmethod
@@ -90,13 +91,17 @@ class MemoryProxy:
             ('authorization','x-api-key','api-key','openai-api-key') if k in headers})).hexdigest()
         return hashlib.sha256(wire.encoded([provider, credential, conversation.strip()])).hexdigest()
 
-    def entry(self, namespace):
+    def entry(self, namespace, *, summary_api=None):
         with self.lock:
             if self.closed:
                 raise MemoryProxyError('Memory proxy is closing', 503)
             if namespace not in self.entries:
                 if len(self.entries) >= self.max_sessions:
                     raise MemoryProxyError('Active memory session limit reached; restart to reopen another session', 429)
+            configure = getattr(self.factory, 'configure_summary_provider', None)
+            if summary_api is not None and configure is not None:
+                configure(namespace, summary_api)
+            if namespace not in self.entries:
                 session = self.factory(namespace, self.directory/'sessions'/namespace)
                 entry = SessionEntry(session)
                 entry.reload()
@@ -113,10 +118,14 @@ class MemoryProxy:
     def status(self):
         with self.lock:
             values = [entry.session.status() for entry in self.entries.values()]
+        summary_status = getattr(self.factory, 'summary_status', lambda: {})
+        retrieval_status = getattr(self.factory, 'retrieval_status', lambda: {})
         return dict(active_sessions=len(values), pending_events=sum(v['pending_events'] for v in values),
                     pending_feedback=sum(v['pending_feedback'] for v in values),
                     failed_sessions=sum(v['last_error'] is not None for v in values),
-                    inline_memory=self.inline_memory, empty_response_retries=self.empty_response_retries)
+                    inline_memory=self.inline_memory, empty_response_retries=self.empty_response_retries,
+                    summary_api_fallback=self.summary_api_fallback, summary_routing=summary_status(),
+                    retrieval=retrieval_status())
 
     def flush(self, provider, headers):
         entry = self.entry(self.namespace(provider, headers))
@@ -164,7 +173,7 @@ class MemoryProxy:
             start -= 1
         return [m for _,m in entry.messages[start:]]
 
-    def exchange(self, body, provider, headers, send):
+    def exchange(self, body, provider, headers, send, summary_send=None):
         """Run synchronously on a worker; send(payload_bytes) bridges async HTTP."""
         try:
             payload = json.loads(body)
@@ -177,7 +186,11 @@ class MemoryProxy:
         if not isinstance(request_key,str) or not request_key.strip() or len(request_key)>512:
             raise MemoryProxyError('Invalid x-memory-request-id')
         request_id = 'proxy:' + hashlib.sha256(request_key.encode()).hexdigest()
-        entry = self.entry(namespace)
+        summary_api = None
+        if self.summary_api_fallback:
+            from memory_condense.interfaces.summary_api import ProviderSummaryAPI
+            summary_api = ProviderSummaryAPI(provider, payload['model'], summary_send or send)
+        entry = self.entry(namespace, summary_api=summary_api)
         session = entry.session
         with session._io_lock:
             with session._connect() as db:

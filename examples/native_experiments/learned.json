@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "modules": ["learned_associations", "heat_diffusion"],
+  "extra_context_tokens": 1024,
+  "extra_raw_spans": 8
+}

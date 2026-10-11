@@ -82,6 +82,42 @@ def test_local_extract_formats_still_validate_source_ownership(envelope):
     assert fallback==0 and value['atoms'][0]['summary']=='Exact source fact.'
 
 
+def test_raw_extract_restores_exact_source_span_after_whitespace_normalization():
+    source = 'After building the radix-trie, the model\nqueries the trie over\nthe test data.'
+    proposed = json.dumps({'atoms': [{'label': 'T0', 'summary':
+        'After building the radix-trie, the model queries the trie over the test data.'}]})
+    value, fallback = raw_extracts([{'label': 'T0', 'fragment': source}], proposed)
+    summary = value['atoms'][0]['summary']
+    assert fallback == 0
+    assert summary == source
+    assert summary in source
+
+
+def test_raw_extract_restores_exact_source_span_after_case_normalization():
+    source = 'Among the options, the **Western Digital Black P50** is designed for gaming.'
+    proposed = json.dumps({'atoms': [{'label': 'T0', 'summary':
+        'The **Western Digital Black P50** is designed for gaming.'}]})
+    value, fallback = raw_extracts([{'label': 'T0', 'fragment': source}], proposed)
+    summary = value['atoms'][0]['summary']
+    assert fallback == 0
+    assert summary == 'the **Western Digital Black P50** is designed for gaming.'
+    assert summary in source
+
+
+def test_raw_extract_restores_exact_source_span_after_markdown_normalization():
+    source = ('3. **Show Respect and Interest:** Demonstrate your genuine interest '
+              "in your relative's life and experiences. This will help them feel "
+              'valued and more likely to open up.')
+    proposed = json.dumps({'atoms': [{'label': 'T6', 'summary':
+        "Show Respect and Interest: Demonstrate your genuine interest in your relative's "
+        'life and experiences. This will help them feel valued and more likely to open up.'}]})
+    value, fallback = raw_extracts([{'label': 'T6', 'fragment': source}], proposed)
+    summary = value['atoms'][0]['summary']
+    assert fallback == 0
+    assert summary == source[3:]
+    assert summary in source
+
+
 def test_merge_never_reattributes_an_extracted_fact():
     request=SpineSummaryRequest('attached_context',(
         SpineSummaryFragment('assistant','2026-09-30','I propose migration orchid; not executed.'),

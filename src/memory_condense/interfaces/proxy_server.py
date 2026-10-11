@@ -25,6 +25,7 @@ copied to the upstream request and excluded from every receipt.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import logging
 import math
 import os
@@ -326,22 +327,32 @@ def build_app(
                 'message':'Memory mode supports /v1/chat/completions and /v1/messages'}},status_code=400)
         if memory is not None and provider is not None:
             from memory_condense.interfaces.proxy_memory import MemoryProxyError, WireResponse
-            import anyio
             if request.method != 'POST':
                 return JSONResponse({'error':{'message':'Chat requests require POST'}},status_code=405)
-            async def send_memory(payload):
+            method = request.method
+            async def send_memory(payload, summary=False):
                 forwarded = {k:v for k,v in headers.items()
                              if not k.lower().startswith('x-memory-') and k.lower() != 'x-conversation-id'}
-                reply = await upstream.send(upstream.build_request(request.method,target,
+                if summary:
+                    # Internal generations are distinct calls, not retries of
+                    # the visible answer. Never reuse its idempotency identity.
+                    forwarded = {k:v for k,v in forwarded.items() if k.lower() not in
+                        ('idempotency-key','x-idempotency-key','x-request-id','request-id','x-client-request-id')}
+                reply = await upstream.send(upstream.build_request(method,target,
                     headers=forwarded,content=payload),stream=True)
                 try:
                     value = await reply.aread()
                     return WireResponse(reply.status_code,dict(_response_headers(reply.headers)),value)
                 finally:
                     await reply.aclose()
+            loop = asyncio.get_running_loop()
+            def send_from_worker(value, summary=False):
+                # Compiler workers are ordinary threads and may outlive this
+                # request. The shared HTTP client stays open through final drain.
+                return asyncio.run_coroutine_threadsafe(send_memory(value,summary),loop).result()
             try:
                 reply = await run_in_threadpool(memory.exchange,body,provider,headers,
-                                                lambda value:anyio.from_thread.run(send_memory,value))
+                    send_from_worker, lambda value:send_from_worker(value,True))
             except MemoryProxyError as exc:
                 return JSONResponse({'error':{'type':'memory_request_error','message':str(exc)}},status_code=exc.status)
             except Exception:
@@ -723,7 +734,15 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     parser.add_argument('--memory-max-sessions',type=int,default=8)
     parser.add_argument('--memory-recent-exchanges',type=int,default=12)
     parser.add_argument('--memory-recent-token-budget',type=int,default=8192)
+    parser.add_argument('--memory-retrieval-policy', choices=('auto','cap8','dialogue','hierarchy_neighborhoods','decision_history'), default='auto',
+                        help='Default: BGE selects focused, overview, or decision/fix history recall; explicit modes override classification')
+    parser.add_argument('--memory-dialogue-config', metavar='JSON',
+                        help='Versioned neighborhood tuning profile for auto or explicit dialogue retrieval')
+    parser.add_argument('--memory-experiment-config', metavar='JSON',
+                        help='Opt-in bounded native experiments; absent means all experimental modules are off')
     parser.add_argument('--memory-empty-response-retries',type=int,choices=(0,1,2),default=2)
+    parser.add_argument('--memory-summary-api-fallback',action=argparse.BooleanOptionalAction,default=True,
+                        help='Escalate failed local summaries to the conversation provider/model')
     parser.add_argument('--assets-dir',help='Local model/runtime assets (otherwise saved setup configuration)')
     parser.add_argument("--capture-queue-size", type=int, default=256)
     parser.add_argument("--capture-queue-max-waiters", type=int)
@@ -770,6 +789,19 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
         default=os.environ.get("OPENAI_BASE_URL", DEFAULT_UPSTREAMS[OPENAI]),
     )
     args = parser.parse_args(argv)
+    from memory_condense.runtime.config import dialogue_policy, experiment_policy
+    try:
+        retrieval = dialogue_policy(args.memory_retrieval_policy, args.memory_dialogue_config)
+        experiments = experiment_policy(args.memory_experiment_config)
+        if experiments is not None and args.mode != 'augment':
+            raise ValueError('--memory-experiment-config requires augment mode')
+        if args.mode != 'augment' and (args.memory_retrieval_policy not in ('auto','cap8')
+                                       or args.memory_dialogue_config is not None):
+            raise ValueError('Dialogue retrieval requires --mode augment')
+        if args.mode != 'augment':
+            retrieval = None
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
 
     config = ProxyConfig(
         mode=args.mode,
@@ -805,12 +837,14 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
         from memory_condense.runtime.config import RuntimeAssets
         from memory_condense.runtime.sessions import NativeProxySessions
         assets = RuntimeAssets.resolve(args.assets_dir)
-        assets.require_files()
+        assets.require_files(include_summarizer=not args.memory_summary_api_fallback)
         factory = NativeProxySessions(args.data_dir,recent_exchanges=args.memory_recent_exchanges,
-                                      recent_token_budget=args.memory_recent_token_budget,assets=assets)
+            recent_token_budget=args.memory_recent_token_budget,assets=assets,
+            summary_api_fallback=args.memory_summary_api_fallback, dialogue_policy=retrieval,
+            retrieval_policy=args.memory_retrieval_policy,experiment_policy=experiments)
         memory = MemoryProxy(args.data_dir,factory,inline_memory=args.inline_memory,
             empty_response_retries=args.memory_empty_response_retries,max_sessions=args.memory_max_sessions,
-            recent_token_budget=args.memory_recent_token_budget)
+            recent_token_budget=args.memory_recent_token_budget,summary_api_fallback=args.memory_summary_api_fallback)
         try:
             app = build_app(config=config,memory=memory)
             uvicorn.run(app,host=args.host,port=args.port,log_level='info')

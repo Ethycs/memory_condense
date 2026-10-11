@@ -1,0 +1,262 @@
+{
+  "version": 1,
+  "purpose": "Five-concept retrieval assay combining the two previously qualified general concepts with three qualified narrow engineering-memory concepts. No benchmark content.",
+  "concepts": [
+    {
+      "name": "context_dependency",
+      "description": "The statement depends on information, decisions, identities, or evidence established earlier rather than being self-contained.",
+      "train": {
+        "positive": [
+          "Remember the database choice we made earlier and use it for this migration.",
+          "Retrieve the user's preferred timezone from the prior conversation.",
+          "This bug is connected to the benchmark result mentioned several turns ago.",
+          "Continue the implementation from the checkpoint recorded in our previous session.",
+          "Use the API contract that we agreed on before generating the client.",
+          "Recall which model produced the earlier baseline and compare against it.",
+          "The current request refers back to the filename supplied at the start.",
+          "Find the old decision about token limits before packing this context.",
+          "Link this correction to the claim it superseded in the conversation history.",
+          "Resume the unresolved task from our last exchange.",
+          "Apply the naming convention established in the preceding design discussion.",
+          "The answer requires the credentials policy that was stated previously."
+        ],
+        "negative": [
+          "A triangle has three sides and three interior angles.",
+          "The package weighs two kilograms before shipping.",
+          "Water freezes at zero degrees Celsius under standard pressure.",
+          "The function sorts a list of integers in ascending order.",
+          "A solar panel converts sunlight into electrical energy.",
+          "The meeting begins at nine o'clock on Tuesday morning.",
+          "This recipe combines flour, salt, water, and yeast.",
+          "The blue button opens the settings panel.",
+          "The report contains twelve tables and four diagrams.",
+          "A checksum detects accidental changes in transmitted data.",
+          "The train travels directly from Portland to Seattle.",
+          "The sensor records temperature once every minute."
+        ]
+      },
+      "test": {
+        "positive": [
+          "Her preferred timezone was stated near the beginning; apply it to this schedule.",
+          "The answer depends on the API decision made several sessions ago.",
+          "Reconnect this exception to the earlier benchmark failure.",
+          "Use the directory I specified before, not a newly invented one.",
+          "The unresolved question from our first discussion determines the next step.",
+          "Find which prior change introduced this regression.",
+          "Continue from the last verified checkpoint.",
+          "The nickname established earlier should appear in the reply."
+        ],
+        "negative": [
+          "Copper conducts electricity and thermal energy.",
+          "The archive contains seven compressed files.",
+          "A compass needle aligns with a magnetic field.",
+          "The script prints the current date in ISO format.",
+          "The garden receives direct sunlight during the afternoon.",
+          "Each container holds exactly sixteen liters.",
+          "The camera stores photographs on a removable card.",
+          "The bridge crosses the river north of the city."
+        ]
+      }
+    },
+    {
+      "name": "binding_constraint",
+      "description": "A prescriptive requirement, prohibition, limit, or invariant rather than a descriptive observation.",
+      "train": {
+        "positive": [
+          "The implementation must preserve source provenance for every memory.",
+          "Never place authentication tokens in the repository.",
+          "Use Pixi for all project Python commands.",
+          "Retrieval may return at most ten chunks.",
+          "The response must not exceed the available context budget.",
+          "Always validate the resolved path before deleting an artifact.",
+          "Only memories belonging to the active user may be retrieved.",
+          "The API identifier must remain stable across migrations.",
+          "Do not treat an attention weight as causal evidence.",
+          "Every compressed summary needs a pointer to its original turns.",
+          "The worker is required to finish writes before acknowledging success.",
+          "Prefer reversible pruning until the retention policy is validated."
+        ],
+        "negative": [
+          "The implementation currently stores provenance beside each memory.",
+          "Authentication tokens were found in an environment file.",
+          "The project uses Pixi to create its Python environment.",
+          "Retrieval returned ten chunks during the benchmark.",
+          "The response consumed most of the available context budget.",
+          "The resolved path points to a temporary artifact directory.",
+          "These memories belong to the active user.",
+          "The API identifier remained stable during the last migration.",
+          "The attention weight was larger in the final layer.",
+          "Each compressed summary contains a source pointer.",
+          "The worker finished its writes before sending the acknowledgement.",
+          "The current pruning operation moves records into cold storage."
+        ]
+      },
+      "test": {
+        "positive": [
+          "Ship only after the regression suite passes.",
+          "Any retrieved claim needs a source pointer.",
+          "Keep credentials outside version control.",
+          "Limit graph traversal to three hops.",
+          "The response should fit within twelve hundred tokens.",
+          "Do not merge records from different users.",
+          "Prefer existing identifiers when importing data.",
+          "The cache directory has to remain disposable."
+        ],
+        "negative": [
+          "The regression suite passed before the release shipped.",
+          "The retrieved claim includes a source pointer.",
+          "Credentials are stored outside version control.",
+          "Graph traversal reached three hops in this run.",
+          "The response occupied twelve hundred tokens.",
+          "The two records came from different users.",
+          "The import retained all existing identifiers.",
+          "The cache directory was empty after the process ended."
+        ]
+      }
+    },
+    {
+      "name": "temporal_revision",
+      "description": "A fact, requirement, relationship, or plan changed over time, and the newer state supersedes or qualifies an older state.",
+      "train": {
+        "positive": [
+          "The timeout was thirty seconds originally, but the October revision raised it to forty-five seconds.",
+          "We replaced the Redis queue with an in-process scheduler after the deployment review.",
+          "The service used to accept anonymous reads; it now requires a signed session.",
+          "Version two deprecated the legacy endpoint and moved clients to the batch endpoint.",
+          "Mira owned the migration last week, and ownership transferred to Dev after the reorganization.",
+          "The initial design stored one snapshot, whereas the approved design retains a revision chain.",
+          "That benchmark was invalidated when the tokenizer configuration changed on Tuesday.",
+          "The release target moved from Friday to Monday because the security audit remained open.",
+          "The old cap of four was superseded by the measured cap of eight.",
+          "We first classified this as a database fault, then corrected the diagnosis to an index rebuild fault."
+        ],
+        "negative": [
+          "The request timeout is forty-five seconds.",
+          "The scheduler runs inside the application process.",
+          "Signed sessions are required for every read.",
+          "Clients send batches through the version two endpoint.",
+          "Dev owns the migration work.",
+          "The approved design retains a revision chain.",
+          "The benchmark uses the production tokenizer configuration.",
+          "The release is scheduled for Monday.",
+          "The configured candidate cap is eight.",
+          "Index rebuilds are recorded in the diagnostic log."
+        ]
+      },
+      "test": {
+        "positive": [
+          "After the memory leak was fixed, the recommended worker count changed from two to six.",
+          "The April policy allowed exports, while the current policy blocks them by default.",
+          "We abandoned the polling approach and adopted event notifications in the final design.",
+          "The first accuracy figure was withdrawn after discovering a grader defect.",
+          "Ownership passed from the platform team to the reliability team this morning.",
+          "The new schema makes the previous foreign-key rule obsolete."
+        ],
+        "negative": [
+          "Six workers are recommended for this service.",
+          "Exports are blocked by default.",
+          "The final design uses event notifications.",
+          "The reported accuracy was checked by a second grader.",
+          "The reliability team owns this service.",
+          "The schema enforces a foreign-key rule."
+        ]
+      }
+    },
+    {
+      "name": "decision_rationale",
+      "description": "A selected engineering choice is connected to evidence, a constraint, a tradeoff, or a rejected alternative.",
+      "train": {
+        "positive": [
+          "We chose SQLite because one writer and durable local transactions fit the deployment shape.",
+          "Keep the embedding model on CPU so the reader can retain the limited GPU memory.",
+          "The team selected exact hydration to preserve quotations after summary-based routing.",
+          "Use a six-exchange queue because it hides ingestion behind normal reply time.",
+          "We rejected a document database since the bottleneck was index construction rather than row lookup.",
+          "The release uses immutable receipts so cached evidence can be audited later.",
+          "We capped graph traversal at two hops to limit hub drift and latency.",
+          "The proxy returns the provider response first because memory learning is asynchronous.",
+          "The implementation favors an extractive summary when the local generator is uncertain.",
+          "We retained the baseline route because experimental additions sometimes distract the reader."
+        ],
+        "negative": [
+          "SQLite is installed in the application environment.",
+          "The embedding model currently runs on CPU.",
+          "The router hydrates exact quotations from stored spans.",
+          "The queue contains six user-assistant exchanges.",
+          "A document database is available on the test network.",
+          "Each release includes an immutable receipt.",
+          "Graph traversal stops after two hops.",
+          "The proxy returned the provider response.",
+          "The summary contains exact extracts from the source.",
+          "The baseline route appears before experimental additions."
+        ]
+      },
+      "test": {
+        "positive": [
+          "We picked the smaller reader after it matched accuracy while cutting decode time in half.",
+          "Preserve direct semantic scores so diffusion cannot erase a precise query match.",
+          "The design stores pointers instead of raw text in the graph to bound persistent state.",
+          "We postponed quantization because the measured memory saving did not justify its accuracy risk.",
+          "The team chose batched ingestion to reduce repeated model setup across adjacent turns.",
+          "Use the frontier model only for uncertain cases to control operating cost."
+        ],
+        "negative": [
+          "The smaller reader completed the decode.",
+          "Direct semantic scores are present in the result.",
+          "The graph stores source pointers.",
+          "Quantization is disabled in this configuration.",
+          "Adjacent turns are ingested as a batch.",
+          "The frontier model answered the uncertain case."
+        ]
+      }
+    },
+    {
+      "name": "measurement_result",
+      "description": "An observed quantitative result is bound to its measured condition, population, or comparison rather than expressed as a target or estimate.",
+      "train": {
+        "positive": [
+          "Across one hundred questions, ninety-five were scored correct.",
+          "Median recall latency measured 1.08 seconds on the million-token archive.",
+          "The optimized cycle fell from 79.3 seconds to 46.7 seconds in the twelve-turn run.",
+          "Peak GPU allocation was 6.2 gigabytes with both local components resident.",
+          "The treatment recovered eight of the twenty-five previously missed checkpoints.",
+          "The cold backfill processed 783 summaries in 167.9 seconds.",
+          "Five independent runs averaged 94.6 percent accuracy.",
+          "The sparse index occupied 52 kilobytes at degree eight.",
+          "Reader output averaged 620 tokens across the evaluated questions.",
+          "The paired control completed in 1.02 seconds while the treatment took 1.07 seconds."
+        ],
+        "negative": [
+          "The goal is at least ninety-five correct answers.",
+          "Recall latency should remain under five seconds.",
+          "We expect the optimized cycle to finish in under fifty seconds.",
+          "The GPU memory budget is eight gigabytes.",
+          "The treatment might recover several missed checkpoints.",
+          "Cold backfill is expected to process every summary.",
+          "We plan to run five independent accuracy trials.",
+          "A sparse index should use little storage.",
+          "Reader outputs may be several hundred tokens long.",
+          "The treatment is intended to match control latency."
+        ]
+      },
+      "test": {
+        "positive": [
+          "The benchmark produced 87 failures, of which 46 were grading defects.",
+          "Warm index construction took 2.86 seconds and made zero Qwen calls.",
+          "At five million tokens, 438 of 500 questions passed.",
+          "The new reader decoded 41 tokens per second on the same prompt set.",
+          "Packet context used 18 percent of the full transcript token count.",
+          "Three repeated trials had a standard deviation of 1.4 percentage points."
+        ],
+        "negative": [
+          "The benchmark should classify every failure.",
+          "Warm construction is supposed to avoid Qwen calls.",
+          "The five-million-token target is five hundred questions.",
+          "A faster reader needs a high decode rate.",
+          "Packet context is designed to save transcript tokens.",
+          "Three repeated trials would estimate the variance."
+        ]
+      }
+    }
+  ]
+}

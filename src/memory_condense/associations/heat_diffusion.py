@@ -380,6 +380,47 @@ def diffuse_association_heat(
     return HeatDiffusion(nodes=_emit_ranked_nodes(current))
 
 
+def diffuse_scalar_heat(seeds, adjacency, *, hops=2, neighbors_per_node=4,
+                        max_nodes=32, restart_probability=0.35):
+    """Reuse the heat engine with published summary co-access conductivities.
+
+    Scalars have already been decayed by the graph publisher. No model artifact,
+    raw chunk hydration, database connection or transformer is required here.
+    """
+    import math
+    _validate_diffusion_knobs(hops=hops,neighbors_per_node=neighbors_per_node,
+        max_nodes=max_nodes,restart_probability=restart_probability,
+        seed_temperature=1.,edge_temperature=1.)
+    if len(seeds)>max_nodes:
+        raise ValueError('Heat seed count exceeds capacity')
+    if any(not math.isfinite(v) or v<=0 for v in seeds.values()):
+        raise ValueError('Heat seeds must be finite and positive')
+    if not seeds:
+        return HeatDiffusion(())
+    distribution = dict(zip(seeds,softmax(list(seeds.values()),temperature=1.),strict=True))
+    current = {key:_MutableHeat(heat=value,hop=0,best_path=(key,),best_contribution=value)
+               for key,value in distribution.items()}
+    @dataclass(frozen=True)
+    class ScalarEdge:
+        destination_chunk_id: str
+        score: float
+        def utility(self, *, now_turn):
+            return self.score
+    for _ in range(hops):
+        groups = {}
+        for key in current:
+            rows = adjacency.get(key,())[:neighbors_per_node]
+            if any(not math.isfinite(score) or score<=0 for _,score in rows):
+                raise ValueError('Heat conductivities must be finite and positive')
+            groups[key] = tuple(ScalarEdge(other,score) for other,score in rows)
+        accumulator = _HeatAccumulator()
+        _seed_restart_mass(accumulator,seeds=distribution,restart_probability=restart_probability)
+        _walk_frontier_mass(accumulator,current=current,edge_groups=groups,
+            walk_fraction=1.-restart_probability,now_turn=0,edge_temperature=1.)
+        current = _trim_to_capacity(accumulator.states,max_nodes=max_nodes) or {}
+    return HeatDiffusion(_emit_ranked_nodes(current))
+
+
 def _default_source_key(result: RetrievalResult) -> str:
     if result.turn is not None and result.turn.source_id:
         return result.turn.source_id

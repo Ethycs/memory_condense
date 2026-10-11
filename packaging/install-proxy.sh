@@ -45,9 +45,9 @@ done
 : "${install_dir:=${XDG_DATA_HOME:-$HOME/.local/share}/memory_condense/proxy}"
 
 command -v pixi >/dev/null 2>&1 || fail 'Install Pixi from https://pixi.sh/ first, then rerun this installer.
-If Pixi is installed, add its bin directory to PATH (usually $HOME/.pixi/bin).'
+If Pixi is installed, add its bin directory to PATH (usually ~/.pixi/bin).'
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 if [ -z "$package_path" ]; then
     shopt -s nullglob
     candidates=("$script_dir"/memory_condense-*.conda)
@@ -90,9 +90,9 @@ percent_encode_path() {
 }
 
 mkdir -p -- "$install_dir"
-destination=$(CDPATH= cd -- "$install_dir" && pwd -P)
+destination=$(CDPATH='' cd -- "$install_dir" && pwd -P)
 installed_package="$destination/$(basename -- "$package_path")"
-source_package=$(CDPATH= cd -- "$(dirname -- "$package_path")" && pwd -P)/$(basename -- "$package_path")
+source_package=$(CDPATH='' cd -- "$(dirname -- "$package_path")" && pwd -P)/$(basename -- "$package_path")
 if [ "$source_package" != "$installed_package" ]; then
     if [ -e "$installed_package" ]; then
         [ "$(file_sha256 "$installed_package")" = "$(file_sha256 "$source_package")" ] \

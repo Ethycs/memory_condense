@@ -127,6 +127,28 @@ def test_background_batches_preserve_summary_and_chunk_order(device,batch_size):
     assert base.execution_identity=={'device':device}
 
 
+def test_cpu_encoder_preference_length_buckets_batches_and_restores_order():
+    base=encoder('cpu')
+    base.preferred_background_batch_size=4
+    base.background_batch_key=lambda text:int(text)
+    calls=[]
+    def embed(values):
+        calls.append(list(values))
+        return np.asarray([[int(value),2.] for value in values],dtype=np.float32)
+    base.embed_queries=embed
+    base.embed_chunks=lambda values:[chunk.model_copy(update={'embedding':[float(chunk.text),2.]})
+                                     for chunk in values]
+    shared=SharedEmbedding(base)
+    incoming=['8','1','6','3','7','2','5','4','9']
+    assert shared.embed_queries(incoming).tolist()==[[float(value),2.] for value in incoming]
+    assert calls==[['1','2','3','4'],['5','6','7','8'],['9']]
+    sources=[Chunk(chunk_id=f'c{i}',turn_id=f't{i}',text=value,start_char=0,
+                   end_char=len(value),token_count=1) for i,value in enumerate(incoming)]
+    assert [chunk.embedding for chunk in shared.embed_chunks(sources)] == [
+        [float(value),2.] for value in incoming]
+    assert shared.background_batch_size==4
+
+
 @pytest.mark.parametrize('size', [0,-1,True,1.5])
 def test_invalid_background_batch_size_rejected(size):
     with pytest.raises(ValueError,match='positive integer'):

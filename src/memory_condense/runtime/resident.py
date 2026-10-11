@@ -5,12 +5,11 @@ immutable index and its authenticated raw turn snapshot. Model operations share
 a short lock; generation and index publication do not hold up recall.
 """
 from dataclasses import asdict, dataclass
-from collections import Counter, OrderedDict, deque
-from contextlib import closing, contextmanager
+from collections import Counter, OrderedDict
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import datetime
-from functools import wraps
 import json
 from pathlib import Path
 import sqlite3
@@ -22,11 +21,11 @@ import numpy as np
 
 from memory_condense.application.chat_native import native_packet, learn_native_packet
 from memory_condense.application.condenser import MemoryCondenser
-from memory_condense.application.native_spine_policy import CAP8_LIMITS
+from memory_condense.application.native_spine_policy import retrieval_limits
+from memory_condense.application.dialogue_retrieval import DialogueRetrievalPolicy
 from memory_condense.domain._discourse_identity import identity_sha256
 from memory_condense.persistence import native_spine_store, native_spine_parent_store
 from memory_condense.persistence import native_spine_incremental_store
-from memory_condense.search.native_spine_user_completion import NativeSpineUserCompletionRouter
 from memory_condense.search.episodes.user_spine_hierarchy import compile_user_spine_exchanges
 from memory_condense.search.episodes.parent_budgeted_spine_hierarchy import build_parent_budgeted_spine_hierarchy
 from memory_condense.search.native_spine_parent_users import project_parent_users
@@ -38,69 +37,7 @@ from memory_condense.runtime.artifacts import read, save
 from memory_condense.runtime.compiler import Compiler, LocalAttention, PreparationSuperseded, storage_rows
 from memory_condense.runtime.seed import load_seed
 from memory_condense.runtime.helpers import StagedEmbedding
-
-
-def model_operation(method):
-    @wraps(method)
-    def guarded(self, *args, **kwargs):
-        with self.model_lock:
-            return method(self, *args, **kwargs)
-    return guarded
-
-
-class RecallPriorityLock:
-    """Reentrant model admission with FIFO queues and foreground priority.
-
-    A running operation finishes normally. On release, queued recalls precede
-    every queued background operation, including jobs that arrived earlier.
-    Admission and priority share one condition so there is no check/lock race.
-    """
-    def __init__(self):
-        self._condition = threading.Condition()
-        self._foreground, self._background = deque(), deque()
-        self._owner, self._depth = None, 0
-
-    def _acquire(self, foreground=False):
-        owner = threading.get_ident()
-        with self._condition:
-            if self._owner == owner:
-                self._depth += 1
-                return
-            queue = self._foreground if foreground else self._background
-            ticket = object()
-            queue.append(ticket)
-            self._condition.notify_all()
-            try:
-                self._condition.wait_for(lambda: self._owner is None
-                    and queue[0] is ticket and (foreground or not self._foreground))
-                self._owner, self._depth = owner, 1
-            finally:
-                queue.remove(ticket)
-                self._condition.notify_all()
-
-    def _release(self):
-        with self._condition:
-            if self._owner != threading.get_ident():
-                raise RuntimeError('Model admission released by a non-owner')
-            self._depth -= 1
-            if not self._depth:
-                self._owner = None
-                self._condition.notify_all()
-
-    def __enter__(self):
-        self._acquire()
-        return self
-
-    def __exit__(self, *_exc):
-        self._release()
-
-    @contextmanager
-    def foreground(self):
-        self._acquire(foreground=True)
-        try:
-            yield
-        finally:
-            self._release()
+from memory_condense.runtime.model_lock import RecallPriorityLock, model_operation
 
 
 class SharedEmbedding:
@@ -109,10 +46,14 @@ class SharedEmbedding:
         self.encoder, self.model_lock = encoder, RecallPriorityLock()
         if background_batch_size is None:
             device = str(encoder.execution_identity.get('device', 'auto'))
-            background_batch_size = 8 if device.startswith('cuda') else 1
+            preferred = getattr(encoder,'preferred_background_batch_size',None)
+            background_batch_size = preferred if preferred is not None else (
+                8 if device.startswith('cuda') else 1)
         if type(background_batch_size) is not int or background_batch_size < 1:
             raise ValueError('Background embedding batch size must be a positive integer')
         self.background_batch_size = background_batch_size
+        key = getattr(encoder,'background_batch_key',None)
+        self.background_batch_key = key if callable(key) else None
         self._chunk_vectors = OrderedDict()
         self._cache_lock = threading.Lock()
         self.metrics = Counter()
@@ -148,12 +89,27 @@ class SharedEmbedding:
             self.metrics[metric+'_batches'] += 1
             return result
 
+    def _background_batches(self, values, text):
+        """Plan short, recall-preemptible batches with optional length bucketing."""
+        indexed = list(enumerate(values))
+        size = self.background_batch_size
+        if self.background_batch_key is not None and len(indexed) > size:
+            indexed.sort(key=lambda item:(self.background_batch_key(text(item[1])),item[0]))
+        return [indexed[i:i+size] for i in range(0,len(indexed),size)]
+
     def embed_queries(self, queries):
         if not queries:
             return self.encoder.embed_queries(queries)
-        size=self.background_batch_size
-        return np.concatenate([self._background(self.encoder.embed_queries,queries[i:i+size],'summary')
-                               for i in range(0,len(queries),size)],axis=0)
+        population=list(queries)
+        restored=[None]*len(population)
+        for batch in self._background_batches(population,lambda value:value):
+            generated=np.asarray(self._background(self.encoder.embed_queries,
+                [value for _,value in batch],'summary'))
+            if len(generated)!=len(batch):
+                raise ValueError('Summary embedding cardinality changed')
+            for (index,_),vector in zip(batch,generated,strict=True):
+                restored[index]=vector
+        return np.stack(restored)
 
     def embed_chunks(self, chunks):
         # Chunk vectors depend on exact text and encoder identity, not turn
@@ -172,9 +128,8 @@ class SharedEmbedding:
                 else:
                     missing[key]=chunk
         pending=list(missing.items())
-        size=self.background_batch_size
-        for i in range(0,len(pending),size):
-            batch=pending[i:i+size]
+        for indexed_batch in self._background_batches(pending,lambda value:value[1].text):
+            batch=[value for _,value in indexed_batch]
             generated=self._background(self.encoder.embed_chunks,[c for _,c in batch],'chunk')
             if len(generated)!=len(batch):
                 raise ValueError('Chunk embedding cardinality changed')
@@ -275,9 +230,27 @@ class PreparedExchange:
 
 class ResidentNativeBackend:
     """Append-only live memory; cold validation once, durable publication per sync."""
-    def __init__(self, run, arm_root, actor, *, runtime=None):
+    recall_accepts_recent = True
+
+    def __init__(self, run, arm_root, actor, *, runtime=None, dialogue_policy=None, retrieval_policy=None,
+                 experiment_policy=None):
+        if dialogue_policy is not None and type(dialogue_policy) is not DialogueRetrievalPolicy:
+            raise TypeError('Expected a validated DialogueRetrievalPolicy')
         self.run, self.arm_root, self.actor = Path(run), Path(arm_root), actor
         self.runtime = runtime
+        if experiment_policy is not None:
+            from memory_condense.application.native_experiments import NativeExperimentPolicy
+            if type(experiment_policy) is not NativeExperimentPolicy:
+                raise TypeError('Expected NativeExperimentPolicy')
+        self.experiment_policy = experiment_policy
+        self._tactic_classifier = None
+        if retrieval_policy not in (None, 'auto', 'cap8', 'dialogue', 'hierarchy_neighborhoods', 'decision_history'):
+            raise ValueError('Unknown retrieval policy')
+        if retrieval_policy == 'cap8' and dialogue_policy is not None:
+            raise ValueError('cap8 cannot configure dialogue retrieval')
+        self.retrieval_policy = retrieval_policy
+        self.dialogue_policy = (dialogue_policy or DialogueRetrievalPolicy()
+            if retrieval_policy in ('auto', 'dialogue', 'hierarchy_neighborhoods', 'decision_history') else dialogue_policy)
         self.rows, self.events, self.live_rows, self.atoms = [], (), [], ()
         self.app = self.encoder = self.attention = self.seed = None
         self.vectors = {}
@@ -659,6 +632,12 @@ class ResidentNativeBackend:
     def _ack(self, events, rows, snapshot, parents, started, phases):
         if snapshot['turn_count'] != len(rows) or not compatible_summary_embedding(self.encoder, snapshot['embedding_identity']):
             raise ValueError('Native chat index has not reached the captured turn prefix')
+        # Build optional routing data before acknowledging the prefix. A failed
+        # preparation leaves readers on their last complete published snapshot.
+        dialogue_start = time.perf_counter()
+        self._prepare_dialogue(self.app._load_native_spine()[2])
+        if self.dialogue_policy is not None:
+            phases = {**phases, 'dialogue_prepare_s': time.perf_counter()-dialogue_start}
         self.events, self.rows = tuple(events), rows
         self.last_reopen = dict(snapshot=snapshot, parent_snapshot=parents,
             history_sha256=identity_sha256(rows), history_turns=len(rows),
@@ -668,6 +647,33 @@ class ResidentNativeBackend:
         self._publish_read_view()
         timing = dict(operation='sync', history_turns=len(rows), elapsed_s=time.perf_counter()-started, **phases)
         self._record_timing(timing)
+
+    def _prepare_dialogue(self, memory):
+        if self.dialogue_policy is None:
+            return
+        identity = summary_embedding_identity(self.encoder)
+        if identity != self.embedding_identity:
+            raise ValueError('Dialogue summary encoder changed before publication')
+        # Reuse the resident content-addressed vector cache on both append and
+        # cold reopen. Only new/changed leaf summaries require BGE work; raw
+        # text, Qwen, and the answer model never enter this preparation step.
+        leaves = tuple(s for s in memory.router.hierarchy.sections if not s.child_section_ids)
+        matrix = self.matrix(SimpleNamespace(sections=leaves))
+        if summary_embedding_identity(self.encoder) != identity:
+            raise ValueError('Dialogue summary encoder changed during preparation')
+        positions = {t.turn_id:i for i,t in enumerate(self.app.transcript.native_snapshot())}
+        memory.configure_dialogue(self.dialogue_policy, matrix, embedding_identity=identity,
+                                 turn_positions=positions)
+        if self.retrieval_policy == 'auto':
+            if self._tactic_classifier is None:
+                from memory_condense.application.tactic_router import BGETacticRouter
+                self._tactic_classifier = (self.runtime.tactic_router() if self.runtime is not None
+                                          else BGETacticRouter(self.encoder))
+            memory.configure_tactics(self._tactic_classifier)
+        elif self.retrieval_policy in ('hierarchy_neighborhoods', 'decision_history'):
+            memory.include_hierarchy = True
+            if self.retrieval_policy == 'decision_history':
+                memory.forced_tactic = 'decision_history'
 
     def _publish_read_view(self):
         # Capture the committed, authenticated prefix once. An active recall
@@ -679,46 +685,87 @@ class ResidentNativeBackend:
             raise ValueError('Published hydration prefix differs from the native index')
         raw = MappingProxyType({t.turn_id: t for t in turns})
         memory = self.app._load_native_spine()[2]
+        if getattr(self,'experiment_policy',None) is not None and self.experiment_policy.modules:
+            from memory_condense.application.native_experiments import PreparedNativeExperiments, SummaryGraph
+            memory = copy(memory)
+            graph = (SummaryGraph.capture(self.app,memory.router,self.experiment_policy)
+                     if {'learned_associations','heat_diffusion'} & set(self.experiment_policy.modules)
+                     else SummaryGraph.empty())
+            reinjection = None
+            if 'cav_reinjection' in self.experiment_policy.modules:
+                prepare = getattr(self.attention,'prepare_cav_reinjection',None)
+                if callable(prepare):
+                    reinjection = prepare(tuple(memory.router.atoms.values()),self.experiment_policy)
+            spectral = None
+            if 'spectral_reinjection' in self.experiment_policy.modules:
+                from memory_condense.associations.spectral_reinjection import SpectralReinjectionIndex
+                sections=memory.router.semantic.sections
+                spectral=SpectralReinjectionIndex.build([s.section_id for s in sections],
+                    [s.source_id for s in sections],memory.router.semantic.address_matrix,
+                    degree=min(8,max(1,len(sections)-1)),restart=.7,hops=2,direct_mix=.7,
+                    provenance=dict(embedding_identity=memory.router.semantic.embedding_identity))
+            memory.experiments = PreparedNativeExperiments(memory.router,self.experiment_policy,
+                graph=graph,attention=self.attention,reinjection=reinjection,spectral=spectral)
+        from memory_condense.application.decision_history import snapshot_revisions
+        revisions = snapshot_revisions(self.app.memory)
         with self._publication_lock:
-            self._published = (memory, self.events, dict(self.last_reopen), raw)
+            self._published = (memory, self.events, dict(self.last_reopen), raw, revisions)
 
-    def recall(self, query):
+    def recall(self, query, *, recent=()):
+        if getattr(self,'experiment_policy',None) is not None and self.experiment_policy.modules:
+            return self.recall_published(query,recent=recent)
         if self.last_reopen is None:
             raise ValueError('Chat recall requires an indexed turn prefix')
         started = time.perf_counter()
         anchor = max(datetime.fromisoformat(e.created_at) for e in self.events if e.created_at).strftime('%Y/%m/%d (%a)')
-        result = native_packet(self.app, query, f'[Question asked at {anchor} 23:59] ' + query, self.events)
+        result = native_packet(self.app, query, f'[Question asked at {anchor} 23:59] ' + query, self.events, recent=recent)
         self.timings.append(dict(operation='recall', elapsed_s=time.perf_counter()-started))
         return {**self.last_reopen, **result}
 
-    def recall_published(self, query):
+    def recall_published(self, query, *, recent=()):
         """Read the last successful prefix while the next batch is building."""
         with self._publication_lock:
             published = self._published
         if published is None:
             raise ValueError('Chat recall requires an indexed turn prefix')
-        original, events, receipt, raw = published
+        original, events, receipt, raw, revisions = published
         started = time.perf_counter()
         anchor = max(datetime.fromisoformat(e.created_at) for e in events if e.created_at).strftime('%Y/%m/%d (%a)')
         transcript = SimpleNamespace(get_turn=raw.get)
         memory = copy(original)
         memory.load_turn = transcript.get_turn
         def retrieve(query, dated_question, **limits):
-            if isinstance(memory.router, NativeSpineUserCompletionRouter):
-                limits = {**CAP8_LIMITS, **limits}
-            return memory.retrieve(query, dated_question, **limits)
-        view = SimpleNamespace(transcript=transcript, retrieve_native_spine=retrieve)
-        result = native_packet(view, query, f'[Question asked at {anchor} 23:59] ' + query, events)
+            return memory.retrieve(query, dated_question, **retrieval_limits(memory, limits))
+        view = SimpleNamespace(transcript=transcript, retrieve_native_spine=retrieve,
+                               decision_revisions=revisions)
+        result = native_packet(view, query, f'[Question asked at {anchor} 23:59] ' + query, events, recent=recent)
         self.timings.append(dict(operation='recall', elapsed_s=time.perf_counter()-started,
                                  published_events=len(events)))
         return {**receipt, **result, 'published_events': len(events)}
 
     def learn(self, packet, *, access_event_id):
         started = time.perf_counter()
-        learned = learn_native_packet(self.app, packet, self.events, access_event_id=access_event_id)
+        receipt = {}
+        weighted = None
+        if getattr(self,'experiment_policy',None) is not None and 'qwen_consolidation' in self.experiment_policy.modules:
+            from memory_condense.application.native_experiment_learning import summary_weights
+            def weighted(chunks):
+                weights, details = summary_weights(self.app,packet,chunks,
+                    self.app._load_native_spine()[2].router,self.attention,self.experiment_policy)
+                receipt.update(details)
+                return weights
+        learned = learn_native_packet(self.app, packet, self.events, access_event_id=access_event_id,
+                                      weight_summaries=weighted)
+        if learned is not None and getattr(self,'experiment_policy',None) is not None and self.experiment_policy.modules:
+            # Publish a NEW read view. In-flight recalls retain their original
+            # immutable graph and raw prefix; learned links are visible next turn.
+            self._publish_read_view()
         self._record_timing(dict(operation='learn', elapsed_s=time.perf_counter()-started,
                                  access_event_id=access_event_id))
-        return dict(learning=asdict(learned) if learned is not None else None)
+        result = dict(learning=asdict(learned) if learned is not None else None)
+        if receipt:
+            result['experimental_learning'] = receipt
+        return result
 
     def close(self):
         try:

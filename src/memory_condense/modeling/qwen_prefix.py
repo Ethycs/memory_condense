@@ -443,18 +443,32 @@ class Qwen3PrefixEncoder:
         model_revision: str = DEFAULT_MODEL_REVISION,
         expected_checkpoint_sha256: str | None = None,
         host_embeddings: bool = False,
+        verify_checkpoint_files: bool = True,
     ) -> None:
         self.model_dir = Path(model_dir)
         self.layers = int(layers)
         self.model_id = str(model_id)
         self.model_revision = str(model_revision)
-        self.checkpoint_identity = verify_prefix_checkpoint(
-            self.model_dir,
-            layers=self.layers,
-            model_id=self.model_id,
-            model_revision=self.model_revision,
-            expected_checkpoint_sha256=expected_checkpoint_sha256,
-        )
+        if verify_checkpoint_files:
+            self.checkpoint_identity = verify_prefix_checkpoint(
+                self.model_dir,
+                layers=self.layers,
+                model_id=self.model_id,
+                model_revision=self.model_revision,
+                expected_checkpoint_sha256=expected_checkpoint_sha256,
+            )
+        else:
+            names = (*_PREFIX_METADATA_FILES, *_known_required_shards(self.layers))
+            missing = [name for name in names if not (self.model_dir/name).is_file()]
+            if missing:
+                raise FileNotFoundError('Qwen prefix checkpoint is incomplete: '+', '.join(missing))
+            expected = expected_prefix_checkpoint_sha256(self.layers,
+                model_id=self.model_id, model_revision=self.model_revision)
+            if expected_checkpoint_sha256 is not None and not hmac.compare_digest(
+                    expected, expected_checkpoint_sha256.casefold()):
+                raise ValueError('Configured Qwen checkpoint identity differs from the pinned manifest')
+            self.checkpoint_identity = QwenPrefixCheckpointIdentity(
+                self.model_id, self.model_revision, expected, tuple(names))
         self.checkpoint_sha256 = self.checkpoint_identity.checkpoint_sha256
         (
             self._torch,
@@ -711,6 +725,30 @@ class Qwen3PrefixEncoder:
             handle.remove()
         return captured["residual"]
 
+    def _forward_through_layer(self, layer: int, **inputs):
+        """Stop after the requested residual, without executing unused tail code.
+
+        Capture hooks registered by callers run first. This also supports the
+        resident prefix whose last MLP/final norm are deliberately absent.
+        """
+        class LayerReady(Exception):
+            pass
+        ready = LayerReady()
+        def stop(_module, _args, _output):
+            raise ready
+        handle = self.model.layers[layer].register_forward_hook(stop)
+        try:
+            try:
+                self._forward(**inputs)
+            except LayerReady as caught:
+                if caught is not ready:
+                    raise
+            else:
+                raise RuntimeError('Qwen layer early exit did not execute')
+        finally:
+            handle.remove()
+            ready.__traceback__ = None
+
     def encode_layers(
         self,
         texts: Sequence[str],
@@ -761,7 +799,7 @@ class Qwen3PrefixEncoder:
                 )
                 inputs = {key: value.to(self.device) for key, value in inputs.items()}
                 with self._torch.inference_mode():
-                    self._forward(**inputs, use_cache=False)
+                    self._forward_through_layer(max(selected), **inputs, use_cache=False)
                     for layer in selected:
                         vectors = mean_pool_residual(
                             captured[layer], inputs.get("attention_mask")
@@ -771,6 +809,83 @@ class Qwen3PrefixEncoder:
             self.tokenizer.padding_side = original_padding_side
             for handle in handles:
                 handle.remove()
+
+        return {
+            layer: self._torch.cat(layer_batches, dim=0)
+            for layer, layer_batches in pooled.items()
+        }
+
+    def encode_attention_values(
+        self,
+        texts: Sequence[str],
+        *,
+        layers: Sequence[int] | None = None,
+        batch_size: int = 8,
+    ) -> dict[int, Any]:
+        """Mean-pool each layer's attention-weighted values before ``W_O``.
+
+        The input to an attention layer's output projection is the concatenated
+        per-head ``A @ V`` result.  It is a fixed-width attention representation,
+        unlike the sequence-length-dependent attention matrix.  Returned tensors
+        are CPU float32 arrays; token activations and attention maps are released
+        after each batch.
+        """
+        if not texts:
+            return {}
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        selected = _validated_layers(
+            range(self.layers) if layers is None else layers, self.layers
+        )
+        pooled: dict[int, list[Any]] = {layer: [] for layer in selected}
+        captured: dict[int, Any] = {}
+        handles = []
+        for layer in selected:
+            projection = self.model.layers[layer].self_attn.o_proj
+
+            def save_values(
+                _module: Any,
+                args: Any,
+                *,
+                layer_index: int = layer,
+            ) -> None:
+                if not args or type(args[0]) is not self._torch.Tensor:
+                    raise RuntimeError("Qwen attention output projection omitted A@V values")
+                captured[layer_index] = args[0]
+
+            handles.append(projection.register_forward_pre_hook(save_values))
+
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "right"
+        try:
+            for start in range(0, len(texts), batch_size):
+                captured.clear()
+                batch = list(texts[start : start + batch_size])
+                inputs = self.tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                inputs = {key: value.to(self.device) for key, value in inputs.items()}
+                with self._torch.inference_mode():
+                    self._forward_through_layer(max(selected), **inputs, use_cache=False)
+                    for layer in selected:
+                        values = captured.get(layer)
+                        if type(values) is not self._torch.Tensor or values.ndim != 3:
+                            raise RuntimeError("Qwen did not expose a bounded A@V tensor")
+                        expected_width = int(self.config.num_attention_heads) * int(
+                            self.model.layers[layer].self_attn.head_dim
+                        )
+                        if int(values.shape[-1]) != expected_width:
+                            raise RuntimeError("Qwen A@V tensor has the wrong head width")
+                        vectors = mean_pool_residual(values, inputs.get("attention_mask"))
+                        pooled[layer].append(vectors.float().cpu())
+        finally:
+            self.tokenizer.padding_side = original_padding_side
+            for handle in handles:
+                handle.remove()
+            captured.clear()
 
         return {
             layer: self._torch.cat(layer_batches, dim=0)
@@ -862,7 +977,7 @@ class Qwen3PrefixEncoder:
                 # Do not ask every retained layer to return its LxL attention
                 # map. We reconstruct maps only for selected layers below,
                 # keeping the transient linker bounded by its own workspace.
-                self._forward(**inputs, use_cache=False, output_attentions=False)
+                self._forward_through_layer(max(selected), **inputs, use_cache=False, output_attentions=False)
                 captures: dict[int, QwenHeadCapture] = {}
                 for layer in selected:
                     decoder = self.model.layers[layer]
@@ -919,7 +1034,8 @@ class Qwen3PrefixEncoder:
                         attention=selected_attention,
                         mixed_values=layer_saved["mixed_values"],
                         attention_output=layer_saved["attention_output"],
-                        _o_weight=attention.o_proj.weight,
+                        _o_weight=(attention.o_proj.restore() if hasattr(attention.o_proj,'restore')
+                                   else attention.o_proj.weight),
                         head_dim=int(attention.head_dim),
                     )
         finally:

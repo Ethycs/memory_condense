@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "modules": ["learned_associations", "heat_diffusion", "qwen_summary_routing", "qwen_associations", "live_head_memory", "qwen_consolidation"],
+  "candidate_limit": 16,
+  "additions": 4,
+  "extra_context_tokens": 1024,
+  "extra_raw_spans": 8,
+  "max_qwen_passes": 16,
+  "workspace_tokens": 1024,
+  "qwen_layer": 4
+}

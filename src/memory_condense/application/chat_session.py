@@ -521,23 +521,35 @@ class ChatSession:
             event = self.event(linked_input)
             if event.role not in ('user', 'assistant', 'tool') or '_chat' in event.metadata:
                 raise ValueError('Recall must link to an ingested input event')
+            recall_options = {}
+            if getattr(self.backend, 'recall_accepts_recent', False):
+                # Only conversation-local messages before this request may
+                # disambiguate it. Exclude recall/feedback copies and tools.
+                with self._connect() as db:
+                    context = db.execute("SELECT text FROM events WHERE role IN ('user','assistant') "
+                        "AND substr(event_id,1,6)!='_chat:' AND sequence < "
+                        "(SELECT sequence FROM events WHERE event_id=?) ORDER BY sequence DESC LIMIT 6",
+                        (linked_input,)).fetchall()
+                recall_options['recent'] = tuple(row[0] for row in reversed(context))
             if self._reader is not None:
                 # Initial admission is the only indexing barrier. Later failed
                 # or slow batches leave the last published archive usable.
                 if not self._verified:
                     self._startup.result()
-                result = (self.backend.recall_published(query) if self._installed else
+                result = (self.backend.recall_published(query, **recall_options) if self._installed else
                           dict(text='', references=[], published_events=0))
                 published = result['published_events']
             else:
                 self._sync(force=not bool(self.batch_exchanges), allow_batch=True)
-                result = self.backend.recall(query) if self._installed else dict(text='', references=[])
+                result = self.backend.recall(query, **recall_options) if self._installed else dict(text='', references=[])
                 published = self._installed
             text, references = result['text'], tuple(result['references'])
             recent = self._recent_events(published)
             if not isinstance(text, str):
                 raise ValueError('Recall packet must contain text')
             receipt = dict(kind='recall', packet_id=packet_id, query=query, references=references, input_event_id=linked_input)
+            if 'retrieval' in result:
+                receipt['retrieval'] = result['retrieval']
             if recent:
                 receipt['recent_event_ids'] = [e['event_id'] for e in recent]
             event = ChatEvent('_chat:recall:' + packet_id, 'tool', text or 'No matching memory found.', metadata={'_chat': receipt})

@@ -140,6 +140,13 @@ class ExactDenseAddressIndex:
     def nbytes(self) -> int:
         return int(self._matrix.nbytes)
 
+    @property
+    def normalized_matrix(self) -> np.ndarray:
+        """Borrow the immutable normalized rows for publication-time indexes."""
+        if self._closed:
+            raise RuntimeError("dense address index is closed")
+        return self._matrix
+
     def score_all(self, query_embedding: np.ndarray) -> np.ndarray:
         """Return immutable chunk-query cosine scores in ``chunk_ids`` order."""
 

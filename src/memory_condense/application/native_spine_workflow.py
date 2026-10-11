@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from memory_condense.domain._discourse_identity import quote_sha256
 from memory_condense.application.native_spine_context_retrieval import ResidentNativeSpineContextMemory
-from memory_condense.application.native_spine_policy import CAP8_LIMITS
+from memory_condense.application.native_spine_policy import retrieval_limits
 from memory_condense.persistence import native_spine_store, native_spine_parent_store
 from memory_condense.persistence import native_spine_incremental_store
 from memory_condense.search.native_spine_user_completion import NativeSpineUserCompletionRouter
@@ -192,15 +192,14 @@ class NativeSpineWorkflowMixin:
 
         Complete native snapshots automatically use the tested 2,048-token,
         eight-direct-route policy with at most eight additional user atoms.
+        A prepared dialogue module supplies its configured hydration budgets.
         Explicit limits override these defaults. Older snapshots without a
         parent index keep their original context router; an invalid parent
         index raises instead of silently falling back. Ordinary chunk retrieval
         remains a separate API.
         """
         memory = self._load_native_spine()[2]
-        if isinstance(memory.router, NativeSpineUserCompletionRouter):
-            limits = {**CAP8_LIMITS, **limits}
-        return memory.retrieve(query, dated_question, **limits)
+        return memory.retrieve(query, dated_question, **retrieval_limits(memory, limits))
 
     def native_parent_user_receipt(self):
         """Return the validated parent index binding for a complete snapshot."""

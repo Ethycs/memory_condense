@@ -23,6 +23,7 @@ class FastEmbedBGE:
         admission = admission or Path(__file__).parent/'data'/'bge-admission'
         model_dir = assets.bge
         plan, result = read(admission/'plan.json'), read(admission/'report.json')
+        batching = read(admission/'batching.json')
         sealed=read(admission/'admission.json')
         if sealed['report_sha256']!=hashlib.sha256((admission/'report.json').read_bytes()).hexdigest():
             raise ValueError('FastEmbed admission report changed')
@@ -32,10 +33,21 @@ class FastEmbedBGE:
                 or {k:r['fidelity']['vectors'] for k,r in result['results'].items()}
                    != {'query':24,'summary':17,'chunk':16}):
             raise ValueError('FastEmbed export lacks the required pinned transition assay')
-        for name, expected in sealed['files'].items():
-            with (model_dir/name).open('rb') as handle:
-                if hashlib.file_digest(handle,'sha256').hexdigest()!=expected:
-                    raise ValueError('FastEmbed export changed')
+        policy = batching.get('policy', {})
+        fidelity = batching.get('fidelity', {})
+        if (batching.get('format') != 'memory-condense-fastembed-batching-admission-v1'
+                or policy != {'batch_size':4, 'ordering':'bge-token-length-ascending-v1'}
+                or fidelity.get('max_absolute_vector_delta') != 0.0
+                or fidelity.get('top10_exact_query_fraction') != 1.0):
+            raise ValueError('FastEmbed batching policy lacks an exact-vector admission')
+        # Setup/doctor already hash every pinned export file. Re-hashing the
+        # 2.27 GB ONNX data file here made every process cold start pay for a
+        # second full disk scan. Runtime admission uses the sealed manifest
+        # identity and fails fast for missing files; explicit verification
+        # remains available through ``memory-condense doctor --verify-models``.
+        missing = [name for name in sealed['files'] if not (model_dir/name).is_file()]
+        if missing:
+            raise FileNotFoundError('FastEmbed export is incomplete: '+', '.join(missing))
         self.model_revision = source['revision']
         self.checkpoint_sha256 = identity_sha256(dict(source=source,files=sealed['files']))
         self.validated_source_embedding_identity = summary_embedding_identity(EmbeddingService(device='cpu',batch_size=8))
@@ -45,6 +57,13 @@ class FastEmbedBGE:
             admission_sha256=hashlib.sha256((admission/'report.json').read_bytes()).hexdigest(),
             source_embedding_identity=self.validated_source_embedding_identity)
         self.model = load(result['selected_threads'], model_dir, assets.fastembed_package)
+        # Batch size is deliberately outside ``execution_identity``. The
+        # production-text admission proves bit-identical vectors against the
+        # batch-one reference, so changing this scheduler must not invalidate
+        # existing indexes or trained BGE classifiers.
+        self.preferred_background_batch_size = policy['batch_size']
+        self.embedding_schedule = dict(policy, admission_sha256=hashlib.sha256(
+            (admission/'batching.json').read_bytes()).hexdigest())
         import fastembed, onnxruntime
         if fastembed.__version__!=plan['fastembed'] or onnxruntime.__version__!=plan['onnxruntime']:
             raise ValueError('FastEmbed runtime differs from the admitted assay')
@@ -55,10 +74,25 @@ class FastEmbedBGE:
     def embed_query(self, query):
         return np.asarray(next(iter(self.model.embed([query],batch_size=1))),dtype=np.float32)
 
+    def background_batch_key(self, text):
+        """Return the admitted padding key from BGE's own tokenizer."""
+        return len(self.model.model.tokenizer.encode(text).ids)
+
     def embed_queries(self, queries):
         if not queries:
             return np.zeros((0,self.dim),dtype=np.float32)
-        return np.asarray(list(self.model.embed(queries,batch_size=1)),dtype=np.float32)
+        population = list(queries)
+        order = list(range(len(population)))
+        if len(population) > self.preferred_background_batch_size:
+            order.sort(key=lambda index:(self.background_batch_key(population[index]),index))
+        ordered = [population[index] for index in order]
+        generated = np.asarray(list(self.model.embed(
+            ordered,batch_size=min(self.preferred_background_batch_size,len(ordered)))),dtype=np.float32)
+        if generated.shape != (len(population),self.dim):
+            raise ValueError('FastEmbed query embedding cardinality or dimension changed')
+        restored = np.empty_like(generated)
+        restored[order] = generated
+        return restored
 
     def embed_chunks(self, chunks):
         vectors=self.embed_queries([c.text for c in chunks])

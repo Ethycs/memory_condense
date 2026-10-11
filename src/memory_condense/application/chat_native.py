@@ -16,12 +16,16 @@ def validate_reference(app, reference):
     return span
 
 
-def exact_memory_passage(span, text, role):
+def exact_memory_passage(span, text, role, *, evidence_id=None):
     """Canonical exact evidence envelope shared by recall and summary reuse."""
     if len(text)!=span.end_char-span.start_char or quote_sha256(text)!=span.span_text_sha256:
         raise ValueError('Recall passage differs from its exact source span')
-    label=json.dumps(dict(turn_id=span.turn_id,source_id=span.source_id,role=role,
-                          start_char=span.start_char,end_char=span.end_char),ensure_ascii=False)
+    metadata=dict(turn_id=span.turn_id,source_id=span.source_id,role=role,
+                  start_char=span.start_char,end_char=span.end_char)
+    if evidence_id is not None:
+        metadata['evidence_id'] = evidence_id
+        metadata['mentioned_at'] = span.created_at
+    label=json.dumps(metadata,ensure_ascii=False)
     return '<MEMORY '+label+'>\n'+text+'\n</MEMORY>'
 
 
@@ -33,12 +37,18 @@ def native_packet(app, query, dated_question, events, **limits):
         raise ValueError('Native chat routing violated the summary-only boundary')
     event_by_id = {e.event_id: e for e in events}
     references, passages = [], []
-    for section in result.hydration.sections:
+    experiments = getattr(result,'experiments',None)
+    extra = experiments.hydration.sections if experiments is not None else ()
+    extra_ids = {s.section.section_id for s in extra}
+    for section in (*result.hydration.sections,*extra):
         for evidence in section.evidence:
             event = event_by_id[evidence.span.turn_id]
             receipt = event.metadata.get('_chat', {})
             reference = dict(section_id=section.section.section_id,
                              span=evidence.span.identity_payload(), independent=not bool(receipt))
+            if section.section.section_id in extra_ids:
+                reference.update(learning_eligible=False,
+                    experimental_route=experiments.receipt['provenance'][section.section.section_id])
             if receipt.get('kind') == 'recall':
                 # Keep the immediate exact source AND ancestry. A retrieved copy
                 # does not manufacture independent support for its own graph.
@@ -52,13 +62,68 @@ def native_packet(app, query, dated_question, events, **limits):
             references.append(reference)
             span = evidence.span
             # Keep exact source addresses visible to the reader so engineering
-            # artifacts can cite them. Stored routing summaries stay out of it.
+            # artifacts can cite them. Summary context is labeled separately.
             passages.append(exact_memory_passage(span,evidence.text,event.role))
-    return dict(text='\n\n'.join(passages), references=references,
-                routing=routing, hydration=result.hydration.identity_payload())
+    packet = dict(text='\n\n'.join(passages), references=references,
+                  routing=routing, hydration=result.hydration.identity_payload())
+    if 'policy' in routing:
+        # The journal needs the deployed policy and actual packing outcome,
+        # not a second copy of every candidate summary in the route receipt.
+        packet['retrieval'] = dict(mode='dialogue', policy=routing['policy'],
+            route_sha256=routing['receipt_sha256'], hierarchy_sha256=routing['hierarchy_sha256'],
+            index_sha256=result.hydration.plan.index_sha256,
+            selected_episode_ids=routing['selected_episode_ids'], exhaustive=False,
+            max_context_tokens=result.hydration.max_context_tokens,
+            context_token_count=result.hydration.context_token_count,
+            max_raw_spans=result.hydration.max_raw_spans,
+            raw_turn_read_count=result.hydration.raw_turn_read_count,
+            raw_reads_during_routing=0, query_qwen_passes=0)
+    if result.tactic is not None:
+        packet.setdefault('retrieval', dict(mode='cap8'))['tactic'] = result.tactic
+    if experiments is not None:
+        packet.setdefault('retrieval',dict(mode='cap8')).update(experiments=experiments.receipt,
+            query_qwen_passes=experiments.receipt['query_qwen_passes'],raw_reads_during_routing=0)
+    if result.hierarchy_context is not None:
+        context = result.hierarchy_context
+        if context.text:
+            packet['text'] = context.text+'\n\nEXACT NEIGHBORHOOD EVIDENCE\n'+packet['text']
+        packet['retrieval'].update(mode='hierarchy_neighborhoods', hierarchy_context=context.receipt())
+    history = result.tactic is not None and result.tactic.get('selected_tactic') == 'decision_history'
+    annotations, labels = '', None
+    if history:
+        from memory_condense.application.decision_history import annotate, snapshot_revisions
+        revisions = getattr(app, 'decision_revisions', None)
+        if revisions is None:
+            revisions = snapshot_revisions(getattr(app, 'memory', None))
+        annotations, labels, receipt = annotate(references, events, revisions=revisions)
+        packet['retrieval'].update(mode='decision_history', decision_history=receipt)
+    if history or result.hierarchy_context is not None:
+        from memory_condense.application.continuity import contract, evidence_labels
+        from memory_condense.search.summary_time_prior_v2 import question_day
+        if labels is None:
+            labels = evidence_labels(references, events)
+        conventions, manifest = contract(references, labels,
+            hierarchy=packet['retrieval'].get('hierarchy_context',{}),
+            source_scope=result.routing.baseline.eligible_source_ids,
+            index_sha256=result.hydration.plan.index_sha256,
+            as_of_day=question_day(query,dated_question).isoformat())
+        exact = []
+        for i, reference in enumerate(references):
+            span = RawSectionSpan(**reference['span'])
+            event = event_by_id[span.turn_id]
+            exact.append(exact_memory_passage(span,event.text[span.start_char:span.end_char],event.role,
+                                             evidence_id=labels[i]))
+        summary = result.hierarchy_context.text if result.hierarchy_context is not None else ''
+        title = 'EXACT HISTORY EVIDENCE' if history else 'EXACT NEIGHBORHOOD EVIDENCE'
+        packet['text'] = '\n\n'.join(t for t in (conventions,annotations,summary,title,*exact) if t)
+        packet['retrieval']['continuity'] = manifest
+    if 'retrieval' in packet:
+        from memory_condense.domain._tokenizer import count_tokens
+        packet['retrieval']['packet_token_count'] = count_tokens(packet['text'])
+    return packet
 
 
-def learn_native_packet(app, packet, events, *, access_event_id):
+def learn_native_packet(app, packet, events, *, access_event_id, weight_summaries=None):
     """Use the existing scalar co-access graph; never send raw text to Qwen.
 
     The input is linked to original chunks actually delivered in the packet.
@@ -70,7 +135,8 @@ def learn_native_packet(app, packet, events, *, access_event_id):
     for reference in packet.references:
         span = validate_reference(app, reference)
         event = event_by_id[span.turn_id]
-        if not reference.get('independent', False) or '_chat' in event.metadata:
+        if (not reference.get('independent', False) or not reference.get('learning_eligible',True)
+                or '_chat' in event.metadata):
             continue
         rows = app._db.execute(
             'SELECT chunk_id FROM chunks WHERE turn_id=? AND start_char<? AND end_char>? ORDER BY start_char, chunk_id',
@@ -88,4 +154,6 @@ def learn_native_packet(app, packet, events, *, access_event_id):
         (packet.input_event_id,)).fetchall()]
     # Reserve one node for the triggering input within the existing 16-node cap.
     chunks = list(dict.fromkeys(inputs[:1] + source_chunks))[:16]
-    return app.observe_context_access([], chunks, access_event_id=access_event_id)
+    activations = weight_summaries(chunks) if weight_summaries is not None else None
+    return app.observe_context_access([], chunks, access_event_id=access_event_id,
+                                      **({'node_activations':activations} if activations is not None else {}))

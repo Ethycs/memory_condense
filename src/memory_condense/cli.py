@@ -5,6 +5,9 @@ import sys
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == 'route':
+        from memory_condense.interfaces.tactic_cli import main as route
+        return route(args[1:])
     if args and args[0] == 'proxy':
         from memory_condense.interfaces.proxy_server import main as proxy
         from memory_condense.runtime.config import user_directory
@@ -13,6 +16,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog='memory-condense', description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('proxy', help='Run the memory-enabled provider proxy')
+    commands.add_parser('route', help='Prioritize memory tactics with the existing CPU BGE model')
     setup_parser = commands.add_parser('setup', help='Download pinned model assets or register an existing cache')
     location = setup_parser.add_mutually_exclusive_group()
     location.add_argument('--assets-dir', help='Download destination (default: per-user application data)')

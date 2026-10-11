@@ -76,7 +76,7 @@ class ScalarAttentionCache:
                     print("Loading local Qwen for query-independent user-summary attention...", flush=True)
                     from memory_condense.runtime.config import RuntimeAssets
                     encoder = Qwen3PrefixEncoder(RuntimeAssets.resolve().qwen,
-                        layers=6, device="cuda", dtype="float16")
+                        layers=6, device="cuda", dtype="float16", verify_checkpoint_files=False)
                     linker = QwenMemoryLinker(encoder, layer=5, max_candidates=8, max_workspace_tokens=4096)
                     self.scorer = QwenAttentionHeadSurpriseScorer(linker, max_spans=8, span_token_cap=128)
                 signal = self.scorer.score_sequence(texts)
@@ -95,7 +95,8 @@ class LocalAttention(ScalarAttentionCache):
         from memory_condense.runtime.config import RuntimeAssets
         model = getattr(self, 'model_dir', None) or RuntimeAssets.resolve().qwen
         encoder = Qwen3PrefixEncoder(model, layers=6, device='cuda', dtype='float16',
-                                    host_embeddings=getattr(self, 'host_embeddings', False))
+                                    host_embeddings=getattr(self, 'host_embeddings', False),
+                                    verify_checkpoint_files=False)
         self.scorer = QwenAttentionHeadSurpriseScorer(
             QwenMemoryLinker(encoder, layer=5, max_candidates=8, max_workspace_tokens=4096),
             max_spans=8, span_token_cap=128)

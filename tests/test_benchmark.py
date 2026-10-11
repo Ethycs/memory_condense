@@ -210,12 +210,14 @@ def test_exact_match_uses_normalization():
 def test_build_qa_prompt_includes_context_and_question():
     messages = build_qa_prompt("Where?", ["chunk one", "chunk two"])
     assert messages[0]["role"] == "system"
-    assert "newest relevant user update" in messages[0]["content"]
-    assert "do not abstain merely because the value is approximate" in (
+    assert "same source_id uniquely establish" in (
         messages[0]["content"]
     )
-    assert "difference, duration, or amount remaining" in messages[0]["content"]
-    assert "explicit start or end boundary" in messages[0]["content"]
+    assert "continues that interpretation without correction" in (
+        messages[0]["content"]
+    )
+    assert "never combine different source_ids" in messages[0]["content"]
+    assert "Say I don't know only when no unique candidate" in messages[0]["content"]
     assert "chunk one" in messages[1]["content"]
     assert "chunk two" in messages[1]["content"]
     assert "Where?" in messages[1]["content"]

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memory_condense"
-version = "0.2.1"
+version = "0.2.2"
 description = "Long-term memory condensation system for LLM conversations"
 requires-python = ">=3.11,<3.13"
 readme = "README.md"
@@ -26,7 +26,10 @@ proxy = [
     "starlette>=0.40,<2", "uvicorn>=0.30,<1",
     "torch>=2.7,<3", "transformers>=4.51,<5", "accelerate>=1,<2",
     "safetensors>=0.5", "fastembed==0.8.1", "onnxruntime==1.30.0",
-    "nvidia-nvcomp-cu12==5.3.0.16; platform_system == 'Windows'",
+    # nvCOMP is required, not optional: compress_qwen is called unconditionally
+    # from CompressedAttention.prepare() on conversation open, with no fallback.
+    # The pinned version ships win_amd64 and manylinux_2_28_x86_64 wheels.
+    "nvidia-nvcomp-cu12==5.3.0.16; platform_system == 'Windows' or (platform_system == 'Linux' and platform_machine == 'x86_64')",
 ]
 
 [project.scripts]

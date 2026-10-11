@@ -1,11 +1,54 @@
 # memory_condense — documentation tree
 
 **Status**: Living Document
-**Date**: 2026-10-02 (includes native-memory proxy integration)
+**Date**: 2026-10-09 (includes retained-attention retrieval assay)
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
+
+**Optional backend experiments:** [Native Experimental Modules](02%20-%20Implementation/07%20-%20Native%20Experimental%20Modules.md)
+documents the nine summary-only native adapters, activation profiles, exact-source
+bounds, and the local engineering-archive integration results. The matched
+[answer-quality characterization](10%20-%20Research%20Log/266%20-%202026-10-08%20-%20Native%20experimental%20technique%20characterization.md),
+[query-free CAV reinjection compute assay](10%20-%20Research%20Log/267%20-%202026-10-09%20-%20Precomputed%20CAV%20reinjection%20compute%20assay.md),
+and [five-concept/spectral payoff](10%20-%20Research%20Log/268%20-%202026-10-09%20-%20Five-concept%20and%20spectral%20reinjection%20payoff.md)
+keep release defaults off: the default memory route scored 75.42% macro, while
+the strongest active selector scored 70.14% after score audit. Precomputed CAV
+reinjection scored 69.65% with zero query-time Qwen passes, supporting the
+compute-substitution hypothesis but not release promotion. Qwen association
+remains a targeted gap-retry candidate rather than an always-on route.
+Five qualified concepts kept the readout below one millisecond but changed only
+two of twelve CAV section lists and recovered no new support. Sparse
+restart-preserving graph filtering built in 71 ms, retained 50,112 bytes and
+changed nine lists, yet also recovered zero new support quotes. Neither arm was
+sent to the reader; the evidence cannot support the requested 10% gain.
+An orthonormal basis over the five-vector span changed five lists and also added
+zero support, ruling out simple CAV correlation as the missing fix.
+
+**Retained attention information:** the earlier blanket policy of discarding
+all transformer state was too broad. A provider-free assay on 783 stored
+summaries found that mean-pooled layer-4 `A @ V` features retrieve exact support
+missed by both the protected production packet and BGE. An unsupervised
+16-dimensional code added five support quotes and completed two facts at an
+eight-candidate budget, across four questions, while its FP16 document codes
+and shared basis total 156,128 bytes. A predeclared holdout on 100 explicit-fact
+questions recovered no support beyond the already near-ceiling production
+packet, rejecting general always-on use. An exact token observable reconstructs
+the rank-16 retrieval cosine to 1.19e-7 and exposes generic summary framing as
+a possible source of score bias. Qwen-token TF-IDF then recovered one of the
+four support quotes missed by the explicit-fact holdout and completed its
+question, while adding nothing at the eight-candidate engineering-synthesis
+cap. The resulting policy uses TF-IDF for rarity-sensitive explicit facts and
+attention codes for dialogue-wide chronology and synthesis; fixed score fusion
+weakened the latter. The representation, holdout and revised retention decision
+are in [Research Log 269](10%20-%20Research%20Log/269%20-%202026-10-09%20-%20Retained%20attention%20information%20retrieval%20assay.md).
+
+**Continuity feature backlog:** [Project Continuity and Changing Facts](06%20-%20Roadmaps/05%20-%20Project%20Continuity%20and%20Changing%20Facts.md)
+records the high-confidence extensions to revisit: shared project scope, current
+state, unresolved work, fix/decision history, constraints, checkpoint changes,
+explicit fact and relationship revisions, and portable handoffs. It identifies
+existing components to reuse, remaining design choices and validation gates.
 
 **Native-memory proxy:** the installable `memory-condense proxy` command connects the
 provider proxy to the evaluated resident ChatSession lifecycle: recall, recent

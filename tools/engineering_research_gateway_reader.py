@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import time
+from types import SimpleNamespace
 
 from tools.engineering_research_gateway import emit, save
 from tools.engineering_research_local import LocalRuntime
 from tools.engineering_research_stream import EmptyGatewayResponseError, StreamTrace
 from tools.run_hot_reduced30_answer_judge import _completion_client
+from memory_condense.runtime.summary_fallback import LocalFirstSummaries
 
 
 def gateway_reader_messages(messages, recent_events, question, tokenizer):
@@ -40,8 +42,9 @@ def gateway_reader_messages(messages, recent_events, question, tokenizer):
 
 
 class GatewayReaderRuntime(LocalRuntime):
-    def __init__(self, root, *, gateway, reader_model, judge_model, empty_response_retries=0):
-        super().__init__(root)
+    def __init__(self, root, *, gateway, reader_model, judge_model, empty_response_retries=0,
+                 summary_api_fallback=False, assets=None):
+        super().__init__(root, assets=assets)
         self.gateway = gateway
         self.reader_model = reader_model
         self.judge_model = judge_model
@@ -50,16 +53,27 @@ class GatewayReaderRuntime(LocalRuntime):
         if empty_response_retries not in (0, 1, 2):
             raise ValueError('Empty-response retries must be bounded to at most two')
         self.empty_response_retries = empty_response_retries
+        self.summary_runtime = None
+        if summary_api_fallback:
+            owner = self
+            class SummaryAPI:
+                identity = dict(provider='openai', gateway=gateway, model=reader_model)
+                def __call__(self, messages, *, max_tokens):
+                    return owner._remote_call('summary_api', messages,
+                        scope='compiler-escalation', max_tokens=max_tokens)
+            local = SimpleNamespace(call=lambda *a,**k:LocalRuntime.call(self,*a,**k),
+                start_reader=lambda:LocalRuntime.start_reader(self), stop_reader=self.stop_reader)
+            self.summary_runtime = LocalFirstSummaries(local,self.root/'summary-fallback',SummaryAPI())
 
     def reader_messages(self, messages, recent_events, question):
         if self.reader_tokenizer is None:
             from transformers import AutoTokenizer
-            self.reader_tokenizer = AutoTokenizer.from_pretrained('.cache/models/Qwen3-8B',
+            self.reader_tokenizer = AutoTokenizer.from_pretrained(self.assets.qwen,
                                                                  local_files_only=True)
         return gateway_reader_messages(messages, recent_events, question, self.reader_tokenizer)
 
-    def start_reader(self):
-        # Validate the answer route before loading the local compiler models.
+    def start_gateway(self):
+        """Validate the remote route without loading an unrelated local reader."""
         if self.remote is None:
             self.remote = _completion_client('LITELLM_KEY', self.gateway).with_options(
                 timeout=120, max_retries=0)
@@ -71,10 +85,20 @@ class GatewayReaderRuntime(LocalRuntime):
                 raise ValueError('Gateway preflight did not establish non-thinking completion')
             emit(phase='gateway_reader_ready', model=self.reader_model,
                  elapsed_s=result['elapsed_s'], response_model=result['response_model'])
-        super().start_reader()
+
+    def start_reader(self):
+        # Validate the answer route before loading the local compiler models.
+        self.start_gateway()
+        if self.summary_runtime is not None:
+            self.summary_runtime.start_reader()
+        else:
+            super().start_reader()
 
     def call(self, kind, messages, *, scope, max_tokens=256, typed_request=None, summary_attempt=0):
         if kind not in ('actor', 'judge', 'gateway_warmup'):
+            if kind in ('raw', 'merge') and self.summary_runtime is not None:
+                return self.summary_runtime.call(kind, messages, scope=scope, max_tokens=max_tokens,
+                    typed_request=typed_request, summary_attempt=summary_attempt)
             return super().call(kind, messages, scope=scope, max_tokens=max_tokens,
                                 typed_request=typed_request, summary_attempt=summary_attempt)
         started = time.perf_counter()

@@ -2015,11 +2015,217 @@ Two defects were exposed and kept visible in the evidence:
 Seven targeted tests passed for vector identity/routing, invalid source bindings,
 bounded protocol retries, unchanged prompts, and repeated recovery preserving
 answers and failed packets. The repaired ingestion path kept pace with the
-reader in the corrected 2M run. The score remains below the 95% accuracy target;
-5M and 10M have not been rerun.
+reader in the corrected 2M run. The score remains below the 95% accuracy target.
+The subsequent 5M result is recorded below; 10M has not been rerun.
 
 Evidence: [verified cross-segment summary](../../eval_results/scale-2m-rerun-20261003-r4/verified-summary.json),
 [all 200 grades and latency](../../eval_results/scale-2m-rerun-20261003-r4/report.json),
 [cold-reopen audit](../../eval_results/scale-2m-rerun-20261003-r4/reopen-audit.json),
 [vector alignment audit](../../eval_results/scale-2m-source-aligned-20261003-r1/vector-alignment-audit.json),
 [invalidated first rerun](../../eval_results/scale-2m-rerun-20261003-r1/accuracy-invalidated.json).
+
+## Live 5M / 500-question run (2026-10-03 UTC)
+
+One combined memory containing **5,661,219 source tokens** completed all **500
+questions**, live IO ingestion, learning, automated grading, and a separate-process
+cold-reopen audit. **460/500 answers were graded correct (92.0%)**, with complete
+reference support quotes in **487/500 packets (97.4%)**. There were no invalid
+grades or manual score adjustments. Of the 40 graded misses, 28 had complete
+support quotes and 12 did not. Quote coverage alone does not distinguish reader
+errors from grader errors or prove that an incomplete packet was unanswerable.
+
+| Measurement | Result |
+| --- | ---: |
+| Mean / median / p95 reply | 14.725 / 14.074 / 20.920 s |
+| Mean reader call | 10.744 s |
+| Mean complete recall operation | 2.045 s |
+| Warm ingestion updates | 501, averaging 8.919 s; maximum 16.391 s |
+| Learning updates | 500, averaging 0.292 s |
+| Maximum completed-exchange backlog | 2 |
+| Final ingestion and learning drain | 23.893 s |
+| Complete answer cycle, including final drain | 7,630.306 s (127.172 min) |
+| Cold startup, measured separately | 380.067 s (6.334 min) |
+| Final pending events / feedback | 0 / 0 |
+
+This was one uninterrupted answer cycle: **500 actor calls, zero gateway errors,
+zero malformed envelopes, and zero process resumptions**. The reader accepted
+**493 inline summary pairs**; seven failed exact-source-quote validation and used
+the fallback path. All seven subsequently ingested and learned successfully.
+Reply timings exclude cold startup, cached source assembly, grading, and the
+independent audit. The full cycle includes inter-answer bookkeeping and final
+drain; it is not merely the sum of reader-call times. Ingestion kept pace with
+replies, but this result remains below the 95% automated accuracy target.
+
+The separate-process audit verified **29,384 events, 500 recall packets, 9,226
+exact original-source pointers, and 500 persisted Hebbian updates**. Native and
+parent index receipts reconstructed exactly; the original source files were
+unchanged. All **9,627 newly captured raw chunks** had **zero raw embeddings and
+zero HNSW labels**. Task model processes stopped after grading. Answer hashes,
+saved grades, and the frozen implementation hashes were verified again before
+publishing the local result summary.
+
+### Matched comparison and scope
+
+The same 200 question IDs, references, and prompt dates used at 2M scored
+**182/200 (91.0%)**, versus **186/200 (93.0%)** at 2M. Complete support changed
+from 199/200 to 197/200. There were 12 regressions and eight recoveries. This is
+not an isolated causal ablation: total indexed history, question order, recent
+generated context, and model stochasticity differ between runs.
+
+| Source question population | Correct / 100 | Complete support / 100 |
+| --- | ---: | ---: |
+| h01 | 90 | 99 |
+| h02 | 92 | 98 |
+| h03 | 87 | 95 |
+| h04 | 96 | 99 |
+| h05 | 95 | 96 |
+
+The source is a chronological union of five authenticated archives in one global
+routing index, with **27,384 original messages**, **5,488,319 unique role/text
+tokens**, **27,544 atomic summary vectors**, and **2,628 parent vectors**.
+Independent source-vector alignment validation found zero mismatches. Questions
+run round-robin across the five populations; this is one 500-question test, not
+500 histories. Historical question dates are preserved, so eligible content
+varies from **1,144,363 to 5,661,219 tokens**. Not every question can retrieve the
+entire history. Generated evaluation IO is excluded from historical routing,
+while the configured bounded recent exchange tail remains available to the reader.
+
+Authenticated precompiled source summaries and vectors were reused. This does
+**not** measure cold summarization of 5M novel tokens. Fresh replies, their inline
+summaries, ongoing compilation, ingestion, and learning use the resident runtime.
+The configuration retains gateway Sol with reasoning disabled for reader and
+judge, local six-layer Qwen attention, FP32 BGE-M3 FastEmbed on CPU, local Llama
+fallback, cap-8 routing, and v7 reader hints. The released production runtime at
+`1149c567abe85e6904fedd01e6002f2a70397741` was unchanged during this test.
+
+### Database assessment and benchmark setup repair
+
+The measured warm ingestion phases average **2.078 s compilation**, **1.828 s
+raw capture**, **1.372 s summary embedding/matrix preparation**, and **3.917 s
+publication**. Compilation and raw capture overlap; their combined preparation
+wall time is 2.361 s. Other admission/bookkeeping work is included in the 8.919 s
+total. Publication includes index validation and hashing, so its timing is not
+a measurement of SQLite writes alone. Likewise, the 2.045 s recall measurement
+includes more than vector similarity search.
+
+Current summary-vector retrieval performs exact in-memory search. A vector
+database could replace that component while retaining exact raw hydration, but
+this run does not establish a migration speedup. Profile vector search,
+publication, and cold admission separately before choosing a replacement.
+Steady-state ingestion is keeping pace; cold admission and remaining whole-index
+work are still optimization targets. Approximate retrieval would also require
+checking recall quality against the existing exact search.
+
+Before answer generation, source assembly exposed avoidable per-message durable
+commit and checkpoint costs. The benchmark builder now reuses authenticated raw
+chunk topology as well as cached vectors, and its disposable source assembly
+defers WAL checkpoints with NORMAL synchronization. It restores FULL
+synchronization and requires a completed TRUNCATE checkpoint before accepting
+the source. A 512-message setup sample changed from **54.6 to 8.6 seconds**;
+these samples overlapped other setup activity and are not isolated production
+throughput measurements. The final cached source build took **720.677 seconds**
+and completed with a `[0, 0, 0]` checkpoint receipt. Production durability settings
+were not changed.
+
+The harness also now forwards its existing bounded malformed-envelope retry
+setting to fresh run preparation; no retry was needed in the completed run.
+**Eleven targeted tests passed**, covering cached chunk/vector equivalence,
+source-tampering rejection, vector alignment, and bounded recovery. Earlier
+setup attempts were stopped before any benchmark answers; one initial model
+startup required explicitly selecting the existing `.cache` assets directory.
+The completed run reused the verified source without another history rebuild.
+
+Evidence: [verified summary](../../eval_results/scale-5m-20261003-r2/verified-summary.json),
+[500 answers, grades, and timings](../../eval_results/scale-5m-20261003-r2/report.json),
+[matched 200-question comparison](../../eval_results/scale-5m-20261003-r2/matched-2m-comparison.json),
+[cold-reopen audit](../../eval_results/scale-5m-20261003-r2/reopen-audit.json),
+[vector alignment audit](../../eval_results/scale-5m-source-20261003-r4/vector-alignment-audit.json),
+[source assembly receipt](../../eval_results/scale-5m-source-20261003-r4/ingest-complete.json),
+[targeted tests](../../eval_results/scale-5m-20261003-fast-controller/setup-checks.xml),
+[completed campaign](../../eval_results/scale-5m-20261003-live2-controller/complete.json).
+
+## 2026-10-03 — Keep valid local work; escalate failed summaries to the API
+
+**Status:** implemented and tested in the checkout; not published in the
+0.2.1 beta and not included in the preceding 92.0% scale result.
+
+The user requested that working local components remain and failing work go
+to the API. The routing and embedding models remain the six-layer Qwen prefix
+and FP32 CPU FastEmbed BGE-M3. The reader remains the caller-selected frontier
+model (Sol in the completed scale evaluation). Valid local Llama extraction and
+merge outputs remain unchanged. Failed generations now escalate to the same
+conversation provider/model rather than silently accepting replacement prefixes.
+
+An audit of the 5M local receipts found **77 merge calls: eight with complete,
+source-valid local output and 69 needing replacement extracts or ending
+incomplete**. The 113 replacement-extract count refers to individual items,
+not calls. No raw extraction model calls occurred in that run. This diagnoses
+a local summarization weakness; it does not attribute the 40 answer misses to
+those jobs or revise the recorded benchmark score.
+
+The new policy validates original model output and completion status before
+accepting the local wrapper's rendered summary. Missing/misattributed extracts,
+malformed output, truncation, local transport errors and unavailable Llama
+startup can escalate. API output must pass the same exact-source checks.
+Valid results are cached per input/policy/provider identity and checked again
+on reuse. Invalid API output remains pending. A durable reservation prevents
+automatic resend of a failed or unknown paid outcome. There is no automatic
+reset command; receipts must be reviewed before recovery, or another model
+selected. Existing compiled caches are not automatically rebuilt.
+
+Production proxy requests bind the provider/model and credential in memory per
+conversation namespace. The transport remains available to background workers
+after reply delivery and through shutdown drain. Internal calls omit the
+visible request's idempotency headers and output/tool contract. A restarted
+proxy needs a normal chat request to restore this binding before pending
+summary work can resume. Merge calls send typed summaries and the user spine;
+raw extraction fallback sends its source fragments. Qwen/BGE identities are
+unchanged. The CLI enables escalation by default with a
+`--no-memory-summary-api-fallback` opt-out. The evaluation harness uses the same
+policy for new gateway plans while retaining older plans' frozen behavior.
+
+### Bounded live repair probe
+
+Authenticated recorded Llama output from the 5M run supplied one valid control
+and two failures. This replay did not rerun Llama or rebuild a history. The
+valid control made **zero API calls** and returned its original result. The
+first live API attempt also failed: Sol selected two extracts from index zero
+and omitted the metadata fragment at index one. Exact-source coverage validation
+rejected it and retained the failed receipt. The API prompt was then tightened
+to require exactly one extract for every supplied index, including metadata.
+
+With that prompt, **both saved failures passed exact-source validation**:
+
+| Saved local job | Local problem | API time | API prompt / completion tokens |
+| --- | --- | ---: | ---: |
+| `00008` | One replacement extract | 18.059 s | 363 / 52 |
+| `00012` | Truncated output, two replacement extracts | 10.929 s | 1,224 / 43 |
+
+Both calls used `codex_sdk/gpt-5.6-sol` on the authorized central-dev gateway
+with zero reported reasoning tokens. They sent summaries only. Reopening both
+accepted jobs under the final implementation reused the cache with **zero
+additional local or API generations**. The first rejected API attempt remains
+in the separate `live` evidence directory; the successful probe is `live-r2`.
+This establishes repair and cache behavior on two real failures, not a new
+answer-accuracy, throughput or full-scale result. Source-extract checks do not
+detect every semantic omission. Since 69/77 recorded local merge calls would
+escalate, compiler latency and paid call volume need a subsequent measurement.
+
+**Validation:** the final CI-selected suite passed **268 tests**. The earlier
+broader compiler selection passed 149, including concurrency, short-summary
+bypass, inline validation, source assembly and resident ingestion. Tests cover
+local acceptance without an API call, failed local output/startup/transport,
+cached repair across reopen, concurrent single-flight execution, rejected API
+output, corrupted cached summaries, and provider rebinding after restart.
+OpenAI and Anthropic HTTP tests exercise actual proxy/ChatSession background
+workers with controlled local/upstream responses, including credential/model
+isolation, no credential persistence, post-reply calls and final drain. These
+tests do not load GPU models. One existing Starlette/httpx deprecation warning
+remains. The first pytest attempt hit sandbox permissions at the default temp
+directory; subsequent passing runs used fresh workspace temp directories.
+
+Evidence: [local call audit](../../eval_results/summary-api-fallback-20261003/local-summary-audit.json),
+[live repair report](../../eval_results/summary-api-fallback-20261003/live-r2/report.json),
+[final cache and implementation check](../../eval_results/summary-api-fallback-20261003/live-r2/final-cache-check.json),
+[final CI-selected tests](../../eval_results/summary-api-fallback-20261003/tests-r4.xml),
+[compiler tests](../../eval_results/summary-api-fallback-20261003/tests-r3.xml).

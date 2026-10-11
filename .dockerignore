@@ -1,0 +1,9 @@
+# Deny all, then admit only what packaging/Dockerfile copies. The repository
+# carries .cache/, eval_results/ and a multi-version dist/, none of which
+# belong in a build context.
+*
+!dist/
+dist/*
+!dist/memory_condense-*.conda
+!packaging/install-proxy.sh
+!packaging/docker-entrypoint.sh

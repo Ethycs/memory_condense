@@ -128,6 +128,11 @@ class SemanticSectionIndex:
     def vector_nbytes(self) -> int:
         return self._dense.nbytes
 
+    @property
+    def address_matrix(self) -> np.ndarray:
+        """Borrow immutable summary vectors for query-independent compilation."""
+        return self._dense.normalized_matrix
+
     def route(self, query: str, *, encoder, max_sections: int = 8, lexical_reserve: int = 0,
               eligible_source_ids: Sequence[str] | None = None) -> SectionRoutePlan:
         exact_text(query, "query")

@@ -111,7 +111,10 @@ class QuestionBackend(ResidentNativeBackend):
 
 def prepare(root,runtime_root, *, reader_gateway=None, reader_model='qwen3-8b',
             judge_model='codex_sdk/gpt-5.6-sol', inline_memory=False, source_dir=None,
-            stop_on_obvious_problems=False, empty_response_retries=0, question_count=100):
+            stop_on_obvious_problems=False, empty_response_retries=0, question_count=100,
+            inline_envelope_retries=0, summary_api_fallback=True):
+    if inline_envelope_retries not in (0, 1, 2):
+        raise ValueError('Inline envelope retries must be bounded to zero, one, or two')
     source_dir=Path(source_dir or SOURCE).resolve()
     if root.exists() or runtime_root.exists():
         raise ValueError('Use fresh evaluation and runtime directories')
@@ -138,13 +141,17 @@ def prepare(root,runtime_root, *, reader_gateway=None, reader_model='qwen3-8b',
         runtime_root=str(runtime_root),history_reingestions=0,source=str(source_dir),
         stop_on_obvious_problems=stop_on_obvious_problems,
         empty_response_retries=empty_response_retries,
+        inline_envelope_retries=inline_envelope_retries,
+        summary_api_fallback=bool(reader_gateway and summary_api_fallback),
         raw_sources_sha256=source['application_files'],
-        network=('local memory/compiler; answer and judge at '+reader_gateway
+        network=(('local attention/embeddings; answer, judge and failed summaries at '
+                  if summary_api_fallback else 'local memory/compiler; answer and judge at ')+reader_gateway
                  if reader_gateway else 'loopback only; no external provider'),
         reader_gateway=reader_gateway,
         models=dict(embedding='FP32 BGE-M3 FastEmbed CPU',attention='six-layer Qwen3-8B lossless GPU',
                     actor=reader_model if reader_gateway else 'Llama-3.2-3B-Instruct-Q4_K_M',
                     raw='Llama exact-extract validation',merge='Llama attributed exact extracts',
+                    summary_fallback=reader_model if reader_gateway and summary_api_fallback else None,
                     judge=judge_model if reader_gateway else 'Llama-3.2-3B-Instruct-Q4_K_M'),
         reader_comparison=('Gateway context limit: all v7 evidence, recent tail capped at 2048 Qwen tokens, '
                            'dated current question last; generated prior answers vary by reader'
@@ -234,7 +241,8 @@ def live(root):
         from tools.engineering_research_gateway_reader import GatewayReaderRuntime
         runtime=GatewayReaderRuntime(root/'local-runtime',gateway=plan['reader_gateway'],
             reader_model=plan['models']['actor'],judge_model=plan['models']['judge'],
-            empty_response_retries=plan.get('empty_response_retries',0))
+            empty_response_retries=plan.get('empty_response_retries',0),
+            summary_api_fallback=plan.get('summary_api_fallback',False))
     else:
         runtime=LocalRuntime(root/'local-runtime')
     backend=QuestionBackend(root,runtime_root,read(root/'actor.json'),runtime,plan)
@@ -325,6 +333,8 @@ def live(root):
                 retained_answers=retained,restored_events=restored_events,
                 embedding_metrics=dict(backend.encoder.metrics),attention_metrics=dict(backend.attention.metrics),
                 runtime_metrics=dict(runtime.metrics),backend_timings=timings,
+                summary_escalation_metrics=dict(runtime.summary_runtime.metrics)
+                    if getattr(runtime,'summary_runtime',None) is not None else {},
                 recalls=sum(t['operation']=='recall' for t in timings),
                 learning_updates=sum(t['operation']=='learn' for t in timings),
                 final_snapshot=backend.last_reopen))
@@ -472,6 +482,7 @@ if __name__=='__main__':
     parser.add_argument('--stop-on-obvious-problems',action='store_true')
     parser.add_argument('--empty-response-retries',type=int,choices=(0,1,2),default=0)
     parser.add_argument('--inline-envelope-retries',type=int,choices=(0,1,2),default=0)
+    parser.add_argument('--summary-api-fallback',action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument('--predecessor',type=Path)
     args=parser.parse_args()
     if args.phase=='prepare':
@@ -479,7 +490,8 @@ if __name__=='__main__':
         prepare(args.root,args.runtime_root,reader_gateway=args.reader_gateway,
                 reader_model=args.reader_model,judge_model=args.judge_model,inline_memory=args.inline_memory,
                 source_dir=args.source,stop_on_obvious_problems=args.stop_on_obvious_problems,
-                empty_response_retries=args.empty_response_retries,question_count=args.question_count)
+                empty_response_retries=args.empty_response_retries,question_count=args.question_count,
+                inline_envelope_retries=args.inline_envelope_retries,summary_api_fallback=args.summary_api_fallback)
     elif args.phase=='resume':
         if args.runtime_root is None or args.predecessor is None:
             parser.error('resume requires --runtime-root and --predecessor')

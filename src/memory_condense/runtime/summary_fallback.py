@@ -32,7 +32,9 @@ def escalation_job(kind, messages, max_tokens, typed_request=None):
         coverage = ('The required output labels are '+json.dumps(required)+'. '
             'Return exactly one atom for each label, in that order. ')
     return [dict(prompt[0], content=prompt[0]['content']+' '+coverage+
-                 'Check coverage and exact substring matches before returning only the JSON object.'),
+                 ('Check coverage and exact substring matches before returning only the indexed lines.'
+                  if kind == 'merge' else
+                  'Check coverage and exact substring matches before returning only the JSON object.')),
             *prompt[1:]], budget
 
 

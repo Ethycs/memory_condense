@@ -399,6 +399,13 @@ def merge_quote_map(request, output):
             candidates = [quote]
             if len(quote) >= 2 and quote[0] == quote[-1] and quote[0] in ('"', "'"):
                 candidates.append(quote[1:-1])
+            # A provider may put sentence punctuation after an otherwise exact
+            # source prefix even when the source sentence continues.  Admit
+            # only the punctuation-stripped bytes when those bytes occur in
+            # the assigned fragment; this repairs presentation without
+            # admitting a paraphrase.
+            candidates.extend(candidate.rstrip('.,;:!?') for candidate in tuple(candidates)
+                              if candidate.rstrip('.,;:!?') != candidate)
             exact = next((candidate for candidate in candidates if candidate in source), None)
             if exact is not None:
                 quotes.setdefault(index, exact)

@@ -13,7 +13,9 @@ from memory_condense.interfaces.proxy_memory import MemoryProxy
 from memory_condense.interfaces.proxy_server import ProxyConfig, build_app
 from memory_condense.interfaces import proxy_memory_wire as wire
 from memory_condense.runtime.artifacts import read
-from memory_condense.runtime.summary_fallback import LocalFirstSummaries, SummaryEscalationError
+from memory_condense.runtime.summary_fallback import (
+    LocalFirstSummaries, SummaryEscalationError, escalation_job,
+)
 from memory_condense.search.spine_summary import SpineSummaryFragment, SpineSummaryRequest, parse_spine_summary
 from tests.test_chat_streaming import StreamingBackend
 from tests.test_proxy_memory import completion
@@ -217,6 +219,16 @@ def test_merge_contract_includes_metadata_and_rejects_duplicate_index_substituti
     assert 'required output indices are [0, 1]' in prompt
     assert 'including JSON metadata, recall receipts and feedback' in prompt
     assert not list(tmp_path.rglob('accepted.json'))
+
+
+def test_merge_escalation_prompt_uses_indexed_lines_without_json_contradiction():
+    request = SpineSummaryRequest('attached_context',
+        (SpineSummaryFragment('assistant', '2026-10-10', 'Please share the exact show title.'),),
+        user_spine='Recommend similar shows.')
+    messages, _budget = escalation_job('merge', request.messages, 128, request)
+    instruction = messages[0]['content']
+    assert 'returning only the indexed lines' in instruction
+    assert 'returning only the JSON object' not in instruction
 
 
 def test_unavailable_local_summarizer_keeps_other_models_and_uses_api(tmp_path):

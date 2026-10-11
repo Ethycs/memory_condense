@@ -231,6 +231,20 @@ def test_merge_escalation_prompt_uses_indexed_lines_without_json_contradiction()
     assert 'returning only the JSON object' not in instruction
 
 
+def test_raw_api_near_quote_ranks_to_an_exact_transcript_line(tmp_path):
+    source = ('the fundamental idea is our\n1:32\nouter world is a reflection\n1:35\n'
+              'the outer world\n1:50\nis merely a reflection formed by the\n1:54\nimage')
+    messages = raw_messages(source)
+    proposed = json.dumps(dict(atoms=[dict(
+        label='T0', summary='the outer world is merely a reflection formed by the')]))
+    api = API(response(proposed))
+    result = LocalFirstSummaries(Local(), tmp_path, api).call('raw', messages, scope='live')
+    atom = json.loads(result['content'])['atoms'][0]
+    assert atom['summary'] == 'is merely a reflection formed by the'
+    assert atom['summary'] in source
+    assert result['api_source_grounding'] is True
+
+
 def test_unavailable_local_summarizer_keeps_other_models_and_uses_api(tmp_path):
     class Missing(Local):
         def start_reader(self):

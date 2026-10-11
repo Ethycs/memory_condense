@@ -8,8 +8,10 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import nullcontext
 import ctypes
+from difflib import SequenceMatcher
 import gc
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -335,7 +337,87 @@ def exact_whitespace_span(source, proposed):
     return source[start:end]
 
 
-def raw_extracts(fragments, output):
+def _ranked_exact_source_span(source, proposed):
+    """Ground a near-copy proposal to one exact source sentence or line.
+
+    Transcript timestamps often split a sentence that a model reproduces
+    without the timestamp. Rank exact source spans against that proposal and
+    keep only a strong multiword match. Returned text is always a substring of
+    ``source``; weak or ambiguous paraphrases remain ungrounded.
+    """
+    token_pattern = re.compile(r"\w+(?:['’\-]\w+)*", flags=re.UNICODE)
+
+    def tokens(text):
+        return [match.group(0).casefold() for match in token_pattern.finditer(text)]
+
+    query = tokens(proposed)
+    if len(query) < 3:
+        return None
+    candidates = []
+    seen = set()
+    # Preserve exact character offsets while treating prose sentences and
+    # timestamp-delimited transcript lines as comparable ranking units.
+    for line in re.finditer(r'[^\r\n]+', source):
+        line_text = line.group(0)
+        if re.fullmatch(r'\s*\d{1,2}:\d{2}(?::\d{2})?\s*', line_text):
+            continue
+        for sentence in re.finditer(r'[^.!?]+(?:[.!?]+(?=\s|$)|$)', line_text):
+            left = line.start()+sentence.start()
+            right = line.start()+sentence.end()
+            while left < right and source[left].isspace():
+                left += 1
+            while right > left and source[right-1].isspace():
+                right -= 1
+            if left == right:
+                continue
+            word_matches = list(token_pattern.finditer(source, left, right))
+            if len(word_matches) < 3:
+                continue
+            window = min(32, max(8, len(query)*2))
+            starts = [0] if len(word_matches) <= window else list(range(0, len(word_matches)-window+1,
+                                                                          max(1, window//2)))
+            if len(word_matches) > window and starts[-1] != len(word_matches)-window:
+                starts.append(len(word_matches)-window)
+            for start in starts:
+                end = min(len(word_matches), start+window)
+                candidate_left = word_matches[start].start()
+                candidate_right = word_matches[end-1].end()
+                exact = source[candidate_left:candidate_right]
+                if exact not in seen:
+                    seen.add(exact)
+                    candidates.append((exact, tokens(exact)))
+    if not candidates:
+        return None
+
+    document_frequency = Counter()
+    for _exact, words in candidates:
+        document_frequency.update(set(words))
+    population = len(candidates)
+    idf = {word: math.log((population+1)/(frequency+1))+1
+           for word, frequency in document_frequency.items()}
+    query_terms = set(query)
+    query_weight = sum(idf.get(word, math.log(population+1)+1) for word in query_terms)
+    ranked = []
+    for ordinal, (exact, words) in enumerate(candidates):
+        terms = set(words)
+        shared = query_terms & terms
+        shared_weight = sum(idf.get(word, 1) for word in shared)
+        coverage = shared_weight/query_weight if query_weight else 0
+        candidate_weight = sum(idf.get(word, 1) for word in terms)
+        precision = shared_weight/candidate_weight if candidate_weight else 0
+        ordered = SequenceMatcher(None, query, words, autojunk=False).find_longest_match().size
+        order_coverage = ordered/len(query)
+        length_fit = min(len(query)/len(words), len(words)/len(query))
+        score = .55*coverage + .25*order_coverage + .10*precision + .10*length_fit
+        ranked.append((score, coverage, ordered, -ordinal, exact))
+    score, coverage, ordered, _ordinal, exact = max(ranked)
+    required_shared = min(4, len(query))
+    if ordered < required_shared or coverage < .45 or score < .52:
+        return None
+    return exact
+
+
+def raw_extracts(fragments, output, *, ground_near_exact=False):
     """Reject invented/reattributed raw summaries; exact-source fallback per item."""
     rows=extract_rows(output,'atoms')
     values, fallback = [], 0
@@ -345,9 +427,11 @@ def raw_extracts(fragments, output):
         proposed = item.get('summary') if isinstance(item, dict) else None
         exact = (exact_whitespace_span(text, proposed)
                  if isinstance(proposed, str) and proposed.strip() else None)
+        if exact is None and ground_near_exact and isinstance(proposed, str) and proposed.strip():
+            exact = _ranked_exact_source_span(text, proposed)
         valid = (isinstance(item, dict) and item.get('label') == label
-                 and exact is not None and count_tokens(proposed) <= 96
-                 and len(proposed.split()) <= 96)
+                 and exact is not None and count_tokens(exact) <= 96
+                 and len(exact.split()) <= 96)
         summary = exact if valid else exact_prefix(text, 64)
         fallback += not valid
         values.append(dict(label=label, summary=summary, support=[exact_prefix(summary, 32)]))

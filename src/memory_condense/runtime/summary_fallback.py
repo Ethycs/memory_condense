@@ -79,7 +79,7 @@ class LocalFirstSummaries:
             save(self.root/'local-startup-failure.json', dict(error_type=type(exc).__name__))
 
     @staticmethod
-    def _validate(kind, messages, response, typed_request):
+    def _validate(kind, messages, response, typed_request, *, ground_near_exact=False):
         finish = response.get('generated_finish_reason', response.get('finish_reason'))
         if finish != 'stop':
             raise ValueError('Summary generation did not complete')
@@ -87,7 +87,8 @@ class LocalFirstSummaries:
         if not isinstance(content, str):
             raise ValueError('Summary generation returned no text')
         if kind == 'raw':
-            value, missing = raw_extracts(json.loads(messages[1]['content'])['fragments'], content)
+            value, missing = raw_extracts(json.loads(messages[1]['content'])['fragments'], content,
+                                          ground_near_exact=ground_near_exact)
         else:
             value, missing = merge_extracts(typed_request, content)
         if missing or response.get('local_extractive_fallbacks', 0):
@@ -232,7 +233,15 @@ class LocalFirstSummaries:
             try:
                 remote = api(prompt, max_tokens=budget)
                 save(directory/'response.json', remote)
-                value = self._validate(kind, api_validation_messages, remote, typed_request)
+                api_source_grounding = False
+                try:
+                    value = self._validate(kind, api_validation_messages, remote, typed_request)
+                except ValueError:
+                    if kind != 'raw':
+                        raise
+                    value = self._validate(kind, api_validation_messages, remote, typed_request,
+                                           ground_near_exact=True)
+                    api_source_grounding = True
                 api_generated = remote['content']
                 if partial_atoms is not None:
                     for atom in value['atoms']:
@@ -244,7 +253,8 @@ class LocalFirstSummaries:
                     api_generated_content=api_generated,
                     generated_finish_reason=remote['finish_reason'], request_sha256=request.sha256,
                     elapsed_s=time.perf_counter()-started, local_extractive_fallbacks=0,
-                    summary_route='api_escalation', local_failure=failure)
+                    summary_route='api_escalation', local_failure=failure,
+                    api_source_grounding=api_source_grounding)
                 save(accepted, result)
             except Exception as exc:
                 save(directory/'error.json', dict(error_type=type(exc).__name__, request_sha256=request.sha256))

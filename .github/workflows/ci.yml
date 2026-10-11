@@ -263,7 +263,11 @@ jobs:
       - name: Smoke the image without a GPU
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         run: |
-          docker run --rm "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}" proxy --help | head -5
+          # No pipe: piping into head would mask a non-zero exit from docker
+          # and make this smoke incapable of failing.
+          docker run --rm "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}"             proxy --help >/tmp/image-help.txt
+          head -5 /tmp/image-help.txt
+          grep -q -- '--memory-retrieval-policy' /tmp/image-help.txt
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

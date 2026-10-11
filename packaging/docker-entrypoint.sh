@@ -17,6 +17,14 @@ command=$1
 shift
 arguments=("$@")
 
+# Introspection must work on a bare image: someone running `proxy --help` to
+# discover the options has no reason to have provisioned models yet.
+for argument in "${arguments[@]+"${arguments[@]}"}"; do
+    case "$argument" in
+        -h|--help) exec "$launcher" "$command" "${arguments[@]}" ;;
+    esac
+done
+
 if [ "$command" = 'proxy' ]; then
     if [ ! -e /models/models ] && [ ! -e "${MEMORY_CONDENSE_CONFIG:-/data/config.json}" ]; then
         cat >&2 <<'MISSING'

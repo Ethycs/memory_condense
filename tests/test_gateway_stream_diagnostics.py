@@ -111,6 +111,25 @@ def test_empty_retry_is_bounded_and_preserves_attempts(tmp_path,monkeypatch):
     assert runtime.metrics['actor_empty_responses']==2
 
 
+def test_summary_api_uses_the_same_bounded_empty_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr('tools.engineering_research_gateway_reader.time.sleep', lambda _: None)
+    runtime = GatewayReaderRuntime(tmp_path, gateway='test-only', reader_model='test',
+        judge_model='test', empty_response_retries=2, summary_api_fallback=True)
+    client = Client([chunk(finish='stop')])
+    runtime.remote = client
+    original = client.create
+    def create(**args):
+        if len(client.calls) == 1:
+            client.chunks = [chunk({'content':'{"atoms":[]}'}, 'stop')]
+        return original(**args)
+    client.chat.completions.create = create
+    result = runtime.summary_runtime.api(
+        [dict(role='user', content='Summarize')], max_tokens=32)
+    assert result['content'] == '{"atoms":[]}' and len(client.calls) == 2
+    assert len(result['empty_response_recovery']) == 1
+    assert runtime.metrics['summary_api_empty_responses'] == 1
+
+
 def test_empty_retry_exhaustion_does_not_loop(tmp_path,monkeypatch):
     monkeypatch.setattr('tools.engineering_research_gateway_reader.time.sleep',lambda _:None)
     runtime=GatewayReaderRuntime(tmp_path,gateway='test-only',reader_model='test',judge_model='test',

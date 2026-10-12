@@ -59,7 +59,7 @@ class GatewayReaderRuntime(LocalRuntime):
             class SummaryAPI:
                 identity = dict(provider='openai', gateway=gateway, model=reader_model)
                 def __call__(self, messages, *, max_tokens):
-                    return owner._remote_call('summary_api', messages,
+                    return owner._remote_with_empty_retries('summary_api', messages,
                         scope='compiler-escalation', max_tokens=max_tokens)
             local = SimpleNamespace(call=lambda *a,**k:LocalRuntime.call(self,*a,**k),
                 start_reader=lambda:LocalRuntime.start_reader(self), stop_reader=self.stop_reader,
@@ -103,6 +103,10 @@ class GatewayReaderRuntime(LocalRuntime):
                     typed_request=typed_request, summary_attempt=summary_attempt)
             return super().call(kind, messages, scope=scope, max_tokens=max_tokens,
                                 typed_request=typed_request, summary_attempt=summary_attempt)
+        return self._remote_with_empty_retries(kind, messages, scope=scope, max_tokens=max_tokens)
+
+    def _remote_with_empty_retries(self, kind, messages, *, scope, max_tokens):
+        """Apply the same bounded empty-completion recovery to every API role."""
         started = time.perf_counter()
         failures = []
         for attempt in range(self.empty_response_retries + 1):

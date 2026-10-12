@@ -240,7 +240,7 @@ class LocalFirstSummaries:
                         return local
                     try:
                         value = self._validate(kind, messages, local, typed_request,
-                                               semantic_grounder=self._semantic_ground)
+                                               ground_near_exact=True)
                     except ValueError:
                         pass
                     else:
@@ -249,10 +249,10 @@ class LocalFirstSummaries:
                         result = dict(local, content=content, generated_content=content,
                             initial_generated_content=generated, generated_finish_reason='stop',
                             finish_reason='stop', elapsed_s=time.perf_counter()-started,
-                            local_extractive_fallbacks=0, summary_route='local_bge_grounding',
-                            bge_source_grounding=True)
+                            local_extractive_fallbacks=0, summary_route='local_lexical_grounding',
+                            lexical_source_grounding=True)
                         with self._lock:
-                            self.metrics['local_bge_grounded'] += 1
+                            self.metrics['local_lexical_grounded'] += 1
                         return result
             # A long raw batch may contain several perfectly generated atoms
             # and one malformed/missing label. Preserve the valid exact
@@ -261,8 +261,7 @@ class LocalFirstSummaries:
             # source-minimal without accepting a synthetic local replacement
             # as a successful model summary.
             if kind == 'raw' and local is not None:
-                partial_atoms, missing, rejected_proposals = self._raw_partial(
-                    messages, local, semantic_grounder=self._semantic_ground)
+                partial_atoms, missing, rejected_proposals = self._raw_partial(messages, local)
                 if 1 < len(json.loads(messages[1]['content'])['fragments']) and missing:
                     residual = []
                     for fragment in missing:
@@ -272,11 +271,10 @@ class LocalFirstSummaries:
                         local_retry_receipts.append(retry.get('request_sha256'))
                         try:
                             value = self._validate(kind, one, retry, None,
-                                                   semantic_grounder=self._semantic_ground)
+                                                   ground_near_exact=True)
                         except ValueError:
                             residual.append(fragment)
-                            _atoms, _missing, retry_proposals = self._raw_partial(
-                                one, retry, semantic_grounder=self._semantic_ground)
+                            _atoms, _missing, retry_proposals = self._raw_partial(one, retry)
                             rejected_proposals.update(retry_proposals)
                         else:
                             atom = value['atoms'][0]

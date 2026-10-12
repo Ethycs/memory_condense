@@ -1,8 +1,10 @@
 """BGE-filtered semantic location followed by exact source hydration."""
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from difflib import SequenceMatcher
 import json
+import math
 from pathlib import Path
 import re
 import threading
@@ -31,6 +33,7 @@ _PENDING = {
     "scheduled",
 }
 _POLICY_PATH = Path(__file__).parent / "data" / "bge-summary-validator-v1.json"
+_CANDIDATE_ALGORITHM = "lexical-prefilter-top4-exact-source-v2"
 
 
 def _tokens(text: str) -> list[str]:
@@ -118,6 +121,46 @@ def exact_candidate_spans(source: str, proposal: str) -> tuple[str, ...]:
     return tuple(values)
 
 
+def semantic_candidate_spans(source: str, proposal: str, *, limit: int = 4) -> tuple[str, ...]:
+    """Keep the few literal spans most likely to need semantic disambiguation.
+
+    BGE remains the admission score. This cheap lexical rank only prevents a
+    validator miss in one long fragment from embedding hundreds of irrelevant
+    source windows. The sealed failure calibration checks that top four retains
+    every known positive source span.
+    """
+    candidates = exact_candidate_spans(source, proposal)
+    if len(candidates) <= limit:
+        return candidates
+    query = _tokens(proposal)
+    if not query:
+        return candidates[:limit]
+    tokenized = [_tokens(candidate) for candidate in candidates]
+    document_frequency = Counter(term for words in tokenized for term in set(words))
+    population = len(candidates)
+    idf = {term: math.log((population + 1) / (frequency + 1)) + 1
+           for term, frequency in document_frequency.items()}
+    query_terms = set(query)
+    query_weight = sum(idf.get(term, math.log(population + 1) + 1)
+                       for term in query_terms)
+
+    def rank(index: int) -> tuple[float, float, float, int]:
+        words = tokenized[index]
+        terms = set(words)
+        shared_weight = sum(idf.get(term, 1) for term in query_terms & terms)
+        coverage = shared_weight / query_weight if query_weight else 0.0
+        candidate_weight = sum(idf.get(term, 1) for term in terms)
+        precision = shared_weight / candidate_weight if candidate_weight else 0.0
+        ordered = SequenceMatcher(None, query, words, autojunk=False).find_longest_match().size
+        order_coverage = ordered / len(query)
+        length_fit = min(len(query) / len(words), len(words) / len(query))
+        score = .55 * coverage + .25 * order_coverage + .10 * precision + .10 * length_fit
+        return score, coverage, order_coverage, -index
+
+    selected = sorted(range(len(candidates)), key=rank, reverse=True)[:limit]
+    return tuple(candidates[index] for index in selected)
+
+
 class BGESourceGrounder:
     """Use the resident BGE encoder only to locate an exact source span."""
 
@@ -127,7 +170,7 @@ class BGESourceGrounder:
         if (self.policy.get("format") != "memory-condense-bge-summary-validator-calibration-v1"
                 or self.policy.get("model_id") != getattr(embedding, "model_name", None)
                 or self.policy.get("model_revision") != getattr(embedding, "model_revision", None)
-                or self.policy.get("candidate_algorithm") != "exact-sentence-and-overlapping-token-windows-v1"):
+                or self.policy.get("candidate_algorithm") != _CANDIDATE_ALGORITHM):
             raise ValueError("BGE summary-validator calibration does not match the resident encoder")
         self.pre_review_cutoff = float(self.policy["pre_review_cutoff"])
         self.reviewed_cutoff = float(self.policy["reviewed_cutoff"])
@@ -156,7 +199,7 @@ class BGESourceGrounder:
         return generated
 
     def __call__(self, source: str, proposal: str, *, reviewed=False) -> str | None:
-        candidates = exact_candidate_spans(source, proposal)
+        candidates = semantic_candidate_spans(source, proposal)
         if not candidates:
             return None
         query = np.asarray(self.embedding.embed_queries([proposal]), dtype=np.float32)

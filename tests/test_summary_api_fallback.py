@@ -303,27 +303,22 @@ def test_failed_local_proposal_is_reviewed_then_exactly_grounded(tmp_path):
     assert request['rejected_proposal_labels'] == ['T0']
 
 
-def test_bge_prefilter_hydrates_local_failure_without_api(tmp_path):
-    source = 'For example, creating short-form videos could appeal to younger viewers.'
+def test_local_lexical_grounding_avoids_bge_and_api(tmp_path):
+    source = ("key is you must always stay with the\n11:03\n"
+              "identity and the Paradigm that you've\n11:05\ncreated for yourself")
     messages = raw_messages(source)
     local = Local(response(json.dumps(dict(atoms=[dict(
-        label='T0', summary='create short-form videos')]))) )
+        label='T0', summary=("key is you must always stay with the identity and the Paradigm "
+                             "that you've created for yourself"))]))) )
     api = API()
-    calls = []
-
-    def ground(raw, proposal, *, reviewed=False):
-        calls.append((raw, proposal, reviewed))
-        return 'creating short-form videos could appeal to younger viewers'
-
     runtime = LocalFirstSummaries(local, tmp_path, api)
-    runtime._grounder = ground
+    runtime._grounder = lambda *_args, **_kwargs: pytest.fail('BGE ran before review')
     result = runtime.call('raw', messages, scope='live')
     atom = json.loads(result['content'])['atoms'][0]
-    assert result['summary_route'] == 'local_bge_grounding'
-    assert result['bge_source_grounding'] is True
+    assert result['summary_route'] == 'local_lexical_grounding'
+    assert result['lexical_source_grounding'] is True
     assert atom['summary'] in source
     assert not api.calls
-    assert calls and all(not reviewed for _raw, _proposal, reviewed in calls)
 
 
 def test_bge_uses_reviewed_cutoff_after_llm_adjudication(tmp_path):

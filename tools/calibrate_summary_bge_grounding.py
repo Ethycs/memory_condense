@@ -11,7 +11,11 @@ import numpy as np
 
 from memory_condense.runtime.artifacts import save
 from memory_condense.runtime.embedding import FastEmbedBGE
-from memory_condense.runtime.semantic_grounding import BGESourceGrounder, exact_candidate_spans
+from memory_condense.runtime.semantic_grounding import (
+    BGESourceGrounder,
+    _CANDIDATE_ALGORITHM,
+    semantic_candidate_spans,
+)
 
 
 # These provider outputs were inspected against their assigned source fragments.
@@ -27,6 +31,7 @@ SUPPORTED_FAILURES = {
     "fd34f8d6c11ebb958fd82f53270498c3331bfb9e63fb3d217ed982b0e78493c7": ("T0",),
     "17c257321c4708f85b717becda2e3deb28bea9e01c30f5962e3c5e22f0799856": ("0",),
     "fdc0742cbbd34a23dc3a288de2c9869a8c7e398214103b01ae3de5864fcb620a": ("T0", "T1", "T2", "T6"),
+    "a2233826b86e183602b2edf3a992b45bda21f596d03378c43d1abacfe114394a": ("T6",),
 }
 
 
@@ -67,7 +72,7 @@ def _examples(eval_root: Path) -> list[dict]:
 
 def calibrate(eval_root: Path, encoder) -> dict:
     rows = _examples(eval_root)
-    candidate_sets = [exact_candidate_spans(row["source"], row["proposal"]) for row in rows]
+    candidate_sets = [semantic_candidate_spans(row["source"], row["proposal"]) for row in rows]
     if any(not candidates for candidates in candidate_sets):
         raise ValueError("A supported failure produced no exact candidate spans")
     texts = tuple(dict.fromkeys(text for row, candidates in zip(rows, candidate_sets, strict=True)
@@ -109,7 +114,7 @@ def calibrate(eval_root: Path, encoder) -> dict:
         "format": "memory-condense-bge-summary-validator-calibration-v1",
         "model_id": encoder.model_name,
         "model_revision": encoder.model_revision,
-        "candidate_algorithm": "exact-sentence-and-overlapping-token-windows-v1",
+        "candidate_algorithm": _CANDIDATE_ALGORITHM,
         "pre_review_cutoff": round(selected, 3),
         "reviewed_cutoff": reviewed,
     }

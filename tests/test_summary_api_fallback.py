@@ -549,6 +549,19 @@ def test_benchmark_routes_summary_failures_through_same_policy(tmp_path,monkeypa
     assert (result.get('summary_route')=='api_escalation') is enabled
 
 
+def test_benchmark_summary_policy_reuses_local_embedding_and_router(tmp_path, monkeypatch):
+    from memory_condense.runtime.local import LocalRuntime
+    from tools.engineering_research_gateway_reader import GatewayReaderRuntime
+
+    embedding, router = object(), object()
+    monkeypatch.setattr(LocalRuntime, 'embedding', lambda self: embedding)
+    monkeypatch.setattr(LocalRuntime, 'tactic_router', lambda self: router)
+    runtime = GatewayReaderRuntime(tmp_path, gateway='https://example.test/v1',
+        reader_model='frontier', judge_model='judge', summary_api_fallback=True)
+    assert runtime.summary_runtime.embedding() is embedding
+    assert runtime.summary_runtime.tactic_router() is router
+
+
 def test_unconfigured_local_policy_remains_offline(tmp_path):
     local=Local()
     runtime=LocalFirstSummaries(local,tmp_path,None)

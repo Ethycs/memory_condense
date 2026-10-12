@@ -62,7 +62,9 @@ class GatewayReaderRuntime(LocalRuntime):
                     return owner._remote_call('summary_api', messages,
                         scope='compiler-escalation', max_tokens=max_tokens)
             local = SimpleNamespace(call=lambda *a,**k:LocalRuntime.call(self,*a,**k),
-                start_reader=lambda:LocalRuntime.start_reader(self), stop_reader=self.stop_reader)
+                start_reader=lambda:LocalRuntime.start_reader(self), stop_reader=self.stop_reader,
+                embedding=lambda:LocalRuntime.embedding(self),
+                tactic_router=lambda:LocalRuntime.tactic_router(self))
             self.summary_runtime = LocalFirstSummaries(local,self.root/'summary-fallback',SummaryAPI())
 
     def reader_messages(self, messages, recent_events, question):

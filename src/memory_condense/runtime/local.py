@@ -353,6 +353,37 @@ def _ranked_exact_source_span(source, proposed):
     query = tokens(proposed)
     if len(query) < 3:
         return None
+    query_terms = set(query)
+
+    def choose(candidates):
+        if not candidates:
+            return None
+        document_frequency = Counter()
+        for _exact, words in candidates:
+            document_frequency.update(set(words))
+        population = len(candidates)
+        idf = {word: math.log((population+1)/(frequency+1))+1
+               for word, frequency in document_frequency.items()}
+        query_weight = sum(idf.get(word, math.log(population+1)+1) for word in query_terms)
+        ranked = []
+        for ordinal, (exact, words) in enumerate(candidates):
+            terms = set(words)
+            shared = query_terms & terms
+            shared_weight = sum(idf.get(word, 1) for word in shared)
+            coverage = shared_weight/query_weight if query_weight else 0
+            candidate_weight = sum(idf.get(word, 1) for word in terms)
+            precision = shared_weight/candidate_weight if candidate_weight else 0
+            ordered = SequenceMatcher(None, query, words, autojunk=False).find_longest_match().size
+            order_coverage = ordered/len(query)
+            length_fit = min(len(query)/len(words), len(words)/len(query))
+            score = .55*coverage + .25*order_coverage + .10*precision + .10*length_fit
+            ranked.append((score, coverage, ordered, -ordinal, exact))
+        score, coverage, ordered, _ordinal, exact = max(ranked)
+        required_shared = min(4, len(query))
+        if ordered < required_shared or coverage < .45 or score < .52:
+            return None
+        return exact
+
     candidates = []
     seen = set()
     # Preserve exact character offsets while treating prose sentences and
@@ -386,39 +417,47 @@ def _ranked_exact_source_span(source, proposed):
                 if exact not in seen:
                     seen.add(exact)
                     candidates.append((exact, tokens(exact)))
-    if not candidates:
+    selected = choose(candidates)
+    if selected is not None:
+        return selected
+
+    # Timestamped transcripts often distribute one grammatical sentence over
+    # several short lines. Consider exact, contiguous windows only after every
+    # individual line fails. Anchor windows on informative query terms so the
+    # ranking remains bounded even for very long transcripts.
+    source_words = list(token_pattern.finditer(source))
+    if not source_words:
         return None
-
-    document_frequency = Counter()
-    for _exact, words in candidates:
-        document_frequency.update(set(words))
-    population = len(candidates)
-    idf = {word: math.log((population+1)/(frequency+1))+1
-           for word, frequency in document_frequency.items()}
-    query_terms = set(query)
-    query_weight = sum(idf.get(word, math.log(population+1)+1) for word in query_terms)
-    ranked = []
-    for ordinal, (exact, words) in enumerate(candidates):
-        terms = set(words)
-        shared = query_terms & terms
-        shared_weight = sum(idf.get(word, 1) for word in shared)
-        coverage = shared_weight/query_weight if query_weight else 0
-        candidate_weight = sum(idf.get(word, 1) for word in terms)
-        precision = shared_weight/candidate_weight if candidate_weight else 0
-        ordered = SequenceMatcher(None, query, words, autojunk=False).find_longest_match().size
-        order_coverage = ordered/len(query)
-        length_fit = min(len(query)/len(words), len(words)/len(query))
-        score = .55*coverage + .25*order_coverage + .10*precision + .10*length_fit
-        ranked.append((score, coverage, ordered, -ordinal, exact))
-    score, coverage, ordered, _ordinal, exact = max(ranked)
-    required_shared = min(4, len(query))
-    if ordered < required_shared or coverage < .45 or score < .52:
-        return None
-    return exact
+    window = min(32, max(8, len(query)+4))
+    last_start = max(0, len(source_words)-window)
+    anchor_terms = {word for word in query_terms if len(word) >= 4}
+    if not anchor_terms:
+        anchor_terms = query_terms
+    starts = set()
+    for index, match in enumerate(source_words):
+        if match.group(0).casefold() not in anchor_terms:
+            continue
+        starts.update((max(0, min(last_start, index-window+1)),
+                       max(0, min(last_start, index-window//2)),
+                       max(0, min(last_start, index))))
+    windows = []
+    for start in sorted(starts):
+        end = min(len(source_words), start+window)
+        exact = source[source_words[start].start():source_words[end-1].end()]
+        windows.append((exact, tokens(exact)))
+    return choose(windows)
 
 
-def raw_extracts(fragments, output, *, ground_near_exact=False):
-    """Reject invented/reattributed raw summaries; exact-source fallback per item."""
+def raw_extracts(fragments, output, *, ground_near_exact=False, require_review_decisions=False,
+                 semantic_grounder=None, semantic_reviewed=False):
+    """Reject invented/reattributed raw summaries; exact-source fallback per item.
+
+    A remote adjudication may receive a rejected local proposal alongside the
+    source.  In that mode it must state whether it kept or replaced the
+    proposal before its supporting quote is admitted.  The decision never
+    substitutes for grounding: the returned summary must still hydrate to an
+    exact source span.
+    """
     rows=extract_rows(output,'atoms')
     values, fallback = [], 0
     for i, fragment in enumerate(fragments):
@@ -429,9 +468,17 @@ def raw_extracts(fragments, output, *, ground_near_exact=False):
                  if isinstance(proposed, str) and proposed.strip() else None)
         if exact is None and ground_near_exact and isinstance(proposed, str) and proposed.strip():
             exact = _ranked_exact_source_span(text, proposed)
-        valid = (isinstance(item, dict) and item.get('label') == label
-                 and exact is not None and count_tokens(exact) <= 96
-                 and len(exact.split()) <= 96)
+        if (exact is None and semantic_grounder is not None
+                and isinstance(proposed, str) and proposed.strip()):
+            exact = semantic_grounder(text, proposed, reviewed=semantic_reviewed)
+        decision_valid = True
+        if require_review_decisions:
+            allowed = ({'supported', 'replaced'} if fragment.get('rejected_summary')
+                       else {'selected'})
+            decision_valid = isinstance(item, dict) and item.get('decision') in allowed
+        valid = (isinstance(item, dict) and item.get('label') == label and decision_valid
+                  and exact is not None and count_tokens(exact) <= 96
+                  and len(exact.split()) <= 96)
         summary = exact if valid else exact_prefix(text, 64)
         fallback += not valid
         values.append(dict(label=label, summary=summary, support=[exact_prefix(summary, 32)]))
@@ -453,7 +500,8 @@ def recall_feedback_quote(fragment):
     return None
 
 
-def merge_quote_map(request, output):
+def merge_quote_map(request, output, *, ground_near_exact=False, semantic_grounder=None,
+                    semantic_reviewed=False):
     """Return only source-exact quotes keyed by their assigned fragment."""
     selected=extract_rows(output,'extracts')
     if not selected:
@@ -491,6 +539,10 @@ def merge_quote_map(request, output):
             candidates.extend(candidate.rstrip('.,;:!?') for candidate in tuple(candidates)
                               if candidate.rstrip('.,;:!?') != candidate)
             exact = next((candidate for candidate in candidates if candidate in source), None)
+            if exact is None and ground_near_exact:
+                exact = _ranked_exact_source_span(source, quote)
+            if exact is None and semantic_grounder is not None:
+                exact = semantic_grounder(source, quote, reviewed=semantic_reviewed)
             if exact is not None:
                 quotes.setdefault(index, exact)
     # Recall feedback is already a typed machine receipt, including the packet
@@ -507,9 +559,12 @@ def merge_quote_map(request, output):
     return quotes
 
 
-def merge_extracts(request, output):
+def merge_extracts(request, output, *, ground_near_exact=False, semantic_grounder=None,
+                   semantic_reviewed=False):
     """Render validated source-indexed quotes with attribution; never paraphrase."""
-    quotes = merge_quote_map(request, output)
+    quotes = merge_quote_map(request, output, ground_near_exact=ground_near_exact,
+                             semantic_grounder=semantic_grounder,
+                             semantic_reviewed=semantic_reviewed)
     parts, fallback = [], 0
     budget = request.max_output_tokens
     for i, fragment in enumerate(request.fragments):

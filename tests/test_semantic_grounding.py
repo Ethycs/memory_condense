@@ -68,8 +68,17 @@ def test_grounder_uses_strict_then_reviewed_cutoff_and_caches_source_vectors():
     grounder = BGESourceGrounder(embedding, policy=policy())
     assert grounder(source, proposal) is None
     assert grounder(source, proposal, reviewed=True) == target
-    candidate_batches = [call for call in embedding.calls if call != (proposal,)]
-    assert len(candidate_batches) == 1
+    assert embedding.calls == [(proposal, *candidates)]
+
+
+def test_grounder_rejects_fact_incompatible_candidates_without_embedding():
+    source = 'Release r18 remains planned, not deployed.'
+    proposal = 'Release r19 deployed.'
+    embedding = Embedding({})
+    grounder = BGESourceGrounder(embedding, policy=policy(pre=0.5, reviewed=0.4))
+
+    assert grounder(source, proposal, reviewed=True) is None
+    assert embedding.calls == []
 
 
 def test_grounder_rejects_calibration_for_another_encoder():

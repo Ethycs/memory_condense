@@ -179,38 +179,51 @@ class BGESourceGrounder:
         self.cache_size = int(cache_size)
         if self.cache_size < 1:
             raise ValueError("BGE source grounding cache must be positive")
-        self._cache: OrderedDict[tuple[str, ...], np.ndarray] = OrderedDict()
+        # Cache individual texts rather than whole candidate tuples. A source
+        # span can recur across retries with a different proposal, and the
+        # proposal itself is reused when a sealed response is revalidated.
+        # Per-text entries also let one admitted FastEmbed batch contain both
+        # the proposal and its eligible source spans.
+        self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._lock = threading.Lock()
 
-    def _candidate_vectors(self, candidates: tuple[str, ...]) -> np.ndarray:
+    def _vectors(self, texts: tuple[str, ...]) -> np.ndarray:
+        values: dict[str, np.ndarray] = {}
+        missing: list[str] = []
         with self._lock:
-            cached = self._cache.get(candidates)
-            if cached is not None:
-                self._cache.move_to_end(candidates)
-                return cached
-        generated = np.asarray(self.embedding.embed_queries(candidates), dtype=np.float32)
-        if generated.shape != (len(candidates), 1024) or not np.isfinite(generated).all():
-            raise ValueError("BGE source grounding returned invalid candidate vectors")
+            for text in texts:
+                cached = self._cache.get(text)
+                if cached is not None:
+                    values[text] = cached
+                    self._cache.move_to_end(text)
+                elif text not in values and text not in missing:
+                    missing.append(text)
+        if missing:
+            generated = np.asarray(self.embedding.embed_queries(missing), dtype=np.float32)
+            if generated.shape != (len(missing), 1024) or not np.isfinite(generated).all():
+                raise ValueError("BGE source grounding returned invalid vectors")
+            with self._lock:
+                for text, vector in zip(missing, generated, strict=True):
+                    values[text] = vector
+                    self._cache[text] = vector
+                    self._cache.move_to_end(text)
         with self._lock:
-            self._cache[candidates] = generated
-            self._cache.move_to_end(candidates)
             while len(self._cache) > self.cache_size:
                 self._cache.popitem(last=False)
-        return generated
+        return np.stack([values[text] for text in texts])
 
     def __call__(self, source: str, proposal: str, *, reviewed=False) -> str | None:
         candidates = semantic_candidate_spans(source, proposal)
         if not candidates:
             return None
-        query = np.asarray(self.embedding.embed_queries([proposal]), dtype=np.float32)
-        if query.shape != (1, 1024) or not np.isfinite(query).all():
-            raise ValueError("BGE source grounding returned an invalid proposal vector")
-        scores = self._candidate_vectors(candidates) @ query[0]
-        eligible = [index for index, candidate in enumerate(candidates)
-                    if _critical_values(proposal).issubset(_critical_values(candidate))
-                    and not _polarity_conflict(proposal, candidate)]
+        critical = _critical_values(proposal)
+        eligible = tuple(candidate for candidate in candidates
+                         if critical.issubset(_critical_values(candidate))
+                         and not _polarity_conflict(proposal, candidate))
         if not eligible:
             return None
-        index = max(eligible, key=lambda value: float(scores[value]))
+        vectors = self._vectors((proposal, *eligible))
+        scores = vectors[1:] @ vectors[0]
+        index = int(np.argmax(scores))
         cutoff = self.reviewed_cutoff if reviewed else self.pre_review_cutoff
-        return candidates[index] if float(scores[index]) >= cutoff else None
+        return eligible[index] if float(scores[index]) >= cutoff else None

@@ -13,6 +13,7 @@ from memory_condense.interfaces.proxy_memory import MemoryProxy
 from memory_condense.interfaces.proxy_server import ProxyConfig, build_app
 from memory_condense.interfaces import proxy_memory_wire as wire
 from memory_condense.runtime.artifacts import read
+from memory_condense.runtime.local import exact_whitespace_span
 from memory_condense.runtime.summary_fallback import (
     LocalFirstSummaries, SummaryEscalationError, escalation_job,
 )
@@ -28,6 +29,38 @@ def raw_messages(text='Release r18 is planned, not deployed.'):
 
 def response(content, **extra):
     return dict(content=content, finish_reason='stop', request_sha256='local-receipt', **extra)
+
+
+def test_exact_hydration_restores_empty_formatting_delimiters_only():
+    source = 'Disclosures (TCFD) recommendations.'
+
+    assert exact_whitespace_span(source, 'TCFD recommendations') == '(TCFD) recommendations'
+    assert exact_whitespace_span('The baseline says foo (not) bar.', 'foo bar') is None
+
+
+def test_reviewed_extract_hydrates_parenthesized_acronym_and_table_row():
+    fragments = [
+        dict(label='T3', role='assistant', rejected_summary='TCFD recommendations',
+             fragment=('We manage risks in line with Task Force on Climate-related Financial '
+                       'Disclosures (TCFD) recommendations.')),
+        dict(label='T7', role='assistant',
+             rejected_summary='Define marketing objectives and target audience $2,000',
+             fragment='| Define marketing objectives and target audience | $2,000 |'),
+    ]
+    messages = [dict(role='system', content='review'),
+                dict(role='user', content=json.dumps(dict(fragments=fragments)))]
+    remote = response(json.dumps(dict(atoms=[
+        dict(label='T3', decision='supported', summary='TCFD recommendations'),
+        dict(label='T7', decision='supported',
+             summary='Define marketing objectives and target audience | $2,000'),
+    ])))
+
+    value = LocalFirstSummaries._validate('raw', messages, remote, None)
+
+    assert [atom['summary'] for atom in value['atoms']] == [
+        '(TCFD) recommendations',
+        'Define marketing objectives and target audience | $2,000',
+    ]
 
 
 class Local:

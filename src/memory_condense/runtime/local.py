@@ -309,9 +309,9 @@ def exact_whitespace_span(source, proposed):
     """Recover an exact source span after presentational normalization.
 
     Providers sometimes normalize whitespace/casing or omit Markdown emphasis
-    markers while otherwise quoting the source character for character. Map
-    those outputs back to the original bytes; changed words or punctuation
-    still fail closed.
+    and empty grouping delimiters while otherwise quoting the source character
+    for character. Map those outputs back to the original bytes; changed words
+    or semantic punctuation still fail closed.
     """
     if proposed in source:
         return proposed
@@ -321,7 +321,7 @@ def exact_whitespace_span(source, proposed):
     def formatted_word(word):
         return r'\**'.join(re.escape(character) for character in word)
     match = re.search(
-        r'(?:\s|\*)+'.join(formatted_word(word) for word in words),
+        r'(?:\s|\*|[()\[\]])+'.join(formatted_word(word) for word in words),
         source,
         flags=re.IGNORECASE,
     )
@@ -334,6 +334,16 @@ def exact_whitespace_span(source, proposed):
             start -= 1
         while end < len(source) and source[end] == '*':
             end += 1
+    # Return balanced formatting bytes when the regex started or ended inside
+    # a parenthesized/bracketed acronym or Markdown-style label.
+    for opening, closing in (('(', ')'), ('[', ']')):
+        matched = source[start:end]
+        while start and source[start-1] == opening and matched.count(closing) > matched.count(opening):
+            start -= 1
+            matched = source[start:end]
+        while end < len(source) and source[end] == closing and matched.count(opening) > matched.count(closing):
+            end += 1
+            matched = source[start:end]
     return source[start:end]
 
 

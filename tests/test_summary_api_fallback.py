@@ -13,7 +13,10 @@ from memory_condense.interfaces.proxy_memory import MemoryProxy
 from memory_condense.interfaces.proxy_server import ProxyConfig, build_app
 from memory_condense.interfaces import proxy_memory_wire as wire
 from memory_condense.runtime.artifacts import read
-from memory_condense.runtime.summary_fallback import LocalFirstSummaries, SummaryEscalationError
+from memory_condense.runtime.local import exact_whitespace_span
+from memory_condense.runtime.summary_fallback import (
+    LocalFirstSummaries, SummaryEscalationError, escalation_job,
+)
 from memory_condense.search.spine_summary import SpineSummaryFragment, SpineSummaryRequest, parse_spine_summary
 from tests.test_chat_streaming import StreamingBackend
 from tests.test_proxy_memory import completion
@@ -26,6 +29,38 @@ def raw_messages(text='Release r18 is planned, not deployed.'):
 
 def response(content, **extra):
     return dict(content=content, finish_reason='stop', request_sha256='local-receipt', **extra)
+
+
+def test_exact_hydration_restores_empty_formatting_delimiters_only():
+    source = 'Disclosures (TCFD) recommendations.'
+
+    assert exact_whitespace_span(source, 'TCFD recommendations') == '(TCFD) recommendations'
+    assert exact_whitespace_span('The baseline says foo (not) bar.', 'foo bar') is None
+
+
+def test_reviewed_extract_hydrates_parenthesized_acronym_and_table_row():
+    fragments = [
+        dict(label='T3', role='assistant', rejected_summary='TCFD recommendations',
+             fragment=('We manage risks in line with Task Force on Climate-related Financial '
+                       'Disclosures (TCFD) recommendations.')),
+        dict(label='T7', role='assistant',
+             rejected_summary='Define marketing objectives and target audience $2,000',
+             fragment='| Define marketing objectives and target audience | $2,000 |'),
+    ]
+    messages = [dict(role='system', content='review'),
+                dict(role='user', content=json.dumps(dict(fragments=fragments)))]
+    remote = response(json.dumps(dict(atoms=[
+        dict(label='T3', decision='supported', summary='TCFD recommendations'),
+        dict(label='T7', decision='supported',
+             summary='Define marketing objectives and target audience | $2,000'),
+    ])))
+
+    value = LocalFirstSummaries._validate('raw', messages, remote, None)
+
+    assert [atom['summary'] for atom in value['atoms']] == [
+        '(TCFD) recommendations',
+        'Define marketing objectives and target audience | $2,000',
+    ]
 
 
 class Local:
@@ -196,6 +231,24 @@ def test_merge_escalation_uses_only_typed_summaries_and_keeps_roles(tmp_path):
     assert sent['user_spine']==request.user_spine
 
 
+def test_merge_api_near_quote_is_hydrated_to_an_exact_source_span(tmp_path):
+    source = ('Hay dos tipos de "th" en inglés: el sonido "voiced th" como en "the", '
+              '"this" y "those", y el sonido "unvoiced th" como en "think", "thought" y "bath".')
+    request = SpineSummaryRequest('attached_context', (
+        SpineSummaryFragment('assistant', '2026-10-11', source),),
+        user_spine='How is th pronounced?', max_output_tokens=64)
+    paraphrase = ('Hay dos tipos de "th" en inglés: el sonido "voiced th" y el sonido '
+                  '"unvoiced th"')
+    api = API(response('0\t'+paraphrase))
+    result = LocalFirstSummaries(Local(), tmp_path, api).call(
+        'merge', request.messages, scope='live', typed_request=request)
+    summary = parse_spine_summary(result['content'], request)
+    exact = summary.removeprefix('[assistant] ')
+    assert exact in source
+    assert 'voiced th' in exact and 'unvoiced th' in exact
+    assert result['api_source_grounding'] is True
+
+
 def test_bad_caller_job_does_not_trigger_api(tmp_path):
     api=API()
     runtime=LocalFirstSummaries(Local(),tmp_path,api)
@@ -217,6 +270,197 @@ def test_merge_contract_includes_metadata_and_rejects_duplicate_index_substituti
     assert 'required output indices are [0, 1]' in prompt
     assert 'including JSON metadata, recall receipts and feedback' in prompt
     assert not list(tmp_path.rglob('accepted.json'))
+
+
+def test_merge_escalation_prompt_uses_indexed_lines_without_json_contradiction():
+    request = SpineSummaryRequest('attached_context',
+        (SpineSummaryFragment('assistant', '2026-10-10', 'Please share the exact show title.'),),
+        user_spine='Recommend similar shows.')
+    messages, _budget = escalation_job('merge', request.messages, 128, request)
+    instruction = messages[0]['content']
+    assert 'returning only the indexed lines' in instruction
+    assert 'returning only the JSON object' not in instruction
+
+
+def test_raw_api_near_quote_ranks_to_an_exact_transcript_line(tmp_path):
+    source = ('the fundamental idea is our\n1:32\nouter world is a reflection\n1:35\n'
+              'the outer world\n1:50\nis merely a reflection formed by the\n1:54\nimage')
+    messages = raw_messages(source)
+    proposed = json.dumps(dict(atoms=[dict(
+        label='T0', summary='the outer world is merely a reflection formed by the')]))
+    api = API(response(proposed))
+    result = LocalFirstSummaries(Local(), tmp_path, api).call('raw', messages, scope='live')
+    atom = json.loads(result['content'])['atoms'][0]
+    assert atom['summary'] == 'is merely a reflection formed by the'
+    assert atom['summary'] in source
+    assert result['api_source_grounding'] is True
+
+
+def test_raw_api_near_quote_ranks_across_timestamped_lines(tmp_path):
+    source = ('lows and you cannot escape it so the\n11:00\n'
+              'key is you must always stay with the\n11:03\n'
+              "identity and the Paradigm that you've\n11:05\n"
+              'created for yourself and that is the best')
+    messages = raw_messages(source)
+    proposed = json.dumps(dict(atoms=[dict(
+        label='T0', summary=("the key is you must always stay with the\n11:03\n"
+                            "identity and the Paradigm that you've\n11:05\n"
+                            'created for yourself'))]))
+    result = LocalFirstSummaries(Local(), tmp_path, API(response(proposed))).call(
+        'raw', messages, scope='live')
+    atom = json.loads(result['content'])['atoms'][0]
+    assert atom['summary'] in source
+    assert 'key is you must always stay with the' in atom['summary']
+    assert "identity and the Paradigm that you've" in atom['summary']
+    assert result['api_source_grounding'] is True
+
+
+def test_failed_local_proposal_is_reviewed_then_exactly_grounded(tmp_path):
+    source = 'Release r18 remains planned, not deployed.'
+    messages = raw_messages(source)
+    local = Local(response(json.dumps(dict(atoms=[dict(
+        label='T0', summary='Release r18 is still planned and has not deployed.')]))) )
+    api = API(response(json.dumps(dict(atoms=[dict(
+        label='T0', decision='supported', summary='Release r18 remains planned')]))) )
+
+    result = LocalFirstSummaries(local, tmp_path, api).call('raw', messages, scope='live')
+
+    atom = json.loads(result['content'])['atoms'][0]
+    sent = json.loads(api.calls[0][0][1]['content'])['fragments'][0]
+    assert result['summary_route'] == 'api_adjudication'
+    assert atom['summary'] == 'Release r18 remains planned'
+    assert atom['summary'] in source
+    assert sent['rejected_summary'] == 'Release r18 is still planned and has not deployed.'
+    assert 'review of excerpts rejected by the deterministic validator' in api.calls[0][0][0]['content']
+    request = read(next(tmp_path.rglob('request.json')))
+    assert request['rejected_proposal_labels'] == ['T0']
+
+
+def test_local_lexical_grounding_avoids_bge_and_api(tmp_path):
+    source = ("key is you must always stay with the\n11:03\n"
+              "identity and the Paradigm that you've\n11:05\ncreated for yourself")
+    messages = raw_messages(source)
+    local = Local(response(json.dumps(dict(atoms=[dict(
+        label='T0', summary=("key is you must always stay with the identity and the Paradigm "
+                             "that you've created for yourself"))]))) )
+    api = API()
+    runtime = LocalFirstSummaries(local, tmp_path, api)
+    runtime._grounder = lambda *_args, **_kwargs: pytest.fail('BGE ran before review')
+    result = runtime.call('raw', messages, scope='live')
+    atom = json.loads(result['content'])['atoms'][0]
+    assert result['summary_route'] == 'local_lexical_grounding'
+    assert result['lexical_source_grounding'] is True
+    assert atom['summary'] in source
+    assert not api.calls
+
+
+def test_bge_uses_reviewed_cutoff_after_llm_adjudication(tmp_path):
+    source = 'For example, creating short-form videos could appeal to younger viewers.'
+    messages = raw_messages(source)
+    proposal = 'create short-form videos'
+    local = Local(response(json.dumps(dict(atoms=[dict(label='T0', summary=proposal)]))) )
+    api = API(response(json.dumps(dict(atoms=[dict(
+        label='T0', decision='supported', summary=proposal)]))) )
+    reviewed_calls = []
+
+    def ground(_raw, _proposal, *, reviewed=False):
+        reviewed_calls.append(reviewed)
+        return ('creating short-form videos could appeal to younger viewers'
+                if reviewed else None)
+
+    runtime = LocalFirstSummaries(local, tmp_path, api)
+    runtime._grounder = ground
+    result = runtime.call('raw', messages, scope='live')
+    atom = json.loads(result['content'])['atoms'][0]
+    assert result['summary_route'] == 'api_adjudication'
+    assert atom['summary'] in source
+    assert True in reviewed_calls and len(api.calls) == 1
+
+
+def test_adjudication_prefilter_preserves_valid_later_batch_rows(tmp_path):
+    messages = [dict(role='system', content='Compile source summaries.'),
+        dict(role='user', content=json.dumps(dict(fragments=[
+            dict(label='T0', role='user', fragment='Alpha remains planned.'),
+            dict(label='T1', role='assistant', fragment='Beta shipped successfully.')]))) ]
+
+    class Sequence(Local):
+        def __init__(self):
+            super().__init__()
+            self.results = iter((
+                response(json.dumps(dict(atoms=[
+                    dict(label='T0', summary='Alpha is still being planned.'),
+                    dict(label='T1', summary='Beta shipped successfully.')] ))),
+                response(json.dumps(dict(atoms=[
+                    dict(label='T0', summary='Alpha is still being planned.')] ))),
+            ))
+
+        def call(self, *args, **kwargs):
+            self.calls += 1
+            return next(self.results)
+
+    local = Sequence()
+    api = API(response(json.dumps(dict(atoms=[dict(
+        label='T0', decision='supported', summary='Alpha remains planned.')]))) )
+    result = LocalFirstSummaries(local, tmp_path, api).call('raw', messages, scope='live')
+
+    atoms = json.loads(result['content'])['atoms']
+    sent = json.loads(api.calls[0][0][1]['content'])['fragments']
+    assert [(atom['label'], atom['summary']) for atom in atoms] == [
+        ('T0', 'Alpha remains planned.'), ('T1', 'Beta shipped successfully.')]
+    assert [fragment['label'] for fragment in sent] == ['T0']
+    assert local.calls == 2 and len(api.calls) == 1
+
+
+def test_adjudication_requires_decision_and_exact_support(tmp_path):
+    source = 'Release r18 remains planned, not deployed.'
+    messages = raw_messages(source)
+    local = Local(response(json.dumps(dict(atoms=[dict(
+        label='T0', summary='Release r18 is still planned and has not deployed.')]))) )
+    # Even an exact quote is not admitted as an adjudication unless the remote
+    # model records what it decided about the rejected proposal.
+    api = API(response(json.dumps(dict(atoms=[dict(
+        label='T0', summary='Release r18 remains planned')]))) )
+    with pytest.raises(SummaryEscalationError):
+        LocalFirstSummaries(local, tmp_path, api).call('raw', messages, scope='live')
+    assert len(api.calls) == 1
+    assert not list(tmp_path.rglob('accepted.json'))
+
+
+def test_adjudication_cannot_accept_a_non_source_quote(tmp_path):
+    source = 'Release r18 remains planned, not deployed.'
+    messages = raw_messages(source)
+    local = Local(response(json.dumps(dict(atoms=[dict(
+        label='T0', summary='Release r18 is still planned and has not deployed.')]))) )
+    api = API(response(json.dumps(dict(atoms=[dict(
+        label='T0', decision='supported', summary='Release r18 deployed successfully')]))) )
+    with pytest.raises(SummaryEscalationError):
+        LocalFirstSummaries(local, tmp_path, api).call('raw', messages, scope='live')
+    assert len(api.calls) == 1
+    assert not list(tmp_path.rglob('accepted.json'))
+
+
+def test_failed_paid_receipt_is_revalidated_without_a_second_api_call(tmp_path, monkeypatch):
+    import memory_condense.runtime.local as local_module
+
+    source = ('key is you must always stay with the\n11:03\n'
+              "identity and the Paradigm that you've\n11:05\ncreated for yourself")
+    messages = raw_messages(source)
+    proposed = json.dumps(dict(atoms=[dict(
+        label='T0', summary=("the key is you must always stay with the\n11:03\n"
+                            "identity and the Paradigm that you've\n11:05\n"
+                            'created for yourself'))]))
+    api = API(response(proposed))
+    original = local_module._ranked_exact_source_span
+    monkeypatch.setattr(local_module, '_ranked_exact_source_span', lambda *_args: None)
+    runtime = LocalFirstSummaries(Local(), tmp_path, api)
+    with pytest.raises(SummaryEscalationError):
+        runtime.call('raw', messages, scope='first')
+    monkeypatch.setattr(local_module, '_ranked_exact_source_span', original)
+    result = runtime.call('raw', messages, scope='resume')
+    atom = json.loads(result['content'])['atoms'][0]
+    assert atom['summary'] in source
+    assert result['summary_route'] == 'api_receipt_revalidated'
+    assert len(api.calls) == 1
 
 
 def test_unavailable_local_summarizer_keeps_other_models_and_uses_api(tmp_path):
@@ -331,6 +575,19 @@ def test_benchmark_routes_summary_failures_through_same_policy(tmp_path,monkeypa
     assert local.calls==1
     assert len(api.calls)==int(enabled)
     assert (result.get('summary_route')=='api_escalation') is enabled
+
+
+def test_benchmark_summary_policy_reuses_local_embedding_and_router(tmp_path, monkeypatch):
+    from memory_condense.runtime.local import LocalRuntime
+    from tools.engineering_research_gateway_reader import GatewayReaderRuntime
+
+    embedding, router = object(), object()
+    monkeypatch.setattr(LocalRuntime, 'embedding', lambda self: embedding)
+    monkeypatch.setattr(LocalRuntime, 'tactic_router', lambda self: router)
+    runtime = GatewayReaderRuntime(tmp_path, gateway='https://example.test/v1',
+        reader_model='frontier', judge_model='judge', summary_api_fallback=True)
+    assert runtime.summary_runtime.embedding() is embedding
+    assert runtime.summary_runtime.tactic_router() is router
 
 
 def test_unconfigured_local_policy_remains_offline(tmp_path):

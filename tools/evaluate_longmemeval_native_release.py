@@ -98,6 +98,8 @@ def prepare(root: Path, dataset: Path) -> None:
         Path("src/memory_condense/runtime/config.py"),
         Path("src/memory_condense/runtime/embedding.py"),
         Path("src/memory_condense/runtime/attention.py"),
+        Path("src/memory_condense/runtime/semantic_grounding.py"),
+        Path("src/memory_condense/runtime/data/bge-summary-validator-v1.json"),
         Path("src/memory_condense/modeling/qwen_prefix.py"),
         Path("src/memory_condense/runtime/summary_fallback.py"),
         Path("tools/engineering_research_gateway_reader.py"),

@@ -160,9 +160,12 @@ class SemanticLocalFirstSummaries(LocalFirstSummaries):
     def configure(self, api):
         super().configure(self._bind_policy(api))
 
-    def _validate(self, kind, messages, response, typed_request):
+    def _validate(self, kind, messages, response, typed_request, *, ground_near_exact=False,
+                  semantic_grounder=None, semantic_reviewed=False):
         try:
-            return super()._validate(kind, messages, response, typed_request)
+            return super()._validate(kind, messages, response, typed_request,
+                ground_near_exact=ground_near_exact, semantic_grounder=semantic_grounder,
+                semantic_reviewed=semantic_reviewed)
         except ValueError:
             if kind != "raw":
                 raise

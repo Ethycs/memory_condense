@@ -81,6 +81,22 @@ def test_local_merge_line_contract_handles_exact_json_punctuation():
     )
 
 
+def test_local_merge_accepts_only_exact_source_after_terminal_punctuation_repair():
+    source = ("Since you didn't mention the specific Netflix show you've been watching, "
+              "could you please share the title of the show?")
+    request = SpineSummaryRequest('attached_context',
+                                  (SpineSummaryFragment('assistant', 'date-not-sent', source),),
+                                  user_spine='Recommend similar shows.')
+    value, fallback = merge_extracts(
+        request,
+        "0\tSince you didn't mention the specific Netflix show you've been watching, "
+        "could you please share the title?",
+    )
+    assert fallback == 0
+    assert value['summary'].endswith('could you please share the title')
+    assert value['summary'][len('[assistant] '):] in source
+
+
 def test_local_merge_prompt_uses_plain_indexed_lines_for_every_fragment():
     request = SpineSummaryRequest('attached_context', (
         SpineSummaryFragment('assistant', 'date-not-sent', 'First source.'),

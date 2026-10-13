@@ -161,9 +161,53 @@ locally for recovery and diagnosis. Credential headers and cookies are excluded
 from saved responses. This is a local beta service, not a hosted authentication
 or tenant-management service.
 
-Supported memory endpoints are `/v1/chat/completions` and `/v1/messages` with
-text and native tools. `/v1/responses` and multimodal memory requests return an
-explicit error. The proxy relays other endpoints but does not add memory to them.
+Supported memory endpoints are `/v1/chat/completions`, `/v1/messages` and
+`/v1/responses` with text and native tools. Multimodal memory requests return
+an explicit error. The proxy relays other endpoints but does not add memory to
+them.
+
+A path selects two independent things: the provider, which binds the credential
+namespace and the upstream host, and the wire format. OpenAI speaks two formats,
+so the axes do not collapse. Internally there is still one message shape — the
+chat-completions `{role, content, tool_calls, tool_call_id}` dict — because that
+shape is the message identity history deduplication compares and the dicts the
+recent window walks. Anthropic and Responses are both translated into it at the
+edge. One consequence is that a conversation may be started on
+`/v1/chat/completions` and continued on `/v1/responses` under the same
+conversation ID: the namespace is keyed on the provider, and both formats reduce
+to the same canonical messages, so the history diff lines up.
+
+On `/v1/responses` the proxy owns the conversation, which is already true of the
+chat path: the client history is discarded and replaced with recall evidence
+plus the recent window. Server-side threading is therefore accepted and ignored.
+`previous_response_id` and `conversation` are deleted from the upstream body and
+`store: false` is set, so no conversation state is left with the provider and
+response IDs need no mapping.
+
+Upstream threading is therefore redundant whenever the turns are also in the
+body, which is the common case: a client that resends its context each turn is
+picked up on a cold conversation ID exactly as a replayed chat history is, and
+the threading fields are simply dropped. What cannot be picked up is a
+conversation that exists only in provider storage. It is recognised by an
+unanswered dialogue — no assistant turn, prose or tool call — arriving against
+no local history while the request threads one upstream. Answering that turn
+with only its own text would be silent amnesia, so it is refused with 409
+before anything is sent upstream. A lone tool result counts as unanswered,
+because the call it replies to is then upstream too. Recall evidence rides the
+`input` channel, not `instructions`, for the same reason it rides a user message
+on the chat path — untrusted source text stays out of the instruction channel.
+
+Summary escalation reuses the visible request's upstream URL, so a Responses
+conversation emits a Responses body for its escalated summaries. The receipt
+identity names only the provider and model, so the wire format does not re-key
+already accepted summaries.
+
+Streaming assembly is simpler here than for Anthropic: of the wire event types,
+`response.completed`, `response.failed` and `response.incomplete` each carry the
+entire final response object, so the assembler reads the terminal event and
+reuses the non-streaming path with no delta accumulation. A stream that ends
+without one of those does not become a successful response. Responses sends no
+`[DONE]` sentinel.
 The Python `proxy` extra declares the resident runtime dependencies. The Pixi
 installer combines the built conda package with its pinned PyPI additions.
 `memory-condense setup` downloads pinned assets; `setup --reuse PATH` registers
@@ -664,8 +708,8 @@ update. Provider traffic used real HTTPS; inbound HTTP ran through Starlette's
 test client, and no external listener was deployed by the probe.
 
 Remaining limits are live tool-route availability on the configured gateway,
-buffered streaming in memory mode, Windows/CUDA native runtime support, and
-Responses API/multimodal support. Observe mode retains its original newest-pair
+buffered streaming in memory mode, and multimodal support. Observe mode retains
+its original newest-pair
 capture and single-store behavior; native tool capture and separate conversation
 stores are augment features.
 

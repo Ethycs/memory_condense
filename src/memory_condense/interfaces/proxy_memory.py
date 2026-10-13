@@ -173,11 +173,14 @@ class MemoryProxy:
             start -= 1
         return [m for _,m in entry.messages[start:]]
 
-    def exchange(self, body, provider, headers, send, summary_send=None):
+    def exchange(self, body, provider, headers, send, summary_send=None, fmt=None):
         """Run synchronously on a worker; send(payload_bytes) bridges async HTTP."""
+        # One provider speaks two wire formats. The credential namespace stays
+        # keyed on the provider, so a conversation may switch format mid-stream.
+        fmt = fmt or wire.format_for(provider)
         try:
             payload = json.loads(body)
-            incoming = wire.validate_request(payload, provider)
+            incoming = wire.validate_request(payload, fmt)
         except (ValueError, TypeError, KeyError) as exc:
             raise MemoryProxyError(str(exc)) from exc
         namespace = self.namespace(provider, headers)
@@ -189,7 +192,7 @@ class MemoryProxy:
         summary_api = None
         if self.summary_api_fallback:
             from memory_condense.interfaces.summary_api import ProviderSummaryAPI
-            summary_api = ProviderSummaryAPI(provider, payload['model'], summary_send or send)
+            summary_api = ProviderSummaryAPI(provider, payload['model'], summary_send or send, fmt=fmt)
         entry = self.entry(namespace, summary_api=summary_api)
         session = entry.session
         with session._io_lock:
@@ -225,6 +228,19 @@ class MemoryProxy:
                     if prior[3]:
                         return WireResponse.restore(json.loads(prior[3]))
                     raise MemoryProxyError('Previous provider outcome is unknown; request was retained and will not be resent',409)
+            threaded = bool(payload.get('previous_response_id') or payload.get('conversation'))
+            replayed = any(m['role'] == 'assistant' for m in incoming)
+            if not prior and not entry.messages and threaded and not replayed:
+                # Upstream threading is redundant whenever the turns are also in
+                # the body: a replayed history opens the conversation as imported
+                # context and the threading is simply dropped. What cannot be
+                # picked up is a conversation that exists only in provider
+                # storage, recognised by an unanswered dialogue arriving against
+                # no local history. Answering its late turn with only its own
+                # text would be silent amnesia, so refuse instead.
+                raise MemoryProxyError('This conversation has no history here and the request threads one '
+                                       'upstream without replaying it; send the prior turns in input, '
+                                       'or use a new conversation ID', 409)
             new = self._new_messages(entry.messages, incoming) if not prior else []
             if not prior and not new:
                 raise MemoryProxyError('No new input; reuse the original request ID to replay its response',409)
@@ -237,7 +253,7 @@ class MemoryProxy:
                         role = 'tool' if wire.tool_result(message) else message['role']
                         events.append(ChatEvent(f'{request_id}:input:{i}',role,wire.message_text(message),
                                                 metadata={'proxy_message':message,'proxy_request_sha256':body_sha}))
-                    policy = dict(system=payload.get('system'),messages=[m for m in payload['messages'] if m['role'] in ('system','developer')])
+                    policy = wire.policy_record(fmt,payload)
                     policies = []
                     if policy != entry.policy:
                         policies = [ChatEvent(request_id+':policy','system',wire.encoded(policy).decode(),metadata={'proxy_policy':policy})]
@@ -256,8 +272,8 @@ class MemoryProxy:
                               if m['role']=='user' and not wire.tool_result(m)),event.text)
                 packet = session.recall(query,packet_id=request_id,input_event_id=input_id)
                 recent = self._recent(entry,packet)
-                inline = wire.use_inline(payload,self.inline_memory)
-                served = wire.prepare_payload(payload,provider,recent,packet.text,event.text,inline)
+                inline = wire.use_inline(payload,self.inline_memory,fmt)
+                served = wire.prepare_payload(payload,fmt,recent,packet.text,event.text,inline)
 
                 def reader():
                     with session._connect() as db:
@@ -270,14 +286,14 @@ class MemoryProxy:
                             if remote.status >= 400:
                                 outcome = 'http_error'
                                 raise UpstreamFailure(remote)
-                            value = wire.assemble_stream(provider,remote.body) if payload.get('stream') else json.loads(remote.body)
-                            message = wire.response_message(provider,value)
-                            finish = wire.finish_reason(provider,value)
+                            value = wire.assemble_stream(fmt,remote.body) if payload.get('stream') else json.loads(remote.body)
+                            message = wire.response_message(fmt,value)
+                            finish = wire.finish_reason(fmt,value)
                             if finish not in ('stop','end_turn','tool_calls','function_call','tool_use','stop_sequence','pause_turn','refusal'):
                                 outcome = 'incomplete_response'
                                 raise ValueError('Provider response did not complete: '+str(finish))
                             empty = not wire.text_content(message).strip() and not wire.has_alternative(message)
-                            reasoning_only = bool(value.get('choices') and value['choices'][0].get('message',{}).get('reasoning_content'))
+                            reasoning_only = wire.reasoning_present(fmt,value)
                             if empty:
                                 outcome = 'empty_completed' if finish in ('stop','end_turn') and not reasoning_only else 'incomplete_or_reasoning_only'
                                 if outcome == 'empty_completed' and attempt < self.empty_response_retries:
@@ -291,11 +307,11 @@ class MemoryProxy:
                             if inline and not wire.has_alternative(message):
                                 parsed = parse_inline_response(dict(result,content=wire.text_content(message),
                                     finish_reason='stop' if finish in ('stop','end_turn') else finish),event.text)
-                                public = wire.public_answer(provider,value,parsed.response['content'])
-                                message = wire.response_message(provider,public)
+                                public = wire.public_answer(fmt,value,parsed.response['content'])
+                                message = wire.response_message(fmt,public)
                                 result['content'] = parsed.response['content']
                             result['proxy_message'] = message
-                            public_body = (wire.answer_stream(provider,public) if payload.get('stream') else wire.encoded(public)) if parsed else remote.body
+                            public_body = (wire.answer_stream(fmt,public) if payload.get('stream') else wire.encoded(public)) if parsed else remote.body
                             public_headers = dict(remote.headers)
                             if parsed:
                                 for key in list(public_headers):

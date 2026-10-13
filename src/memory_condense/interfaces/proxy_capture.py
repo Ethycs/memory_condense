@@ -6,10 +6,16 @@ request body it is about to forward and the response bytes it is streaming
 back.  Splitting them keeps wire-format handling testable without binding a
 port, and keeps the proxy's hot path free of retrieval imports.
 
-Both vendors accept the same request shape for our purposes — a ``messages``
-array of ``{role, content}`` with content either a string or typed blocks — so
-:func:`request_messages` delegates to the transcript parser already used for
-account exports.  Responses differ and are handled per provider.
+A path selects two independent things: the provider, which binds credentials
+and the upstream host, and the wire *format*.  OpenAI speaks two formats, so
+the axes do not collapse.  ``chat`` and ``anthropic`` both carry a ``messages``
+array of ``{role, content}``, which is why :func:`request_messages` can
+delegate both to the transcript parser used for account exports; ``responses``
+carries a typed ``input`` item array instead and is parsed here.
+
+Note that "responses" is overloaded.  Where this module says *response* with
+no qualifier it means an HTTP response body, which every format has.  The
+``responses`` format is the OpenAI Responses API specifically.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from typing import Any, Iterable
 
 from memory_condense.ingest.transcripts import (
     TranscriptMessage,
+    normalize_role,
     parse_anthropic_messages,
 )
 
@@ -28,22 +35,36 @@ from memory_condense.ingest.transcripts import (
 ANTHROPIC = "anthropic"
 OPENAI = "openai"
 
-#: Response paths worth intercepting.  Anything else is proxied untouched.
+#: Chat paths worth intercepting, as ``(provider, format)``.  Anything else is
+#: proxied untouched.
 CAPTURED_PATHS = {
-    "/v1/messages": ANTHROPIC,
-    "/v1/chat/completions": OPENAI,
+    "/v1/messages": (ANTHROPIC, "anthropic"),
+    "/v1/chat/completions": (OPENAI, "chat"),
+    "/v1/responses": (OPENAI, "responses"),
 }
 
 
-def provider_for_path(path: str) -> str | None:
-    """Return the provider whose wire format ``path`` uses, if captured."""
+def _captured(path: str) -> tuple[str, str] | None:
     return CAPTURED_PATHS.get(path.rstrip("/") or "/")
+
+
+def provider_for_path(path: str) -> str | None:
+    """Return the provider whose credentials and host ``path`` uses."""
+    entry = _captured(path)
+    return None if entry is None else entry[0]
+
+
+def format_for_path(path: str) -> str | None:
+    """Return the wire format ``path`` carries, if captured."""
+    entry = _captured(path)
+    return None if entry is None else entry[1]
 
 
 def request_messages(
     body: bytes,
     *,
     conversation_id: str,
+    fmt: str | None = None,
 ) -> list[TranscriptMessage]:
     """Extract the prompt turns from a request body.
 
@@ -56,7 +77,52 @@ def request_messages(
         return []
     if not isinstance(payload, dict):
         return []
+    if fmt == "responses":
+        return _responses_messages(payload, conversation_id)
     return parse_anthropic_messages(payload, fallback_id=conversation_id)
+
+
+def _responses_messages(
+    payload: dict[str, Any],
+    conversation_id: str,
+) -> list[TranscriptMessage]:
+    """Parse a Responses request: ``instructions`` plus the typed ``input``."""
+    parsed: list[TranscriptMessage] = []
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        parsed.append(
+            TranscriptMessage(
+                role="system",
+                text=instructions,
+                conversation_id=conversation_id,
+                message_id=f"{conversation_id}:instructions",
+                ordinal=0,
+            )
+        )
+    items = payload.get("input")
+    if isinstance(items, str):
+        items = [{"role": "user", "content": items}]
+    if not isinstance(items, list):
+        return parsed
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        role = normalize_role(item.get("role"))
+        if role is None:
+            continue
+        text = _blocks_text(item.get("content"))
+        if not text.strip():
+            continue
+        parsed.append(
+            TranscriptMessage(
+                role=role,
+                text=text,
+                conversation_id=conversation_id,
+                message_id=f"{conversation_id}:{index}",
+                ordinal=len(parsed),
+            )
+        )
+    return parsed
 
 
 def request_model(body: bytes) -> str | None:
@@ -85,14 +151,19 @@ def _blocks_text(value: Any) -> str:
         return ""
     parts: list[str] = []
     for block in value:
-        if isinstance(block, dict) and block.get("type") in (None, "text"):
+        if isinstance(block, dict) and block.get("type") in (
+            None,
+            "text",
+            "input_text",
+            "output_text",
+        ):
             text = block.get("text")
             if isinstance(text, str):
                 parts.append(text)
     return "".join(parts)
 
 
-def response_text(provider: str, body: bytes) -> str:
+def response_text(provider: str, body: bytes, fmt: str | None = None) -> str:
     """Extract assistant prose from a complete (non-streaming) response."""
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -100,6 +171,15 @@ def response_text(provider: str, body: bytes) -> str:
         return ""
     if not isinstance(payload, dict):
         return ""
+    if fmt == "responses":
+        output = payload.get("output")
+        if not isinstance(output, list):
+            return ""
+        return "".join(
+            _blocks_text(item.get("content"))
+            for item in output
+            if isinstance(item, dict) and item.get("type") in (None, "message")
+        ).strip()
     if provider == ANTHROPIC:
         return _blocks_text(payload.get("content")).strip()
     choices = payload.get("choices")
@@ -122,6 +202,7 @@ class StreamAccumulator:
     """
 
     provider: str
+    fmt: str = ""
     _buffer: bytes = b""
     _parts: list[str] = field(default_factory=list)
     _stop_reason: str | None = None
@@ -162,10 +243,30 @@ class StreamAccumulator:
             return
         if not isinstance(event, dict):
             return
-        if self.provider == ANTHROPIC:
+        kind = self.fmt or ("anthropic" if self.provider == ANTHROPIC else "chat")
+        if kind == "anthropic":
             self._consume_anthropic(event)
+        elif kind == "responses":
+            self._consume_responses(event)
         else:
             self._consume_openai(event)
+
+    def _consume_responses(self, event: dict[str, Any]) -> None:
+        kind = event.get("type")
+        if kind == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                self._parts.append(delta)
+        elif kind in (
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        ):
+            response = event.get("response")
+            status = response.get("status") if isinstance(response, dict) else None
+            self._stop_reason = (
+                status if isinstance(status, str) else kind.rpartition(".")[2]
+            )
 
     def _consume_anthropic(self, event: dict[str, Any]) -> None:
         kind = event.get("type")
@@ -324,6 +425,7 @@ __all__ = [
     "ExchangeCapture",
     "StreamAccumulator",
     "estimate_prompt_tokens",
+    "format_for_path",
     "is_streaming_request",
     "provider_for_path",
     "request_messages",

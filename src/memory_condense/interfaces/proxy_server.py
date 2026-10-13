@@ -49,6 +49,7 @@ from memory_condense.interfaces.proxy_capture import (
     ExchangeCapture,
     StreamAccumulator,
     estimate_prompt_tokens,
+    format_for_path,
     is_streaming_request,
     provider_for_path,
     request_messages,
@@ -319,12 +320,10 @@ def build_app(
         path = "/" + request.path_params.get("path", "").lstrip("/")
         body = await request.body()
         provider = provider_for_path(path)
+        fmt = format_for_path(path)
         headers = _forward_headers(request.headers.raw)
         target = upstream_url(provider, path, request.url.query)
 
-        if memory is not None and path.rstrip('/') == '/v1/responses':
-            return JSONResponse({'error':{'type':'unsupported_memory_endpoint',
-                'message':'Memory mode supports /v1/chat/completions and /v1/messages'}},status_code=400)
         if memory is not None and provider is not None:
             from memory_condense.interfaces.proxy_memory import MemoryProxyError, WireResponse
             if request.method != 'POST':
@@ -352,7 +351,7 @@ def build_app(
                 return asyncio.run_coroutine_threadsafe(send_memory(value,summary),loop).result()
             try:
                 reply = await run_in_threadpool(memory.exchange,body,provider,headers,
-                    send_from_worker, lambda value:send_from_worker(value,True))
+                    send_from_worker, lambda value:send_from_worker(value,True),fmt)
             except MemoryProxyError as exc:
                 return JSONResponse({'error':{'type':'memory_request_error','message':str(exc)}},status_code=exc.status)
             except Exception:
@@ -397,7 +396,7 @@ def build_app(
         body_sha = hashlib.sha256(body).hexdigest()
         conversation_id = conversation_id_for(headers, body_sha)
         full_prompt = tuple(
-            request_messages(body, conversation_id=conversation_id)
+            request_messages(body, conversation_id=conversation_id, fmt=fmt)
         )
         prompt_tokens_estimate = estimate_prompt_tokens(full_prompt)
         if settings.capture_compact_prompts:
@@ -436,7 +435,7 @@ def build_app(
             payload = await response.aread()
             await response.aclose()
             try:
-                await publish(response_text(provider, payload), False)
+                await publish(response_text(provider, payload, fmt), False)
             except CaptureQueueRejectedError as exc:
                 logger.warning("response capture rejected: %s", exc)
             except Exception:
@@ -447,7 +446,7 @@ def build_app(
                 headers=dict(_response_headers(response.headers)),
             )
 
-        accumulator = StreamAccumulator(provider=provider)
+        accumulator = StreamAccumulator(provider=provider, fmt=fmt or "")
 
         async def tee() -> AsyncIterator[bytes]:
             try:

@@ -243,7 +243,19 @@ for validation and recovery details.
 
 The installed `proxy` command enables memory by default. `--mode observe`
 selects transparent capture. Memory mode buffers streamed replies before
-delivery; Responses API and multimodal requests are not supported yet.
+delivery; multimodal requests are not supported yet.
+
+Memory mode serves `/v1/chat/completions`, `/v1/messages` and `/v1/responses`.
+On the Responses endpoint the proxy owns the conversation, so server-side
+threading is accepted and ignored: `previous_response_id` and `conversation`
+are dropped, `store: false` is sent, and the reply reads as an ordinary
+Responses body. A session that resends its context each turn is picked up
+normally on a new conversation ID: the replayed turns open the conversation as
+imported context, and setting `previous_response_id` alongside them changes
+nothing. Only a first turn that threads its history upstream *without* sending
+it is refused, with 409, because those turns are in provider storage and not in
+the request; answering it would drop the history silently. A conversation may
+switch between the chat and Responses formats under one conversation ID.
 
 The current Sol gateway route returned 404 for native tool requests in the live
 probe, including a direct control without this proxy. Select a gateway/model

@@ -85,5 +85,14 @@ SHA256SUMS-linux64.json; the conda package is noarch and shared by both.
 Upstream Qwen, BGE, and Llama weights remain separate verified downloads; setup
 downloads only Qwen's required first shard and metadata. The release bundles
 the small project-trained routing head. Streaming in memory mode is buffered;
-Responses API and multimodal requests remain unsupported in this beta. Native
-tool availability also depends on the configured upstream gateway/model.
+multimodal requests remain unsupported in this beta. Native tool availability
+also depends on the configured upstream gateway/model.
+
+Memory mode now serves `/v1/responses` alongside `/v1/chat/completions` and
+`/v1/messages`, in both streaming and non-streaming form. The proxy owns the
+conversation there as it does elsewhere, so `previous_response_id` and
+`conversation` are accepted from the client and dropped, and `store: false` is
+sent upstream. A first turn on a conversation ID that threads its history
+upstream instead of sending it is refused with 409 rather than answered without
+that history. Observe mode now also captures this endpoint, which it previously
+relayed without capture.

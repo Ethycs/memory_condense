@@ -32,6 +32,7 @@ from memory_condense.runtime.attention import LocalAttention, cache_method
 from memory_condense.runtime.model_lock import RecallPriorityLock
 from memory_condense.runtime.llama import MODEL_SHA, invoke, gpu
 from memory_condense.runtime.config import RuntimeAssets
+from memory_condense.search.native_spine_summary import SUMMARY_TOKEN_LIMIT
 
 
 class CPUEmbedding(EmbeddingService):
@@ -487,7 +488,7 @@ def raw_extracts(fragments, output, *, ground_near_exact=False, require_review_d
                        else {'selected'})
             decision_valid = isinstance(item, dict) and item.get('decision') in allowed
         valid = (isinstance(item, dict) and item.get('label') == label and decision_valid
-                  and exact is not None and count_tokens(exact) <= 96
+                  and exact is not None and count_tokens(exact) <= SUMMARY_TOKEN_LIMIT
                   and len(exact.split()) <= 96)
         summary = exact if valid else exact_prefix(text, 64)
         fallback += not valid

@@ -316,6 +316,18 @@ def exact_whitespace_span(source, proposed):
     """
     if proposed in source:
         return proposed
+    # Models sometimes wrap a source title in quotation marks while moving
+    # source punctuation outside that presentation wrapper.  For example,
+    # ``"Planet Earth"`` does not literally occur in ``"Planet Earth,"`` even
+    # though its interior is an exact contiguous source span.  Admit only the
+    # byte-exact interior of a balanced quote pair; changed words still fail
+    # the ordinary grounding checks below.
+    stripped = proposed.strip()
+    quote_pairs = {'"': '"', "'": "'", '“': '”', '‘': '’'}
+    if len(stripped) > 2 and quote_pairs.get(stripped[0]) == stripped[-1]:
+        interior = stripped[1:-1].strip()
+        if interior and interior in source:
+            return interior
     words = re.split(r'\s+', proposed.strip())
     if not words or any(not word for word in words):
         return None

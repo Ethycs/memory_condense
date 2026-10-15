@@ -63,6 +63,20 @@ def test_reviewed_extract_hydrates_parenthesized_acronym_and_table_row():
     ]
 
 
+def test_reviewed_extract_hydrates_quoted_title_with_source_internal_punctuation():
+    source = 'You will find content like "Planet Earth," "March of the Penguins," and more.'
+    fragments = [dict(label='T3', role='assistant',
+                      rejected_summary='"Planet Earth"', fragment=source)]
+    messages = [dict(role='system', content='review'),
+                dict(role='user', content=json.dumps(dict(fragments=fragments)))]
+    remote = response(json.dumps(dict(atoms=[dict(
+        label='T3', decision='supported', summary='"Planet Earth"')])))
+
+    value = LocalFirstSummaries._validate('raw', messages, remote, None)
+
+    assert value['atoms'][0]['summary'] == 'Planet Earth'
+
+
 def test_reviewed_multilingual_extract_uses_documented_128_token_limit():
     summary = ('Είναι ισχυρή και ευέλικτη, και μπορεί να χρησιμοποιηθεί για να '
                'υπολογίσει ολικές συναρτήσεις πολλών διαστάσεων.')

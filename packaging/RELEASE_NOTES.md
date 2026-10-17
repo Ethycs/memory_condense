@@ -1,3 +1,16 @@
+Unreleased additions:
+
+- Optional Codex ChatGPT transport through the existing Responses memory engine:
+  stable conversation/retry identity, namespaced/custom tools, Responses Lite
+  catalogues, retained assistant phases, compacted replay and interrupted prose.
+- Optional Windows `-StartAtLogin` installation with a current-user task using
+  the installed `pythonw.exe`; status/start/stop/removal are in `manage-startup.ps1`.
+- Optional MCP extra and reuse of explicitly configured installed BGE assets.
+
+See `docs/02 - Implementation/32 - Codex Client and Windows Startup.md` for
+configuration, affected features and limits. Existing provider routes and
+memory algorithms remain in use. No private configuration/data is distributed.
+
 Memory Condense v0.2.2-beta.1 adds automatic retrieval selection to the local
 memory proxy for OpenAI Chat Completions and Anthropic Messages.
 

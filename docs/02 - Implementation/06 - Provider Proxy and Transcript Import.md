@@ -7,6 +7,10 @@
 **Date:** 2026-08-23
 **Updated:** 2026-10-08
 
+**Codex transport and Windows startup:** see the
+[client/startup guide](32%20-%20Codex%20Client%20and%20Windows%20Startup.md).
+The optional Codex adapter uses this same memory lifecycle and provider routing.
+
 Memory needs conversations. There are two ways to get them, and this project
 now has both: a proxy that sees live traffic, and an importer for the exports
 you already have.

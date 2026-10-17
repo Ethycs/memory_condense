@@ -33,7 +33,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e ".[proxy]" pytest build
+          python -m pip install -e ".[proxy,mcp]" pytest build
       - name: Rebuild portable Linux HNSW extension
         if: runner.os == 'Linux'
         env:
@@ -46,10 +46,12 @@ jobs:
         # surfaces on a user's machine rather than in the Python suite.
         run: shellcheck -s bash packaging/install-proxy.sh packaging/docker-entrypoint.sh
       - name: Test proxy, lifecycle, persistence and package boundaries
+        # Nested digest receipts can exceed Windows MAX_PATH under default TEMP.
         run: >-
           python -m pytest -q
           tests/test_proxy_package.py tests/test_proxy_memory.py tests/test_proxy.py
           tests/test_proxy_responses.py
+          tests/test_proxy_codex.py tests/test_windows_startup.py tests/test_mcp_local_assets.py
           tests/test_proxy_scheduler.py tests/test_chat_session.py tests/test_chat_streaming.py
           tests/test_inline_memory.py tests/test_engineering_research_resident.py
           tests/test_engineering_research_local.py tests/test_engineering_research_seed.py
@@ -74,7 +76,7 @@ jobs:
           tests/test_memory_surfaces.py
           tests/test_proxy_sessions.py tests/test_proxy_attribution.py
           tests/test_proxy_headers.py tests/test_proxy_receipts.py tests/test_proxy_units.py
-          --junitxml=eval_results/ci-tests.xml
+          --basetemp="${{ runner.temp }}/memory-tests" --junitxml=eval_results/ci-tests.xml
       - name: Build wheel and source distribution
         run: python -m build --outdir dist/python
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -160,6 +162,7 @@ jobs:
           path: |
             dist/*.zip
             dist/install-proxy.ps1
+            dist/manage-startup.ps1
             dist/SHA256SUMS-win64.json
           if-no-files-found: error
 
@@ -311,6 +314,7 @@ jobs:
           dist/memory-condense-*-win64.zip dist/memory-condense-*-linux64.tar.gz
           dist/memory_condense-*.conda
           dist/install-proxy.ps1 dist/install-proxy.sh
+          dist/manage-startup.ps1
           dist/SHA256SUMS-win64.json dist/SHA256SUMS-linux64.json
           --verify-tag --prerelease --title "Memory Condense $RELEASE_TAG"
           --notes-file packaging/RELEASE_NOTES.md

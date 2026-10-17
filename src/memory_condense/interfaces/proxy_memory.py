@@ -312,8 +312,14 @@ class MemoryProxy:
             raise failures[0]
 
     @staticmethod
-    def _new_messages(history, incoming):
-        old = [wire.canonical_message(m) for _,m in history]
+    def _new_messages(history, incoming, fmt=None):
+        if fmt == 'responses':
+            # A captured response is one event; its replay can contain several
+            # messages and tool calls. Compare the same item boundaries.
+            old = [wire.canonical_message(wire.responses.canonical_item(item))
+                   for _, message in history for item in wire.responses.input_item(message)]
+        else:
+            old = [wire.canonical_message(m) for _,m in history]
         values = [wire.canonical_message(m) for m in incoming]
         # Full history, a sliding suffix, or a single new input/tool-result batch.
         for overlap in range(min(len(old),len(values)), 0, -1):
@@ -331,7 +337,10 @@ class MemoryProxy:
         # Never separate a tool result from its assistant call and user request.
         while start > 0 and (entry.messages[start][1]['role'] != 'user' or wire.tool_result(entry.messages[start][1])):
             start -= 1
-        return [m for _,m in entry.messages[start:]]
+        # Local text models cannot summarize visual evidence. Keep earlier
+        # image-bearing messages intact rather than silently losing screenshots.
+        pinned = [m for _,m in entry.messages[:start] if 'responses_content' in m]
+        return pinned + [m for _,m in entry.messages[start:]]
 
     def exchange(self, body, provider, headers, send, summary_send=None, fmt=None):
         """Run synchronously on a worker; send(payload_bytes) bridges async HTTP."""
@@ -400,7 +409,7 @@ class MemoryProxy:
                 raise MemoryProxyError('This conversation has no history here and the request threads one '
                                        'upstream without replaying it; send the prior turns in input, '
                                        'or use a new conversation ID', 409)
-            new = self._new_messages(entry.messages, incoming) if not prior else []
+            new = self._new_messages(entry.messages, incoming, fmt) if not prior else []
             if not prior and not new:
                 raise MemoryProxyError('No new input; reuse the original request ID to replay its response',409)
             with session.capture_exchange():

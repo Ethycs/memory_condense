@@ -24,7 +24,8 @@ def encoded(value):
 
 def canonical_message(message):
     value = {k: deepcopy(v) for k, v in message.items()
-             if k in ('role', 'content', 'tool_calls', 'tool_call_id', 'function_call', 'name', 'refusal')
+             if k in ('role', 'content', 'tool_calls', 'tool_call_id', 'function_call', 'name', 'refusal',
+                      'phase', 'responses_type', 'responses_content')
              and v is not None}
     value.setdefault('content', '')
     return value
@@ -32,6 +33,9 @@ def canonical_message(message):
 
 def message_text(message):
     content = message.get('content')
+    if 'responses_content' in message:
+        # Vision payloads stay on the wire, never as base64 tokens for Qwen/BGE.
+        return content or '[Attached image retained in provider context]'
     if isinstance(content, str) and content.strip() and not message.get('tool_calls') and not message.get('function_call'):
         return content
     if isinstance(content, list) and content and all(b.get('type') == 'text' for b in content):

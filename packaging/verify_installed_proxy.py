@@ -37,6 +37,11 @@ def main():
     from memory_condense.associations.heat_diffusion import diffuse_scalar_heat
     from memory_condense.runtime.sessions import NativeProxySessions
     from memory_condense.interfaces.proxy_server import build_app
+    from memory_condense.interfaces.windows_startup import load_arguments
+    from memory_condense.interfaces.proxy_codex import CodexMemoryProxy
+    # Import-only contracts still verify the installed public runtime surface.
+    assert all(callable(symbol) for symbol in (PreparedHierarchyContext, PreparedNativeExperiments,
+        summary_weights, cav_bundle, NativeProxySessions, build_app, load_arguments, CodexMemoryProxy))
     from memory_condense.runtime.artifacts import read
     from memory_condense.cli import main as cli
     assert not Path(memory_condense.__file__).resolve().is_relative_to(repo/'src'), 'Imported checkout'
@@ -66,6 +71,7 @@ def main():
     assert 'hierarchy_neighborhoods' in help_text.getvalue()
     assert 'decision_history' in help_text.getvalue()
     assert '--memory-experiment-config' in help_text.getvalue()
+    assert '--codex-chatgpt' in help_text.getvalue()
     print(json.dumps(dict(installed_version=expected,package=str(Path(memory_condense.__file__).parent),
         sealed_classifier=True,proxy_default='auto',research_imports=False,model_downloads=0,
         note='Offline package/identity smoke; deterministic vector, no model accuracy claim.')))

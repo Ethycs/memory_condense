@@ -17,6 +17,21 @@ CUDA 12.8 because upstream `b11272` publishes no lower Linux CUDA build. The
 archive carries its own `libcudart`, so CUDA minor-version compatibility keeps
 the driver requirement at 12.x.
 
+## Codex with ChatGPT login
+
+The proxy can connect Codex clients using ChatGPT login to the existing native
+memory engine. This extends the Responses API transport; Qwen attention, CPU BGE
+automatic retrieval, Llama summaries and durable journals are unchanged.
+After installation, run `memory-condense proxy --codex-chatgpt --port 8788` and
+configure Codex's provider base URL as `http://127.0.0.1:8788` with
+`wire_api = "responses"`, `supports_websockets = false`, and
+`requires_openai_auth = true`. Set `model_provider` above any TOML table.
+
+See [Codex client and Windows startup](docs/02%20-%20Implementation/32%20-%20Codex%20Client%20and%20Windows%20Startup.md)
+for complete configuration, supported tool formats, restart/replay behavior,
+limitations and the optional terminal-free Windows login task. This does not
+change the ordinary ChatGPT desktop/web application's connection.
+
 ## Install using Pixi
 
 Install [Pixi](https://pixi.sh/), download your platform's archive from
@@ -28,6 +43,21 @@ On Windows:
 ```powershell
 .\install-proxy.ps1
 ```
+
+To install and start automatically after Windows login, use the optional
+`-StartAtLogin` switch. The matching `manage-startup.ps1` is included in the
+Windows release bundle and must remain beside the installer during setup:
+
+```powershell
+.\install-proxy.ps1 -StartAtLogin -ProxyArguments @('--codex-chatgpt', '--port', '8788')
+```
+
+This registers a task for the current user and installation, starts it now,
+and launches the installed `pythonw.exe` directly on future logins. It does not
+open a terminal, store provider credentials, or modify Codex configuration.
+Models, data and startup arguments remain in user-selected locations. Local
+Windows task policy may require a one-time elevated setup; no password is saved.
+See the startup guide for status, removal and upgrade instructions.
 
 On Linux the bundle is a flat tarball, so extract it into a directory of its own:
 

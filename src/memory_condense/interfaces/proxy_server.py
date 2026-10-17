@@ -26,11 +26,14 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import gzip
+import json
 import logging
 import math
 import os
 import ssl
 import time
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Sequence
@@ -105,6 +108,8 @@ class ProxyConfig:
     #: service to replace older dialogue with authenticated recalled evidence.
     mode: str = "observe"
     timeout_seconds: float = 600.0
+    codex_chatgpt: bool = False
+    codex_base_url: str = 'https://chatgpt.com/backend-api/codex'
     capture_queue_size: int = 256
     capture_queue_max_waiters: int | None = None
     capture_offer_timeout_seconds: float = 1.0
@@ -323,6 +328,29 @@ def build_app(
         fmt = format_for_path(path)
         headers = _forward_headers(request.headers.raw)
         target = upstream_url(provider, path, request.url.query)
+
+        if settings.codex_chatgpt and not path.startswith('/v1/'):
+            # Codex uses a backend root without /v1 and sends other endpoints
+            # (models, compaction) through the same configured provider.
+            target = settings.codex_base_url.rstrip('/') + path
+            if request.url.query:
+                target += '?' + request.url.query
+            if path.rstrip('/') == '/responses' and memory is not None:
+                from memory_condense.interfaces.proxy_codex import conversation_headers
+                from memory_condense.interfaces.proxy_memory import MemoryProxyError
+                try:
+                    encoding = headers.get('content-encoding', '').lower()
+                    decoded = (gzip.decompress(body) if encoding == 'gzip' else
+                               zlib.decompress(body) if encoding == 'deflate' else body)
+                    if encoding not in ('', 'identity', 'gzip', 'deflate'):
+                        raise MemoryProxyError('Unsupported Codex request compression: ' + encoding)
+                    adapted = conversation_headers(json.loads(decoded), headers)
+                    if adapted is not None:
+                        headers = adapted
+                        headers.pop('content-encoding', None)
+                        body, provider, fmt = decoded, OPENAI, 'responses'
+                except (MemoryProxyError, ValueError, OSError, zlib.error) as exc:
+                    return JSONResponse({'error': {'message': str(exc)}}, status_code=400)
 
         if memory is not None and provider is not None:
             from memory_condense.interfaces.proxy_memory import MemoryProxyError, WireResponse
@@ -743,6 +771,10 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     parser.add_argument('--memory-summary-api-fallback',action=argparse.BooleanOptionalAction,default=True,
                         help='Escalate failed local summaries to the conversation provider/model')
     parser.add_argument('--assets-dir',help='Local model/runtime assets (otherwise saved setup configuration)')
+    parser.add_argument('--codex-chatgpt', action='store_true',
+                        help='Use Codex ChatGPT backend routing and stable account/thread identity')
+    parser.add_argument('--codex-base-url', default='https://chatgpt.com/backend-api/codex',
+                        help='Codex transport upstream; standard /v1 routes use their own provider URLs')
     parser.add_argument("--capture-queue-size", type=int, default=256)
     parser.add_argument("--capture-queue-max-waiters", type=int)
     parser.add_argument("--capture-offer-timeout-seconds", type=float, default=1.0)
@@ -804,6 +836,9 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
 
     config = ProxyConfig(
         mode=args.mode,
+        codex_chatgpt=args.codex_chatgpt,
+        codex_base_url=args.codex_base_url,
+        default_provider=OPENAI if args.codex_chatgpt else ANTHROPIC,
         upstreams={
             ANTHROPIC: args.anthropic_base_url,
             OPENAI: args.openai_base_url,
@@ -841,7 +876,11 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
             recent_token_budget=args.memory_recent_token_budget,assets=assets,
             summary_api_fallback=args.memory_summary_api_fallback, dialogue_policy=retrieval,
             retrieval_policy=args.memory_retrieval_policy,experiment_policy=experiments)
-        memory = MemoryProxy(args.data_dir,factory,inline_memory=args.inline_memory,
+        memory_class = MemoryProxy
+        if args.codex_chatgpt:
+            from memory_condense.interfaces.proxy_codex import CodexMemoryProxy
+            memory_class = CodexMemoryProxy
+        memory = memory_class(args.data_dir,factory,inline_memory=args.inline_memory,
             empty_response_retries=args.memory_empty_response_retries,max_sessions=args.memory_max_sessions,
             recent_token_budget=args.memory_recent_token_budget,summary_api_fallback=args.memory_summary_api_fallback)
         try:

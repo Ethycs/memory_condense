@@ -5,15 +5,15 @@ The proxy keeps a single internal message form: the chat-completions
 :func:`proxy_memory_wire.canonical_message` defines.  That form is not merely a
 serialization choice.  It is the message identity ``MemoryProxy._new_messages``
 deduplicates resent history by, and the dicts ``MemoryProxy._recent`` walks to
-assemble the resend window.  Widening it would reach into history diffing, the
-recent window and the journal at once, so Responses is translated at the edge
-instead — exactly as Anthropic already is by ``assemble_stream``, which rebuilds
-an ``object='chat.completion'`` envelope.
+assemble the resend window. Responses is translated at the edge, with explicit
+fields for custom tools, namespaces, assistant phases and image content. The
+shared recall and publication pipeline remains the source of memory selection.
 
 One consequence is worth stating because it is a feature: a conversation started
 over ``/v1/chat/completions`` can be continued over ``/v1/responses`` under the
 same conversation ID, because both land in the same namespace and both reduce to
-the same canonical messages.
+the same canonical messages. Responses-specific tools and image content require
+the Responses endpoint when that history is continued.
 
 Everything here is pure: payload in, payload out.  No IO, no session state.
 """
@@ -63,6 +63,12 @@ def block_text(item, *, strict=False):
 def canonical_item(item):
     """One input item as an internal message, or ``None`` for one to drop."""
     kind = item_type(item)
+    if kind == 'additional_tools':
+        if item.get('role') != 'developer' or not isinstance(item.get('tools'), list):
+            raise ValueError('Responses additional_tools requires developer role and a tools array')
+        # Responses Lite puts tool declarations in input, not top-level tools.
+        # Keep this policy item native so namespaces and schemas survive recall.
+        return dict(role='developer', content='', responses_tools=deepcopy(item))
     if kind == 'reasoning':
         # Opaque and signed to an upstream response the proxy never resends.
         return None
@@ -70,18 +76,40 @@ def canonical_item(item):
         role = item.get('role')
         if role not in ('system', 'developer', 'user', 'assistant'):
             raise ValueError('Unsupported message role')
-        return dict(role=role, content=block_text(item, strict=True))
-    if kind == 'function_call':
-        name, arguments = item.get('name'), item.get('arguments')
+        content = item.get('content')
+        images = (role == 'user' and isinstance(content, list) and any(
+            isinstance(block, dict) and block.get('type') == 'input_image' for block in content))
+        if images:
+            if any(not isinstance(block, dict) or not (
+                    block.get('type') in TEXT_BLOCKS or
+                    (block.get('type') == 'input_image' and isinstance(block.get('image_url'), str)))
+                   for block in content):
+                raise ValueError('Memory beta supports text items and inline image URLs')
+            message = dict(role=role, content=block_text(item), responses_content=deepcopy(content))
+        else:
+            message = dict(role=role, content=block_text(item, strict=True))
+        if item.get('phase') is not None:
+            message['phase'] = item['phase']
+        return message
+    if kind in ('function_call', 'custom_tool_call'):
+        custom = kind == 'custom_tool_call'
+        name, arguments = item.get('name'), item.get('input' if custom else 'arguments')
         if not isinstance(name, str) or not isinstance(arguments, str):
-            raise ValueError('A function_call item requires a name and string arguments')
+            raise ValueError('A tool call requires a name and string arguments/input')
+        call = dict(id=item.get('call_id') or item.get('id') or '',
+                    type='custom' if custom else 'function')
+        call[call['type']] = dict(name=name, **{'input' if custom else 'arguments': arguments})
+        if item.get('namespace') is not None:
+            call['namespace'] = item['namespace']
         return dict(role='assistant', content='',
-                    tool_calls=[dict(id=item.get('call_id') or item.get('id') or '', type='function',
-                                     function=dict(name=name, arguments=arguments))])
-    if kind == 'function_call_output':
+                    tool_calls=[call])
+    if kind in ('function_call_output', 'custom_tool_call_output'):
         output = item.get('output')
-        return dict(role='tool', tool_call_id=item.get('call_id') or '',
+        message = dict(role='tool', tool_call_id=item.get('call_id') or '',
                     content=output if isinstance(output, str) else json.dumps(output, ensure_ascii=False))
+        if kind == 'custom_tool_call_output':
+            message['responses_type'] = kind
+        return message
     if kind == 'item_reference':
         # The referenced item lives in upstream storage the proxy declines to use.
         raise ValueError('Memory mode cannot resolve an item_reference; send the item inline')
@@ -144,21 +172,44 @@ def use_inline(payload):
 
 def input_item(message):
     """Render one internal message back as zero or more input items."""
+    if 'responses_tools' in message:
+        return [deepcopy(message['responses_tools'])]
+    if 'responses_items' in message:
+        # Keep separate assistant phases and parallel tool items in wire order.
+        return deepcopy(message['responses_items'])
     role, content = message['role'], message.get('content')
+    if 'responses_content' in message:
+        blocks = deepcopy(message['responses_content'])
+        # Recall may prepend evidence to the canonical text. Keep the image
+        # bytes untouched and add only that prefix to the rendered message.
+        original = block_text(dict(content=blocks))
+        if content != original and isinstance(content, str) and content.endswith(original):
+            prefix = content[:-len(original)] if original else content
+            blocks.insert(0, dict(type='input_text', text=prefix))
+        return [dict(type='message', role=role, content=blocks)]
     text = content if isinstance(content, str) else ''.join(
         b.get('text') or '' for b in content or []
         if isinstance(b, dict) and b.get('type') in TEXT_BLOCKS)
     if role in ('tool', 'function'):
-        return [dict(type='function_call_output', call_id=message.get('tool_call_id') or '', output=text)]
+        return [dict(type=message.get('responses_type', 'function_call_output'),
+                     call_id=message.get('tool_call_id') or '', output=text)]
     if role == 'assistant':
         # Assistant prose replayed into `input` must use output_text; input_text
         # is rejected for that role.
         items = [dict(type='message', role='assistant', content=[dict(type='output_text', text=text)])] \
             if text.strip() else []
+        if items and message.get('phase') is not None:
+            items[0]['phase'] = message['phase']
         for call in message.get('tool_calls') or []:
-            function = call.get('function') or {}
-            items.append(dict(type='function_call', call_id=call.get('id') or '',
-                              name=function.get('name') or '', arguments=function.get('arguments') or ''))
+            custom = call.get('type') == 'custom'
+            function = call.get('custom' if custom else 'function') or {}
+            item = dict(type='custom_tool_call' if custom else 'function_call',
+                        call_id=call.get('id') or '', name=function.get('name') or '')
+            field = 'input' if custom else 'arguments'
+            item[field] = function.get(field) or ''
+            if call.get('namespace') is not None:
+                item['namespace'] = call['namespace']
+            items.append(item)
         return items
     return [dict(type='message', role=role, content=[dict(type='input_text', text=text)])]
 
@@ -199,10 +250,8 @@ def response_message(payload):
                     text.append(block.get('text') or '')
                 elif block.get('type') == 'refusal':
                     refusal.append(block.get('refusal') or '')
-        elif kind == 'function_call':
-            calls.append(dict(id=item.get('call_id') or item.get('id') or '', type='function',
-                              function=dict(name=item.get('name') or '',
-                                            arguments=item.get('arguments') or '')))
+        elif kind in ('function_call', 'custom_tool_call'):
+            calls.extend(canonical_item(item)['tool_calls'])
         else:
             # A hosted tool ran upstream.  Its result is not an answer this
             # proxy can store, and dropping it silently would misreport the turn.
@@ -212,6 +261,12 @@ def response_message(payload):
         message['tool_calls'] = calls
     if refusal:
         message['refusal'] = ''.join(refusal)
+    # ChatIO captures one assistant event, while Responses clients replay each
+    # output item separately. Retain their boundaries for matching and resend.
+    if not refusal:
+        message['responses_items'] = [rendered for item in output
+            if item_type(item) != 'reasoning'
+            for rendered in input_item(canonical_item(item))]
     return message
 
 
@@ -223,7 +278,7 @@ def finish_reason(payload):
         reason = details.get('reason') if isinstance(details, dict) else None
         return str(status) + (':' + str(reason) if reason else '')
     output = [i for i in payload.get('output') or [] if isinstance(i, dict)]
-    if any(item_type(i) == 'function_call' for i in output):
+    if any(item_type(i) in ('function_call', 'custom_tool_call') for i in output):
         return 'tool_calls'
     for item in output:
         if item_type(item) == 'message' and any(
@@ -253,13 +308,22 @@ def public_answer(result, answer):
 def assemble_stream(events):
     """Return the terminal event's response; no delta accumulation is needed."""
     value = None
+    completed_items = {}
     for event in events:
+        if event.get('type') == 'response.output_item.done' and isinstance(event.get('item'), dict):
+            completed_items[event['output_index']] = event['item']
         if event.get('type') in TERMINAL_EVENTS:
             value = event.get('response')
             if not isinstance(value, dict):
                 raise ValueError('Provider stream ended without a response object')
     if value is None:
         raise ValueError('Provider stream ended before completion')
+    if 'output' not in value and completed_items:
+        # Codex can finish with a lightweight terminal envelope. Only completed
+        # item events are authoritative; partial deltas must never be committed.
+        if sorted(completed_items) != list(range(len(completed_items))):
+            raise ValueError('Provider stream omitted completed output items')
+        value = dict(value, output=[completed_items[i] for i in sorted(completed_items)])
     return deepcopy(value)
 
 

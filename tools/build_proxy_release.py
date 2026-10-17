@@ -40,14 +40,23 @@ def members(repo, output, version, platform):
     if spec['format'] == 'tar':
         installer.chmod(0o755)          # CI executes the loose copy directly
     guide = repo/'docs/02 - Implementation/06 - Provider Proxy and Transcript Import.md'
-    return package, {
+    files = {
         package.name: package,
         installer.name: installer,
         'README.md': repo/'README.md',
         'packaging/MODEL_ASSETS.md': repo/'packaging/MODEL_ASSETS.md',
         'RELEASE_NOTES.md': repo/'packaging/RELEASE_NOTES.md',
         'docs/02 - Implementation/06 - Provider Proxy and Transcript Import.md': guide,
+        'docs/02 - Implementation/32 - Codex Client and Windows Startup.md':
+            repo/'docs/02 - Implementation/32 - Codex Client and Windows Startup.md',
+        'docs/verification/codex-windows-startup.md': repo/'docs/verification/codex-windows-startup.md',
     }
+    if platform == 'win64':
+        # The installer copies this helper into the independent application.
+        startup = output/'manage-startup.ps1'
+        shutil.copyfile(repo/'packaging'/startup.name, startup)
+        files[startup.name] = startup
+    return package, files
 
 
 def write_bundle(archive, files, manifest_path, platform):

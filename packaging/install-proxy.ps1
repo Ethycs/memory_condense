@@ -2,9 +2,14 @@ param(
     [string]$PackagePath,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'memory_condense\proxy'),
     [string]$AssetsDir,
-    [switch]$SkipSetup
+    [switch]$SkipSetup,
+    [switch]$StartAtLogin,
+    [string[]]$ProxyArguments = @()
 )
 $ErrorActionPreference = 'Stop'
+if ($StartAtLogin -and $SkipSetup) { throw 'StartAtLogin requires successful model setup and diagnostics; omit SkipSetup.' }
+$startupHelper = Join-Path $PSScriptRoot 'manage-startup.ps1'
+if ($StartAtLogin -and -not (Test-Path -LiteralPath $startupHelper -PathType Leaf)) { throw 'The matching manage-startup.ps1 must be beside the installer.' }
 if (-not (Get-Command pixi -ErrorAction SilentlyContinue)) {
     throw 'Install Pixi from https://pixi.sh/ first, then rerun this installer.'
 }
@@ -65,6 +70,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Pixi dependency installation failed.' }
 $launcherPath = Join-Path $destination 'memory-condense.cmd'
 $launcher = "@echo off`r`npixi run --manifest-path `"%~dp0pixi.toml`" memory-condense %*`r`n"
 [IO.File]::WriteAllText($launcherPath, $launcher, [Text.ASCIIEncoding]::new())
+$installedStartup = Join-Path $destination 'manage-startup.ps1'
+if ($startupHelper -ne $installedStartup -and (Test-Path -LiteralPath $startupHelper -PathType Leaf)) {
+    Copy-Item -LiteralPath $startupHelper -Destination $installedStartup -Force
+}
 if (-not $SkipSetup) {
     if ($AssetsDir) {
         & pixi run --manifest-path $manifestPath memory-condense setup --reuse $AssetsDir
@@ -72,5 +81,11 @@ if (-not $SkipSetup) {
     if ($LASTEXITCODE -ne 0) { throw 'Model asset setup failed; the application environment is installed.' }
     & pixi run --manifest-path $manifestPath memory-condense doctor
     if ($LASTEXITCODE -ne 0) { throw 'Runtime diagnostics failed; inspect the doctor output above.' }
+}
+if ($StartAtLogin) {
+    # Use absolute model/data paths; login must not depend on the download CWD.
+    $startupArguments = @('--data-dir', (Join-Path $destination 'data'))
+    if ($AssetsDir) { $startupArguments += @('--assets-dir', [IO.Path]::GetFullPath($AssetsDir)) }
+    & $installedStartup -Action Install -InstallDir $destination -ProxyArguments ($startupArguments + $ProxyArguments)
 }
 Write-Output "Installed. Run: & '$launcherPath' proxy --openai-base-url https://your-gateway.example/v1"

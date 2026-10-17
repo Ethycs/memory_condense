@@ -80,7 +80,14 @@ def _condense() -> MemoryCondenser:
         # the normal case here — the stdio client does not forward the parent
         # environment — and a silent fallback would look like bad extraction.
         logger.info("memory extraction: %s", reason)
-        _condenser = MemoryCondenser(data_dir=target, extractor=extractor)
+        embedder = None
+        if os.environ.get('MEMORY_CONDENSE_ASSETS'):
+            # A packaged install already has the admitted CPU BGE export. Reuse
+            # it rather than downloading a second sentence-transformer checkpoint.
+            from memory_condense.runtime.config import RuntimeAssets
+            from memory_condense.runtime.embedding import FastEmbedBGE
+            embedder = FastEmbedBGE(assets=RuntimeAssets.resolve())
+        _condenser = MemoryCondenser(data_dir=target, extractor=extractor, embedder=embedder)
         atexit.register(_close)
     return _condenser
 

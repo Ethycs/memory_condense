@@ -118,6 +118,12 @@ Messages you will see: the current line on the first prompt of a session
 `health ok -> degraded`, `status file gone (proxy stopped?)`. Several changes
 in one turn are joined with `;`.
 
+In **augment** mode — which is what the installed `memory-condense proxy`
+runs — a snapshot name is a *directory* under `<data-dir>/snapshots/`, not a
+`.sqlite` file, so `snapshot taken <name>` and `store.last_snapshot` carry a
+bare name with no suffix. `ctl save|load|reset` work in both modes;
+`ctl load-transcript` is observe-mode only.
+
 Add to `settings.json`:
 
 ```json

@@ -90,6 +90,27 @@ class NativeProxySessions:
     def configure_summary_provider(self, namespace, api):
         self._summary_runtime(namespace, api, configure=True)
 
+    def forget(self, namespaces=None):
+        """Drop per-conversation state for stores that no longer exist.
+
+        A control-plane swap (``MemoryProxy.swap``) closes every session and
+        then replaces or deletes the trees under ``sessions/``. The lifecycle
+        records and summary runtimes keyed on those namespaces describe stores
+        that are gone: left in place, ``startup_status`` keeps reporting a
+        conversation that no longer exists, and a namespace whose journal was
+        just restored is reported ``ready`` before its models have reopened.
+        ``None`` forgets every namespace, which is what a whole-tree swap
+        means. The resident models belong to the service and are untouched.
+        """
+        with self.registry_lock:
+            if namespaces is None:
+                self._lifecycle.clear()
+                self.summary_runtimes.clear()
+                return
+            for namespace in namespaces:
+                self._lifecycle.pop(namespace, None)
+                self.summary_runtimes.pop(namespace, None)
+
     def summary_status(self):
         from collections import Counter
         counts = Counter()

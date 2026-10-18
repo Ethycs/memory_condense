@@ -370,6 +370,13 @@ def reopen(root, request):
                                for r in request['rows'])
                 if request.get('query'):
                     from memory_condense.domain.question_time import dated_recall_question
+                    # An absent asked_at means "now" by design, not an oversight.
+                    # The recall clock belongs to the asker, not to the indexed
+                    # history: a live question about "last week" must resolve
+                    # against the wall clock even when the store ends months
+                    # earlier. Do not restore the old max(created_at) anchor here.
+                    # Callers that replay a fixed corpus (the research battery)
+                    # send an explicit asked_at so their runs do not drift.
                     dated = dated_recall_question(request['query'], request.get('asked_at'))
                     output.update(native_packet(app, request['query'], dated, events))
                 if request.get('operation') == 'learn':
@@ -378,6 +385,9 @@ def reopen(root, request):
                     output['learning'] = asdict(learned) if learned is not None else None
             if request.get('query') and not request.get('chat'):
                 query_start = time.perf_counter()
+                # This branch keeps its own end-of-day anchor on the export date
+                # and never consults the wall clock or asked_at, so a batch
+                # replay asks the same dated question on any later run date.
                 anchor = datetime.fromisoformat(request['storage_timestamp']).strftime('%Y/%m/%d (%a)')
                 dated = f'[Question asked at {anchor} 23:59] ' + request['query']
                 result = app.retrieve_native_spine(request['query'], dated)

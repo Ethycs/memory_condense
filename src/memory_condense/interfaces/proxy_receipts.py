@@ -55,17 +55,35 @@ class ServingReceipt:
         return self.served_tokens
 
     @property
+    def effective_static_tokens(self) -> int | None:
+        """The client-side figure to publish, in the served figure's unit.
+
+        When nothing was rewritten the prompt the upstream counted *is* the
+        prompt the client sent, so the upstream's exact count describes both
+        sides.  Publishing the char/4 estimate against that exact count would
+        show a gap made of nothing but estimator error — a saving in observe
+        mode, which forwards verbatim and saves nothing.  Only a real rewrite
+        has two different prompts to compare, and there the estimate is the
+        only figure that exists for the client's side.
+        """
+        if not self.rewritten and self.usage_input_tokens is not None:
+            return self.usage_input_tokens
+        return self.static_tokens
+
+    @property
     def saved_tokens(self) -> int:
         """``static - served`` when both are known, else 0; never negative.
 
-        Uses :attr:`effective_served_tokens` so the figure matches what the
-        publisher accumulates into ``saved_tokens_total``.  Clamped because a
-        char/4 estimate can undercount what the upstream then reports.
+        Uses the two ``effective_`` figures, so it is exactly the difference
+        the publisher's ``static_tokens_last`` and ``served_tokens_last``
+        show, and it is zero whenever the served prompt is the client's own.
+        Still clamped: against a rewrite, a char/4 estimate of the client's
+        prompt can undercount what the upstream then reports for the packet.
         """
-        served = self.effective_served_tokens
-        if self.static_tokens is None or served is None:
+        static, served = self.effective_static_tokens, self.effective_served_tokens
+        if static is None or served is None:
             return 0
-        return max(0, int(self.static_tokens) - int(served))
+        return max(0, int(static) - int(served))
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -268,10 +286,20 @@ def receipt_for_augment(
     when the request never reached the point of being served (the served
     side is then unknown).  ``rewritten`` is true only when the served JSON
     differs from the original: a passthrough re-encoding is not a rewrite.
+
+    ``reason`` is free text for whoever knows more than this module does (the
+    pre-send guard's verdict, say); left empty it is derived from the three
+    cases above, so a receipt always says which one it is.
     """
     static = prompt_tokens(fmt, original_bytes)
     served = prompt_tokens(fmt, served_bytes) if served_bytes is not None else None
     rewritten = served_bytes is not None and not _same_payload(original_bytes, served_bytes)
+    if not reason:
+        reason = (
+            "nothing served"
+            if served_bytes is None
+            else "memory served" if rewritten else "passthrough"
+        )
     return ServingReceipt(
         format=fmt,
         mode="augment",
@@ -286,14 +314,14 @@ def receipt_for_augment(
 def publish(receipt: ServingReceipt, publisher: Any) -> None:
     """Hand one receipt to ``StatusPublisher.record_serving``.
 
-    Served is the upstream's exact count when the receipt has one, else the
-    estimate; the publisher derives ``saved_tokens_total`` from that pair.
+    The whole receipt goes over, not three positionals: every decision in it
+    -- which estimator, whether the upstream's exact ``usage`` beats the
+    estimate, whether a passthrough counts as a rewrite, how savings are
+    clamped -- is made here, and the publisher only accumulates. This is the
+    one production call site; nothing else is allowed to hand the publisher
+    serving numbers.
     """
-    publisher.record_serving(
-        receipt.static_tokens,
-        receipt.effective_served_tokens,
-        receipt.rewritten,
-    )
+    publisher.record_serving(receipt)
 
 
 __all__ = [

@@ -15,9 +15,13 @@ Two things are load-bearing for an stdio MCP server:
 
 Storage location, in precedence order:
 
-    $MEMORY_CONDENSE_DATA_DIR  →  $CLAUDE_PROJECT_DIR/.memory_condense  →  ./.memory_condense
+    $MEMORY_CONDENSE_DATA_DIR  →  <project root>/.memory_condense  →  <session home>/data
 
-so each project gets its own memory by default.
+so each project gets its own memory by default. The project root is
+$CLAUDE_PROJECT_DIR when the client sets it, else the nearest ancestor of the
+working directory holding a `.git` or `pyproject.toml`; see
+`memory_condense.runtime.project`, which the proxy and the status resolver
+share, so every surface agrees on which store is this project's.
 """
 
 from __future__ import annotations
@@ -69,12 +73,13 @@ _condenser: MemoryCondenser | None = None
 
 
 def _data_dir() -> Path:
-    explicit = os.environ.get("MEMORY_CONDENSE_DATA_DIR")
-    if explicit:
-        return Path(explicit)
-    project = os.environ.get("CLAUDE_PROJECT_DIR")
-    base = Path(project) if project else Path.cwd()
-    return base / ".memory_condense"
+    # One resolver, shared with the proxy and control/status.py, so this
+    # server and the proxy cannot land on different stores. It also walks up
+    # to the project root, where this used to trust Path.cwd() and so gave a
+    # process launched from a subdirectory its own separate store.
+    from memory_condense.runtime.project import project_data_dir
+
+    return project_data_dir()
 
 
 def _condense() -> MemoryCondenser:
@@ -357,6 +362,13 @@ def memory_stats() -> str:
 
     Useful when deciding whether memory is worth consulting at all, or when
     the user asks what you remember about this project.
+
+    Reports two stores, which are separate by default: this server's own store
+    (what `recall`, `remember`, `ingest`, `forget` and `supersede` use) and the
+    memory proxy's store (what `memory_snapshot_save`,
+    `memory_snapshot_restore`, `memory_reset` and `memory_load_transcript` act
+    on). Their directories are resolved independently, so a count or a snapshot
+    on one says nothing about the other.
     """
     condenser = _condense()
     heat = condenser.heat_counts()
@@ -365,7 +377,11 @@ def memory_stats() -> str:
     tiers = heat_map(items, now_turn=condenser.transcript.current_turn())
 
     lines = [
+        # Line 0 stays exactly "Store: <path>" — the control-plane tests pin it.
+        # The provenance of the numbers below it goes on its own line.
         f"Store: {_data_dir()}",
+        "  (this MCP server's own store — what recall/remember/ingest/forget/"
+        "supersede below read and write)",
         f"Turns ingested: {condenser.transcript.count()}",
         f"Active memories: {len(items)} ({pinned} pinned)",
         f"Heat: HOT {heat.get('HOT', 0)} / WARM {heat.get('WARM', 0)} / COLD {heat.get('COLD', 0)}"
@@ -380,12 +396,24 @@ def memory_stats() -> str:
     if status_path is not None:
         doc = read_status(status_path)
         if doc is not None:
+            lines.append(
+                "A separate store, not the one above: the memory proxy's. "
+                "memory_snapshot_save/memory_snapshot_restore/memory_reset/"
+                "memory_load_transcript act on this one."
+            )
+            # Kept last and verbatim: the control-plane tests pin this line.
             lines.append(f"Proxy: {one_line(doc)}")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Control plane (proxy routes; see docs/01 - Design/03 - System Controls.md)
+#
+# Everything below acts on *the proxy's* store, not on the condenser this
+# module opens in `_data_dir()`. The two locations are resolved independently
+# (here: $MEMORY_CONDENSE_DATA_DIR / $CLAUDE_PROJECT_DIR; the installed proxy:
+# `user_directory()/'data'`) and are different stores by default. The tool
+# descriptions have to say so, because a model has no other way to find out.
 # ---------------------------------------------------------------------------
 
 
@@ -412,13 +440,20 @@ def _control(route: str, payload: dict) -> str:
 
 
 @mcp.tool()
-def memory_save(name: str = "") -> str:
-    """Take a named snapshot of the memory store before anything risky.
+def memory_snapshot_save(name: str = "") -> str:
+    """Take a named snapshot of the proxy's memory store.
 
     Call this when the user asks to save, back up, or checkpoint memory, and
-    before you call `memory_load` or `memory_reset` on their behalf if they
-    want a restore point. The snapshot is atomic and leaves the live store
-    serving. Requires the memory proxy to be running.
+    before you call `memory_snapshot_restore` or `memory_reset` on their behalf
+    if they want a restore point for those.
+
+    It is not a restore point for `forget` or `supersede`. Those act on this
+    server's own store, which is a different store from the proxy's — the two
+    resolve their directories independently and `memory_stats` lists them
+    separately. Snapshotting here will not let you undo a local edit there.
+
+    The snapshot is atomic and leaves the live store serving. Requires the
+    memory proxy to be running.
 
     Args:
         name: Optional snapshot name. Leave empty for a timestamped name.
@@ -431,37 +466,49 @@ def memory_save(name: str = "") -> str:
 
 
 @mcp.tool()
-def memory_load(name: str) -> str:
-    """Swap the live memory store to a previously saved snapshot.
+def memory_snapshot_restore(name: str) -> str:
+    """DESTRUCTIVE: discard the proxy's entire memory store and replace it with a snapshot.
 
-    Use this when the user wants to go back to a saved state. During the swap
-    the proxy serves requests passthrough and queues captures, so nothing is
-    lost, but the current (unsaved) store is replaced — offer `memory_save`
-    first when the user has not saved recently. Snapshot names are listed by
-    `memory_stats`' proxy line and `memory-condense ctl status`.
+    Everything in the proxy's store that is not in the named snapshot is gone
+    afterwards. This is **not** how you load content into memory: to add
+    material use `remember` (one fact), `ingest` (text), or
+    `memory_load_transcript` (a whole past session) — none of those discard
+    anything.
+
+    Call this only when the user explicitly asks to roll back to a saved state,
+    and offer `memory_snapshot_save` first if they have not saved recently.
+    During the swap the proxy serves requests passthrough and queues captures,
+    so nothing in flight is lost. Snapshot names are listed by `memory_stats`'
+    proxy line and `memory-condense ctl status`.
 
     Args:
-        name: The snapshot name to load.
+        name: The snapshot name to restore.
 
     Returns:
-        The proxy's reply, or why the load was refused.
+        The proxy's reply, or why the restore was refused.
     """
     target = name.strip()
     if not target:
-        return "Nothing loaded: a snapshot name is required."
+        return "Nothing restored: a snapshot name is required."
     return _control("load", {"name": target})
 
 
 @mcp.tool()
 def memory_reset(confirm: bool = False) -> str:
-    """Erase the memory store and start empty (an automatic snapshot is taken first).
+    """Erase the proxy's memory store and start empty (an automatic snapshot is taken first).
+
+    The store this erases is the one the memory proxy serves. That is not
+    necessarily the store `recall`, `remember`, `forget` and `supersede` read
+    and write — those use this server's own store, resolved independently, and
+    `memory_stats` lists the two separately. So this does not clear what
+    `recall` returns here, and is not a fix for bad `recall` results.
 
     This is destructive. Before calling it, ask the user for explicit
     confirmation in your own words ("This will reset all project memory —
     continue?") and call with `confirm=True` only after they say yes. Never
     set `confirm=True` on your own initiative, and never call this just
     because the user sounded frustrated with memory results — suggest
-    `memory_save` plus `supersede`/`forget` for targeted fixes instead.
+    `memory_snapshot_save` plus `supersede`/`forget` for targeted fixes instead.
 
     Args:
         confirm: Must be True, and only after the user has confirmed.
@@ -479,13 +526,17 @@ def memory_reset(confirm: bool = False) -> str:
 
 @mcp.tool()
 def memory_load_transcript(session: str) -> str:
-    """Bulk-ingest an entire on-disk conversation transcript into memory.
+    """Bulk-ingest an entire on-disk conversation transcript into the proxy's store.
 
-    Use this when the user wants a whole past session loaded, not just the
-    turns flowing through the proxy now. The load runs as a background job
-    on the proxy; progress (percent, ETA, rate) appears in `memory_stats`'
-    proxy line and the status line, so call `memory_stats` afterwards rather
-    than waiting here.
+    This only adds; nothing already stored is discarded (unlike
+    `memory_snapshot_restore`). Use it when the user wants a whole past session
+    loaded, not just the turns flowing through the proxy now. The material lands
+    in the proxy's store, which `memory_stats` lists separately from this
+    server's own store — `recall` here will not necessarily see it.
+
+    The load runs as a background job on the proxy; progress (percent, ETA,
+    rate) appears in `memory_stats`' proxy line and the status line, so call
+    `memory_stats` afterwards rather than waiting here.
 
     Args:
         session: A session id or a path to the transcript file.

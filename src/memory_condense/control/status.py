@@ -36,9 +36,16 @@ def _iter_candidates(env: Mapping[str, str], cwd: Path) -> Iterator[Path]:
         yield Path(env["MEMORY_CONDENSE_STATUS"]).expanduser()
     if env.get("MEMORY_CONDENSE_DATA_DIR"):
         yield Path(env["MEMORY_CONDENSE_DATA_DIR"]).expanduser() / STATUS_RELPATH
-    if env.get("CLAUDE_PROJECT_DIR"):
-        yield Path(env["CLAUDE_PROJECT_DIR"]) / ".memory_condense" / STATUS_RELPATH
-    yield cwd / ".memory_condense" / STATUS_RELPATH
+    # runtime.project is stdlib-only and costs nothing extra here; it is the
+    # same resolver the proxy writes with, so the walk up to the project root
+    # cannot drift from where the store actually is. cwd/.memory_condense is
+    # kept as a candidate for a store that predates the project-root walk.
+    from memory_condense.runtime.project import DIRNAME, project_root
+
+    root = project_root(cwd, env)
+    if root is not None:
+        yield root / DIRNAME / STATUS_RELPATH
+    yield cwd / DIRNAME / STATUS_RELPATH
     yield user_data_dir() / STATUS_RELPATH
 
 

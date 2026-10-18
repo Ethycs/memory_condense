@@ -90,6 +90,12 @@ class StatusPublisher:
         self._pid = pid
         self.path: Path | None = status_path_for(data_dir) if data_dir is not None else None
 
+        # Two locks, with a fixed order: `_publish_lock` is always taken
+        # before `_lock`, never the reverse. `_lock` guards the small mutable
+        # counters the request path touches; `_publish_lock` serializes a
+        # whole publish (assembly *and* write) so documents cannot go
+        # backwards. See `publish` for why they are not the same lock.
+        self._publish_lock = threading.RLock()
         self._lock = threading.RLock()
         self._state_override: str | None = None
         self._error: str | None = None
@@ -115,21 +121,24 @@ class StatusPublisher:
             bulk.set_listener(self._on_bulk)
 
     # -- receipts ----------------------------------------------------------
-    def record_serving(
-        self,
-        static_tokens: int | None,
-        served_tokens: int | None,
-        rewritten: bool,
-    ) -> None:
-        """One inference request: what the client sent vs. what went upstream."""
+    def record_serving(self, receipt: Any) -> None:
+        """One inference request, described by a serving receipt.
+
+        ``receipt`` is an ``interfaces.proxy_receipts.ServingReceipt``, taken
+        duck-typed so the control plane keeps no dependency on the proxy: it
+        needs ``effective_static_tokens``, ``effective_served_tokens``,
+        ``saved_tokens`` and ``rewritten``. The receipt has decided every one
+        -- which estimator produced them, whether the upstream's exact
+        ``usage`` beats the estimate, and whether a passthrough counts as a
+        rewrite. Nothing is recomputed here; this only accumulates.
+        """
         with self._lock:
             serving = self._serving
             serving["requests"] += 1
-            serving["rewritten"] += int(bool(rewritten))
-            serving["static_tokens_last"] = static_tokens
-            serving["served_tokens_last"] = served_tokens
-            if static_tokens is not None and served_tokens is not None:
-                serving["saved_tokens_total"] += max(0, int(static_tokens) - int(served_tokens))
+            serving["rewritten"] += int(bool(receipt.rewritten))
+            serving["static_tokens_last"] = receipt.effective_static_tokens
+            serving["served_tokens_last"] = receipt.effective_served_tokens
+            serving["saved_tokens_total"] += int(receipt.saved_tokens)
             self._dirty = True
 
     def record_capture(self, tokens: int, conversation_id: str | None = None) -> None:
@@ -216,6 +225,11 @@ class StatusPublisher:
 
         totals = doc["totals"]
         totals["records_ingested"] = int(getattr(captures, "ingested", 0))
+        # One unit on both lanes: tokens of the text actually handed to the
+        # sink, by `bulk.ingested_tokens`. The bulk job's `tokens_done` is a
+        # *file* progress figure (every JSONL record, tool calls and meta
+        # included) and drives the rate window and the ETA; adding it here
+        # would inflate the headline against the same content arriving live.
         totals["tokens_ingested"] = live_tokens + (bulk["totals"]["tokens_ingested"] if bulk else 0)
         totals["sessions"] = live_sessions + (bulk["totals"]["sessions"] if bulk else 0)
 
@@ -262,11 +276,29 @@ class StatusPublisher:
         return doc
 
     def publish(self, reason: str = "change") -> dict[str, Any]:
-        """Assemble and write (when a path is configured). Never raises."""
-        doc = self.document()
-        with self._lock:
-            self._dirty = False
-            self.last_document = doc
+        """Assemble and write (when a path is configured). Never raises.
+
+        Assembly and the write happen together under ``_publish_lock``, so
+        publishes are totally ordered and an older document can never land on
+        top of a newer one -- which is what happened when ``document()`` was
+        built outside the lock the writer then took: a request handler and the
+        one-second ticker could interleave and leave the file stale until the
+        next tick.
+
+        That lock is deliberately not ``_lock``. ``document()`` stats files,
+        lists the snapshot directory, and calls ``memory.status()``; holding
+        the counter lock across all of that would make ``record_serving`` and
+        ``record_capture`` -- which run on the inference path -- queue behind
+        slow status work, and ``runtime/sessions.py`` is explicit that status
+        reporting must never do that. Nothing on the inference path publishes:
+        the ticker, the bulk worker, the control routes and a swap do, and
+        serializing those costs the proxy nothing.
+        """
+        with self._publish_lock:
+            doc = self.document()
+            with self._lock:
+                self._dirty = False
+                self.last_document = doc
             if self.path is not None:
                 try:
                     write_status(self.path, doc)

@@ -44,9 +44,33 @@ class TestDataDirResolution:
         monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path / "project"))
         assert mcp_server._data_dir() == tmp_path / "project" / ".memory_condense"
 
-    def test_falls_back_to_cwd(self, monkeypatch, tmp_path):
+    def test_walks_up_to_the_project_root(self, monkeypatch, tmp_path):
+        """A subdirectory shares the project's store instead of starting its own.
+
+        This used to trust `Path.cwd()`, so a server launched from `src/` kept
+        a different store than one launched from the repository root.
+        """
         monkeypatch.delenv("MEMORY_CONDENSE_DATA_DIR", raising=False)
         monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        (tmp_path / ".git").mkdir()
+        deep = tmp_path / "src" / "pkg" / "sub"
+        deep.mkdir(parents=True)
+        monkeypatch.chdir(deep)
+        assert mcp_server._data_dir() == tmp_path / ".memory_condense"
+
+    def test_no_project_falls_back_to_the_session_home(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("MEMORY_CONDENSE_DATA_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)  # a bare directory: no .git, no pyproject.toml
+        from memory_condense.runtime.config import user_directory
+
+        assert mcp_server._data_dir() == user_directory() / "data"
+
+    def test_an_existing_local_store_is_adopted_not_orphaned(self, monkeypatch, tmp_path):
+        """The old `<cwd>/.memory_condense` default may hold real memories."""
+        monkeypatch.delenv("MEMORY_CONDENSE_DATA_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        (tmp_path / ".memory_condense").mkdir()
         monkeypatch.chdir(tmp_path)
         assert mcp_server._data_dir() == tmp_path / ".memory_condense"
 
@@ -140,6 +164,13 @@ class TestStatsPinForget:
         out = server.memory_stats()
         assert "Active memories: 1" in out
         assert "Heat:" in out
+
+    def test_stats_labels_whose_store_it_is(self, server):
+        """The proxy keeps a different store; the label must not let that blur."""
+        lines = server.memory_stats().splitlines()
+        assert lines[0].startswith("Store: ")
+        assert "this MCP server's own store" in lines[1]
+        assert "recall" in lines[1] and "forget" in lines[1]
 
     def test_pin_by_short_id(self, server):
         server.remember("We decided to use SQLite for storage.")
@@ -321,11 +352,30 @@ class TestToolRegistration:
             "pin_memory",
             "supersede",
             "forget",
-            "memory_save",
-            "memory_load",
+            "memory_snapshot_save",
+            "memory_snapshot_restore",
             "memory_reset",
             "memory_load_transcript",
         }
+
+    def test_the_old_ambiguous_names_are_gone(self):
+        """`memory_load` read as "load content in" reached a destructive tool."""
+        assert {"memory_save", "memory_load"}.isdisjoint({t.name for t in self._tools()})
+
+    def test_the_destructive_tool_says_so_in_its_first_line(self):
+        by_name = {t.name: (t.description or "") for t in self._tools()}
+        first = by_name["memory_snapshot_restore"].splitlines()[0]
+        assert "DESTRUCTIVE" in first
+        assert "discard" in first
+
+    def test_control_tools_name_the_store_they_act_on(self):
+        """The control tools act on the proxy's store, not this server's."""
+        by_name = {t.name: (t.description or "") for t in self._tools()}
+        for name in ("memory_snapshot_save", "memory_snapshot_restore",
+                     "memory_reset", "memory_load_transcript"):
+            assert "proxy" in by_name[name], name
+        for name in ("memory_reset", "memory_snapshot_save"):
+            assert "separate" in by_name[name] or "different store" in by_name[name], name
 
     def test_every_tool_has_a_description(self):
         for tool in self._tools():

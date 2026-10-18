@@ -10,6 +10,14 @@ Progress and ETA come from a **recent window** (``window_s`` seconds, a ring
 buffer of ``(t, tokens, records)`` samples), never a lifetime mean: ingest
 speed varies with record size, and a lifetime mean lies for the first minute
 and the last.
+
+Two token figures, deliberately distinct. ``bytes_done``/``bytes_total``,
+``tokens_done`` and the rate window all track the **file**: every JSONL
+record, tool calls and meta included, which is what a percentage and an ETA
+have to be measured against. ``tokens_ingested`` tracks what the emitted
+captures actually carry (:func:`ingested_tokens`), which is the one unit the
+status document's ``totals.tokens_ingested`` reports for both bulk jobs and
+live traffic.
 """
 
 from __future__ import annotations
@@ -49,10 +57,29 @@ _CODEX_RECORD_TYPES = frozenset({"session_meta", "response_item", "turn_context"
 
 
 def estimate_tokens(raw: bytes | str) -> int:
-    """``len(bytes) // 4`` — the same cheap proxy the capture path uses."""
+    """``len(bytes) // 4`` — the same cheap proxy the capture path uses.
+
+    Applied to a raw JSONL record this measures *file* progress, not ingest:
+    a transcript line may be a tool call, a thinking block or a meta record
+    that carries nothing ingestable. Use :func:`ingested_tokens` for the
+    token total the status document publishes.
+    """
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
     return len(raw) // 4
+
+
+def ingested_tokens(capture: ExchangeCapture) -> int:
+    """Tokens of the text one capture actually hands to the sink.
+
+    The single definition of ``totals.tokens_ingested`` for both lanes: the
+    live proxy path and bulk jobs call this on the same
+    :class:`ExchangeCapture` objects, so a transcript loaded in bulk and the
+    same conversation arriving live contribute the same number. Counting the
+    raw file instead would include tool calls, thinking blocks and meta
+    records that are never ingested.
+    """
+    return sum(len(record[1]) for record in capture.ingest_records()) // 4
 
 
 # -- record parsing ----------------------------------------------------------
@@ -143,7 +170,14 @@ class BulkJob:
     records_total: int = 0
     records_done: int = 0
     bytes_done: int = 0
+    #: File progress, in ``estimate_tokens`` over every raw JSONL record.
+    #: Paired with ``bytes_done``/``bytes_total`` and what the rate window and
+    #: the ETA are computed from. Not the ingest total.
     tokens_done: int = 0
+    #: What the emitted captures actually carry, by ``ingested_tokens`` -- the
+    #: same unit the live proxy path reports. This is what reaches
+    #: ``totals.tokens_ingested`` in the status document.
+    tokens_ingested: int = 0
     captures_emitted: int = 0
     #: Jobs ahead of this one (a running job counts) plus one, at submit time.
     position_at_submit: int = 1
@@ -182,6 +216,7 @@ class BulkJob:
             "bytes_done": self.bytes_done,
             "bytes_total": self.bytes_total,
             "tokens_done": self.tokens_done,
+            "tokens_ingested": self.tokens_ingested,
             "captures_emitted": self.captures_emitted,
             "started_at": self.started_at,
             "eta_s": eta_s,
@@ -353,20 +388,29 @@ class BulkLoader:
         return job
 
     def cancel(self, job_id: str) -> bool:
-        with self._lock:
-            for job in self._queued:
-                if job.id == job_id:
-                    job.state = "cancelled"
-                    job.finished_at = now_iso()
-                    self._queued.remove(job)
-                    self._history.append(job)
-                    self._notify("state")
+        # The listener is notified after this lock is released, never under
+        # it: the publisher's listener publishes, and publishing reads back
+        # through `snapshot()`. Calling out while holding the job lock would
+        # invert the lock order against a concurrent publish.
+        notify = False
+        try:
+            with self._lock:
+                for job in self._queued:
+                    if job.id == job_id:
+                        job.state = "cancelled"
+                        job.finished_at = now_iso()
+                        self._queued.remove(job)
+                        self._history.append(job)
+                        notify = True
+                        return True
+                current = self._current
+                if current is not None and current.id == job_id:
+                    self._cancel.set()
                     return True
-            current = self._current
-            if current is not None and current.id == job_id:
-                self._cancel.set()
-                return True
-        return False
+            return False
+        finally:
+            if notify:
+                self._notify("state")
 
     def start(self) -> None:
         with self._lock:
@@ -438,9 +482,12 @@ class BulkLoader:
             now = time.monotonic()
             rates = self._window.rates(now)
             if current is not None and current.active:
+                # The ETA is file progress against a file-progress rate: both
+                # sides are bytes//4, which is why the window is fed
+                # `estimate_tokens(record.raw)` and not the ingest total.
                 remaining = max(0, current.bytes_total - current.bytes_done) // 4
                 current_doc = current.current_doc(self._window.eta_s(remaining, now))
-                running_tokens = current.tokens_done
+                running_tokens = current.tokens_ingested
                 running_records = current.records_done
             else:
                 current_doc = None
@@ -451,6 +498,8 @@ class BulkLoader:
                 "rates": rates,
                 "jobs": [job.queue_doc(i + 1) for i, job in enumerate(queued)],
                 "totals": {
+                    # Ingested text, in the live path's unit; see
+                    # `ingested_tokens`.
                     "tokens_ingested": self._tokens_finished + running_tokens,
                     "records_ingested": self._records_finished + running_records,
                     "sessions": self._sessions_finished,
@@ -491,7 +540,7 @@ class BulkLoader:
             finally:
                 job.finished_at = now_iso()
                 with self._lock:
-                    self._tokens_finished += job.tokens_done
+                    self._tokens_finished += job.tokens_ingested
                     self._records_finished += job.records_done
                     if job.state == "done":
                         self._sessions_finished += 1
@@ -561,6 +610,9 @@ class BulkLoader:
                 pending_user, pending_user_offset, pending_assistant = [], None, []
                 self._offer(capture)
                 job.captures_emitted += 1
+                # Counted on admission, from the capture itself: the same
+                # number the live proxy path records for the same exchange.
+                job.tokens_ingested += ingested_tokens(capture)
 
             for record in self._bounded_records(mapped, total):
                 self._check_cancel()
@@ -641,6 +693,7 @@ __all__ = [
     "RateWindow",
     "estimate_tokens",
     "exchange_text",
+    "ingested_tokens",
     "resolve_transcript",
     "sniff_kind",
 ]

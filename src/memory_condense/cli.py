@@ -4,22 +4,53 @@ import sys
 
 # Client presets for `proxy --print-env`: which upstream each client expects
 # the proxy to forward to. Carried over from the retired context_proxy CLI.
+# `codex-api` is written without the `/v1` segment so it compares equal to the
+# proxy's own OpenAI default (the request path already carries `/v1`).
 PRESETS = {
     'claude': 'https://api.anthropic.com',
     'codex-chatgpt': 'https://chatgpt.com/backend-api/codex',
-    'codex-api': 'https://api.openai.com/v1',
+    'codex-api': 'https://api.openai.com',
 }
 DEFAULT_PORTS = {'claude': 8787, 'codex-chatgpt': 8788, 'codex-api': 8788}
-# The running proxy's built-in upstreams (interfaces.proxy_server.DEFAULT_UPSTREAMS);
-# any other preset upstream has to be passed on the command line.
-_BUILTIN_UPSTREAMS = {'claude': 'https://api.anthropic.com', 'codex-api': 'https://api.openai.com'}
+# Which of the proxy's two upstream slots a preset's URL would occupy. The URLs
+# themselves are read from the proxy rather than restated here, so `--print-env`
+# cannot drift away from DEFAULT_UPSTREAMS.
+_PRESET_PROVIDERS = {'claude': 'anthropic', 'codex-chatgpt': 'openai', 'codex-api': 'openai'}
+
+
+def _proxy_default_upstream(preset):
+    """The upstream the running proxy already defaults to for ``preset``.
+
+    Imported inside the function on purpose: ``proxy_server`` drags in starlette
+    and httpx, and this module stays import-light so `--help`, `route` and `ctl`
+    start fast. `--print-env` is a terminal-only path where the cost is invisible.
+    """
+    from memory_condense.interfaces.proxy_server import DEFAULT_UPSTREAMS
+
+    return DEFAULT_UPSTREAMS[_PRESET_PROVIDERS[preset]]
+
+
+def _same_upstream(a, b):
+    """Whether two base URLs make the proxy forward to the same place.
+
+    ``proxy_server.upstream_url`` drops a leading ``/v1`` from the request path
+    when the base already ends in ``/v1``, so the two spellings are equivalent
+    there and must be equivalent here too — otherwise `--print-env` emits a
+    redundant (or, if the defaults move, a wrong) ``--openai-base-url``.
+    """
+    def normalise(url):
+        trimmed = url.rstrip('/')
+        return trimmed[:-3].rstrip('/') if trimmed.endswith('/v1') else trimmed
+
+    return normalise(a) == normalise(b)
 
 
 def proxy_command(preset, port):
     """The `memory-condense proxy` invocation that serves ``preset`` on ``port``."""
     command = f'memory-condense proxy --port {port}'
-    if preset not in _BUILTIN_UPSTREAMS:
-        command += f' --openai-base-url {PRESETS[preset]}'
+    if not _same_upstream(PRESETS[preset], _proxy_default_upstream(preset)):
+        # The proxy's override flags are named after the provider slot.
+        command += f' --{_PRESET_PROVIDERS[preset]}-base-url {PRESETS[preset]}'
     return command
 
 

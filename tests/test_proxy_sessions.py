@@ -76,6 +76,12 @@ def test_first_user_text_of_transcript_handles_both_clients(tmp_path):
 
 
 def _ref(path, session_id, liveness, mtime):
+    """A SessionRef stand-in whose on-disk mtime matches what the scan saw.
+
+    ``locate`` re-stats a candidate rather than trusting the scan's frozen
+    mtime, so the file has to carry the age the ref claims.
+    """
+    os.utime(path, (mtime, mtime))
     return SimpleNamespace(key=str(path).lower(), path=str(path), session_id=session_id, liveness=liveness, mtime=mtime)
 
 
@@ -122,3 +128,99 @@ def test_locator_never_blocks_or_raises_when_scan_fails(monkeypatch):
     assert loc.locate("anything") is None
     cid, src = ps.resolve_conversation_id({}, _anthropic("anything"), locator=loc)
     assert src == ps.SOURCE_DIGEST
+
+
+def test_locator_evicts_sessions_that_have_exited(tmp_path, monkeypatch):
+    """A finished transcript stops being a candidate.
+
+    Otherwise a new conversation opening with the same line as a finished one
+    is captured under the dead session's id, merging the two.
+    """
+    old, new = tmp_path / "old.jsonl", tmp_path / "new.jsonl"
+    for p in (old, new):
+        _write_transcript(p, "same opening line")
+    now = time.time()
+    live = [_ref(old, "OLD", "handle", now)]
+    monkeypatch.setattr("memory_condense.live_sessions.live_sessions", lambda **kw: live)
+    loc = ps.TranscriptLocator()
+    loc.refresh(wait=True)
+    assert loc.locate("same opening line").session_id == "OLD"
+    live[:] = [_ref(new, "NEW", "handle", now)]  # the old session exited
+    loc._built_at = 0.0  # ttl elapsed -> the proxy's background scan runs again
+    loc.refresh(wait=True)
+    assert loc.locate("same opening line").session_id == "NEW"
+    live[:] = []  # nothing live at all -> no attribution, caller uses the digest
+    loc._built_at = 0.0
+    loc.refresh(wait=True)
+    assert loc.locate("same opening line") is None
+
+
+def test_stale_handle_liveness_does_not_outrank_a_live_session(tmp_path, monkeypatch):
+    """Past max_age the scan's liveness tier is no longer evidence."""
+    dead, alive = tmp_path / "dead.jsonl", tmp_path / "alive.jsonl"
+    for p in (dead, alive):
+        _write_transcript(p, "shared opening")
+    now = time.time()
+    # At scan time both were live and the one that has since exited held a handle,
+    # which would beat the other's recency-only tier forever if it were cached.
+    refs = [_ref(dead, "DEAD", "handle", now), _ref(alive, "ALIVE", "recent", now)]
+    monkeypatch.setattr("memory_condense.live_sessions.live_sessions", lambda **kw: refs)
+    loc = ps.TranscriptLocator(max_age=0.0)  # the index is immediately past max_age
+    loc.refresh(wait=True)
+    os.utime(dead, (now - 600, now - 600))  # dead went cold; alive keeps being appended
+    assert loc.locate("shared opening").session_id == "ALIVE"
+    os.utime(alive, (now - 600, now - 600))  # both cold -> nothing is attributable
+    assert loc.locate("shared opening") is None
+
+
+def test_live_session_keeps_one_conversation_id_across_turns(tmp_path, monkeypatch):
+    """Expiry must not make a still-live session flap between id and digest."""
+    t = tmp_path / "live.jsonl"
+    _write_transcript(t, "keep me together")
+    sid = "77777777-aaaa-bbbb-cccc-888888888888"
+    refs = [_ref(t, sid, "handle", time.time())]
+    monkeypatch.setattr("memory_condense.live_sessions.live_sessions", lambda **kw: refs)
+    loc = ps.TranscriptLocator()
+    loc.refresh(wait=True)
+    ids = set()
+    for _turn in range(4):
+        with open(t, "ab") as fh:  # the client appends this turn to its transcript
+            fh.write(b'{"type": "user", "message": {"role": "user", "content": "more"}}\n')
+        refs[:] = [_ref(t, sid, "handle", time.time())]
+        loc._built_at = 0.0
+        loc.refresh(wait=True)  # the rescan a long-lived proxy does between turns
+        cid, src = ps.resolve_conversation_id({}, _anthropic("keep me together"), locator=loc)
+        assert src == ps.SOURCE_TRANSCRIPT
+        ids.add(cid)
+    ids.add(ps.resolve_conversation_id({}, _anthropic("keep me together"), locator=loc)[0])
+    ids.add(ps.resolve_conversation_id({}, _anthropic("keep me together"), locator=loc)[0])
+    assert ids == {f"transcript:{sid}"}
+
+
+def test_rescan_prunes_its_caches_and_reads_each_transcript_once(tmp_path, monkeypatch):
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    _write_transcript(a, "alpha")
+    _write_transcript(b, "beta")
+    reads: list[str] = []
+    real = ps.first_user_text_of_transcript
+    monkeypatch.setattr(ps, "first_user_text_of_transcript",
+                        lambda path, **kw: (reads.append(path), real(path, **kw))[1])
+    live = [_ref(a, "A", "handle", time.time())]
+    monkeypatch.setattr("memory_condense.live_sessions.live_sessions", lambda **kw: live)
+    loc = ps.TranscriptLocator()
+    loc.refresh(wait=True)
+    live[:] = [_ref(b, "B", "handle", time.time())]
+    loc._built_at = 0.0
+    loc.refresh(wait=True)
+    assert loc.locate("alpha") is None and loc.locate("beta").session_id == "B"
+    assert set(loc._seen) == {str(b).lower()}  # bounded by the live set, not by history
+    assert reads == [str(a), str(b)]  # the first-message read is cached across scans
+
+
+def test_client_native_id_folds_a_bare_uuid_header_to_one_id():
+    uid = "user_ab12_session_8F7F7561-E2AF-4BAB-8F13-8FAB1E2D71BB"
+    from_header = ps.client_native_id({"session_id": "8F7F7561-E2AF-4BAB-8F13-8FAB1E2D71BB"}, None)
+    from_metadata = ps.client_native_id({}, {"metadata": {"user_id": uid}})
+    assert from_header == from_metadata == "session:8f7f7561-e2af-4bab-8f13-8fab1e2d71bb"
+    # an opaque id may be case-sensitive, so it crosses verbatim
+    assert ps.client_native_id({"session_id": "AbC-123"}, None) == "session:AbC-123"

@@ -26,7 +26,9 @@ def recall_summary_alias(row, originals):
     try:
         if text.startswith('[Question asked at '):
             # Only skip the exact clock bound to this recall's durable input.
-            # Arbitrary preambles still require ordinary compilation.
+            # Arbitrary preambles still require ordinary compilation. An empty
+            # retrieval carries neither header nor references, so it is already
+            # rejected above and never reaches this clock check.
             if not isinstance(receipt.get('query'), str) or receipt.get('asked_at') is None:
                 return None
             dated = dated_recall_question(receipt['query'], receipt['asked_at'])

@@ -120,8 +120,12 @@ def native_packet(app, query, dated_question, events, **limits):
         packet['retrieval']['continuity'] = manifest
     # The reader and router must see the same question clock. Mention dates
     # describe the source turn, not necessarily the date of the event it names.
+    # Validate the header shape whatever the retrieval outcome, but never let it
+    # become the whole body: an empty retrieval must stay empty so the caller
+    # still reports that the store held nothing instead of a bare date.
     header = _ASKED.match(dated_question).group(0).strip()
-    packet['text'] = header + '\n\n' + packet['text']
+    if packet['text']:
+        packet['text'] = header + '\n\n' + packet['text']
     packet.setdefault('retrieval', dict(mode='cap8'))['dated_question'] = dated_question
     from memory_condense.domain._tokenizer import count_tokens
     packet['retrieval']['packet_token_count'] = count_tokens(packet['text'])

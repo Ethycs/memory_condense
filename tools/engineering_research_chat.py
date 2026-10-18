@@ -58,11 +58,15 @@ class ProcessNativeBackend:
             raise ValueError('Native chat index has not reached the captured turn prefix')
 
     def recall(self, query, *, asked_at=None):
-        from tools.run_engineering_research_battery import memory_phase
-        from memory_condense.domain.question_time import question_timestamp
+        from tools.run_engineering_research_battery import memory_phase, replay_anchor
         if self.installed_folder is None:
             raise ValueError('Chat recall requires an indexed turn prefix')
-        asked_at = question_timestamp(asked_at).isoformat()
+        # Resolve the request clock once, before it addresses anything: now()
+        # carries microseconds, which would make this folder unique on every
+        # call and defeat the already-computed short circuit. The resolved
+        # value is always part of the identity, so one effective clock is one
+        # cache entry however the caller spelled it.
+        asked_at = replay_anchor(self.actor, asked_at)
         folder = self.arm_root / ('chat-recall-' + identity_sha256(dict(rows=self.rows, query=query, asked_at=asked_at)))
         result = memory_phase(self.run, folder, self.actor, self.rows, self.actor['case_id']+'/memory/'+folder.name,
             ingest=self.installed_folder/'ingest.json', query=query, chat=True, asked_at=asked_at)

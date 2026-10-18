@@ -15,6 +15,7 @@ import time
 
 from memory_condense.domain._discourse_identity import identity_sha256
 from memory_condense.domain._tokenizer import count_chat_prompt_token_proxy, count_tokens
+from memory_condense.domain.question_time import question_timestamp
 from tools import engineering_research_battery as battery
 from tools.engineering_research_gateway import Gateway, save, read, emit
 from tools.engineering_research_execution import execute_tests
@@ -151,6 +152,22 @@ def source_query(actor):
     return actor['original_request'].strip() + '\n' + actor['task']
 
 
+def replay_anchor(actor, asked_at=None):
+    """Resolve one deterministic request clock for a replayed chat recall query.
+
+    compiler.reopen's chat branch dates an undated request from the wall clock
+    by design (a live asker's "now"). A battery query replays a frozen export,
+    so an undated call is anchored to that export instead and every re-run asks
+    the identical dated question. Resolving and normalizing here gives the
+    request, the content-addressed folder and the dated question one single
+    value, and rejects an unusable anchor before the worker starts. An actor
+    without an export timestamp (diagnostic fixtures) keeps the wall clock.
+    """
+    if asked_at is None:
+        asked_at = actor.get('source', {}).get('export_timestamp')
+    return None if asked_at is None else question_timestamp(asked_at).isoformat()
+
+
 def memory_phase(run, folder, actor, rows, scope, *, query=None, ingest=None, chat=False, learning=None, asked_at=None):
     folder.mkdir(parents=True, exist_ok=True)
     output = folder / ('ingest.json' if ingest is None else 'reopened.json')
@@ -159,6 +176,13 @@ def memory_phase(run, folder, actor, rows, scope, *, query=None, ingest=None, ch
         output=str(output), scope=scope, query=query, ingest_receipt=str(ingest) if ingest else None)
     if chat:
         request['chat'] = True
+        # Only compiler.reopen's chat query branch reads asked_at, and it dates
+        # an undated request from the wall clock by design. Resolve the replay
+        # anchor for that branch alone: the non-chat branch builds its own
+        # storage_timestamp end-of-day anchor and would ignore the field, so a
+        # non-chat request receipt does not carry one.
+        if query is not None:
+            asked_at = replay_anchor(actor, asked_at)
         if asked_at is not None:
             request['asked_at'] = asked_at
         if actor.get('native_seed'):
@@ -183,6 +207,9 @@ def sync_and_reopen(run, arm_root, actor, rows, label, query=None):
     folder = arm_root / label
     scope = f"{actor['case_id']}/memory/{label}"
     installed = memory_phase(run, folder, actor, rows, scope)
+    # No asked_at: this is compiler.reopen's non-chat query branch, which dates
+    # the query from the request's storage_timestamp at end of day. It never
+    # reads the wall clock, so the dated question is the same on any run date.
     reopened = memory_phase(run, folder, actor, rows, scope, query=query, ingest=folder/'ingest.json')
     return reopened
 

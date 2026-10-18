@@ -18,6 +18,13 @@ prompt to swap bulk history for a retrieved packet is the point of the
 project, but it is a separate, opt-in mode: a proxy that silently edits
 prompts would be blamed for every quality regression downstream.
 
+**One receipt per served request.**  Neither mode computes serving numbers
+inline.  Both build an ``interfaces.proxy_receipts`` receipt once the request
+has actually been served, from one estimator over the client's body and the
+body that went upstream, preferring the upstream's own ``usage`` count where
+the response carries it.  That is the only thing the status document's
+``serving`` block is assembled from.
+
 Credentials are forwarded and never stored: the client's own auth headers are
 copied to the upstream request and excluded from every receipt.
 """
@@ -33,6 +40,7 @@ import ssl
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import AsyncIterator, Sequence
 
 import httpx
@@ -43,9 +51,14 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 from starlette.concurrency import run_in_threadpool
 
-from memory_condense.control.bulk import BulkLoader
+from memory_condense.control.bulk import BulkLoader, ingested_tokens
 from memory_condense.control.publisher import StatusPublisher
-from memory_condense.control.snapshots import CondenserHandle, SnapshotStore
+from memory_condense.control.snapshots import (
+    SESSIONS_DIRNAME,
+    CondenserHandle,
+    SessionSnapshotStore,
+    SnapshotStore,
+)
 from memory_condense.interfaces.proxy_sessions import (
     SOURCE_HEADER,
     TranscriptLocator,
@@ -64,6 +77,7 @@ from memory_condense.interfaces.proxy_capture import (
     request_model,
     response_text,
 )
+from memory_condense.interfaces import proxy_receipts
 from memory_condense.interfaces.proxy_scheduler import (
     CaptureQueue,
     CaptureQueueClosedError,
@@ -294,6 +308,28 @@ def memory_health(snapshot) -> tuple[str, list[str]]:
     return 'ok', []
 
 
+def default_data_dir() -> str:
+    """Where a proxy run with no ``--data-dir`` publishes and keeps its store.
+
+    Delegates to :func:`memory_condense.runtime.project.project_data_dir`, the
+    one resolver the MCP server and ``control/status.py`` also use, so the
+    writer and every reader land in the same place: an explicit
+    ``$MEMORY_CONDENSE_DATA_DIR``, else ``<project root>/.memory_condense``,
+    else the session's home. The old default was the relative ``"data"``,
+    which is in nobody's search path.
+
+    ``MEMORY_DATA_DIR`` is still honoured, after the canonical name, so an
+    existing launcher keeps working -- but it is only visible to a reader that
+    also sets ``MEMORY_CONDENSE_STATUS`` or the canonical variable.
+    """
+    legacy = os.environ.get("MEMORY_DATA_DIR")
+    if legacy and legacy.strip() and not (os.environ.get("MEMORY_CONDENSE_DATA_DIR") or "").strip():
+        return str(Path(legacy).expanduser())
+    from memory_condense.runtime.project import project_data_dir
+
+    return str(project_data_dir())
+
+
 def build_app(
     *,
     config: ProxyConfig | None = None,
@@ -315,11 +351,15 @@ def build_app(
     ``client`` is injectable so tests can serve a transport without a socket.
 
     ``data_dir`` enables the control plane's on-disk status document and
-    snapshot directory; ``store`` (a :class:`CondenserHandle` whose sink and
-    completion callback are the ones passed above) enables ``load``/``reset``
-    by letting the proxy close, swap, and reopen the condenser under the same
-    lock the sink uses. Without either, the control routes still answer but
-    the mutating ones return 501.
+    snapshot directory. ``save``/``load``/``reset`` then work in either mode:
+    in observe mode through ``store`` (a :class:`CondenserHandle` whose sink
+    and completion callback are the ones passed above), which closes, swaps,
+    and reopens the condenser under the same lock the sink uses; in augment
+    mode through ``memory.swap``, which closes every session store, mutates
+    the ``sessions/`` tree, and lets the next request re-admit. Without a
+    ``data_dir`` -- or, in observe mode, without ``store`` -- the control
+    routes still answer but the mutating ones return 501. ``load-transcript``
+    is observe-mode only in any case: it feeds the capture queue.
     """
 
     settings = config or ProxyConfig()
@@ -353,18 +393,30 @@ def build_app(
     )
     # Control plane: one publisher owns status.json; bulk jobs ride the same
     # capture queue as live traffic; snapshots live beside the store.
-    # Augment mode keeps per-session stores under sessions/<ns>, not one
-    # SQLite file, so it has no snapshot store (save/load/reset answer 501).
-    snapshots = (
-        SnapshotStore(data_dir, db_path=store.db_path if store is not None else None)
-        if data_dir is not None and memory is None
-        else None
-    )
+    # Each mode gets the snapshot store that matches what its store *is*:
+    # one SQLite file in observe mode, a tree of per-conversation stores
+    # under sessions/<ns> in augment mode. Both duck-type the same surface,
+    # so the control routes and the status publisher do not branch on mode.
+    if data_dir is None:
+        snapshots = None
+    elif memory is not None:
+        snapshots = SessionSnapshotStore(
+            data_dir,
+            sessions_dir=Path(getattr(memory, 'directory', data_dir)) / SESSIONS_DIRNAME,
+        )
+    else:
+        snapshots = SnapshotStore(data_dir, db_path=store.db_path if store is not None else None)
+    # Bulk loading rides the observe-mode capture queue, which augment mode
+    # does not use at all; there is nothing to generalize here.
     bulk = (
         BulkLoader(captures, capacity=settings.capture_queue_size)
         if memory is None
         else None
     )
+    # The thing a swap quiesces: the condenser handle in observe mode, the
+    # session registry in augment mode. Both expose `swap(mutate)`,
+    # `generation`, and a `closed` that is False while they are serving.
+    swappable = store if store is not None else memory
     publisher = StatusPublisher(
         mode=settings.mode,
         captures=captures,
@@ -397,6 +449,21 @@ def build_app(
             path = path[3:]
         return f"{base}{path}{'?' + query if query else ''}"
 
+    def record_receipt(receipt) -> None:
+        """Publish one serving receipt; never let bookkeeping break a reply.
+
+        Every serving number in the status document comes through here, in
+        both modes, so ``static_tokens`` and ``served_tokens`` are produced by
+        one estimator and are always comparable. Call this *after* the request
+        has been served: a receipt describes what happened, so a request that
+        failed before reaching the upstream must not increment ``requests``
+        or ``rewritten``.
+        """
+        try:
+            proxy_receipts.publish(receipt, publisher)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("serving receipt failed")
+
     async def handle(request: Request) -> Response:
         path = "/" + request.path_params.get("path", "").lstrip("/")
         body = await request.body()
@@ -422,7 +489,16 @@ def build_app(
                 # header; hand the memory service the resolved id the same way
                 # an explicit header would. send_memory strips it upstream.
                 headers = {**headers, 'x-memory-conversation-id': conversation_id}
+            # What the memory service actually put on the wire for the
+            # visible answer, and the upstream's own count of it. The service
+            # never returns the served request, but it hands every byte of it
+            # to this very callback, so there is nothing to guess at. Summary
+            # generations are separate calls, not what the client asked for,
+            # and are excluded; a retry overwrites with the same `sent`.
+            served_body: bytes | None = None
+            served_usage: int | None = None
             async def send_memory(payload, summary=False):
+                nonlocal served_body, served_usage
                 forwarded = {k:v for k,v in headers.items()
                              if not k.lower().startswith('x-memory-') and k.lower() != 'x-conversation-id'}
                 if summary:
@@ -434,6 +510,14 @@ def build_app(
                     headers=forwarded,content=payload),stream=True)
                 try:
                     value = await reply.aread()
+                    if not summary:
+                        sent = payload.encode('utf-8') if isinstance(payload, str) else payload
+                        if isinstance(sent, (bytes, bytearray)):
+                            served_body = bytes(sent)
+                        # The body is already fully buffered here, streaming
+                        # or not, so the exact prompt count is read off it
+                        # without keeping a second copy of the stream.
+                        served_usage = proxy_receipts.usage_from_response(fmt, value)
                     return WireResponse(reply.status_code,dict(_response_headers(reply.headers)),value)
                 finally:
                     await reply.aclose()
@@ -442,9 +526,6 @@ def build_app(
                 # Compiler workers are ordinary threads and may outlive this
                 # request. The shared HTTP client stays open through final drain.
                 return asyncio.run_coroutine_threadsafe(send_memory(value,summary),loop).result()
-            # The served size is known only inside the memory service; the
-            # receipt records the client's static prompt and that it was rewritten.
-            publisher.record_serving(len(body)//4, None, True)
             try:
                 reply = await run_in_threadpool(memory.exchange,body,provider,headers,
                     send_from_worker, lambda value:send_from_worker(value,True),fmt)
@@ -453,6 +534,15 @@ def build_app(
             except Exception:
                 logger.exception('memory request failed before provider completion')
                 return JSONResponse({'error':{'type':'memory_error','message':'Memory request failed; inspect local service logs'}},status_code=503)
+            # The request was served, so there is something to describe. A
+            # served body identical to the client's is the pre-send guard's
+            # sanctioned passthrough, and `receipt_for_augment` scores that as
+            # not rewritten. A served body of None means nothing went upstream
+            # at all -- an idempotent replay of an already-complete request --
+            # so the served side stays unknown rather than being invented.
+            record_receipt(proxy_receipts.receipt_for_augment(
+                fmt, body, served_body, usage=served_usage
+            ))
             if reply.headers.get('content-type','').startswith('text/event-stream'):
                 # Inline summaries are validated before any visible bytes leave
                 # the proxy. Native tool streams retain their original framing.
@@ -507,8 +597,6 @@ def build_app(
             prompt = full_prompt
         model = request_model(body)
         streaming = is_streaming_request(body)
-        # Observe mode forwards verbatim: served equals static, nothing rewritten.
-        publisher.record_serving(prompt_tokens_estimate, prompt_tokens_estimate, False)
 
         async def publish(reply_text: str, streamed: bool) -> None:
             if not prompt and not reply_text:
@@ -526,14 +614,19 @@ def build_app(
             if settings.capture_compact_prompts:
                 capture = capture.compact_for_ingest()
             await captures.offer_async(capture)
-            publisher.record_capture(
-                sum(len(record[1]) for record in capture.ingest_records()) // 4,
-                conversation_id,
-            )
+            # Tokens of the text handed to the sink -- the same function bulk
+            # jobs count with, so `totals.tokens_ingested` means one thing.
+            publisher.record_capture(ingested_tokens(capture), conversation_id)
 
         if not streaming:
             payload = await response.aread()
             await response.aclose()
+            # Observe mode forwards verbatim, so served equals static and
+            # nothing is rewritten; the upstream's own prompt count is right
+            # here in the body it just returned, and beats the estimate.
+            record_receipt(proxy_receipts.receipt_for_observe(
+                fmt, body, usage=proxy_receipts.usage_from_response(fmt, payload)
+            ))
             try:
                 await publish(response_text(provider, payload, fmt), False)
             except CaptureQueueRejectedError as exc:
@@ -547,17 +640,31 @@ def build_app(
             )
 
         accumulator = StreamAccumulator(provider=provider, fmt=fmt or "")
+        # Same chunks, same single pass: the usage accumulator shares the
+        # stream the capture accumulator already sees, so reading the
+        # upstream's exact prompt count costs no second copy of the body.
+        usage = proxy_receipts.UsageAccumulator(fmt=fmt or "")
 
         async def tee() -> AsyncIterator[bytes]:
             try:
                 async for chunk in response.aiter_bytes():
                     try:
                         accumulator.feed(chunk)
+                        usage.feed(chunk)
                     except Exception:  # never interrupt the client's stream
                         logger.exception("stream capture failed")
                     yield chunk
             finally:
                 await response.aclose()
+                try:
+                    usage.close()
+                except Exception:
+                    logger.exception("stream usage finalization failed")
+                # After the stream, not before it: the receipt describes a
+                # request that was actually served.
+                record_receipt(proxy_receipts.receipt_for_observe(
+                    fmt, body, usage=usage.input_tokens
+                ))
                 try:
                     accumulator.close()
                     await publish(accumulator.text, True)
@@ -783,6 +890,12 @@ def build_app(
             if store is not None:
                 with store.lock:  # a quiescent point: no capture batch in flight
                     return snapshots.save(name)
+            if memory is not None:
+                # Same idea one level up: VACUUM INTO is already consistent
+                # per database, and quiescing makes the whole tree one point
+                # in time. Sessions stay open, so this costs no model reload.
+                with memory.quiesce():
+                    return snapshots.save(name)
             return snapshots.save(name)
 
         try:
@@ -793,27 +906,53 @@ def build_app(
             return JSONResponse({'error': {'message': str(exc)}}, status_code=409)
         except FileNotFoundError as exc:
             return JSONResponse({'error': {'message': str(exc)}}, status_code=404)
+        except Exception as exc:
+            status = getattr(exc, 'status', None)
+            if not isinstance(status, int):
+                raise
+            return JSONResponse({'error': {'message': str(exc)}}, status_code=status)
         logger.info('control: snapshot saved %s', record['file'])
         await run_in_threadpool(publisher.publish, 'snapshot')
         return JSONResponse(record)
 
+    def _store_live() -> bool:
+        """Is the store serving again? ``closed`` is False while either the
+        condenser handle or the memory proxy is able to take work."""
+        return not bool(getattr(swappable, 'closed', False))
+
     def _swap(mutate):
-        """Close, mutate, reopen under the sink's lock; state is visible throughout."""
+        """Quiesce, mutate the files, resume; the state is visible throughout.
+
+        ``swappable.swap`` is the observe-mode :class:`CondenserHandle` or the
+        augment-mode ``MemoryProxy``; both close every open store, run
+        ``mutate``, and come back. A mutation that failed before touching the
+        files leaves the store serving again, and a status document left
+        wedged in ``error`` would then be a standing lie with no recovery
+        route short of restarting the proxy. So only a store that did *not*
+        come back is published as an error; the failure itself still
+        propagates to the caller, which answers 500.
+        """
         publisher.set_state('swapping')
         try:
-            result = store.swap(mutate)
+            result = swappable.swap(mutate)
         except Exception as exc:
-            publisher.set_state('error', error=f'{type(exc).__name__}: {exc}')
+            if _store_live():
+                publisher.set_state(None)
+            else:
+                publisher.set_state('error', error=f'{type(exc).__name__}: {exc}')
             raise
         publisher.set_state(None)
         return result
 
+    def _no_swappable_store() -> Response:
+        return _not_implemented(
+            'this needs a store to swap: start the proxy with a --data-dir (observe '
+            'mode also needs the condenser handle the installed command supplies)'
+        )
+
     async def control_load(request: Request) -> Response:
-        if snapshots is None or store is None:
-            return _not_implemented(
-                'load needs a swappable store: start the proxy in observe mode with a '
-                '--data-dir (augment mode keeps per-session stores, not one SQLite file)'
-            )
+        if snapshots is None or swappable is None:
+            return _no_swappable_store()
         body = await _json_body(request)
         name = body.get('name')
         if not isinstance(name, str) or not name.strip():
@@ -822,28 +961,27 @@ def build_app(
             path = snapshots.path_for(name)
         except ValueError as exc:
             return JSONResponse({'error': {'message': str(exc)}}, status_code=400)
-        if not path.is_file():
+        if not snapshots.has_snapshot(name):
             return JSONResponse({'error': {'message': f'snapshot {name!r} does not exist'}}, status_code=404)
         try:
             await run_in_threadpool(_swap, lambda: snapshots.restore(name))
         except Exception as exc:
             logger.exception('control: load failed')
-            return JSONResponse({'error': {'type': 'swap_failed', 'message': f'{type(exc).__name__}: {exc}'}}, status_code=500)
+            return JSONResponse({'error': {'type': 'swap_failed', 'message': f'{type(exc).__name__}: {exc}',
+                                           'store_live': _store_live()}}, status_code=500)
         logger.info('control: store loaded from snapshot %s', path.name)
-        return JSONResponse({'loaded': path.name, 'store': str(store.db_path), 'generation': store.generation})
+        return JSONResponse({'loaded': path.name, 'store': str(snapshots.db_path),
+                             'generation': swappable.generation})
 
     async def control_reset(request: Request) -> Response:
         body = await _json_body(request)
         if body.get('confirm') is not True:
             return JSONResponse({'error': {'message': 'reset requires {"confirm": true}'}}, status_code=400)
-        if snapshots is None or store is None:
-            return _not_implemented(
-                'reset needs a swappable store: start the proxy in observe mode with a '
-                '--data-dir (augment mode keeps per-session stores, not one SQLite file)'
-            )
+        if snapshots is None or swappable is None:
+            return _no_swappable_store()
 
         def backup_then_clear():
-            record = snapshots.save() if snapshots.db_path.is_file() else None
+            record = snapshots.save() if snapshots.has_store() else None
             snapshots.clear()
             return record
 
@@ -851,13 +989,19 @@ def build_app(
             record = await run_in_threadpool(_swap, backup_then_clear)
         except Exception as exc:
             logger.exception('control: reset failed')
-            return JSONResponse({'error': {'type': 'swap_failed', 'message': f'{type(exc).__name__}: {exc}'}}, status_code=500)
+            return JSONResponse({'error': {'type': 'swap_failed', 'message': f'{type(exc).__name__}: {exc}',
+                                           'store_live': _store_live()}}, status_code=500)
         logger.info('control: store reset (backup %s)', record['file'] if record else 'none')
-        return JSONResponse({'reset': True, 'backup': record, 'store': str(store.db_path), 'generation': store.generation})
+        return JSONResponse({'reset': True, 'backup': record, 'store': str(snapshots.db_path),
+                             'generation': swappable.generation})
 
     async def control_load_transcript(request: Request) -> Response:
         if bulk is None:
-            return _not_implemented('bulk loading needs the observe-mode capture queue')
+            return _not_implemented(
+                'bulk transcript loading is observe-mode only: it feeds the observe-mode '
+                'capture queue, which augment mode does not run. In augment mode a '
+                'transcript enters memory by being replayed through the proxy.'
+            )
         body = await _json_body(request)
         session = body.get('session')
         if not isinstance(session, str) or not session.strip():
@@ -922,6 +1066,7 @@ def build_app(
     app.state.bulk = bulk
     app.state.snapshots = snapshots
     app.state.store = store
+    app.state.swappable = swappable
     if memory is not None:
         async def flush(request):
             from memory_condense.interfaces.proxy_memory import MemoryProxyError
@@ -948,7 +1093,11 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
-    parser.add_argument("--data-dir", default=os.environ.get("MEMORY_DATA_DIR", "data"))
+    parser.add_argument(
+        "--data-dir",
+        default=default_data_dir(),
+        help="control/status.json and snapshots/ live here (default: %(default)s)",
+    )
     parser.add_argument('--mode',choices=('observe','augment'),default='observe')
     parser.add_argument('--inline-memory',action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument('--memory-max-sessions',type=int,default=8)
@@ -1123,6 +1272,7 @@ __all__ = [
     "condenser_completion_callback",
     "condenser_sink",
     "conversation_id_for",
+    "default_data_dir",
     "main",
     "redacted_headers",
 ]

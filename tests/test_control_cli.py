@@ -258,26 +258,26 @@ class TestMCPControlTools:
         monkeypatch.setenv("MEMORY_CONDENSE_PROXY", fake_proxy.base_url)
         self.proxy = fake_proxy
 
-    def test_memory_save(self):
-        out = mcp_server.memory_save()
+    def test_memory_snapshot_save(self):
+        out = mcp_server.memory_snapshot_save()
         assert self.proxy.calls == [("/_control/save", {})]
         assert json.loads(out)["ok"] is True
 
-    def test_memory_save_named(self):
-        mcp_server.memory_save("milestone")
+    def test_memory_snapshot_save_named(self):
+        mcp_server.memory_snapshot_save("milestone")
         assert self.proxy.calls == [("/_control/save", {"name": "milestone"})]
 
-    def test_memory_load(self):
-        out = mcp_server.memory_load("milestone")
+    def test_memory_snapshot_restore(self):
+        out = mcp_server.memory_snapshot_restore("milestone")
         assert self.proxy.calls == [("/_control/load", {"name": "milestone"})]
         assert json.loads(out)["echo"] == {"name": "milestone"}
 
     def test_memory_load_requires_name(self):
-        assert "required" in mcp_server.memory_load("  ")
+        assert "required" in mcp_server.memory_snapshot_restore("  ")
         assert self.proxy.calls == []
 
     def test_memory_load_refusal_is_text_not_exception(self):
-        out = mcp_server.memory_load("missing")
+        out = mcp_server.memory_snapshot_restore("missing")
         assert "refused" in out and "no such snapshot" in out
 
     def test_memory_reset_refuses_without_confirm(self):
@@ -302,7 +302,7 @@ class TestMCPControlTools:
 class TestMCPProxyDown:
     def test_friendly_text_when_proxy_is_down(self, closed_port, monkeypatch):
         monkeypatch.setenv("MEMORY_CONDENSE_PROXY", closed_port)
-        out = mcp_server.memory_save()
+        out = mcp_server.memory_snapshot_save()
         assert "not reachable" in out
         assert "nothing was changed" in out
 

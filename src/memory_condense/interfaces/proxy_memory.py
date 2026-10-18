@@ -1,5 +1,6 @@
 """Durable ChatSession integration for provider-compatible memory requests."""
 from base64 import b64decode, b64encode
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
@@ -8,6 +9,7 @@ import threading
 import time
 
 from memory_condense.application.chat_io import ChatIO
+from memory_condense.control.status import now_iso
 from memory_condense.application.chat_session import ChatEvent
 from memory_condense.application.inline_memory import parse_inline_response
 from memory_condense.interfaces.proxy_units import guard_served_body
@@ -49,6 +51,11 @@ class SessionEntry:
     session: object
     messages: list = field(default_factory=list)
     policy: object = None
+    #: Set by :meth:`MemoryProxy.swap` once this entry's session has been
+    #: closed and dropped from the registry. A request that resolved the entry
+    #: before the swap began and is only now winning its IO lock must not use
+    #: it: the files underneath it may have been replaced.
+    stale: bool = False
 
     def reload(self):
         self.messages = []
@@ -84,6 +91,11 @@ class MemoryProxy:
         # request never queues behind a cold start.
         self._status_lock = threading.RLock()
         self._live, self._opening = {}, {}
+        # Lock order everywhere in this class: `lock` -> a session's `_io_lock`
+        # -> `_status_lock`. `quiesce`/`swap` take the first two in that order;
+        # the request path takes `lock` (inside `entry`), releases it, then
+        # takes `_io_lock`. Nothing ever takes `lock` while holding `_io_lock`.
+        self.generation, self.last_swap_at = 0, None
 
     @staticmethod
     def namespace(provider, headers):
@@ -122,8 +134,14 @@ class MemoryProxy:
                 with session._connect() as db:
                     db.execute('CREATE TABLE IF NOT EXISTS proxy_requests (request_id TEXT PRIMARY KEY, body_sha TEXT NOT NULL, state TEXT NOT NULL, input_id TEXT, failure TEXT)')
                     db.execute('CREATE TABLE IF NOT EXISTS proxy_attempts (request_id TEXT NOT NULL, attempt INTEGER NOT NULL, status INTEGER, outcome TEXT NOT NULL, elapsed_s REAL NOT NULL, headers TEXT NOT NULL, PRIMARY KEY(request_id,attempt))')
-                    if 'served_body' not in {r[1] for r in db.execute('PRAGMA table_info(proxy_requests)')}:
+                    columns = {r[1] for r in db.execute('PRAGMA table_info(proxy_requests)')}
+                    if 'served_body' not in columns:
                         db.execute('ALTER TABLE proxy_requests ADD COLUMN served_body BLOB')
+                    if 'served_guard' not in columns:
+                        # The pre-send guard's verdict on the rewritten body,
+                        # kept apart from served_body so the ledger can say
+                        # both what was sent and why it was not the rewrite.
+                        db.execute('ALTER TABLE proxy_requests ADD COLUMN served_guard TEXT')
                     if 'response_body' not in {r[1] for r in db.execute('PRAGMA table_info(proxy_attempts)')}:
                         db.execute('ALTER TABLE proxy_attempts ADD COLUMN response_body BLOB')
                 self.entries[namespace] = entry
@@ -170,9 +188,93 @@ class MemoryProxy:
                     summary_api_fallback=self.summary_api_fallback, summary_routing=summary_status(),
                     retrieval=retrieval_status())
 
+    @contextmanager
+    def _io(self, namespace, *, summary_api=None):
+        """Own one session's IO, re-resolving across a concurrent swap.
+
+        A swap closes sessions while holding their `_io_lock`, so a request
+        that resolved its entry before the swap started would otherwise wake
+        up owning the lock of a closed session over replaced files. The entry
+        is re-admitted instead. `stale` is only ever set under that same
+        `_io_lock`, so reading it here needs no further lock.
+        """
+        for _ in range(8):
+            entry = self.entry(namespace, summary_api=summary_api)
+            entry.session._io_lock.acquire()
+            if entry.stale:
+                entry.session._io_lock.release()
+                continue
+            try:
+                yield entry
+            finally:
+                entry.session._io_lock.release()
+            return
+        raise MemoryProxyError('Memory store is being replaced; retry the request', 503)
+
+    @contextmanager
+    def quiesce(self):
+        """Block admissions and wait out in-flight IO, leaving stores open.
+
+        Enough to take a snapshot (``VACUUM INTO`` is consistent under WAL,
+        and quiescing makes the *tree* consistent too, not just each file).
+        Not enough to replace files: use :meth:`swap` for that.
+        """
+        with self.lock:
+            if self.closed:
+                raise MemoryProxyError('Memory proxy is closing', 503)
+            entries = list(self.entries.values())
+            held = []
+            try:
+                for entry in entries:
+                    entry.session._io_lock.acquire()
+                    held.append(entry)
+                yield entries
+            finally:
+                for entry in reversed(held):
+                    entry.session._io_lock.release()
+
+    def swap(self, mutate):
+        """Close every session, run ``mutate`` on the files, re-admit lazily.
+
+        The augment counterpart of :meth:`CondenserHandle.swap`, with the same
+        invariant: the files move only while nothing holds a store open. The
+        difference is that nothing is reopened here -- :meth:`entry` rebuilds a
+        session on its next request -- which is also the recovery story when
+        ``mutate`` raises. The sessions are already out of the registry, the
+        files are untouched in the pre-mutation failures, and the next request
+        opens them again, so a failed swap reports its error without wedging
+        the proxy. A request that arrives mid-swap waits on :attr:`lock`
+        rather than reading a half-swapped tree.
+        """
+        with self.quiesce() as entries:
+            failures = []
+            for entry in entries:
+                entry.stale = True
+                try:
+                    entry.session.close()
+                except Exception as exc:
+                    failures.append(exc)
+            self.entries.clear()
+            with self._status_lock:
+                self._live.clear()
+            # The factory caches per-namespace lifecycle and summary state over
+            # the same trees. Keeping it would report a conversation that the
+            # swap deleted, or call a restored one 'ready' before it reopens.
+            forget = getattr(self.factory, 'forget', None)
+            if forget is not None:
+                forget()
+            self.generation += 1
+            if failures:
+                # Mutating files under a session that would not close is the
+                # one thing this must never do.
+                raise failures[0]
+            try:
+                return mutate()
+            finally:
+                self.last_swap_at = now_iso()
+
     def flush(self, provider, headers):
-        entry = self.entry(self.namespace(provider, headers))
-        with entry.session._io_lock:
+        with self._io(self.namespace(provider, headers)) as entry:
             return entry.session.flush()
 
     def close(self):
@@ -239,9 +341,8 @@ class MemoryProxy:
         if self.summary_api_fallback:
             from memory_condense.interfaces.summary_api import ProviderSummaryAPI
             summary_api = ProviderSummaryAPI(provider, payload['model'], summary_send or send, fmt=fmt)
-        entry = self.entry(namespace, summary_api=summary_api)
-        session = entry.session
-        with session._io_lock:
+        with self._io(namespace, summary_api=summary_api) as entry:
+            session = entry.session
             with session._connect() as db:
                 prior = db.execute('SELECT body_sha,state,input_id,failure FROM proxy_requests WHERE request_id=?',(request_id,)).fetchone()
                 if prior and prior[0] != body_sha:
@@ -321,39 +422,54 @@ class MemoryProxy:
                 inline = wire.use_inline(payload,self.inline_memory,fmt)
                 served = wire.prepare_payload(payload,fmt,recent,packet.text,event.text,inline)
 
+                # Pre-send guard: a served body that lost a tool pairing is
+                # never sent; the client's original goes through verbatim
+                # (passthrough is the sanctioned degraded mode). `served` is
+                # the same on every attempt, so the verdict is decided once.
+                problems = guard_served_body(fmt, served)
+                sent = body if problems else wire.encoded(served)
+
+                def tagged(value):
+                    """Compose an attempt outcome with the guard's verdict.
+
+                    Both facts matter and neither may overwrite the other: a
+                    passthrough that then got an HTTP 500 is
+                    ``invalid_served_body+http_error``, not one or the other.
+                    """
+                    return f'invalid_served_body+{value}' if problems else value
+
                 def reader():
                     with session._connect() as db:
-                        db.execute("UPDATE proxy_requests SET state='calling',served_body=? WHERE request_id=?",(wire.encoded(served),request_id))
+                        # served_body is what actually went upstream, which on
+                        # the passthrough path is the client's own bytes;
+                        # served_guard says why the rewrite was not sent.
+                        db.execute("UPDATE proxy_requests SET state='calling',served_body=?,served_guard=? "
+                                   "WHERE request_id=?",
+                                   (sent, wire.encoded(problems).decode() if problems else None, request_id))
                     for attempt in range(self.empty_response_retries+1):
                         started = time.perf_counter()
-                        outcome, remote = 'unknown', None
+                        outcome, remote = tagged('unknown'), None
                         try:
-                            # Pre-send guard: a served body that lost a tool
-                            # pairing is never sent; the client's original goes
-                            # through verbatim (passthrough is the sanctioned
-                            # degraded mode) and the ledger records why.
-                            problems = guard_served_body(fmt, served)
-                            if problems:
-                                outcome = 'invalid_served_body'
-                            remote = send(body if problems else wire.encoded(served))
+                            remote = send(sent)
                             if remote.status >= 400:
-                                outcome = 'http_error'
+                                outcome = tagged('http_error')
                                 raise UpstreamFailure(remote)
                             value = wire.assemble_stream(fmt,remote.body) if payload.get('stream') else json.loads(remote.body)
                             message = wire.response_message(fmt,value)
                             finish = wire.finish_reason(fmt,value)
                             if finish not in ('stop','end_turn','tool_calls','function_call','tool_use','stop_sequence','pause_turn','refusal'):
-                                outcome = 'incomplete_response'
+                                outcome = tagged('incomplete_response')
                                 raise ValueError('Provider response did not complete: '+str(finish))
                             empty = not wire.text_content(message).strip() and not wire.has_alternative(message)
                             reasoning_only = wire.reasoning_present(fmt,value)
                             if empty:
-                                outcome = 'empty_completed' if finish in ('stop','end_turn') and not reasoning_only else 'incomplete_or_reasoning_only'
-                                if outcome == 'empty_completed' and attempt < self.empty_response_retries:
+                                retryable = finish in ('stop','end_turn') and not reasoning_only
+                                outcome = tagged('empty_completed' if retryable else 'incomplete_or_reasoning_only')
+                                if retryable and attempt < self.empty_response_retries:
                                     time.sleep(attempt+1)
                                     continue
                                 raise ValueError('Provider returned no completed answer')
-                            outcome = 'complete' if not problems else 'invalid_served_body'
+                            outcome = tagged('complete')
                             public = value
                             result = dict(content=wire.message_text(message),finish_reason='stop',elapsed_s=time.perf_counter()-started)
                             parsed = None
@@ -373,8 +489,11 @@ class MemoryProxy:
                             result['proxy_wire'] = WireResponse(remote.status,public_headers,public_body).stored()
                             return replace(parsed,response=result) if parsed else result
                         except (ValueError,KeyError,TypeError) as exc:
-                            if outcome == 'complete':
-                                outcome = 'invalid_inline_envelope' if inline else 'invalid_response'
+                            # Compare against the composed value: after a guard
+                            # rejection the outcome is `invalid_served_body+complete`,
+                            # and the envelope failure must still be diagnosed.
+                            if outcome == tagged('complete'):
+                                outcome = tagged('invalid_inline_envelope' if inline else 'invalid_response')
                             raise ValueError('Provider response could not be safely delivered: '+str(exc)) from exc
                         finally:
                             with session._connect() as db:

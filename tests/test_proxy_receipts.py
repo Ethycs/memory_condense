@@ -77,11 +77,21 @@ def _expected(fmt: str, body: bytes) -> int:
 
 
 class _FakePublisher:
-    def __init__(self) -> None:
-        self.calls: list[tuple[int | None, int | None, bool]] = []
+    """Records what ``publish`` hands the publisher: the receipt, whole."""
 
-    def record_serving(self, static_tokens, served_tokens, rewritten) -> None:
-        self.calls.append((static_tokens, served_tokens, rewritten))
+    def __init__(self) -> None:
+        self.receipts: list[ServingReceipt] = []
+
+    def record_serving(self, receipt) -> None:
+        self.receipts.append(receipt)
+
+    @property
+    def calls(self) -> list[tuple[int | None, int | None, bool]]:
+        """The three values the publisher reads off each receipt."""
+        return [
+            (r.effective_static_tokens, r.effective_served_tokens, r.rewritten)
+            for r in self.receipts
+        ]
 
 
 class TestEstimates:
@@ -184,6 +194,26 @@ class TestUsage:
 
         without = receipt_for_observe("anthropic", ANTHROPIC_BODY, usage=None)
         assert without.effective_served_tokens == estimate
+        assert without.effective_static_tokens == estimate
+
+    def test_verbatim_forwarding_never_claims_a_saving(self):
+        """A char/4 estimate against an exact count is not a rewrite.
+
+        Observe mode forwards the client's bytes, so both published figures
+        have to be the same prompt measured the same way, or the statusline
+        reads as though memory saved something it never touched.
+        """
+        receipt = receipt_for_observe("anthropic", ANTHROPIC_BODY, usage=1243)
+        assert receipt.effective_static_tokens == receipt.effective_served_tokens == 1243
+        assert receipt.saved_tokens == 0
+        # The raw estimate is still on the receipt; it is just not what gets
+        # compared against the upstream's count.
+        assert receipt.static_tokens == _expected("anthropic", ANTHROPIC_BODY)
+
+        # An augment passthrough is the same situation one mode up.
+        through = receipt_for_augment("anthropic", ANTHROPIC_BODY, ANTHROPIC_BODY, usage=1243)
+        assert through.rewritten is False and through.saved_tokens == 0
+        assert through.effective_static_tokens == 1243
 
 
 class TestSavedTokens:
@@ -224,6 +254,17 @@ class TestSavedTokens:
         assert receipt.static_tokens is not None and receipt.served_tokens is None
         assert receipt.saved_tokens == 0
 
+    def test_an_omitted_reason_names_which_of_the_three_cases_it_is(self):
+        payload = json.loads(ANTHROPIC_BODY)
+        served = json.dumps(dict(payload, messages=payload["messages"][-1:])).encode()
+        assert receipt_for_augment("anthropic", ANTHROPIC_BODY, served).reason == "memory served"
+        assert receipt_for_augment("anthropic", ANTHROPIC_BODY, ANTHROPIC_BODY).reason == "passthrough"
+        assert receipt_for_augment("anthropic", ANTHROPIC_BODY, None).reason == "nothing served"
+        # An explicit reason always wins: the caller knows more than we do.
+        assert receipt_for_augment(
+            "anthropic", ANTHROPIC_BODY, None, reason="rejected"
+        ).reason == "rejected"
+
     def test_unknown_sides_yield_zero_savings(self):
         assert ServingReceipt("anthropic", "observe", False, "", None, 5, None).saved_tokens == 0
         assert ServingReceipt("anthropic", "observe", False, "", 5, None, None).saved_tokens == 0
@@ -252,9 +293,17 @@ class TestPublish:
 
         assert publisher.calls == [
             (estimate, estimate, False),
-            (estimate, 1243, False),
+            # Verbatim forwarding with a usage report: both sides are the
+            # upstream's own count, so there is no gap to render.
+            (1243, 1243, False),
             (estimate, _expected("anthropic", served), True),
             (None, None, False),
+        ]
+        # The receipt itself goes over, so the publisher cannot disagree with
+        # it about savings: nothing is recomputed on the other side.
+        assert all(isinstance(r, ServingReceipt) for r in publisher.receipts)
+        assert [r.saved_tokens for r in publisher.receipts] == [
+            0, 0, estimate - _expected("anthropic", served), 0
         ]
 
     def test_publish_matches_the_real_publisher_arithmetic(self):

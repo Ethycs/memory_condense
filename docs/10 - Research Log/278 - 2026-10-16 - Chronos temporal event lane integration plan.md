@@ -56,6 +56,25 @@ packet also exposes the question-time header used by routing and records the
 bound question in its retrieval receipt. Mention time is not an extracted
 event date or a fact-validity interval.
 
+The header is prepended **only when the packet carries evidence**. An empty
+retrieval keeps an empty body, because a bare date header is truthy and was
+defeating two downstream "nothing found" guards: `ChatSession`'s
+`'No matching memory found.'` fallback, and `proxy_memory_wire.prepare_payload`'s
+`if evidence` test, which in augment mode wrapped the lone header in a
+"Recalled conversation evidence" block containing no evidence.
+`retrieval.dated_question` is recorded either way.
+
+An absent `asked_at` resolves to the wall clock **by design** on the live and
+standalone paths and in `compiler.reopen`'s *chat* query branch: the recall
+clock belongs to the asker, not to the indexed history, so a live question
+about "last week" must resolve against now even when the store ends months
+earlier. Replay callers pin it instead — the research battery resolves one
+anchor from `actor['source']['export_timestamp']` for its chat recalls and for
+their cache identity, so re-runs ask the identical dated question.
+`compiler.reopen`'s *non-chat* query branch is separate and has always dated
+from the request's `storage_timestamp` at 23:59; it never consulted the wall
+clock, and nothing there reads `asked_at`.
+
 Regression testing exposed an integration dependency: copied-recall summary
 reuse previously accepted only undated envelopes. Its parser now authenticates
 the new question clock against the recall receipt and the mention clock against

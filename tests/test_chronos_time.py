@@ -9,8 +9,10 @@ import pytest
 from memory_condense.application.chat_native import native_packet
 from memory_condense.application.chat_session import ChatEvent, ChatSession
 from memory_condense.domain import question_time
+from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.runtime import resident
 from tests.test_chat_batch_queue import PublishedBackend
+from tests.test_chat_session import Backend
 from tests.test_dialogue_retrieval import prepared, QUERY, DATED
 
 
@@ -122,6 +124,30 @@ def test_cap8_renders_source_dates_and_question_time_without_changing_support():
     assert packet['retrieval']['dated_question'] == DATED
 
 
+def test_empty_retrieval_keeps_the_no_matching_memory_signal(tmp_path):
+    """The question clock must never pose as the only retrieved evidence."""
+    empty = SimpleNamespace(tactic=None, hierarchy_context=None,
+        routing=SimpleNamespace(identity_payload=lambda: dict(raw_reads_during_routing=0, query_qwen_passes=0)),
+        hydration=SimpleNamespace(sections=(), identity_payload=lambda: dict(sections=0)))
+    app = SimpleNamespace(retrieve_native_spine=lambda query, dated, **limits: empty)
+    packet = native_packet(app, QUERY, DATED, ())
+    assert packet['text'] == ''
+    assert packet['references'] == []
+    assert packet['retrieval']['dated_question'] == DATED
+    assert packet['retrieval']['packet_token_count'] == count_tokens('')
+
+    class EmptyBackend(Backend):
+        def recall(self, query):
+            return native_packet(app, query, DATED, ())
+    with ChatSession(tmp_path, 's', EmptyBackend()) as chat:
+        chat.ingest(ChatEvent('question', 'user', QUERY, '2024-03-01T00:30:00Z'))
+        chat.flush()
+        delivered = chat.recall(QUERY, packet_id='p', input_event_id='question')
+        assert delivered.text == '' and delivered.references == ()
+        assert chat.event('_chat:recall:p').text == 'No matching memory found.'
+        assert chat.event('_chat:recall:p').metadata['_chat']['retrieval']['dated_question'] == DATED
+
+
 def test_packet_rejects_a_clock_bound_to_another_query():
     with pytest.raises(ValueError, match='bound to the retrieval query'):
         native_packet(SimpleNamespace(), 'Different question', DATED, ())
@@ -131,7 +157,8 @@ def test_subprocess_recall_binds_cache_identity_and_request_to_clock(tmp_path, m
     from tools.engineering_research_chat import ProcessNativeBackend
     from tools import run_engineering_research_battery as runner
     from memory_condense.domain._discourse_identity import identity_sha256
-    backend = ProcessNativeBackend(tmp_path, tmp_path/'arm', dict(case_id='test'))
+    actor = dict(case_id='test', source=dict(family='live', export_timestamp='2024-03-03T12:00:00Z'))
+    backend = ProcessNativeBackend(tmp_path, tmp_path/'arm', actor)
     backend.rows = [dict(turn_id='old')]
     backend.installed_folder = tmp_path/'installed'
     backend.last_reopen = dict(snapshot=dict(turn_count=1))
@@ -146,6 +173,13 @@ def test_subprocess_recall_binds_cache_identity_and_request_to_clock(tmp_path, m
     assert calls[0] == calls[1]
     assert calls[0][0] != calls[2][0]
     assert calls[0][1] == '2024-03-01T00:30:00+00:00'
+    backend.recall('When?')
+    backend.recall('When?', asked_at='2024-03-03T12:00:00Z')
+    # An undated replay resolves to the export anchor instead of a microsecond
+    # unique now(), and shares its single cache entry with an explicit call
+    # carrying that same clock.
+    assert calls[-1] == calls[-2] == (calls[-1][0], '2024-03-03T12:00:00+00:00')
+    assert calls[-1][0] not in {call[0] for call in calls[:3]}
 
 
 @pytest.mark.parametrize('tamper', [None, 'quote', 'source', 'extra'])

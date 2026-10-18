@@ -197,7 +197,8 @@ def test_proxy_default_and_forced_modes_reach_native_sessions(tmp_path,monkeypat
     monkeypatch.setattr(sessions,'LocalRuntime',lambda *a,**k:SimpleNamespace(close=lambda:None))
     monkeypatch.setattr(sessions,'ChatSession',lambda path,name,backend,**k:SimpleNamespace(backend=backend))
     observed=[]
-    def serve(config,memory):
+    def serve(config,memory,locator=None,**_):
+        assert locator is not None
         assert memory.status()['retrieval']['mode']==mode
         backend=memory.factory('one',tmp_path/'one').backend
         assert backend.retrieval_policy==mode

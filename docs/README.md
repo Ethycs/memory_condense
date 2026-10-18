@@ -7,6 +7,17 @@
 
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
 
+**Current design directions:** [Viable Directions Index](01%20-%20Design/04%20-%20Viable%20Directions%20Index.md)
+maps release integration, cold-start controls, isolated-session branching,
+recent-packet reuse, temporal events, ingestion scheduling, continuity views
+and document support to their existing briefs. It distinguishes implementation
+from proposals and records failed promotion experiments so they are not
+mistaken for release candidates. Reconciled 2026-10-17.
+
+**Next-session handoff:** [Controls, cold start and release readiness](07%20-%20Status%20Reports/2026-10-17_controls-cold-start-release-handoff.md)
+records the immediate implementation task, current gaps, known test failure,
+timestamp blocker and acceptance checks.
+
 **Optional backend experiments:** [Native Experimental Modules](02%20-%20Implementation/07%20-%20Native%20Experimental%20Modules.md)
 documents the nine summary-only native adapters, activation profiles, exact-source
 bounds, and the local engineering-archive integration results. The matched
@@ -49,6 +60,34 @@ records the high-confidence extensions to revisit: shared project scope, current
 state, unresolved work, fix/decision history, constraints, checkpoint changes,
 explicit fact and relationship revisions, and portable handoffs. It identifies
 existing components to reuse, remaining design choices and validation gates.
+
+**Chronos temporal-event integration:** [Research Log 278](10%20-%20Research%20Log/278%20-%202026-10-16%20-%20Chronos%20temporal%20event%20lane%20integration%20plan.md)
+maps Chronos's selective event calendar onto the deployed summary hierarchy,
+exact raw hydration, BGE tactic router, closure receipts and supersession
+links. The first implementation carries true question time and displays source
+timestamps; its saved-packet audit preserved all 9,772 evidence spans across 500
+questions, adding 445.5 tokens per packet on average. The first replay tied
+baseline at 299/500 and exposed a timestamp provenance defect: native spans
+carry export anchors, not original message dates. The completed 500-question
+comparison with source-authenticated dates improved **299/500 to 331/500
+(59.8% to 66.2%, +6.4 points)**; temporal reasoning rose **60/133 to 90/133**.
+Paired control rechecks preserved the result. The production date boundary
+still needs repair; this was a fixed-packet replay with no reingestion or
+rerouting. The remaining plan stores source-bound event ranges and validity
+intervals, retrieves turns and events in parallel,
+and applies deterministic temporal/counting operators before reader synthesis.
+It deliberately avoids an always-on prompt-generation call because Chronos's
+strong-reader ablation found no aggregate benefit from that component.
+
+**INT8 landmark linker result:** [Research Log 273](10%20-%20Research%20Log/273%20-%202026-10-15%20-%20Post-benchmark%20INT8%20landmark%20experiment%20plan.md)
+now contains the completed 100-question holdout. Symmetric eight-landmark Qwen
+K/V reranking failed to generalize: the intended eight-section packet fell
+from 153 to 12 exact supports, while interactive execution improved only from
+the 78 ms full-Qwen reference to about 63 ms. The route is rejected for
+production; BGE ordering remains protected. The run also exposed a separate,
+anomalous 23--25 minute cold construction window for the 2.27 GB FP32 BGE ONNX
+model on this machine, which is tracked as a filesystem/startup fault rather
+than query latency.
 
 **Native-memory proxy:** the installable `memory-condense proxy` command connects the
 provider proxy to the evaluated resident ChatSession lifecycle: recall, recent

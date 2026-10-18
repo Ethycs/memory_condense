@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from memory_condense.domain._discourse_identity import quote_sha256
+from memory_condense.domain.question_time import dated_recall_question
 from memory_condense.search.section_summary import RawSectionSpan
 
 
@@ -23,6 +24,18 @@ def recall_summary_alias(row, originals):
         return None
     text, cursor, reused = row['text'], 0, []
     try:
+        if text.startswith('[Question asked at '):
+            # Only skip the exact clock bound to this recall's durable input.
+            # Arbitrary preambles still require ordinary compilation.
+            if not isinstance(receipt.get('query'), str) or receipt.get('asked_at') is None:
+                return None
+            dated = dated_recall_question(receipt['query'], receipt['asked_at'])
+            if receipt.get('retrieval', {}).get('dated_question', dated) != dated:
+                return None
+            header = dated.split(']', 1)[0] + ']\n\n'
+            if not text.startswith(header):
+                return None
+            cursor = len(header)
         for i, reference in enumerate(references):
             span = RawSectionSpan(**reference['span'])
             original = originals.get(span.receipt_sha256)
@@ -39,8 +52,10 @@ def recall_summary_alias(row, originals):
             role = label.get('role')
             if role not in ({'system', 'tool', 'source'} if span.role == 'system' else {span.role}):
                 return None
-            if label != dict(turn_id=span.turn_id, source_id=span.source_id, role=role,
-                             start_char=span.start_char, end_char=span.end_char):
+            expected = dict(turn_id=span.turn_id, source_id=span.source_id, role=role,
+                            start_char=span.start_char, end_char=span.end_char)
+            # Retain old envelopes and validate the new source date exactly.
+            if label not in (expected, dict(expected, mentioned_at=span.created_at)):
                 return None
             start = end+2
             cursor = start + span.end_char-span.start_char

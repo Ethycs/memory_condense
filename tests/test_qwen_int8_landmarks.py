@@ -10,6 +10,7 @@ from memory_condense.associations.qwen_int8_landmarks import (
     grouped_query_head_indices,
     score_int8_landmarks,
     score_landmark_keys,
+    score_symmetric_int8_kv_landmark_batch,
     score_symmetric_int8_kv_landmarks,
 )
 
@@ -131,3 +132,64 @@ def test_symmetric_kv_score_prefers_a_matching_landmark_code() -> None:
     assert matching_score > 0.99
     assert matching_heads.shape == (2,)
     assert opposite_score < -0.99
+
+
+def test_vectorized_symmetric_score_matches_scalar_candidates() -> None:
+    rng = np.random.default_rng(29)
+    query_keys = rng.normal(size=(2, 5, 8)).astype(np.float32)
+    query_values = rng.normal(size=(2, 5, 8)).astype(np.float32)
+    codes = []
+    for _ in range(7):
+        code, _, _ = compile_int8_kv_landmarks(
+            rng.normal(size=(2, 19, 8)).astype(np.float32),
+            rng.normal(size=(2, 19, 8)).astype(np.float32),
+            landmarks=8,
+        )
+        codes.append(code)
+
+    batch_scores, batch_heads = score_symmetric_int8_kv_landmark_batch(
+        query_keys,
+        query_values,
+        keys=np.ascontiguousarray(np.stack([code.keys for code in codes])),
+        values=np.ascontiguousarray(np.stack([code.values for code in codes])),
+        key_scales=np.ascontiguousarray(np.stack([code.key_scales for code in codes])),
+        value_scales=np.ascontiguousarray(np.stack([code.value_scales for code in codes])),
+        token_counts=np.ascontiguousarray(np.stack([code.token_counts for code in codes])),
+        head_vote_k=1,
+    )
+    def reference(code):
+        counts = code.token_counts.astype(np.float32)
+        valid = counts > 0
+        weights = counts[valid] / counts[valid].sum()
+
+        def head_cosines(query, candidates):
+            query_pooled = query.mean(axis=1)
+            query_pooled /= np.maximum(
+                np.linalg.norm(query_pooled, axis=-1, keepdims=True), 1e-12
+            )
+            candidate_valid = candidates[:, valid, :]
+            candidate_valid /= np.maximum(
+                np.linalg.norm(candidate_valid, axis=-1, keepdims=True), 1e-12
+            )
+            candidate_pooled = np.einsum(
+                "hld,l->hd", candidate_valid, weights, optimize=True
+            )
+            candidate_pooled /= np.maximum(
+                np.linalg.norm(candidate_pooled, axis=-1, keepdims=True), 1e-12
+            )
+            return np.einsum(
+                "hd,hd->h", query_pooled, candidate_pooled, optimize=True
+            )
+
+        heads = (
+            head_cosines(query_keys, code.dequantized_keys())
+            + head_cosines(query_values, code.dequantized_values())
+        ) * np.float32(0.5)
+        return float(np.max(heads)), heads
+
+    scalar = [reference(code) for code in codes]
+
+    np.testing.assert_allclose(batch_scores, [row[0] for row in scalar], atol=1e-7)
+    np.testing.assert_allclose(batch_heads, [row[1] for row in scalar], atol=1e-7)
+    assert batch_scores.flags.c_contiguous
+    assert batch_heads.flags.c_contiguous

@@ -104,6 +104,8 @@ def prepare(root: Path, dataset: Path) -> None:
         Path("src/memory_condense/runtime/summary_fallback.py"),
         Path("tools/engineering_research_gateway_reader.py"),
         Path("src/memory_condense/application/chat_native.py"),
+        Path("src/memory_condense/domain/question_time.py"),
+        Path("src/memory_condense/search/recall_summary_reuse.py"),
         Path("src/memory_condense/application/native_spine_retrieval.py"),
         Path("src/memory_condense/application/dialogue_retrieval.py"),
         Path("src/memory_condense/application/tactic_router.py"),
@@ -172,6 +174,8 @@ def answer(root: Path, dataset: Path, start: int, count: int) -> None:
             question = sample.questions[0]
             if question.answer != "[withheld until judge phase]":
                 raise ValueError("Gold crossed the answer-phase boundary")
+            if not question.question_date:
+                raise ValueError("Benchmark recall requires the dataset question date")
             events = events_for(sample, ordinal)
             actor = {"case_id": f"longmemeval-s-{ordinal:03d}", "source": {
                 "family": f"longmemeval-s-{ordinal:03d}",
@@ -186,7 +190,7 @@ def answer(root: Path, dataset: Path, start: int, count: int) -> None:
                 backend.sync(events)
                 ingested_s = time.perf_counter() - started
                 recall_started = time.perf_counter()
-                packet = backend.recall(question.question)
+                packet = backend.recall(question.question, asked_at=question.question_date)
                 recall_s = time.perf_counter() - recall_started
                 messages = build_qa_prompt(question.dated_question, [packet["text"]])
                 result = runtime.call("actor", messages, scope=f"longmemeval-s-{ordinal:03d}", max_tokens=256)

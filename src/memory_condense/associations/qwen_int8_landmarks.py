@@ -285,40 +285,113 @@ def score_symmetric_int8_kv_landmarks(
     candidate re-encoding and transformer weights at score time.
     """
 
+    scores, heads = score_symmetric_int8_kv_landmark_batch(
+        query_keys,
+        query_values,
+        keys=code.keys[None, ...],
+        values=code.values[None, ...],
+        key_scales=code.key_scales[None, ...],
+        value_scales=code.value_scales[None, ...],
+        token_counts=code.token_counts[None, ...],
+        head_vote_k=head_vote_k,
+    )
+    return float(scores[0]), np.ascontiguousarray(heads[0])
+
+
+def score_symmetric_int8_kv_landmark_batch(
+    query_keys: np.ndarray,
+    query_values: np.ndarray,
+    *,
+    keys: np.ndarray,
+    values: np.ndarray,
+    key_scales: np.ndarray,
+    value_scales: np.ndarray,
+    token_counts: np.ndarray,
+    head_vote_k: int = 4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorize the symmetric readout over one contiguous candidate batch.
+
+    Candidate arrays have shapes ``[candidates, heads, landmarks, width]``,
+    ``[candidates, heads]`` for scales, and ``[candidates, landmarks]`` for
+    counts.  This API lets a memory-mapped index gather one shortlist into a
+    contiguous buffer and score it without constructing one Python object per
+    summary.
+    """
+
     query_key_matrix = np.asarray(query_keys, dtype=np.float32)
     query_value_matrix = np.asarray(query_values, dtype=np.float32)
+    candidate_keys = np.asarray(keys)
+    candidate_values = np.asarray(values)
+    candidate_key_scales = np.asarray(key_scales)
+    candidate_value_scales = np.asarray(value_scales)
+    counts = np.asarray(token_counts)
     if query_key_matrix.ndim != 3 or query_value_matrix.shape != query_key_matrix.shape:
         raise ValueError("query K/V inputs must share [KV heads, tokens, width]")
-    if query_key_matrix.shape[0] != code.kv_heads or query_key_matrix.shape[2] != code.head_dim:
-        raise ValueError("query K/V dimensions do not match the landmark code")
+    if (
+        candidate_keys.dtype != np.int8
+        or candidate_values.dtype != np.int8
+        or candidate_keys.ndim != 4
+        or candidate_values.shape != candidate_keys.shape
+    ):
+        raise ValueError("candidate K/V inputs must share INT8 [candidates, heads, landmarks, width]")
+    candidates, heads, landmarks, width = candidate_keys.shape
+    if candidates < 1:
+        raise ValueError("at least one landmark candidate is required")
+    if query_key_matrix.shape[0] != heads or query_key_matrix.shape[2] != width:
+        raise ValueError("query K/V dimensions do not match landmark candidates")
+    if candidate_key_scales.shape != (candidates, heads) or candidate_value_scales.shape != (
+        candidates,
+        heads,
+    ):
+        raise ValueError("candidate scales must have [candidates, heads] shape")
+    if candidate_key_scales.dtype != np.float16 or candidate_value_scales.dtype != np.float16:
+        raise TypeError("candidate scales must be float16")
+    if counts.shape != (candidates, landmarks) or counts.dtype != np.uint16:
+        raise TypeError("candidate token counts must be uint16 [candidates, landmarks]")
+    if np.any(counts.sum(axis=1, dtype=np.uint64) == 0):
+        raise ValueError("every candidate must contain at least one source token")
+    if not np.isfinite(candidate_key_scales).all() or not np.isfinite(candidate_value_scales).all():
+        raise ValueError("candidate scales must be finite")
+    if np.any(candidate_key_scales <= 0) or np.any(candidate_value_scales <= 0):
+        raise ValueError("candidate scales must be positive")
     vote_count = int(head_vote_k)
-    if not 1 <= vote_count <= code.kv_heads:
+    if not 1 <= vote_count <= heads:
         raise ValueError("head_vote_k lies outside the KV-head range")
 
-    counts = code.token_counts.astype(np.float32)
-    valid = counts > 0
-    weights = counts[valid] / counts[valid].sum()
+    def normalized_query(query: np.ndarray) -> np.ndarray:
+        pooled = query.mean(axis=1)
+        return pooled / np.maximum(
+            np.linalg.norm(pooled, axis=-1, keepdims=True), np.float32(1e-12)
+        )
 
-    def head_cosines(query: np.ndarray, candidates: np.ndarray) -> np.ndarray:
-        query_pooled = query.mean(axis=1)
-        query_norms = np.linalg.norm(query_pooled, axis=-1, keepdims=True)
-        query_pooled = query_pooled / np.maximum(query_norms, np.float32(1e-12))
-        candidate_valid = candidates[:, valid, :]
-        candidate_norms = np.linalg.norm(candidate_valid, axis=-1, keepdims=True)
-        candidate_normalized = candidate_valid / np.maximum(
-            candidate_norms, np.float32(1e-12)
-        )
-        candidate_pooled = np.einsum(
-            "hld,l->hd", candidate_normalized, weights, optimize=True
-        )
-        candidate_pooled /= np.maximum(
-            np.linalg.norm(candidate_pooled, axis=-1, keepdims=True),
+    weights = counts.astype(np.float32)
+    weights /= weights.sum(axis=1, keepdims=True)
+
+    def head_cosines(
+        query: np.ndarray, quantized: np.ndarray, scales: np.ndarray
+    ) -> np.ndarray:
+        dequantized = quantized.astype(np.float32)
+        dequantized *= scales.astype(np.float32)[:, :, None, None]
+        dequantized /= np.maximum(
+            np.linalg.norm(dequantized, axis=-1, keepdims=True),
             np.float32(1e-12),
         )
-        return np.einsum("hd,hd->h", query_pooled, candidate_pooled, optimize=True)
+        pooled = np.einsum("chld,cl->chd", dequantized, weights, optimize=True)
+        pooled /= np.maximum(
+            np.linalg.norm(pooled, axis=-1, keepdims=True),
+            np.float32(1e-12),
+        )
+        return np.einsum(
+            "hd,chd->ch", normalized_query(query), pooled, optimize=True
+        )
 
-    key_scores = head_cosines(query_key_matrix, code.dequantized_keys())
-    value_scores = head_cosines(query_value_matrix, code.dequantized_values())
+    key_scores = head_cosines(query_key_matrix, candidate_keys, candidate_key_scales)
+    value_scores = head_cosines(
+        query_value_matrix, candidate_values, candidate_value_scales
+    )
     head_scores = (key_scores + value_scores) * np.float32(0.5)
-    strongest = np.partition(head_scores, -vote_count)[-vote_count:]
-    return float(strongest.mean()), np.ascontiguousarray(head_scores)
+    strongest = np.partition(head_scores, heads - vote_count, axis=1)[:, -vote_count:]
+    return (
+        np.ascontiguousarray(strongest.mean(axis=1, dtype=np.float32)),
+        np.ascontiguousarray(head_scores),
+    )

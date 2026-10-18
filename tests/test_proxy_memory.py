@@ -220,10 +220,13 @@ def test_namespaces_id_conflicts_and_concurrent_duplicate_requests(tmp_path):
         assert all(r.status_code==200 for r in replies) and len(calls)==1
         conflict=client.post('/v1/chat/completions',headers=HEADERS,json=dict(payload,messages=[dict(role='user',content='Changed')]))
         assert conflict.status_code==409 and len(calls)==1
-        assert client.post('/v1/chat/completions',headers={'authorization':'Bearer test-secret'},json=payload).status_code==400
+        # A client without a conversation header (Claude Code, Codex) is
+        # attributed by request digest and served in its own namespace, not refused.
+        headerless=client.post('/v1/chat/completions',headers={'authorization':'Bearer test-secret'},json=payload)
+        assert headerless.status_code==200 and len(memory.entries)==2 and len(calls)==2
         assert client.post('/v1/chat/completions',headers=dict(HEADERS,authorization='Bearer second-user'),json=payload).status_code==200
-        assert len(memory.entries)==2 and len(calls)==2
-        assert client.get('/_memory/health').json()['active_sessions']==2
+        assert len(memory.entries)==3 and len(calls)==3
+        assert client.get('/_memory/health').json()['active_sessions']==3
 
 
 def test_tool_sse_fragments_and_truncated_anthropic_are_not_lost():

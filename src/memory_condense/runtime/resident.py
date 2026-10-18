@@ -24,6 +24,7 @@ from memory_condense.application.condenser import MemoryCondenser
 from memory_condense.application.native_spine_policy import retrieval_limits
 from memory_condense.application.dialogue_retrieval import DialogueRetrievalPolicy
 from memory_condense.domain._discourse_identity import identity_sha256
+from memory_condense.domain.question_time import dated_recall_question
 from memory_condense.persistence import native_spine_store, native_spine_parent_store
 from memory_condense.persistence import native_spine_incremental_store
 from memory_condense.search.episodes.user_spine_hierarchy import compile_user_spine_exchanges
@@ -231,6 +232,7 @@ class PreparedExchange:
 class ResidentNativeBackend:
     """Append-only live memory; cold validation once, durable publication per sync."""
     recall_accepts_recent = True
+    recall_accepts_asked_at = True
 
     def __init__(self, run, arm_root, actor, *, runtime=None, dialogue_policy=None, retrieval_policy=None,
                  experiment_policy=None):
@@ -711,18 +713,18 @@ class ResidentNativeBackend:
         with self._publication_lock:
             self._published = (memory, self.events, dict(self.last_reopen), raw, revisions)
 
-    def recall(self, query, *, recent=()):
+    def recall(self, query, *, recent=(), asked_at=None):
         if getattr(self,'experiment_policy',None) is not None and self.experiment_policy.modules:
-            return self.recall_published(query,recent=recent)
+            return self.recall_published(query,recent=recent,asked_at=asked_at)
         if self.last_reopen is None:
             raise ValueError('Chat recall requires an indexed turn prefix')
         started = time.perf_counter()
-        anchor = max(datetime.fromisoformat(e.created_at) for e in self.events if e.created_at).strftime('%Y/%m/%d (%a)')
-        result = native_packet(self.app, query, f'[Question asked at {anchor} 23:59] ' + query, self.events, recent=recent)
+        dated = dated_recall_question(query, asked_at)
+        result = native_packet(self.app, query, dated, self.events, recent=recent)
         self.timings.append(dict(operation='recall', elapsed_s=time.perf_counter()-started))
         return {**self.last_reopen, **result}
 
-    def recall_published(self, query, *, recent=()):
+    def recall_published(self, query, *, recent=(), asked_at=None):
         """Read the last successful prefix while the next batch is building."""
         with self._publication_lock:
             published = self._published
@@ -730,7 +732,7 @@ class ResidentNativeBackend:
             raise ValueError('Chat recall requires an indexed turn prefix')
         original, events, receipt, raw, revisions = published
         started = time.perf_counter()
-        anchor = max(datetime.fromisoformat(e.created_at) for e in events if e.created_at).strftime('%Y/%m/%d (%a)')
+        dated = dated_recall_question(query, asked_at)
         transcript = SimpleNamespace(get_turn=raw.get)
         memory = copy(original)
         memory.load_turn = transcript.get_turn
@@ -738,7 +740,7 @@ class ResidentNativeBackend:
             return memory.retrieve(query, dated_question, **retrieval_limits(memory, limits))
         view = SimpleNamespace(transcript=transcript, retrieve_native_spine=retrieve,
                                decision_revisions=revisions)
-        result = native_packet(view, query, f'[Question asked at {anchor} 23:59] ' + query, events, recent=recent)
+        result = native_packet(view, query, dated, events, recent=recent)
         self.timings.append(dict(operation='recall', elapsed_s=time.perf_counter()-started,
                                  published_events=len(events)))
         return {**receipt, **result, 'published_events': len(events)}

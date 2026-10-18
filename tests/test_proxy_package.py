@@ -59,6 +59,7 @@ def test_proxy_cli_wires_dialogue_profile_to_each_native_session(tmp_path, monke
     from memory_condense.cli import main
     from memory_condense.interfaces import proxy_server
     from memory_condense.runtime import sessions
+    from memory_condense.interfaces.proxy_sessions import TranscriptLocator
     from memory_condense.application.dialogue_retrieval import DialogueRetrievalPolicy
     policy = DialogueRetrievalPolicy(episode_limit=8, max_context_tokens=4096)
     path = tmp_path/'dialogue.json'
@@ -67,7 +68,10 @@ def test_proxy_cli_wires_dialogue_profile_to_each_native_session(tmp_path, monke
     monkeypatch.setattr(sessions, 'LocalRuntime', lambda *a, **k: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(sessions, 'ChatSession', lambda path, name, backend, **k: SimpleNamespace(backend=backend))
     observed = []
-    def serve(config, memory):
+    def serve(config, memory, locator=None, **_):
+        # Augment mode must still receive a transcript locator; the bulk
+        # control route cannot resolve a saved session without one.
+        assert isinstance(locator, TranscriptLocator)
         assert memory.status()['retrieval'] == dict(mode='dialogue', policy=policy.identity_payload())
         for name in ('a', 'b'):
             session = memory.factory(name, tmp_path/name)

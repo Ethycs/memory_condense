@@ -23,6 +23,7 @@ so each project gets its own memory by default.
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import os
 import sys
@@ -31,6 +32,14 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.control.cli import (
+    ControlRefused,
+    ControlUnavailable,
+    default_proxy_url,
+    post_control,
+    unreachable_hint,
+)
+from memory_condense.control.status import locate_status_file, one_line, read_status
 from memory_condense.domain import decay as decay_module
 from memory_condense.domain.decay import heat_map, item_energy, item_heat
 from memory_condense.application.llm_provider import resolve_extractor
@@ -366,7 +375,128 @@ def memory_stats() -> str:
         lines.append("Most recent:")
         for item in items[:5]:
             lines.append(f"  {_describe(item, tiers.get(item.mem_id))}")
+    # Appended, never computed here: the proxy is the single writer of status.
+    status_path = locate_status_file()
+    if status_path is not None:
+        doc = read_status(status_path)
+        if doc is not None:
+            lines.append(f"Proxy: {one_line(doc)}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Control plane (proxy routes; see docs/01 - Design/03 - System Controls.md)
+# ---------------------------------------------------------------------------
+
+
+def _control(route: str, payload: dict) -> str:
+    """POST to a proxy control route and render the reply as text.
+
+    Shared by every control tool so the proxy URL, transport, and the
+    "proxy is down" wording are decided in exactly one place.
+    """
+    base = default_proxy_url()
+    try:
+        reply = post_control(base, route, payload)
+    except ControlUnavailable:
+        return (
+            f"{unreachable_hint(base)}. The memory store itself is unaffected; "
+            "nothing was changed."
+        )
+    except ControlRefused as exc:
+        detail = exc.body if isinstance(exc.body, str) else json.dumps(exc.body, indent=2)
+        return f"The proxy refused `{route}` ({exc}):\n{detail}"
+    if isinstance(reply, str):
+        return reply
+    return json.dumps(reply, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def memory_save(name: str = "") -> str:
+    """Take a named snapshot of the memory store before anything risky.
+
+    Call this when the user asks to save, back up, or checkpoint memory, and
+    before you call `memory_load` or `memory_reset` on their behalf if they
+    want a restore point. The snapshot is atomic and leaves the live store
+    serving. Requires the memory proxy to be running.
+
+    Args:
+        name: Optional snapshot name. Leave empty for a timestamped name.
+
+    Returns:
+        The snapshot record as reported by the proxy, or why it could not be taken.
+    """
+    payload = {"name": name.strip()} if name.strip() else {}
+    return _control("save", payload)
+
+
+@mcp.tool()
+def memory_load(name: str) -> str:
+    """Swap the live memory store to a previously saved snapshot.
+
+    Use this when the user wants to go back to a saved state. During the swap
+    the proxy serves requests passthrough and queues captures, so nothing is
+    lost, but the current (unsaved) store is replaced — offer `memory_save`
+    first when the user has not saved recently. Snapshot names are listed by
+    `memory_stats`' proxy line and `memory-condense ctl status`.
+
+    Args:
+        name: The snapshot name to load.
+
+    Returns:
+        The proxy's reply, or why the load was refused.
+    """
+    target = name.strip()
+    if not target:
+        return "Nothing loaded: a snapshot name is required."
+    return _control("load", {"name": target})
+
+
+@mcp.tool()
+def memory_reset(confirm: bool = False) -> str:
+    """Erase the memory store and start empty (an automatic snapshot is taken first).
+
+    This is destructive. Before calling it, ask the user for explicit
+    confirmation in your own words ("This will reset all project memory —
+    continue?") and call with `confirm=True` only after they say yes. Never
+    set `confirm=True` on your own initiative, and never call this just
+    because the user sounded frustrated with memory results — suggest
+    `memory_save` plus `supersede`/`forget` for targeted fixes instead.
+
+    Args:
+        confirm: Must be True, and only after the user has confirmed.
+
+    Returns:
+        The proxy's reply (including the pre-reset snapshot), or a refusal.
+    """
+    if not confirm:
+        return (
+            "Reset refused: confirm=False. Ask the user to confirm explicitly that "
+            "all project memory should be erased, then call memory_reset(confirm=True)."
+        )
+    return _control("reset", {"confirm": True})
+
+
+@mcp.tool()
+def memory_load_transcript(session: str) -> str:
+    """Bulk-ingest an entire on-disk conversation transcript into memory.
+
+    Use this when the user wants a whole past session loaded, not just the
+    turns flowing through the proxy now. The load runs as a background job
+    on the proxy; progress (percent, ETA, rate) appears in `memory_stats`'
+    proxy line and the status line, so call `memory_stats` afterwards rather
+    than waiting here.
+
+    Args:
+        session: A session id or a path to the transcript file.
+
+    Returns:
+        The enqueued job record, or why it could not be queued.
+    """
+    target = session.strip()
+    if not target:
+        return "Nothing queued: a session id or transcript path is required."
+    return _control("load-transcript", {"session": target})
 
 
 @mcp.tool()

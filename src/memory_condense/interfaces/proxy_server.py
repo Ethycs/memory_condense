@@ -43,6 +43,14 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 from starlette.concurrency import run_in_threadpool
 
+from memory_condense.control.bulk import BulkLoader
+from memory_condense.control.publisher import StatusPublisher
+from memory_condense.control.snapshots import CondenserHandle, SnapshotStore
+from memory_condense.interfaces.proxy_sessions import (
+    SOURCE_HEADER,
+    TranscriptLocator,
+    resolve_conversation_id,
+)
 from memory_condense.interfaces.proxy_capture import (
     ANTHROPIC,
     OPENAI,
@@ -123,6 +131,9 @@ class ProxyConfig:
     capture_drain_max_chunks: int = 128
     capture_drain_max_tokens: int = 32_000
     capture_enrichment_max_turns: int = 1
+    #: Where the control plane writes ``control/status.json`` and keeps
+    #: ``snapshots/``; ``None`` keeps the status document in memory only.
+    data_dir: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("observe", "augment"):
@@ -255,6 +266,34 @@ def conversation_id_for(headers: dict[str, str], body_sha: str) -> str:
     return f"proxy:{body_sha[:16]}"
 
 
+def capture_health(captures: CaptureQueue) -> tuple[str, list[str]]:
+    """``(status, reasons)`` for ``/health`` in observe mode; the status
+    document mirrors this exact reasoning rather than recomputing it."""
+    health_reasons: list[str] = []
+    worker_failed = captures.state == "failed" or (
+        captures.state == "running" and captures.worker_quiesced
+    )
+    if worker_failed:
+        health_reasons.append("capture_worker_failed")
+    if captures.rejected_saturated:
+        health_reasons.append("capture_admission_loss")
+    if captures.capture_terminal_failures:
+        health_reasons.append("terminal_capture_loss")
+    status = (
+        "failed"
+        if "capture_worker_failed" in health_reasons
+        else "degraded" if health_reasons else "ok"
+    )
+    return status, health_reasons
+
+
+def memory_health(snapshot) -> tuple[str, list[str]]:
+    """``(status, reasons)`` for ``/health`` in augment mode."""
+    if snapshot.get('failed_sessions'):
+        return 'degraded', ['memory_sessions_failed']
+    return 'ok', []
+
+
 def build_app(
     *,
     config: ProxyConfig | None = None,
@@ -262,6 +301,9 @@ def build_app(
     completion: CompletionCallback | None = None,
     client: httpx.AsyncClient | None = None,
     memory=None,
+    data_dir: str | os.PathLike[str] | None = None,
+    store: CondenserHandle | None = None,
+    locator: TranscriptLocator | None = None,
 ) -> Starlette:
     """Build the proxy application.
 
@@ -271,11 +313,22 @@ def build_app(
     with observational sinks. The ``completion`` callback drives bounded
     startup, idle, and final maintenance from the same serialized scheduler.
     ``client`` is injectable so tests can serve a transport without a socket.
+
+    ``data_dir`` enables the control plane's on-disk status document and
+    snapshot directory; ``store`` (a :class:`CondenserHandle` whose sink and
+    completion callback are the ones passed above) enables ``load``/``reset``
+    by letting the proxy close, swap, and reopen the condenser under the same
+    lock the sink uses. Without either, the control routes still answer but
+    the mutating ones return 501.
     """
 
     settings = config or ProxyConfig()
     if (settings.mode == 'augment') != (memory is not None):
         raise ValueError('Augment mode requires a memory service; observe mode does not use one')
+    if data_dir is None:
+        data_dir = settings.data_dir if settings.data_dir is not None else (
+            store.data_dir if store is not None else None
+        )
     captures = CaptureQueue(
         sink or (lambda capture: None),
         maxsize=settings.capture_queue_size,
@@ -298,6 +351,32 @@ def build_app(
         sink_max_retries=settings.capture_sink_max_retries,
         completion=completion,
     )
+    # Control plane: one publisher owns status.json; bulk jobs ride the same
+    # capture queue as live traffic; snapshots live beside the store.
+    # Augment mode keeps per-session stores under sessions/<ns>, not one
+    # SQLite file, so it has no snapshot store (save/load/reset answer 501).
+    snapshots = (
+        SnapshotStore(data_dir, db_path=store.db_path if store is not None else None)
+        if data_dir is not None and memory is None
+        else None
+    )
+    bulk = (
+        BulkLoader(captures, capacity=settings.capture_queue_size)
+        if memory is None
+        else None
+    )
+    publisher = StatusPublisher(
+        mode=settings.mode,
+        captures=captures,
+        capacity=settings.capture_queue_size,
+        health=lambda: capture_health(captures),
+        data_dir=data_dir,
+        memory=memory,
+        memory_health=memory_health,
+        bulk=bulk,
+        snapshots=snapshots,
+        store_path=(lambda: store.db_path) if store is not None else None,
+    )
     owns_client = client is None
     if client is None:
         import truststore
@@ -312,7 +391,9 @@ def build_app(
             settings.upstreams[settings.default_provider],
         ).rstrip("/")
         # Accept either the provider root or the familiar .../v1 base URL.
-        if base.endswith('/v1') and path.startswith('/v1/'):
+        # The ChatGPT Codex backend mounts the Responses API at
+        # .../backend-api/codex/responses with no /v1 segment.
+        if path.startswith('/v1/') and (base.endswith('/v1') or base.endswith('/backend-api/codex')):
             path = path[3:]
         return f"{base}{path}{'?' + query if query else ''}"
 
@@ -323,12 +404,24 @@ def build_app(
         fmt = format_for_path(path)
         headers = _forward_headers(request.headers.raw)
         target = upstream_url(provider, path, request.url.query)
+        body_sha = hashlib.sha256(body).hexdigest()
+        if provider is not None:
+            conversation_id, conversation_source = resolve_conversation_id(
+                headers, body, body_sha=body_sha, locator=locator
+            )
+        else:
+            conversation_id, conversation_source = f"proxy:{body_sha[:16]}", "digest"
 
         if memory is not None and provider is not None:
             from memory_condense.interfaces.proxy_memory import MemoryProxyError, WireResponse
             if request.method != 'POST':
                 return JSONResponse({'error':{'message':'Chat requests require POST'}},status_code=405)
             method = request.method
+            if conversation_source != SOURCE_HEADER:
+                # Clients such as Claude Code and Codex send no conversation
+                # header; hand the memory service the resolved id the same way
+                # an explicit header would. send_memory strips it upstream.
+                headers = {**headers, 'x-memory-conversation-id': conversation_id}
             async def send_memory(payload, summary=False):
                 forwarded = {k:v for k,v in headers.items()
                              if not k.lower().startswith('x-memory-') and k.lower() != 'x-conversation-id'}
@@ -349,6 +442,9 @@ def build_app(
                 # Compiler workers are ordinary threads and may outlive this
                 # request. The shared HTTP client stays open through final drain.
                 return asyncio.run_coroutine_threadsafe(send_memory(value,summary),loop).result()
+            # The served size is known only inside the memory service; the
+            # receipt records the client's static prompt and that it was rewritten.
+            publisher.record_serving(len(body)//4, None, True)
             try:
                 reply = await run_in_threadpool(memory.exchange,body,provider,headers,
                     send_from_worker, lambda value:send_from_worker(value,True),fmt)
@@ -393,8 +489,6 @@ def build_app(
                 background=BackgroundTask(response.aclose),
             )
 
-        body_sha = hashlib.sha256(body).hexdigest()
-        conversation_id = conversation_id_for(headers, body_sha)
         full_prompt = tuple(
             request_messages(body, conversation_id=conversation_id, fmt=fmt)
         )
@@ -413,6 +507,8 @@ def build_app(
             prompt = full_prompt
         model = request_model(body)
         streaming = is_streaming_request(body)
+        # Observe mode forwards verbatim: served equals static, nothing rewritten.
+        publisher.record_serving(prompt_tokens_estimate, prompt_tokens_estimate, False)
 
         async def publish(reply_text: str, streamed: bool) -> None:
             if not prompt and not reply_text:
@@ -430,6 +526,10 @@ def build_app(
             if settings.capture_compact_prompts:
                 capture = capture.compact_for_ingest()
             await captures.offer_async(capture)
+            publisher.record_capture(
+                sum(len(record[1]) for record in capture.ingest_records()) // 4,
+                conversation_id,
+            )
 
         if not streaming:
             payload = await response.aread()
@@ -475,27 +575,13 @@ def build_app(
     async def health(_: Request) -> Response:
         if memory is not None:
             snapshot = await run_in_threadpool(memory.status)
-            return JSONResponse(dict(mode='augment',status='degraded' if snapshot['failed_sessions'] else 'ok',**snapshot))
+            return JSONResponse(dict(mode='augment',status=memory_health(snapshot)[0],**snapshot))
         # Pending-ingest/enrichment projections use the condenser's SQLite
         # connection. The serialized worker publishes an immutable snapshot;
         # the event loop reads only that cache and never shares the connection.
         snapshot = captures.pending_snapshot
         sampled_now = time.monotonic()
-        health_reasons: list[str] = []
-        worker_failed = captures.state == "failed" or (
-            captures.state == "running" and captures.worker_quiesced
-        )
-        if worker_failed:
-            health_reasons.append("capture_worker_failed")
-        if captures.rejected_saturated:
-            health_reasons.append("capture_admission_loss")
-        if captures.capture_terminal_failures:
-            health_reasons.append("terminal_capture_loss")
-        status = (
-            "failed"
-            if "capture_worker_failed" in health_reasons
-            else "degraded" if health_reasons else "ok"
-        )
+        status, health_reasons = capture_health(captures)
         return JSONResponse(
             {
                 "status": status,
@@ -671,25 +757,156 @@ def build_app(
             status_code=503 if status == "failed" else 200,
         )
 
+    # -- control plane -----------------------------------------------------
+    async def _json_body(request: Request) -> dict:
+        try:
+            value = await request.json()
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _not_implemented(message: str) -> Response:
+        return JSONResponse({'error': {'type': 'not_implemented', 'message': message}}, status_code=501)
+
+    async def control_status(_: Request) -> Response:
+        return JSONResponse(await run_in_threadpool(publisher.publish, 'status'))
+
+    async def control_save(request: Request) -> Response:
+        if snapshots is None:
+            return _not_implemented('snapshots need the proxy started with a --data-dir')
+        body = await _json_body(request)
+        name = body.get('name')
+        if name is not None and not isinstance(name, str):
+            return JSONResponse({'error': {'message': 'name must be a string'}}, status_code=400)
+
+        def save():
+            if store is not None:
+                with store.lock:  # a quiescent point: no capture batch in flight
+                    return snapshots.save(name)
+            return snapshots.save(name)
+
+        try:
+            record = await run_in_threadpool(save)
+        except ValueError as exc:
+            return JSONResponse({'error': {'message': str(exc)}}, status_code=400)
+        except FileExistsError as exc:
+            return JSONResponse({'error': {'message': str(exc)}}, status_code=409)
+        except FileNotFoundError as exc:
+            return JSONResponse({'error': {'message': str(exc)}}, status_code=404)
+        logger.info('control: snapshot saved %s', record['file'])
+        await run_in_threadpool(publisher.publish, 'snapshot')
+        return JSONResponse(record)
+
+    def _swap(mutate):
+        """Close, mutate, reopen under the sink's lock; state is visible throughout."""
+        publisher.set_state('swapping')
+        try:
+            result = store.swap(mutate)
+        except Exception as exc:
+            publisher.set_state('error', error=f'{type(exc).__name__}: {exc}')
+            raise
+        publisher.set_state(None)
+        return result
+
+    async def control_load(request: Request) -> Response:
+        if snapshots is None or store is None:
+            return _not_implemented(
+                'load needs a swappable store: start the proxy in observe mode with a '
+                '--data-dir (augment mode keeps per-session stores, not one SQLite file)'
+            )
+        body = await _json_body(request)
+        name = body.get('name')
+        if not isinstance(name, str) or not name.strip():
+            return JSONResponse({'error': {'message': 'name is required'}}, status_code=400)
+        try:
+            path = snapshots.path_for(name)
+        except ValueError as exc:
+            return JSONResponse({'error': {'message': str(exc)}}, status_code=400)
+        if not path.is_file():
+            return JSONResponse({'error': {'message': f'snapshot {name!r} does not exist'}}, status_code=404)
+        try:
+            await run_in_threadpool(_swap, lambda: snapshots.restore(name))
+        except Exception as exc:
+            logger.exception('control: load failed')
+            return JSONResponse({'error': {'type': 'swap_failed', 'message': f'{type(exc).__name__}: {exc}'}}, status_code=500)
+        logger.info('control: store loaded from snapshot %s', path.name)
+        return JSONResponse({'loaded': path.name, 'store': str(store.db_path), 'generation': store.generation})
+
+    async def control_reset(request: Request) -> Response:
+        body = await _json_body(request)
+        if body.get('confirm') is not True:
+            return JSONResponse({'error': {'message': 'reset requires {"confirm": true}'}}, status_code=400)
+        if snapshots is None or store is None:
+            return _not_implemented(
+                'reset needs a swappable store: start the proxy in observe mode with a '
+                '--data-dir (augment mode keeps per-session stores, not one SQLite file)'
+            )
+
+        def backup_then_clear():
+            record = snapshots.save() if snapshots.db_path.is_file() else None
+            snapshots.clear()
+            return record
+
+        try:
+            record = await run_in_threadpool(_swap, backup_then_clear)
+        except Exception as exc:
+            logger.exception('control: reset failed')
+            return JSONResponse({'error': {'type': 'swap_failed', 'message': f'{type(exc).__name__}: {exc}'}}, status_code=500)
+        logger.info('control: store reset (backup %s)', record['file'] if record else 'none')
+        return JSONResponse({'reset': True, 'backup': record, 'store': str(store.db_path), 'generation': store.generation})
+
+    async def control_load_transcript(request: Request) -> Response:
+        if bulk is None:
+            return _not_implemented('bulk loading needs the observe-mode capture queue')
+        body = await _json_body(request)
+        session = body.get('session')
+        if not isinstance(session, str) or not session.strip():
+            return JSONResponse({'error': {'message': 'session (id or transcript path) is required'}}, status_code=400)
+        try:
+            job = await run_in_threadpool(bulk.submit, session.strip())
+        except FileNotFoundError as exc:
+            return JSONResponse({'error': {'message': str(exc)}}, status_code=404)
+        except RuntimeError as exc:
+            return JSONResponse({'error': {'message': str(exc)}}, status_code=503)
+        logger.info('control: bulk job %s queued for %s', job.id, job.path)
+        return JSONResponse({'job': job.queue_doc(job.position_at_submit), 'path': job.path}, status_code=202)
+
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
         if memory is None:
             captures.start()
+        if bulk is not None:
+            bulk.bind_loop(asyncio.get_running_loop())
+        publisher.start()
         try:
             yield
         finally:
+            # Signal bulk work synchronously so no await lands between the
+            # lifespan exit and the queue's own shutdown sequencing.
+            if bulk is not None:
+                bulk.request_stop()
             try:
                 if memory is not None:
                     await run_in_threadpool(memory.close)
                 else:
                     await captures.stop()
             finally:
-                if owns_client:
-                    await upstream.aclose()
+                try:
+                    if bulk is not None:
+                        await run_in_threadpool(bulk.join)
+                    await run_in_threadpool(publisher.stop)
+                finally:
+                    if owns_client:
+                        await upstream.aclose()
 
     app = Starlette(
         routes=[
             Route("/_memory/health", health, methods=["GET"]),
+            Route("/_control/status", control_status, methods=["GET"]),
+            Route("/_control/save", control_save, methods=["POST"]),
+            Route("/_control/load", control_load, methods=["POST"]),
+            Route("/_control/reset", control_reset, methods=["POST"]),
+            Route("/_control/load-transcript", control_load_transcript, methods=["POST"]),
             Route(
                 "/{path:path}",
                 handle,
@@ -701,6 +918,10 @@ def build_app(
     app.state.captures = captures
     app.state.config = settings
     app.state.memory = memory
+    app.state.publisher = publisher
+    app.state.bulk = bulk
+    app.state.snapshots = snapshots
+    app.state.store = store
     if memory is not None:
         async def flush(request):
             from memory_condense.interfaces.proxy_memory import MemoryProxyError
@@ -830,6 +1051,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
         capture_drain_max_chunks=args.capture_drain_max_chunks,
         capture_drain_max_tokens=args.capture_drain_max_tokens,
         capture_enrichment_max_turns=args.capture_enrichment_max_turns,
+        data_dir=args.data_dir,
     )
     if args.mode == 'augment':
         from memory_condense.interfaces.proxy_memory import MemoryProxy
@@ -845,31 +1067,37 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
             empty_response_retries=args.memory_empty_response_retries,max_sessions=args.memory_max_sessions,
             recent_token_budget=args.memory_recent_token_budget,summary_api_fallback=args.memory_summary_api_fallback)
         try:
-            app = build_app(config=config,memory=memory)
+            app = build_app(config=config,memory=memory,locator=TranscriptLocator())
             uvicorn.run(app,host=args.host,port=args.port,log_level='info')
         finally:
             if not memory.closed:
                 memory.close()
         return 0
-    condenser = MemoryCondenser(data_dir=args.data_dir)
+    # The handle owns the condenser so the control plane can close, swap,
+    # and reopen it under the same lock the capture sink takes.
+    store = CondenserHandle(
+        lambda: MemoryCondenser(data_dir=args.data_dir), data_dir=args.data_dir
+    )
+    store.open()
     app: Starlette | None = None
     try:
         app = build_app(
             config=config,
-            sink=condenser_capture_sink(condenser),
-            completion=condenser_completion_callback(
-                condenser,
+            sink=store.capture_sink(),
+            completion=store.completion_callback(
                 max_manifests=config.capture_drain_max_manifests,
                 max_chunks=config.capture_drain_max_chunks,
                 max_tokens=config.capture_drain_max_tokens,
                 max_enrichment_turns=config.capture_enrichment_max_turns,
             ),
+            store=store,
+            locator=TranscriptLocator(),
         )
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     finally:
         captures = app.state.captures if app is not None else None
         if captures is None or captures.worker_quiesced:
-            condenser.close()
+            store.close()
         else:
             # An arbitrary Python/C worker cannot be killed safely. The
             # durable journal will recover on restart, and deliberately not
@@ -890,6 +1118,7 @@ __all__ = [
     "PendingWorkSnapshot",
     "ProxyConfig",
     "build_app",
+    "capture_health",
     "condenser_capture_sink",
     "condenser_completion_callback",
     "condenser_sink",

@@ -2,8 +2,97 @@
 
 **Date:** 2026-10-15
 
-**Status:** Predeclared; execute after the active 500-question r27 benchmark
-finishes and releases the local GPU models
+**Status:** Complete; primary holdout rejected the INT8 landmark route
+
+## Execution result (2026-10-16)
+
+The post-benchmark run completed after r27 reached its terminal 500-question
+report. It compiled and sealed eight INT8 K/V landmarks for all 5,483 holdout
+summaries, reused the deployed BGE address space, and evaluated 100 questions
+against 191 exact supports. Qwen received stored summaries and questions only;
+raw transcript spans were opened only by the exact-support scorer after
+selection.
+
+The development result did not generalize. On the 783-summary, twelve-question
+development archive, reranking BGE's top 64 improved the eight-section packet
+from 5 to 9 support quotes and from 1 to 4 complete facts. On the predeclared
+holdout, the same readout severely damaged every useful cutoff:
+
+| Packet limit | BGE supports | Landmark supports | BGE complete questions | Landmark complete questions |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 132 | 6 | 58 | 1 |
+| 8 | 153 | 12 | 69 | 3 |
+| 16 | 171 | 29 | 85 | 9 |
+| 32 | 178 | 73 | 90 | 27 |
+| 64 | 183 | 183 | 94 | 94 |
+
+The equality at 64 is mechanical: both arms contain the same BGE top-64 set.
+The landmark order added no novel support at any smaller packet size. The
+standalone corpus-wide landmark arm was worse, finding only 2/191 supports and
+completing 1/100 questions at limit 64.
+
+A saved-ranking diagnosis ruled out a simple polarity mistake. Reversing the
+landmark order reached only 35 supports and 13 complete questions at limit 8.
+A post-hoc 5% landmark/95% BGE rank blend reached 151 supports and 69 complete
+questions, versus BGE's 153 and 69; it did not improve any tested cutoff. This
+diagnostic is not a new promotion attempt and must not be tuned further on the
+holdout.
+
+### Measured speed and storage
+
+| Measurement | Holdout result |
+| --- | ---: |
+| Landmark compilation | 5,483 summaries in 66.382 s |
+| Compilation throughput | 82.6 summaries/s |
+| Durable landmark payload | 16,432 bytes/summary; 85.92 MiB total |
+| Memory-map gather | 0.185 ms mean |
+| Warm single-query Qwen prefix | 61.483 ms mean; 65.209 ms p95 |
+| GPU top-64 transfer + dequantization + score | 1.573 ms mean; 2.213 ms p95 |
+| Interactive landmark total | about 63.06 ms mean; 67.42 ms additive p95 |
+| Full-Qwen reference | 78 ms |
+| Interactive speedup | 1.24x; about 14.95 ms saved |
+| Batched 100-query throughput | 9.918 ms query encoding + 1.573 ms score per question |
+
+The interactive route misses both predeclared speed gates: it is not at least
+3x faster than the 78 ms reference, and its additive p95 exceeds 50 ms. The
+batched number is useful for offline throughput but does not represent one
+interactive chat request.
+
+The holdout's one-time publication rate is acceptable, but cold startup on
+this machine was anomalous. A fully cold Qwen diagnostic took 762.164 s, while
+subsequent warm-cache preparations took 15--17 s. The uninstrumented
+FastEmbed constructor window for the pinned 2.27 GB FP32 BGE-M3 ONNX export
+then consumed roughly 23--25 minutes; the measured 100-query embedding work
+itself took 45.426 s. Process telemetry showed nearly idle CPU with resident
+memory rising slowly. A post-run file-attribute audit confirmed that the
+2,266,886,160-byte ONNX data file is NTFS-compressed, stored as 1,972,076,544
+bytes (only a 1.1:1 ratio), and is not sparse. All five Qwen safetensor shards
+and sampled Transformers, PyTorch and SciPy package files are also marked
+compressed. The broad compression policy is the leading explanation for both
+pathological cold starts; filesystem filtering or storage contention may add
+to it. Treat these cold-load intervals as an environment fault, test model and
+environment files on an uncompressed local path, and do not use them as the
+expected model-load or query latency.
+
+### Decision
+
+Stop before reader evaluation. The primary arm loses 141 exact supports and
+66 complete questions at the intended eight-section packet, recovers no novel
+support, fails the compression-support condition, and misses both speed gates.
+Keep the vectorized INT8 scorer and resumable assay as experimental tooling,
+but do not add landmark state or routing to the deployed pipeline. Preserve
+BGE as the production candidate generator and ordering signal.
+
+Sealed results:
+
+- `eval_results/qwen-int8-landmark-post-benchmark-development-20261016-r1`
+- `eval_results/qwen-int8-landmark-post-benchmark-holdout-20261016-r1`
+
+Implementation and focused validation:
+
+- `tools/run_qwen_int8_landmark_post_benchmark.py`
+- `src/memory_condense/associations/qwen_int8_landmarks.py`
+- `tests/test_qwen_int8_landmarks.py`: 7 passed
 
 ## Objective
 

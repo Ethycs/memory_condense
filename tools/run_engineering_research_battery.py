@@ -151,7 +151,7 @@ def source_query(actor):
     return actor['original_request'].strip() + '\n' + actor['task']
 
 
-def memory_phase(run, folder, actor, rows, scope, *, query=None, ingest=None, chat=False, learning=None):
+def memory_phase(run, folder, actor, rows, scope, *, query=None, ingest=None, chat=False, learning=None, asked_at=None):
     folder.mkdir(parents=True, exist_ok=True)
     output = folder / ('ingest.json' if ingest is None else 'reopened.json')
     request = dict(operation='install' if ingest is None else 'reopen', case_root=str(folder.parents[0] / 'store'),
@@ -159,6 +159,8 @@ def memory_phase(run, folder, actor, rows, scope, *, query=None, ingest=None, ch
         output=str(output), scope=scope, query=query, ingest_receipt=str(ingest) if ingest else None)
     if chat:
         request['chat'] = True
+        if asked_at is not None:
+            request['asked_at'] = asked_at
         if actor.get('native_seed'):
             request['native_seed'] = actor['native_seed']
     if learning is not None:

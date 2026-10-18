@@ -5,6 +5,8 @@ import json
 
 from memory_condense.domain._discourse_identity import quote_sha256
 from memory_condense.search.section_summary import RawSectionSpan
+from memory_condense.search.summary_time_prior import _ASKED
+from memory_condense.search.summary_time_prior_v2 import question_day
 
 
 def validate_reference(app, reference):
@@ -21,16 +23,16 @@ def exact_memory_passage(span, text, role, *, evidence_id=None):
     if len(text)!=span.end_char-span.start_char or quote_sha256(text)!=span.span_text_sha256:
         raise ValueError('Recall passage differs from its exact source span')
     metadata=dict(turn_id=span.turn_id,source_id=span.source_id,role=role,
-                  start_char=span.start_char,end_char=span.end_char)
+                  start_char=span.start_char,end_char=span.end_char,mentioned_at=span.created_at)
     if evidence_id is not None:
         metadata['evidence_id'] = evidence_id
-        metadata['mentioned_at'] = span.created_at
     label=json.dumps(metadata,ensure_ascii=False)
     return '<MEMORY '+label+'>\n'+text+'\n</MEMORY>'
 
 
 def native_packet(app, query, dated_question, events, **limits):
     """Only spans which survived packing acquire pointers or learning credit."""
+    question_day(query, dated_question)  # Validate the clock/query binding before retrieval.
     result = app.retrieve_native_spine(query, dated_question, **limits)
     routing = result.routing.identity_payload()
     if routing['raw_reads_during_routing'] or routing['query_qwen_passes']:
@@ -99,7 +101,6 @@ def native_packet(app, query, dated_question, events, **limits):
         packet['retrieval'].update(mode='decision_history', decision_history=receipt)
     if history or result.hierarchy_context is not None:
         from memory_condense.application.continuity import contract, evidence_labels
-        from memory_condense.search.summary_time_prior_v2 import question_day
         if labels is None:
             labels = evidence_labels(references, events)
         conventions, manifest = contract(references, labels,
@@ -117,9 +118,13 @@ def native_packet(app, query, dated_question, events, **limits):
         title = 'EXACT HISTORY EVIDENCE' if history else 'EXACT NEIGHBORHOOD EVIDENCE'
         packet['text'] = '\n\n'.join(t for t in (conventions,annotations,summary,title,*exact) if t)
         packet['retrieval']['continuity'] = manifest
-    if 'retrieval' in packet:
-        from memory_condense.domain._tokenizer import count_tokens
-        packet['retrieval']['packet_token_count'] = count_tokens(packet['text'])
+    # The reader and router must see the same question clock. Mention dates
+    # describe the source turn, not necessarily the date of the event it names.
+    header = _ASKED.match(dated_question).group(0).strip()
+    packet['text'] = header + '\n\n' + packet['text']
+    packet.setdefault('retrieval', dict(mode='cap8'))['dated_question'] = dated_question
+    from memory_condense.domain._tokenizer import count_tokens
+    packet['retrieval']['packet_token_count'] = count_tokens(packet['text'])
     return packet
 
 

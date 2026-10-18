@@ -2,21 +2,84 @@
 import argparse
 import sys
 
+# Client presets for `proxy --print-env`: which upstream each client expects
+# the proxy to forward to. Carried over from the retired context_proxy CLI.
+PRESETS = {
+    'claude': 'https://api.anthropic.com',
+    'codex-chatgpt': 'https://chatgpt.com/backend-api/codex',
+    'codex-api': 'https://api.openai.com/v1',
+}
+DEFAULT_PORTS = {'claude': 8787, 'codex-chatgpt': 8788, 'codex-api': 8788}
+# The running proxy's built-in upstreams (interfaces.proxy_server.DEFAULT_UPSTREAMS);
+# any other preset upstream has to be passed on the command line.
+_BUILTIN_UPSTREAMS = {'claude': 'https://api.anthropic.com', 'codex-api': 'https://api.openai.com'}
+
+
+def proxy_command(preset, port):
+    """The `memory-condense proxy` invocation that serves ``preset`` on ``port``."""
+    command = f'memory-condense proxy --port {port}'
+    if preset not in _BUILTIN_UPSTREAMS:
+        command += f' --openai-base-url {PRESETS[preset]}'
+    return command
+
+
+def client_instructions(preset, port):
+    url = f'http://127.0.0.1:{port}'
+    if preset == 'claude':
+        return (
+            f'Claude Code:  set ANTHROPIC_BASE_URL={url}\n'
+            f'  Start the proxy with: {proxy_command(preset, port)}\n'
+            '  Leave ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN unset to keep your claude.ai login;\n'
+            '  the OAuth capability rides in anthropic-beta, which this proxy forwards verbatim.\n'
+            '  Optional: CLAUDE_CODE_ATTRIBUTION_HEADER=0 (the system array is forwarded untouched, so not required).'
+        )
+    auth = 'true' if preset == 'codex-chatgpt' else 'false'
+    return (
+        f'Codex: start the proxy with: {proxy_command(preset, port)}\n'
+        '  Then add to ~/.codex/config.toml (model_provider is a top-level key, above any table)\n'
+        '  model_provider = "local_proxy"\n'
+        '\n'
+        '  [model_providers.local_proxy]\n'
+        '  name = "local context proxy"\n'
+        f'  base_url = "{url}/v1"\n'
+        '  wire_api = "responses"\n'
+        f'  requires_openai_auth = {auth}\n'
+        + ('  env_key = "OPENAI_API_KEY"\n' if preset == 'codex-api' else '')
+        + '  # Note: with OPENAI_API_KEY exported Codex ignores custom providers under ChatGPT login.'
+    )
+
+
+def print_env(args):
+    """`proxy --print-env`: print client configuration without starting the server."""
+    parser = argparse.ArgumentParser(prog='memory-condense proxy', add_help=False)
+    parser.add_argument('--print-env', action='store_true')
+    parser.add_argument('--preset', choices=sorted(PRESETS), default='claude')
+    parser.add_argument('--port', type=int)
+    parsed, _ = parser.parse_known_args(args)
+    print(client_instructions(parsed.preset, parsed.port or DEFAULT_PORTS[parsed.preset]))
+    return 0
+
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == 'route':
         from memory_condense.interfaces.tactic_cli import main as route
         return route(args[1:])
+    if args and args[0] == 'proxy' and '--print-env' in args:
+        return print_env(args[1:])
     if args and args[0] == 'proxy':
         from memory_condense.interfaces.proxy_server import main as proxy
         from memory_condense.runtime.config import user_directory
         # Installed command enables memory; the legacy module CLI stays observe.
         return proxy(['--mode','augment','--data-dir',str(user_directory()/'data'),*args[1:]])
+    if args and args[0] == 'ctl':
+        from memory_condense.control.cli import main as ctl
+        return ctl(args[1:])
     parser = argparse.ArgumentParser(prog='memory-condense', description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('proxy', help='Run the memory-enabled provider proxy')
+    commands.add_parser('proxy', help='Run the memory-enabled provider proxy (--print-env [--preset claude|codex-chatgpt|codex-api] [--port N] prints client setup)')
     commands.add_parser('route', help='Prioritize memory tactics with the existing CPU BGE model')
+    commands.add_parser('ctl', help='Control plane: status | save | load | reset | load-transcript')
     setup_parser = commands.add_parser('setup', help='Download pinned model assets or register an existing cache')
     location = setup_parser.add_mutually_exclusive_group()
     location.add_argument('--assets-dir', help='Download destination (default: per-user application data)')

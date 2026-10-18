@@ -183,7 +183,8 @@ def test_native_continuation_never_calls_raw_embedder_or_reloads_all_turns(tmp_p
         monkeypatch.setattr(backend.app.transcript, 'get_all', forbidden)
         additions = (ChatEvent('native-u', 'user', 'Continue the deployment plan.', STAMP),
             ChatEvent('_chat:recall:native-p', 'system', packet['text'], STAMP,
-                {'_chat': dict(kind='recall',packet_id='native-p',references=packet['references'])}),
+                {'_chat': dict(kind='recall',packet_id='native-p',references=packet['references'],
+                               query='Deployment?',asked_at=STAMP,retrieval=packet['retrieval'])}),
             ChatEvent('native-a', 'assistant', 'The deployment remains planned.', STAMP))
         backend.start_stream()
         prepared = backend.prepare_exchange(additions)
@@ -207,6 +208,16 @@ def test_native_continuation_never_calls_raw_embedder_or_reloads_all_turns(tmp_p
 
 
 def setup(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from memory_condense.domain.question_time import dated_recall_question
+    # Models are test doubles; opening the backend only needs this Torch call.
+    # Avoid a heavyweight DLL import solely to configure unused model threads.
+    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(set_num_threads=lambda _: None,
+        cuda=SimpleNamespace(empty_cache=lambda: None)))
+    # Reopen equivalence must compare the same request time, even across minutes.
+    monkeypatch.setattr(resident, 'dated_recall_question',
+        lambda query, asked_at=None: dated_recall_question(query, asked_at or STAMP))
     binding, rows, encoder = fixture(tmp_path)
     calls = []
     encoder.embed_queries = lambda texts: np.asarray([[1., 0.] for _ in texts], dtype=np.float32)

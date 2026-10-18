@@ -21,6 +21,7 @@ def event_from_row(row, source_id, timestamp=None):
 
 class ProcessNativeBackend:
     """Diagnostic subprocess control; live chat uses the resident backend."""
+    recall_accepts_asked_at = True
     def __init__(self, run, arm_root, actor):
         self.run, self.arm_root, self.actor = run, arm_root, actor
         self.rows = []
@@ -56,13 +57,15 @@ class ProcessNativeBackend:
                 or receipt['snapshot']['turn_count'] != len(rows)):
             raise ValueError('Native chat index has not reached the captured turn prefix')
 
-    def recall(self, query):
+    def recall(self, query, *, asked_at=None):
         from tools.run_engineering_research_battery import memory_phase
+        from memory_condense.domain.question_time import question_timestamp
         if self.installed_folder is None:
             raise ValueError('Chat recall requires an indexed turn prefix')
-        folder = self.arm_root / ('chat-recall-' + identity_sha256(dict(rows=self.rows, query=query)))
+        asked_at = question_timestamp(asked_at).isoformat()
+        folder = self.arm_root / ('chat-recall-' + identity_sha256(dict(rows=self.rows, query=query, asked_at=asked_at)))
         result = memory_phase(self.run, folder, self.actor, self.rows, self.actor['case_id']+'/memory/'+folder.name,
-            ingest=self.installed_folder/'ingest.json', query=query, chat=True)
+            ingest=self.installed_folder/'ingest.json', query=query, chat=True, asked_at=asked_at)
         self._validate_prefix(result, self.rows)
         if result['snapshot'] != self.last_reopen['snapshot']:
             raise ValueError('Recall used a different native chat snapshot')

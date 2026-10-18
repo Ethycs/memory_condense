@@ -10,6 +10,7 @@ import time
 from memory_condense.application.chat_io import ChatIO
 from memory_condense.application.chat_session import ChatEvent
 from memory_condense.application.inline_memory import parse_inline_response
+from memory_condense.interfaces.proxy_units import guard_served_body
 from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.interfaces import proxy_memory_wire as wire
 
@@ -77,6 +78,12 @@ class MemoryProxy:
         self.max_sessions, self.recent_token_budget = max_sessions, recent_token_budget
         self.summary_api_fallback = summary_api_fallback
         self.entries, self.lock, self.closed = {}, threading.RLock(), False
+        # `lock` is held across session construction and journal replay, which
+        # is exactly the work status must be able to describe. These mirrors are
+        # written under a lock that is never held across slow work, so a status
+        # request never queues behind a cold start.
+        self._status_lock = threading.RLock()
+        self._live, self._opening = {}, {}
 
     @staticmethod
     def namespace(provider, headers):
@@ -102,9 +109,16 @@ class MemoryProxy:
             if summary_api is not None and configure is not None:
                 configure(namespace, summary_api)
             if namespace not in self.entries:
-                session = self.factory(namespace, self.directory/'sessions'/namespace)
-                entry = SessionEntry(session)
-                entry.reload()
+                with self._status_lock:
+                    self._opening[namespace] = time.monotonic()
+                try:
+                    session = self.factory(namespace, self.directory/'sessions'/namespace)
+                    entry = SessionEntry(session)
+                    entry.reload()
+                except BaseException:
+                    with self._status_lock:
+                        self._opening.pop(namespace, None)
+                    raise
                 with session._connect() as db:
                     db.execute('CREATE TABLE IF NOT EXISTS proxy_requests (request_id TEXT PRIMARY KEY, body_sha TEXT NOT NULL, state TEXT NOT NULL, input_id TEXT, failure TEXT)')
                     db.execute('CREATE TABLE IF NOT EXISTS proxy_attempts (request_id TEXT NOT NULL, attempt INTEGER NOT NULL, status INTEGER, outcome TEXT NOT NULL, elapsed_s REAL NOT NULL, headers TEXT NOT NULL, PRIMARY KEY(request_id,attempt))')
@@ -113,16 +127,45 @@ class MemoryProxy:
                     if 'response_body' not in {r[1] for r in db.execute('PRAGMA table_info(proxy_attempts)')}:
                         db.execute('ALTER TABLE proxy_attempts ADD COLUMN response_body BLOB')
                 self.entries[namespace] = entry
+                with self._status_lock:
+                    self._opening.pop(namespace, None)
+                    self._live[namespace] = entry
             return self.entries[namespace]
 
     def status(self):
-        with self.lock:
-            values = [entry.session.status() for entry in self.entries.values()]
+        # Deliberately does not take `self.lock`: a session being opened holds
+        # it for the whole of construction and journal replay.
+        now = time.monotonic()
+        with self._status_lock:
+            live = list(self._live.items())
+            opening = {namespace: round(now-started, 3) for namespace, started in self._opening.items()}
+        sessions, values = {}, []
+        for namespace, entry in live:
+            try:
+                value = entry.session.status()
+            except Exception as exc:
+                sessions[namespace] = dict(unavailable=f'{type(exc).__name__}: {exc}')
+                continue
+            sessions[namespace] = value
+            values.append(value)
+        startup_status = getattr(self.factory, 'startup_status', lambda: {})
         summary_status = getattr(self.factory, 'summary_status', lambda: {})
         retrieval_status = getattr(self.factory, 'retrieval_status', lambda: {})
-        return dict(active_sessions=len(values), pending_events=sum(v['pending_events'] for v in values),
+        try:
+            startup = startup_status()
+        except Exception as exc:
+            startup = dict(unavailable=f'{type(exc).__name__}: {exc}')
+        pending_events = sum(v['pending_events'] for v in values)
+        return dict(active_sessions=len(values), pending_events=pending_events,
                     pending_feedback=sum(v['pending_feedback'] for v in values),
                     failed_sessions=sum(v['last_error'] is not None for v in values),
+                    opening_sessions=opening, startup=startup, sessions=sessions,
+                    # Aggregation must not hide which session is blocked, and a
+                    # session still opening is work in progress, not idle.
+                    busy=bool(opening) or bool(pending_events)
+                         or any(v['preparation_jobs'] for v in values)
+                         or any(stage not in ('ready', None) for stage in
+                                (r.get('stage') for r in startup.values() if isinstance(r, dict))),
                     inline_memory=self.inline_memory, empty_response_retries=self.empty_response_retries,
                     summary_api_fallback=self.summary_api_fallback, summary_routing=summary_status(),
                     retrieval=retrieval_status())
@@ -136,6 +179,9 @@ class MemoryProxy:
         with self.lock:
             self.closed = True
             entries = list(self.entries.values())
+        with self._status_lock:
+            self._live.clear()
+            self._opening.clear()
         failures = []
         for entry in entries:
             try:
@@ -282,7 +328,14 @@ class MemoryProxy:
                         started = time.perf_counter()
                         outcome, remote = 'unknown', None
                         try:
-                            remote = send(wire.encoded(served))
+                            # Pre-send guard: a served body that lost a tool
+                            # pairing is never sent; the client's original goes
+                            # through verbatim (passthrough is the sanctioned
+                            # degraded mode) and the ledger records why.
+                            problems = guard_served_body(fmt, served)
+                            if problems:
+                                outcome = 'invalid_served_body'
+                            remote = send(body if problems else wire.encoded(served))
                             if remote.status >= 400:
                                 outcome = 'http_error'
                                 raise UpstreamFailure(remote)
@@ -300,7 +353,7 @@ class MemoryProxy:
                                     time.sleep(attempt+1)
                                     continue
                                 raise ValueError('Provider returned no completed answer')
-                            outcome = 'complete'
+                            outcome = 'complete' if not problems else 'invalid_served_body'
                             public = value
                             result = dict(content=wire.message_text(message),finish_reason='stop',elapsed_s=time.perf_counter()-started)
                             parsed = None

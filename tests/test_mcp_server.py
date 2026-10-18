@@ -321,6 +321,10 @@ class TestToolRegistration:
             "pin_memory",
             "supersede",
             "forget",
+            "memory_save",
+            "memory_load",
+            "memory_reset",
+            "memory_load_transcript",
         }
 
     def test_every_tool_has_a_description(self):

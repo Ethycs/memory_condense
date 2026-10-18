@@ -73,3 +73,35 @@ def test_incremental_and_clean_compile_agree_for_live_source(tmp_path):
     incremental = (first, *compiler.atoms([receipt], 'live', STAMP, original_atoms=(first,)))
     clean = Compiler(tmp_path/'clean', 'test', report=lambda **_: None).atoms([source, receipt], 'live', STAMP)
     assert clean == incremental
+
+
+@pytest.mark.parametrize('change', [None, 'asked_at', 'mentioned_at', 'missing_clock', 'preamble', 'query'])
+def test_dated_packet_reuse_authenticates_both_clocks(tmp_path, change):
+    from memory_condense.application.chat_native import exact_memory_passage
+    from memory_condense.domain.question_time import dated_recall_question
+    atom, row = packet()
+    span = atom.spans[0]
+    body = row['text'].split('>\n', 1)[1][:-len('\n</MEMORY>')]
+    dated = dated_recall_question('Deployment?', STAMP)
+    row['text'] = dated.split(']', 1)[0] + ']\n\n' + exact_memory_passage(span, body, span.role)
+    receipt = row['metadata']['_chat']
+    receipt.update(query='Deployment?', asked_at=STAMP, retrieval=dict(dated_question=dated))
+    if change == 'asked_at':
+        row['text'] = row['text'].replace('2026/09/29', '2026/09/28', 1)
+    elif change == 'mentioned_at':
+        row['text'] = row['text'].replace(STAMP, '2026-09-28T00:00:00+00:00', 1)
+    elif change == 'missing_clock':
+        del receipt['asked_at']
+    elif change == 'preamble':
+        row['text'] = 'New unsupported fact\n' + row['text']
+    elif change == 'query':
+        receipt['query'] = 'Another question'
+    originals = {span.receipt_sha256: atom}
+    if change:
+        assert recall_summary_alias(row, originals) is None
+    else:
+        assert recall_summary_alias(row, originals)['reused_sections'][0]['span'] == span.identity_payload()
+        compiler = Compiler(tmp_path, 'test', report=lambda **_: None)
+        compiler.gateway.call = lambda *a, **kw: pytest.fail('Dated exact copies must not regenerate')
+        copied, = compiler.atoms([row], 'live', STAMP, original_atoms=(atom,))
+        assert 'adds no new facts' in copied.summary

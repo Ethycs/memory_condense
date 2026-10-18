@@ -369,8 +369,9 @@ def reopen(root, request):
                 events = tuple(ChatEvent(r['turn_id'], r['role'], r['text'], r.get('created_at'), r.get('metadata', {}))
                                for r in request['rows'])
                 if request.get('query'):
-                    anchor = max(datetime.fromisoformat(e.created_at) for e in events if e.created_at).strftime('%Y/%m/%d (%a)')
-                    output.update(native_packet(app, request['query'], f'[Question asked at {anchor} 23:59] ' + request['query'], events))
+                    from memory_condense.domain.question_time import dated_recall_question
+                    dated = dated_recall_question(request['query'], request.get('asked_at'))
+                    output.update(native_packet(app, request['query'], dated, events))
                 if request.get('operation') == 'learn':
                     learned = learn_native_packet(app, RecallPacket(**request['packet']), events,
                                                   access_event_id=request['access_event_id'])

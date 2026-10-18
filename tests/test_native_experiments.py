@@ -374,7 +374,8 @@ def test_installed_proxy_cli_propagates_experiments_to_all_sessions(tmp_path,mon
     monkeypatch.setattr(sessions,'LocalRuntime',lambda *a,**k:SimpleNamespace(close=lambda:None))
     monkeypatch.setattr(sessions,'ChatSession',lambda path,name,backend,**k:SimpleNamespace(backend=backend))
     observed=[]
-    def serve(config,memory):
+    def serve(config,memory,locator=None,**_):
+        assert locator is not None
         assert memory.status()['retrieval']['experiments']==policy.identity_payload()
         for name in ('a','b'):
             session=memory.factory(name,tmp_path/name)

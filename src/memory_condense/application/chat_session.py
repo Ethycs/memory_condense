@@ -522,6 +522,10 @@ class ChatSession:
             if event.role not in ('user', 'assistant', 'tool') or '_chat' in event.metadata:
                 raise ValueError('Recall must link to an ingested input event')
             recall_options = {}
+            if getattr(self.backend, 'recall_accepts_asked_at', False):
+                # Bind relative dates to the durable input, including while
+                # recall serves a stale published prefix behind the IO queue.
+                recall_options['asked_at'] = event.created_at
             if getattr(self.backend, 'recall_accepts_recent', False):
                 # Only conversation-local messages before this request may
                 # disambiguate it. Exclude recall/feedback copies and tools.
@@ -547,7 +551,8 @@ class ChatSession:
             recent = self._recent_events(published)
             if not isinstance(text, str):
                 raise ValueError('Recall packet must contain text')
-            receipt = dict(kind='recall', packet_id=packet_id, query=query, references=references, input_event_id=linked_input)
+            receipt = dict(kind='recall', packet_id=packet_id, query=query, references=references,
+                           input_event_id=linked_input, asked_at=event.created_at)
             if 'retrieval' in result:
                 receipt['retrieval'] = result['retrieval']
             if recent:

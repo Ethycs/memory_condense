@@ -5,14 +5,20 @@ observe mode made every turn its own conversation and augment mode answered
 400. Resolution order, first hit wins:
 
 1. explicit header (``x-memory-conversation-id`` / ``x-conversation-id``)
-2. the client's own id: Codex sends a ``session_id`` request header; Claude
+2. Codex's own ``client_metadata`` (``installation_id`` + ``thread_id``),
+   from the request body or the ``x-codex-turn-metadata`` header
+3. the client's own session id: a ``session_id`` request header; Claude
    Code's ``metadata.user_id`` may carry ``session_<uuid>``
-3. the on-disk transcript whose first user message matches this request's
+4. the on-disk transcript whose first user message matches this request's
    (located through ``live_sessions``; the file is only ever read)
-4. the request digest -- no threading, which is correct but memoryless
+5. the request digest -- no threading, which is correct but memoryless
 
 Locating never blocks inference: the transcript index refreshes on a
 background thread and a stale or empty index simply falls through.
+
+:func:`is_conversation_turn` is the other half of what Codex metadata buys:
+the same metadata says whether a request is a user exchange at all, and the
+capture path must not ingest the ones that are not.
 """
 
 from __future__ import annotations
@@ -33,7 +39,18 @@ _EXPLICIT = ("x-memory-conversation-id", "x-conversation-id")
 _CLIENT_SESSION = ("session_id", "x-session-id", "x-codex-session-id")
 _MAX_ID = 512
 
+#: Codex carries its identity in the request body under ``client_metadata``
+#: and/or in this header, whose value is a dict or a JSON string.
+_CODEX_TURN_METADATA = "x-codex-turn-metadata"
+_CODEX_IDENTITY = ("installation_id", "thread_id", "turn_id", "request_kind")
+
+#: ``request_kind`` values that are machinery, not a user exchange. A denylist
+#: on purpose -- see :func:`is_conversation_turn` for why an unknown kind must
+#: still be captured.
+NON_CONVERSATION_KINDS = frozenset({"title", "compaction", "compact", "summary", "summarize"})
+
 SOURCE_HEADER = "header"
+SOURCE_CODEX = "codex"
 SOURCE_CLIENT = "client"
 SOURCE_TRANSCRIPT = "transcript"
 SOURCE_DIGEST = "digest"
@@ -52,7 +69,130 @@ def explicit_conversation_id(headers: Mapping[str, str]) -> str | None:
     return None
 
 
+def _as_mapping(payload: Any) -> Mapping[str, Any] | None:
+    """A request body as a mapping, whether it arrives parsed or as bytes."""
+    if isinstance(payload, Mapping):
+        return payload
+    if isinstance(payload, (bytes, bytearray, str)):
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def codex_metadata(
+    headers: Mapping[str, str], payload: Any
+) -> dict[str, Any] | None:
+    """Codex's ``installation_id``/``thread_id``/``turn_id``/``request_kind``.
+
+    Wire format taken from PR #2 (``codex/codex-proxy-windows-startup``,
+    ``interfaces/proxy_codex.py:conversation_headers``), which is what a real
+    ChatGPT-login Codex client sends: a ``client_metadata`` object in the
+    request body, the same fields in an ``x-codex-turn-metadata`` header that
+    may be a dict *or* a JSON string, and -- per key -- the body value with
+    the header value as fallback. That per-key fallback is theirs and is kept
+    verbatim: a client may split the identity across the two carriers.
+
+    Unlike theirs, this never raises. Malformed metadata yields ``None`` (or a
+    partial dict), and the caller falls through to the next resolution step:
+    ``resolve_conversation_id`` promises not to raise, and the proxy's
+    ``except Exception`` around it is a net, not a control-flow path.
+    """
+    body = _as_mapping(payload)
+    metadata = body.get("client_metadata") if body else None
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    turn = metadata.get(_CODEX_TURN_METADATA) or _lower(headers).get(_CODEX_TURN_METADATA)
+    if isinstance(turn, str):
+        try:
+            turn = json.loads(turn)
+        except ValueError:
+            turn = None  # degrade to whatever the body carried; never raise
+    if not isinstance(turn, Mapping):
+        turn = {}
+    if not metadata and not turn:
+        return None
+    return {key: metadata.get(key) or turn.get(key) for key in _CODEX_IDENTITY}
+
+
+def _codex_field(metadata: Mapping[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def codex_conversation_id(headers: Mapping[str, str], payload: Any) -> str | None:
+    """Codex's conversation id: one per *thread*, stable across its turns.
+
+    Keyed on ``installation_id`` + ``thread_id`` only. ``turn_id`` changes
+    every turn and keying on it (or falling through to the request digest, as
+    this module did before) makes every turn of one thread its own
+    conversation -- exactly the failure this module exists to prevent.
+
+    The id is a digest rather than the ids themselves: both are opaque
+    client-supplied strings of unbounded length, and ``conversation_id`` is
+    used as a message-id prefix joined with ``":"`` (see ``proxy_capture``),
+    so an embedded value containing ``":"`` could collide across
+    conversations. The readable ``codex:`` prefix keeps the existing
+    ``<source>:<id>`` style, and the digest keeps the id inside ``_MAX_ID``.
+    The hash input is JSON-encoded, so ("ab", "c") and ("a", "bc") differ.
+    """
+    metadata = codex_metadata(headers, payload)
+    if not metadata:
+        return None
+    installation = _codex_field(metadata, "installation_id")
+    thread = _codex_field(metadata, "thread_id")
+    if not installation or not thread:
+        # Half an identity is not an identity: fall through rather than
+        # invent a key that a later, complete request would not match.
+        # ``turn_id`` is deliberately not required -- we never key on it.
+        return None
+    digest = hashlib.sha256(
+        json.dumps([installation, thread], ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return f"codex:{digest[:16]}"
+
+
+def is_conversation_turn(headers: Mapping[str, str], payload: Any) -> bool:
+    """Is this request a user conversation exchange worth capturing?
+
+    Provenance: PR #2's ``proxy_codex.conversation_headers``, whose comment
+    reads "Title generation and compaction are not user conversation
+    exchanges." Codex sends those on the same endpoint as real turns, with
+    ``request_kind`` set to something other than ``"turn"``; ingesting them
+    pollutes memory with text the user never said.
+
+    Absent or malformed metadata means an ordinary request (every Anthropic
+    client, and Codex itself before this field existed), so the default is
+    ``True``.
+
+    **This excludes by denylist, not by ``kind != "turn"``, and that is the
+    load-bearing difference from the PR.** Theirs runs only behind an opt-in
+    ``--codex-chatgpt`` flag on one transport path; this runs in the universal
+    capture path for every request in observe mode. There the two failure
+    directions are wildly asymmetric: refusing an unrecognised kind means
+    memory silently stops recording real turns and nothing says so, while
+    accepting one means a title-generation request lands in memory, which is
+    visible and removable. A new ``request_kind`` in some later Codex release
+    must therefore keep being captured.
+    """
+    metadata = codex_metadata(headers, payload)
+    if not metadata:
+        return True
+    kind = _codex_field(metadata, "request_kind")
+    return kind is None or kind.casefold() not in NON_CONVERSATION_KINDS
+
+
 def client_native_id(headers: Mapping[str, str], payload: Mapping[str, Any] | None) -> str | None:
+    # Codex's own thread identity first: it is what the client actually sends
+    # (the ``session_id`` family below is a guess that real Codex traffic
+    # never satisfies), and it is authoritative where those are heuristics.
+    codex = codex_conversation_id(headers, payload)
+    if codex:
+        return codex
     low = _lower(headers)
     for key in _CLIENT_SESSION:
         value = low.get(key)
@@ -276,6 +416,12 @@ def resolve_conversation_id(
         payload = parsed if isinstance(parsed, dict) else None
     except ValueError:
         payload = None
+    # Authoritative client metadata beats every heuristic below it, and is
+    # named apart from SOURCE_CLIENT: "the client told us its thread" is a
+    # different quality of evidence from "a session header looked like an id".
+    codex = codex_conversation_id(headers, payload)
+    if codex:
+        return codex, SOURCE_CODEX
     native = client_native_id(headers, payload)
     if native:
         return native, SOURCE_CLIENT

@@ -1,7 +1,7 @@
 # Proxy consolidation — matrix, decision, migration
 
-**Status**: Decision record + migration roadmap (read-only analysis, work package D)
-**Date**: 2026-10-13
+**Status**: Decision record + migration roadmap. M1-M3 delivered; M4-M7 open.
+**Date**: 2026-10-13, delivery status appended 2026-10-20
 **Resolves**: the "Two proxies" open question in `01 - Design/03 - System Controls.md`
 **Decision in one line**: the serving path is `interfaces/proxy_server.py`; `context_proxy/` is a
 donor — its unit grouping + validators, its bridge, and its ledger semantics move into the
@@ -101,12 +101,49 @@ completions, which `context_proxy` does not.
 Where the existing proxy is simply better — queue, durability, recall policy, tokenizer,
 Responses threading semantics, redaction, test depth — nothing moves.
 
+## Delivery status (2026-10-20)
+
+M1, M2 and M3 are delivered. M4 and M5 are untouched: augment still buffers the whole
+upstream response, and `context_proxy/` is still present in full (8 files). Two milestones
+are **new**, from findings the original analysis could not have had — M6 from an integration
+review of the delivered work, M7 from a collaborator's PR.
+
+Three things the plan got wrong, recorded because each cost a bug:
+
+1. **Recommendation 4's receipt recipe manufactures savings.** It says to prefer the
+   upstream's exact `usage.input_tokens` for `served_tokens_last` and the shared estimator
+   for `static_tokens_last`. Followed literally, observe mode — which forwards verbatim and
+   saves nothing — reports a gap made of pure char/4 estimator error and accrues
+   `saved_tokens_total`. The fix is `ServingReceipt.effective_static_tokens`: when nothing
+   was rewritten, the prompt the upstream counted *is* the prompt the client sent, so its
+   exact count describes both sides. Only a real rewrite has two different prompts to
+   compare.
+2. **The transcript bridge is not the only attribution that works for Codex.** "Unique
+   value" claims it is. A real ChatGPT-login Codex client sends authoritative identity —
+   `client_metadata.{installation_id, thread_id, turn_id, request_kind}` in the body, or an
+   `x-codex-turn-metadata` header — so the bridge is step 4 of the chain, not step 2. See M7.
+3. **M1's `served_body` misreports on the passthrough path.** The guard serves the client's
+   original bytes, but the ledger wrote the *rejected* rewrite into `served_body`. Now it
+   records what actually went upstream, with a `served_guard` column for the verdict and
+   composed attempt outcomes (`invalid_served_body+http_error`) so neither fact overwrites
+   the other.
+
+Also superseded: the matrix's **Session attribution** cell for the existing proxy ("Augment
+**requires** the header: a bare Claude Code or Codex client gets 400") and the "Two proxies"
+open question's first load-bearing finding. Both are resolved by M2. The second finding,
+response buffering, stands as M4.
+
+The **Receipts / ledger** cell's note that headers are "allow-listed to protocol/correlation
+keys" is still true, but `redacted_headers` (cited for observe-mode logs) has **no production
+caller** — it is exported and tested while protecting nothing. Wire it or delete it; the test
+name currently reads as a guarantee that is not in force.
+
 ## Migration sequence
 
 Gate after every step: `pixi run -e dev pytest -q tests/` green; observe-mode bytes unchanged
 (M1–M3 add receipts and fallbacks only). M4 is the one behavior-visible step.
 
-- **M1 — Units as a guard** (pure gain). Move `CP/units.py` → `IF/proxy_units.py`; move the
+- **M1 — Units as a guard** (pure gain). **DELIVERED** as `IF/proxy_units.py` + `T/test_proxy_units.py`; `guard_served_body` is called before send and serves the client's original verbatim on any orphan. See delivery note 3 for the ledger correction. Move `CP/units.py` → `IF/proxy_units.py`; move the
   grouping/apply tests from `T/test_context_proxy.py:57-72,125-132` → `T/test_proxy_units.py`.
   Extend `check()` with a `chat` branch (`tool_calls` ↔ `role: tool`/`tool_call_id`), which
   `units.py` lacks and the existing proxy serves. In `IF/proxy_memory.py` call
@@ -114,14 +151,14 @@ Gate after every step: `pixi run -e dev pytest -q tests/` green; observe-mode by
   `outcome='invalid_served_body'` in `proxy_attempts` and serve the client's original body
   verbatim (passthrough is already the sanctioned degraded mode — design note, `/_control/load`).
   Optional later: re-express the boundary walk at `:171-173` as "snap to unit boundary".
-- **M2 — Bridge as attribution fallback.** Move `CP/bridge.py` → `IF/proxy_sessions.py`
+- **M2 — Bridge as attribution fallback.** **DELIVERED** as `IF/proxy_sessions.py` + `T/test_proxy_sessions.py`, with the tiebreak and the transcript fixture the plan asked for. Two things the plan missed: the index never expired, so a finished session kept winning attribution and a stale `handle` liveness outranked a session still being written (now rebuilt from the live set each scan, with `locate` re-stat'ing candidates); and a session scanned before its first user message was cached under `fingerprint("")` forever. `MemoryProxy.namespace` no longer needs to "accept the locator-derived id" — see M6. Move `CP/bridge.py` → `IF/proxy_sessions.py`
   (keep the `live_sessions` dependency lazy). Change `conversation_id_for` (`IF/proxy_server.py:244`)
   to header → locator `session_id` → body sha, and let `MemoryProxy.namespace`
   (`IF/proxy_memory.py:82-92`) accept the locator-derived id. Add a tiebreak (most recently
   modified transcript wins; fall through to sha on ambiguity). Write the missing test with a
   transcript fixture under `tmp_path`. Keep the "never block inference on locating" rule
   (`CP/wire.py:54`).
-- **M3 — Serving receipts.** Add a `ServingReceipt` (fields: `format, mode, rewritten, reason,
+- **M3 — Serving receipts.** **DELIVERED** as `IF/proxy_receipts.py` with exactly the field list below, sole producer of `serving.*` in both modes, fed the upstream's `usage` on all four request paths. The missing header assertion is `T/test_proxy_headers.py` (`anthropic-beta` and `Authorization: Bearer` reach upstream). See delivery note 1. Add a `ServingReceipt` (fields: `format, mode, rewritten, reason,
   static_tokens, served_tokens, usage_input_tokens`) emitted in `handle` for both modes; in
   augment, return the `served` payload size alongside `WireResponse` from `exchange`. Feed
   `serving.requests/rewritten/static_tokens_last/served_tokens_last/saved_tokens_total` in
@@ -129,14 +166,134 @@ Gate after every step: `pixi run -e dev pytest -q tests/` green; observe-mode by
   `control/status.py:76-77`). Add the end-to-end header assertion the existing suite lacks
   (`anthropic-beta` and `Authorization: Bearer` reach upstream), lifted from
   `T/test_context_proxy.py:190-208`.
-- **M4 — Stream in augment mode** when `inline` is false (`IF/proxy_server.py:360-363`):
+- **M4 — Stream in augment mode** (**OPEN**, unchanged) when `inline` is false (`IF/proxy_server.py:360-363`):
   tee as observe does (`:451-473`), run `assemble_stream` on the captured bytes in the
   stream's `finally`, and commit the session record there. Own commit; docs note; the inline
   (buffered) path is untouched.
-- **M5 — Retire.** Move `client_instructions` and the `codex-chatgpt` upstream
+- **M5 — Retire.** **PARTIAL**: `client_instructions` and the `codex-chatgpt` upstream are now `proxy --print-env` in `cli.py` (all three presets), and `cli.py` reads `DEFAULT_UPSTREAMS` from the proxy instead of restating it. `CP/` and `T/test_context_proxy.py` are **not** deleted and the "Two proxies" question is not yet struck. Move `client_instructions` and the `codex-chatgpt` upstream
   (`CP/cli.py:12-43`) into `src/memory_condense/cli.py` as `proxy --print-env`; then delete
   `CP/` and `T/test_context_proxy.py`; strike the "Two proxies" open question from
   `01 - Design/03 - System Controls.md` and link here.
 
+- **M6 — Passthrough is a mode, not just a failure path.** **OPEN.** The governing
+  property, reasoned backwards from stability: an enhancement layer must not be able to
+  refuse the thing it enhances. Today every memory-layer problem becomes the client's
+  problem, because `handle` turns `MemoryProxyError` into a client-facing error and anything
+  else into a 503 — so the ninth conversation fails a user's *inference request* with
+  "restart to reopen another session", and divergent history fails it with a 409.
+
+  One passthrough path, three triggers. **`require`** never passes through and fails
+  instead; **`auto`** (default) passes through when memory cannot serve; **`off`** always
+  passes through. Carried per request by a header so a client can choose per conversation,
+  with a CLI default.
+
+  **Why three and not two.** `off` is the burst lever: a passthrough request returns before
+  `entry()`, so it builds no session, takes no `model_start_lock`, opens no journal and
+  touches **no local models**. That makes `max_sessions` a ceiling on *memory-backed*
+  conversations rather than on conversations — N at once with only k warm. `require` is the
+  opposite guarantee, and it is not optional: for a benchmark or eval a silent passthrough
+  produces "memory did not help" results that actually mean "memory was never used", so the
+  strict mode has to exist before anyone measures anything.
+
+  **This supersedes LRU-on-admission**, which an earlier draft of this milestone proposed.
+  For burst it is the wrong policy: 20 active conversations against 8 slots thrash, and every
+  reopen replays a journal and rebuilds an index. Overflow should pass through — free — and
+  leave the warm slots warm. An *idle* reclaim (close sessions untouched for N, reusing
+  `SessionEntry.stale`, `session.close()`, `entry.reload()` on lazy re-admit and
+  `factory.forget(namespaces=[ns])`, exactly as `MemoryProxy.swap` already does to every
+  entry at once) is the optional refinement for when warm slots are held by dead
+  conversations. It is not needed for the burst property.
+
+  **Four properties make it safe, all verified:**
+  - *No double-send.* Every `MemoryProxyError` is raised before `capture_exchange()`, which
+    is where ingestion, the ledger write and the upstream send all happen. **The one
+    exception is "Previous provider outcome is unknown; request was retained and will not be
+    resent"** — that guard exists precisely because a prior send's outcome is unknown, and it
+    must keep propagating even in `auto`.
+  - *A degraded turn self-heals.* Record nothing on passthrough and the proxy's history stays
+    an exact prefix of the client's, so the overlap loop in `_new_messages` returns the
+    skipped exchange on the following turn and it is ingested then. This is why the
+    fall-through must happen before `capture_exchange()`: half-written state breaks the
+    prefix relationship and the degradation becomes permanent instead of transient.
+  - *A whole passthrough conversation back-fills.* `_new_messages([], client_history)` returns
+    the entire history via its `if not old` branch, so a conversation that ran in `off` and is
+    later switched to `auto` ingests its backlog on the first memory-backed turn. Forced
+    passthrough is reversible with no loss.
+  - *Forced and degraded must not look alike.* "The operator asked for no memory" and "memory
+    broke" carry opposite meanings. Split the counters — `serving.passthrough_forced` and
+    `serving.passthrough_degraded` — and make only the second a `health.reasons` entry.
+    Receipts already carry `reason`.
+
+  **Observability gap to close first, independent of the rest.** `status()` reports
+  `active_sessions` but nothing reports `max_sessions`, and `memory_health` only flags
+  `failed_sessions`. So the control plane cannot say that the next new conversation will be
+  refused: health reads `ok` right up to a user-facing 429, invisible to the statusline, the
+  hook, `ctl status` and `memory_stats`. Publish the limit beside the count and add a
+  capacity health reason. A few lines, worth having before any of the above, and under `auto`
+  it becomes the signal that a conversation is running without memory.
+
+- **M7 — Conversation identity from the client, not from inference.** **PARTIAL.** Adopted
+  from PR #2 (`codex/codex-proxy-windows-startup`): Codex's own `client_metadata`
+  (`installation_id` + `thread_id`) is now step 2 of the chain, ahead of the session-id header
+  guesses and the transcript bridge, and `is_conversation_turn` keeps Codex's title and
+  compaction requests out of memory — they were being ingested as user turns. Deliberately
+  **not** taken, to stay mergeable: the `--codex-chatgpt` flag, the transport routing,
+  `CodexMemoryProxy` (its `_new_messages` compaction matching and `chatgpt-account-id`
+  namespace), and the header injection. One divergence must survive a merge: our
+  `request_kind` filter excludes by **denylist**, not by `kind != "turn"`. Theirs runs behind
+  an opt-in flag on one transport; ours runs in the universal capture path, where refusing an
+  unrecognised kind means memory silently stops recording real turns, while accepting one
+  means a title request lands in memory — visible and removable.
+
+  Still open: a *content-based* step to replace the transcript bridge and the digest, neither
+  of which threads reliably. The primitive already exists — the canonical per-message overlap
+  in `_new_messages` — lifted one level to choose *which* conversation rather than which
+  messages are new. Index candidates by `fingerprint(head_text)`, confirm by exact canonical
+  overlap. Exact, not fuzzy: clients resend history verbatim, so LSH buys nothing for the
+  common case and costs precision. Fuzzy evidence may narrow candidates, never decide — a
+  false merge contaminates one conversation with another's memory, silently, where a false
+  split merely loses threading. Two things to design for first: turn 1 has no prefix to match
+  (retroactive linking needs a merge path), and the header is large and byte-identical across
+  conversations from one client, so measure the header-to-tail ratio on real captures before
+  committing to it.
+
 Order-of-magnitude effort: M1 and M3 are a sitting each; M2 is a sitting plus the fixture;
-M4 is small but must not be rushed; M5 is an hour.
+M4 is small but must not be rushed; M5 is an hour. In M6 the capacity-visibility fix is
+minutes, the three modes a sitting, the idle reclaim a second sitting and optional; the
+content step in M7 needs the measurement first.
+
+## Decisions taken since, that change the plan
+
+- **Credentials do not partition memory** (2026-10-20). `MemoryProxy.namespace` was
+  `sha256([provider, sha256(auth headers), conversation_id])`; it is now
+  `sha256([provider, conversation_id])`. The credential hash was doing tenant isolation at
+  the storage layer, which is the wrong layer, and it cost real data: provider OAuth tokens
+  rotate — and `proxy --print-env` tells Claude Code users to keep their claude.ai login,
+  which is exactly such a token — so every refresh minted a fresh empty namespace for a
+  conversation the user was in the middle of, silently, and burned one of `max_sessions`.
+  The system now assumes a **privileged environment**; access control over a network belongs
+  to a transport in front of the proxy.
+
+  Consequences: branching is unaffected (it was always by conversation id, and divergent
+  history still 409s); a request id can no longer be reused across credentials within one
+  conversation, which is now a correct 409; and `configure_summary_provider` is newly
+  load-bearing on its *reconfigure* path, since a rotated token now lands on an existing
+  summary runtime rather than a fresh one. **The container is the exposure**:
+  `docker-entrypoint.sh` passes `--host 0.0.0.0`, so the shipped image has no storage-level
+  isolation and the transport is load-bearing rather than optional for that deployment.
+
+- **One resolver decides the data directory** (2026-10-19). The MCP server kept a per-project
+  store while the proxy kept one global store, so `memory_reset` erased a different store
+  than `recall` read. `runtime/project.py` is now the single answer for every surface that
+  infers one. Deployment is deliberately different and unchanged: the installed command
+  injects an absolute `--data-dir`, because the Docker image sets `XDG_DATA_HOME` to land the
+  store on the mounted volume. One migration: a store left in a *subdirectory* by the old
+  `Path.cwd()` rule is not found from the project root — adopting it would make the answer
+  depend on directory contents, so it is a release note, not a fallback.
+
+- **Still open, not scheduled.** `session.recall` and its `_chat:recall:` event are written
+  *before* the M1 guard runs, so on the passthrough path the journal asserts recall evidence
+  was delivered to a model that never saw it. Fixing it means either deferring the recall
+  write past the guard verdict — which reorders the durable capture boundary that crash
+  recovery in `exchange` depends on — or writing a compensating marker. It deserves its own
+  finding.

@@ -1,5 +1,6 @@
 """Clients without x-memory-conversation-id (Claude Code, Codex) are served and threaded."""
 
+import hashlib
 import json
 
 import httpx
@@ -116,3 +117,64 @@ def test_chatgpt_codex_backend_path_drops_v1():
     with TestClient(app) as client:
         client.post("/v1/responses", content=_responses_body("hi"), headers={"content-type": "application/json"})
     assert str(seen[-1].url) == "https://chatgpt.com/backend-api/codex/responses"
+
+
+# -- Codex: threads by client_metadata, and non-turn requests are not captured ------
+# Wire format adapted from PR #2 (origin/codex/codex-proxy-windows-startup,
+# ``interfaces/proxy_codex.py:conversation_headers``): a real ChatGPT-login Codex
+# client sends ``client_metadata`` in the body, and marks title generation and
+# compaction with a ``request_kind`` other than ``"turn"``.
+
+
+def _codex_body(text: str, *, request_kind: str = "turn", turn: str = "turn-1",
+                thread: str = "thread-abc") -> bytes:
+    return json.dumps({"model": "gpt-5-codex", "input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}],
+        "client_metadata": {"installation_id": "installation", "thread_id": thread,
+                            "turn_id": turn, "request_kind": request_kind}}).encode()
+
+
+def test_observe_threads_codex_turns_by_client_metadata():
+    """Every turn of one Codex thread is one conversation.
+
+    Provenance: PR #2 keys Codex identity on ``installation_id`` +
+    ``thread_id``. Without it Codex sent nothing this proxy recognised and
+    each turn fell through to the request digest -- two ``proxy:`` ids here.
+    """
+    captured = []
+    seen: list[httpx.Request] = []
+    app = build_app(config=ProxyConfig(mode="observe", capture_compact_prompts=False),
+                    sink=lambda c: captured.append(c) or True, client=_upstream(seen))
+    with TestClient(app) as client:
+        for turn, text in (("turn-1", "fix it"), ("turn-2", "now the test")):
+            r = client.post("/v1/responses", content=_codex_body(text, turn=turn),
+                            headers={"content-type": "application/json"})
+            assert r.status_code == 200
+    assert len(captured) == 2
+    ids = {c.conversation_id for c in captured}
+    assert len(ids) == 1 and ids.pop().startswith("codex:")
+    assert all("x-memory-conversation-id" not in req.headers for req in seen)
+
+
+def test_observe_does_not_capture_codex_title_or_compaction_requests():
+    """Title generation and compaction are not user conversation exchanges.
+
+    Provenance: PR #2's ``conversation_headers`` returns ``None`` for a
+    ``request_kind`` other than ``"turn"``; here the same metadata gates the
+    capture queue, so those requests are still served and still proxied but
+    never ingested as something the user said.
+    """
+    captured = []
+    seen: list[httpx.Request] = []
+    app = build_app(config=ProxyConfig(mode="observe", capture_compact_prompts=False),
+                    sink=lambda c: captured.append(c) or True, client=_upstream(seen))
+    turn_body = _codex_body("fix it")
+    with TestClient(app) as client:
+        for kind in ("title", "compaction"):
+            r = client.post("/v1/responses", content=_codex_body("name this thread", request_kind=kind),
+                            headers={"content-type": "application/json"})
+            assert r.status_code == 200, r.text  # served, just not remembered
+        assert client.post("/v1/responses", content=turn_body,
+                           headers={"content-type": "application/json"}).status_code == 200
+    assert len(seen) == 3  # all three reached the upstream unchanged
+    assert [c.request_sha256 for c in captured] == [hashlib.sha256(turn_body).hexdigest()]

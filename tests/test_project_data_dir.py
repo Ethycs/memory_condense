@@ -227,3 +227,39 @@ class TestDeploymentContractIsNotTheDevelopmentOne:
     def test_a_user_supplied_data_dir_still_overrides_the_injected_default(self, monkeypatch, tmp_path):
         argv = self._installed_argv(monkeypatch, extra=["--data-dir", str(tmp_path / "chosen")])
         assert argv[-2:] == ["--data-dir", str(tmp_path / "chosen")]
+
+
+class TestOneProjectOneStore:
+    """Inside a project the answer is the root, never the directory contents.
+
+    A store left in a subdirectory by the old `Path.cwd()` rule is NOT found
+    from the root. That is a deliberate migration, not an oversight: adopting
+    it would make which store a project uses depend on what some subdirectory
+    happens to contain, so neither a user nor this code could answer the
+    question without going and looking. Called out in the release notes
+    instead. Adoption stays only for the no-project case, where there is no
+    root to prefer and nothing to be ambiguous against.
+    """
+
+    def _project(self, tmp_path, *, sub_store, root_store):
+        (tmp_path / ".git").mkdir()
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        if sub_store:
+            (sub / ".memory_condense").mkdir()
+        if root_store:
+            (tmp_path / ".memory_condense").mkdir()
+        return sub
+
+    def test_a_store_in_a_subdirectory_does_not_hijack_the_project(self, tmp_path):
+        sub = self._project(tmp_path, sub_store=True, root_store=False)
+        assert project.project_data_dir({}, sub) == tmp_path / ".memory_condense"
+
+    def test_the_project_store_is_used_when_both_exist(self, tmp_path):
+        sub = self._project(tmp_path, sub_store=True, root_store=True)
+        assert project.project_data_dir({}, sub) == tmp_path / ".memory_condense"
+
+    def test_a_fresh_project_uses_its_root(self, tmp_path):
+        sub = self._project(tmp_path, sub_store=False, root_store=False)
+        assert project.project_data_dir({}, sub) == tmp_path / ".memory_condense"
+        assert not (sub / ".memory_condense").exists()

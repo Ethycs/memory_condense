@@ -99,16 +99,28 @@ class MemoryProxy:
 
     @staticmethod
     def namespace(provider, headers):
+        """The store partition for one conversation. Credentials play no part.
+
+        This assumes a privileged environment: a single user's own machine,
+        with the proxy bound to localhost by default. Memory is partitioned by
+        conversation, and the provider credential is forwarded upstream
+        without ever being read here.
+
+        It used to mix ``sha256(authorization, x-api-key, ...)`` into the key
+        for tenant isolation. That was the wrong layer and it cost real data:
+        provider OAuth tokens rotate, so every refresh minted a fresh empty
+        namespace for a conversation the user was in the middle of -- silently,
+        and burning one of ``max_sessions`` each time. Access control over a
+        network belongs to a transport in front of this, not to the shape of
+        the storage key; see ``docs/01 - Design/03 - System Controls.md``.
+        """
         headers = {k.lower():v for k,v in headers.items()}
         conversation = headers.get('x-memory-conversation-id') or headers.get('x-conversation-id')
         if not conversation or not conversation.strip():
             raise MemoryProxyError('Memory mode requires x-memory-conversation-id')
         if len(conversation) > 512:
             raise MemoryProxyError('Conversation ID is too long')
-        # A rotating credential selects a new namespace. Hashes are local only.
-        credential = hashlib.sha256(wire.encoded({k:headers[k] for k in
-            ('authorization','x-api-key','api-key','openai-api-key') if k in headers})).hexdigest()
-        return hashlib.sha256(wire.encoded([provider, credential, conversation.strip()])).hexdigest()
+        return hashlib.sha256(wire.encoded([provider, conversation.strip()])).hexdigest()
 
     def entry(self, namespace, *, summary_api=None):
         with self.lock:

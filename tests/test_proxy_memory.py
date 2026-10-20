@@ -237,9 +237,15 @@ def test_namespaces_id_conflicts_and_concurrent_duplicate_requests(tmp_path):
         # attributed by request digest and served in its own namespace, not refused.
         headerless=client.post('/v1/chat/completions',headers={'authorization':'Bearer test-secret'},json=payload)
         assert headerless.status_code==200 and len(memory.entries)==2 and len(calls)==2
+        # Credentials do not partition memory: this system assumes a
+        # privileged environment, and a conversation keeps its store when the
+        # provider token rotates. Previously this minted a third namespace,
+        # which meant an OAuth refresh silently emptied a live conversation's
+        # memory and consumed one of max_sessions. Same conversation and same
+        # request id, so it replays rather than calling upstream again.
         assert client.post('/v1/chat/completions',headers=dict(HEADERS,authorization='Bearer second-user'),json=payload).status_code==200
-        assert len(memory.entries)==3 and len(calls)==3
-        assert client.get('/_memory/health').json()['active_sessions']==3
+        assert len(memory.entries)==2 and len(calls)==2
+        assert client.get('/_memory/health').json()['active_sessions']==2
 
 
 def test_tool_sse_fragments_and_truncated_anthropic_are_not_lost():
@@ -511,3 +517,24 @@ def test_a_guarded_passthrough_keeps_its_verdict_through_an_envelope_failure(tmp
         with entry.session._connect() as db:
             outcomes=[r[0] for r in db.execute('SELECT outcome FROM proxy_attempts ORDER BY attempt')]
         assert outcomes==['invalid_served_body+invalid_inline_envelope']
+
+
+def test_a_rotated_credential_keeps_the_conversations_memory():
+    """A refreshed provider token must not fork the store.
+
+    The namespace used to mix `sha256(authorization, x-api-key, ...)` in for
+    tenant isolation. Provider OAuth tokens rotate -- and `proxy --print-env`
+    tells Claude Code users to keep their claude.ai login, which is exactly
+    such a token -- so every refresh handed a live conversation a fresh empty
+    namespace and burned one of `max_sessions`. Access control over a network
+    is a transport concern, not a storage-key concern.
+    """
+    conversation = {'x-memory-conversation-id': 'engineering'}
+    rotated = [MemoryProxy.namespace('openai', dict(conversation, authorization=f'Bearer token-v{n}'))
+               for n in range(3)]
+    assert len(set(rotated)) == 1
+    # No credential at all is the same conversation, too.
+    assert MemoryProxy.namespace('openai', conversation) == rotated[0]
+    # What still partitions: the conversation, and the provider.
+    assert MemoryProxy.namespace('openai', {'x-memory-conversation-id': 'other'}) not in rotated
+    assert MemoryProxy.namespace('anthropic', conversation) not in rotated

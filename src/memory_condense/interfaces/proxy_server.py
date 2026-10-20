@@ -62,6 +62,7 @@ from memory_condense.control.snapshots import (
 from memory_condense.interfaces.proxy_sessions import (
     SOURCE_HEADER,
     TranscriptLocator,
+    is_conversation_turn,
     resolve_conversation_id,
 )
 from memory_condense.interfaces.proxy_capture import (
@@ -600,6 +601,11 @@ def build_app(
 
         async def publish(reply_text: str, streamed: bool) -> None:
             if not prompt and not reply_text:
+                return
+            # Codex sends title generation and compaction to the same endpoint
+            # as real turns; those are not user exchanges and must not be
+            # ingested as ones. Everything else is a turn by default.
+            if not is_conversation_turn(headers, body):
                 return
             capture = ExchangeCapture(
                 provider=provider,

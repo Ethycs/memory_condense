@@ -111,7 +111,16 @@ def project_data_dir(env: Mapping[str, str] | None = None, cwd: Path | str | Non
         return Path(explicit).expanduser()
     root = project_root(cwd, env)
     if root is not None:
+        # One project, one store, always at the root -- never conditional on
+        # what a subdirectory happens to contain. A store left in a
+        # subdirectory by the old ``Path.cwd()`` rule is therefore not found
+        # from the root, and that migration is called out in the release
+        # notes rather than papered over: adopting it would make the answer
+        # depend on the filesystem, so neither a user nor this code could say
+        # which store a project uses without going and looking.
         return root / DIRNAME
+    # No root to prefer, so adopting is the only way to find anything at all,
+    # and there is nothing for it to be ambiguous against.
     return _existing_local(cwd) or home_data_dir()
 
 

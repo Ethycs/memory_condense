@@ -555,7 +555,16 @@ def test_background_escalation_uses_conversation_model_and_credentials_after_rep
         try:
             for i in range(2):
                 release.clear()
-                headers={'authorization':f'Bearer private-key-{i}','x-memory-conversation-id':'same-name',
+                # Two namespaces, separated by conversation. This used to send one
+                # conversation name under two credentials and rely on the
+                # credential partitioning the store; credentials no longer
+                # partition anything (a privileged environment is assumed, and
+                # a rotating token must not fork a live conversation), so the
+                # same request id in one namespace is now correctly a 409.
+                # What is still under test is unchanged: each conversation's
+                # escalation uses its own model and credential, and no
+                # credential reaches disk.
+                headers={'authorization':f'Bearer private-key-{i}','x-memory-conversation-id':f'conversation-{i}',
                          'x-memory-request-id':'same-request','idempotency-key':'visible-request',
                          'x-memory-provider':provider}
                 payload=dict(model=f'frontier-{i}',messages=[dict(role='user',content=f'Release r{i} remains a plan.')],max_tokens=256)

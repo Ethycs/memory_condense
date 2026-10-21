@@ -236,8 +236,8 @@ def test_provider_authorization_fails_before_environment_or_client(
         lambda: (_ for _ in ()).throw(AssertionError("environment loaded")),
     )
     monkeypatch.setattr(
-        solver_cli.live,
-        "_make_provider_client",
+        solver_cli.provider_runtime,
+        "make_provider_client",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("client created")
         ),
@@ -277,8 +277,8 @@ def test_preflight_provider_materialize_and_replay_are_one_sealed_lifecycle(
     monkeypatch.setenv("TEST_LITELLM_KEY", "controlled-key")
     monkeypatch.setattr(solver_cli, "load_dotenv", lambda: None)
     monkeypatch.setattr(
-        solver_cli.live,
-        "_make_provider_client",
+        solver_cli.provider_runtime,
+        "make_provider_client",
         lambda *_args, **_kwargs: fake,
     )
     provider_result = _provider(

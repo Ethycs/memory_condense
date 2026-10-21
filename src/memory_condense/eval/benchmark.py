@@ -38,6 +38,9 @@ from memory_condense.domain._tokenizer import (
     truncate_to_tokens,
 )
 from memory_condense.application.condenser import MemoryCondenser
+from memory_condense.eval._retrieval_qa_prompt import (
+    QA_SYSTEM_PROMPT as _RETRIEVAL_QA_SYSTEM_PROMPT,
+)
 from memory_condense.search.packing.context_packer import ContextBudget
 from memory_condense.modeling.embedding import EmbeddingService
 from memory_condense.eval.search_kwargs import (
@@ -94,16 +97,15 @@ IngestFn = Callable[[BenchmarkSample, EvalConfig, Path], SupportsSearch]
 # Prompt templates
 # ---------------------------------------------------------------------------
 
-QA_SYSTEM_PROMPT = (
-    "Answer questions about a conversation from the supplied excerpts. "
-    "Infer the intended answer from conversational continuity when one turn "
-    "omits a relation that nearby turns in the same source_id uniquely "
-    "establish. Assistant interpretations may establish context when the "
-    "user continues that interpretation without correction. Preserve "
-    "attribution, never combine different source_ids, and return only the "
-    "shortest best-supported answer. Say I don't know only when no unique "
-    "candidate is supported."
-)
+# Re-exported, not redefined. 684c3dd rewrote a private copy here and left
+# _retrieval_qa_prompt and tools/matched_eval/qa_prompt_policy on the older
+# text, so one eval pipeline answered under two reader policies depending on
+# which function you entered through -- and provider-free replay could not
+# reconstruct its own recordings. _retrieval_qa_prompt is the owner because
+# the packer/recorder (eval/diffuse_longmemeval.py) reads it and because
+# tests/test_frozen_treatment_audit.py reads this text out of git objects at
+# FROZEN_V3, i.e. it is the contract this module is recorded as having had.
+QA_SYSTEM_PROMPT = _RETRIEVAL_QA_SYSTEM_PROMPT
 
 QA_USER_TEMPLATE = (
     "Retrieved excerpts from the conversation history:\n"

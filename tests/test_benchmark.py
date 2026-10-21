@@ -25,6 +25,9 @@ from memory_condense.eval.benchmark import (
     run_benchmark,
     save_benchmark_report,
 )
+from memory_condense.eval._retrieval_qa_prompt import (
+    QA_SYSTEM_PROMPT as OWNED_QA_SYSTEM_PROMPT,
+)
 from memory_condense.eval.cache_receipts import cache_receipts_sha256
 from memory_condense.eval.sample_identity import sample_sha256
 from memory_condense.eval.schemas import (
@@ -210,14 +213,19 @@ def test_exact_match_uses_normalization():
 def test_build_qa_prompt_includes_context_and_question():
     messages = build_qa_prompt("Where?", ["chunk one", "chunk two"])
     assert messages[0]["role"] == "system"
-    assert "same source_id uniquely establish" in (
-        messages[0]["content"]
-    )
-    assert "continues that interpretation without correction" in (
-        messages[0]["content"]
-    )
-    assert "never combine different source_ids" in messages[0]["content"]
-    assert "Say I don't know only when no unique candidate" in messages[0]["content"]
+    # Compared against the OWNING module, not against benchmark's own
+    # constant, so this fails if benchmark ever re-forks the text. That is
+    # the check 684c3dd needed and did not have: it rewrote a private copy
+    # here while the packer/recorder kept reading the owner, and every
+    # assertion that only grepped benchmark's own text stayed green.
+    assert messages[0]["content"] == OWNED_QA_SYSTEM_PROMPT
+    # The substantive reader policy, so a future edit that guts the prompt
+    # is caught even if both copies move together.
+    assert "ONLY the retrieved excerpts" in messages[0]["content"]
+    assert "do not" in messages[0]["content"]
+    assert "mistake assistant suggestions" in messages[0]["content"]
+    assert "newest relevant user update" in messages[0]["content"]
+    assert "reply exactly: I don't know." in messages[0]["content"]
     assert "chunk one" in messages[1]["content"]
     assert "chunk two" in messages[1]["content"]
     assert "Where?" in messages[1]["content"]

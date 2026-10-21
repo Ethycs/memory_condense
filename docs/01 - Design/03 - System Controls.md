@@ -160,6 +160,18 @@ read (tool calls, thinking and meta records included) so the ETA tracks the
 file. Expect `tokens_ingested` to be well below `tokens_done` on a real
 client transcript.
 
+**Augment capacity.** In augment mode `memory` carries `max_sessions`,
+`admitted_sessions` and `sessions_at_capacity` beside `active_sessions`.
+`MemoryProxy.entry` refuses a *new* conversation with a 429 once the registry
+reaches `max_sessions`, and it evicts nothing, so health must say so before that
+happens rather than after: `sessions_at_capacity` raises
+`memory_sessions_at_capacity` in `health.reasons` and the status becomes
+`degraded`. Conversations already open keep working, which is why this is
+`degraded` and not `failed`. `admitted_sessions` counts the registry that gates
+admission, not the sessions whose status happened to be readable, so the signal
+cannot report room that does not exist. See
+`01 - Design/05 - Local Model Handoff and Concurrent Linking.md`, package A.
+
 **`serving` units.** `static_tokens_last` and `served_tokens_last` are always
 in the same unit. When the prompt was *not* rewritten the upstream's exact
 `usage` count describes both sides, so observe mode and an augment passthrough

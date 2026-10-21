@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import threading
+from types import SimpleNamespace
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ from memory_condense.interfaces.proxy_server import (
     build_app,
     capture_health,
     default_data_dir,
+    memory_health,
 )
 
 
@@ -1298,3 +1300,54 @@ class TestServingReceipts:
             doc = client.get("/_control/status").json()
         assert doc["serving"] == empty_status()["serving"]
         assert "serving" not in one_line(doc)
+
+
+class TestSessionCapacityIsVisible:
+    """An operator must see a full session registry before it refuses a request.
+
+    `MemoryProxy.entry` raises 429 when `len(self.entries)` reaches
+    `max_sessions`, and it removes no session to make room. Before this,
+    `status()` published `active_sessions` but never the limit, and
+    `memory_health` only flagged `failed_sessions` -- so health read `ok` right
+    up to a user-facing 429, and no surface could warn. Package A of
+    `01 - Design/05 - Local Model Handoff and Concurrent Linking.md`.
+    """
+
+    def test_health_collects_every_reason_rather_than_the_first(self):
+        assert memory_health({}) == ("ok", [])
+        assert memory_health({"failed_sessions": 1}) == ("degraded", ["memory_sessions_failed"])
+        assert memory_health({"sessions_at_capacity": True}) == (
+            "degraded", ["memory_sessions_at_capacity"])
+        status, reasons = memory_health({"failed_sessions": 1, "sessions_at_capacity": True})
+        assert status == "degraded"
+        assert reasons == ["memory_sessions_failed", "memory_sessions_at_capacity"]
+
+    def test_a_conversation_still_open_is_not_a_failure(self):
+        """At capacity is degraded, not failed: open conversations keep working."""
+        assert memory_health({"sessions_at_capacity": True})[0] == "degraded"
+
+    def test_status_publishes_the_limit_and_the_count_that_gates_admission(self, tmp_path):
+        """Built on a real MemoryProxy: `status` grows, and a duck-type rots."""
+        from memory_condense.interfaces.proxy_memory import MemoryProxy, SessionEntry
+
+        def session(_namespace, _directory):
+            raise AssertionError("this test never admits a real session")
+
+        memory = MemoryProxy(tmp_path, session, inline_memory=False, max_sessions=2)
+        assert memory.status()["max_sessions"] == 2
+        assert memory.status()["sessions_at_capacity"] is False
+
+        for n in range(2):
+            entry = SessionEntry(SimpleNamespace(
+                status=lambda: dict(pending_events=0, pending_feedback=0,
+                                    last_error=None, preparation_jobs=0)))
+            # The registry `entry` gates on, and the mirror `status` reads.
+            memory.entries[f"ns{n}"] = entry
+            memory._live[f"ns{n}"] = entry
+            snapshot = memory.status()
+            assert snapshot["admitted_sessions"] == n + 1
+            assert snapshot["sessions_at_capacity"] is (n + 1 >= 2)
+
+        # The signal must follow the count that `entry` enforces, not the count
+        # of sessions whose status happened to be readable.
+        assert memory_health(memory.status())[1] == ["memory_sessions_at_capacity"]

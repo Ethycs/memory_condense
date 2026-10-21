@@ -186,7 +186,16 @@ class MemoryProxy:
         except Exception as exc:
             startup = dict(unavailable=f'{type(exc).__name__}: {exc}')
         pending_events = sum(v['pending_events'] for v in values)
+        # `entry` gates admission on `len(self.entries)`, so the capacity signal
+        # must count the same thing or it reports room that does not exist. Read
+        # without `self.lock` for the reason above: a length read is atomic, and
+        # a monitoring value may be one admission stale. Publishing the limit is
+        # what lets a surface warn before the next new conversation is refused,
+        # instead of health reading `ok` up to the moment it fails.
+        admitted = len(self.entries)
         return dict(active_sessions=len(values), pending_events=pending_events,
+                    max_sessions=self.max_sessions, admitted_sessions=admitted,
+                    sessions_at_capacity=admitted >= self.max_sessions,
                     pending_feedback=sum(v['pending_feedback'] for v in values),
                     failed_sessions=sum(v['last_error'] is not None for v in values),
                     opening_sessions=opening, startup=startup, sessions=sessions,

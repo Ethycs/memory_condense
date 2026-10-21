@@ -308,10 +308,20 @@ def capture_health(captures: CaptureQueue) -> tuple[str, list[str]]:
 
 
 def memory_health(snapshot) -> tuple[str, list[str]]:
-    """``(status, reasons)`` for ``/health`` in augment mode."""
+    """``(status, reasons)`` for ``/health`` in augment mode.
+
+    Collects every reason rather than returning the first, so one condition
+    cannot hide another. ``memory_sessions_at_capacity`` is the one an operator
+    needs early: the next *new* conversation is refused at that point, while
+    the conversations already open keep working, so health would otherwise read
+    ``ok`` right up to a user-facing 429.
+    """
+    reasons: list[str] = []
     if snapshot.get('failed_sessions'):
-        return 'degraded', ['memory_sessions_failed']
-    return 'ok', []
+        reasons.append('memory_sessions_failed')
+    if snapshot.get('sessions_at_capacity'):
+        reasons.append('memory_sessions_at_capacity')
+    return ('degraded' if reasons else 'ok'), reasons
 
 
 def default_data_dir() -> str:

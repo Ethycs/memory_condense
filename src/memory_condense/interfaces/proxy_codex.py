@@ -4,27 +4,33 @@ import json
 
 from memory_condense.interfaces.proxy_memory import MemoryProxy, MemoryProxyError
 from memory_condense.interfaces.proxy_memory_wire import encoded
+from memory_condense.interfaces.proxy_sessions import codex_metadata
 from memory_condense.interfaces import proxy_memory_wire as wire
 
 
 def conversation_headers(body, headers):
-    metadata = body.get('client_metadata') or {}
-    if not isinstance(metadata, dict):
-        raise MemoryProxyError('Invalid Codex client metadata')
-    turn = metadata.get('x-codex-turn-metadata') or headers.get('x-codex-turn-metadata') or {}
-    if isinstance(turn, str):
-        try:
-            turn = json.loads(turn)
-        except ValueError as exc:
-            raise MemoryProxyError('Invalid Codex turn metadata') from exc
-    if not isinstance(turn, dict):
-        raise MemoryProxyError('Invalid Codex turn metadata')
-    identity = {key: metadata.get(key) or turn.get(key) for key in
-                ('installation_id', 'thread_id', 'turn_id', 'request_kind')}
-    if identity['request_kind'] and identity['request_kind'] != 'turn':
+    """Codex transport headers for one turn, or None when it is not a turn.
+
+    The wire parsing lives in ``proxy_sessions.codex_metadata`` so there is one
+    reader of Codex's identity fields. What stays here is this path's stricter
+    policy, which is deliberately not the capture path's:
+
+    * **Strict, not permissive.** ``codex_metadata`` never raises, because the
+      universal capture path must degrade to its next resolution step. This
+      path runs only behind ``--codex-chatgpt`` and owns the namespace, so
+      incomplete identity is an error -- better a 400 than a conversation
+      silently keyed on something that a later complete request will not match.
+    * **Allowlist, not denylist.** Only ``request_kind == 'turn'`` is a turn
+      here, whereas ``is_conversation_turn`` admits unknown kinds by design.
+      The asymmetry is intended: there, refusing an unrecognised kind would
+      silently stop recording real turns; here, an unexpected kind merely
+      passes through untouched to the provider.
+    """
+    identity = codex_metadata(headers, body) or {}
+    if identity.get('request_kind') and identity['request_kind'] != 'turn':
         # Title generation and compaction are not user conversation exchanges.
         return None
-    if not identity['thread_id'] or not identity['turn_id']:
+    if not identity.get('thread_id') or not identity.get('turn_id'):
         raise MemoryProxyError('Codex memory requires thread_id and turn_id metadata')
     result = dict(headers)
     result['x-memory-client'] = 'codex-chatgpt'

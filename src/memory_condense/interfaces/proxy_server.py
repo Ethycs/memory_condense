@@ -505,6 +505,17 @@ def build_app(
                         headers = adapted
                         headers.pop('content-encoding', None)
                         body, provider, fmt = decoded, OPENAI, 'responses'
+                        # Codex posts to /responses, which has no provider, so
+                        # the resolver above produced a body digest -- a
+                        # different id for every turn of one thread. The
+                        # adaptation has since set an explicit conversation
+                        # header from Codex's own thread identity, so resolve
+                        # again against it: SOURCE_HEADER then keeps the
+                        # generic override below from overwriting the thread
+                        # id with that digest and splitting the namespace.
+                        conversation_id, conversation_source = resolve_conversation_id(
+                            headers, body, body_sha=body_sha, locator=locator
+                        )
                 except (MemoryProxyError, ValueError, OSError, zlib.error) as exc:
                     return JSONResponse({'error': {'message': str(exc)}}, status_code=400)
 

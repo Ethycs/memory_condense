@@ -1,0 +1,44 @@
+# Explicit research snapshots keep DVC from walking the entire artifact archive.
+# Add a completed run below before running `dvc add --no-relink` on it.
+# See docs/02 - Implementation/34 - Research Data with DVC.md.
+/.cache/
+/.pixi/
+/.claude/worktrees/
+/.memory_condense/
+/.agent_tmp/
+/.agent_test_tmp/
+/.pytest*/
+/.test-tmp*/
+/.tmp*/
+/tmp/
+/tmp-pytest*/
+/dist/
+/build/
+/_ingest/
+/eval_cache/
+__pycache__/
+
+# Durable source files are tracked; mutable memory stores are not snapshots.
+/data/*.store/
+/data/*.db
+/data/*.db-wal
+/data/*.db-shm
+
+# Completed evidence only. Keep stage files visible for `dvc status` / `pull`.
+/eval_results/*
+!/eval_results/*.dvc
+!/eval_results/longmemeval-s-native-release-sol-20261014-r27/
+!/eval_results/longmemeval-s-native-release-sol-20261014-r27/**
+!/eval_results/chronos-time-packet-audit-20261016-r1/
+!/eval_results/chronos-time-packet-audit-20261016-r1/**
+!/eval_results/chronos-time-accuracy-20261016-r2/
+!/eval_results/chronos-time-accuracy-20261016-r2/**
+!/eval_results/chronos-source-time-accuracy-20261016-r1/
+!/eval_results/chronos-source-time-accuracy-20261016-r1/**
+
+# The baseline's compiler and transport caches are separate from sealed samples.
+/eval_results/longmemeval-s-native-release-sol-20261014-r27/compiler/
+/eval_results/longmemeval-s-native-release-sol-20261014-r27/runtime-runs/
+
+# Keep this after the allowlist so admitted runs still exclude bytecode caches.
+__pycache__/

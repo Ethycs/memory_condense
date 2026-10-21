@@ -5,6 +5,10 @@
 **Applies to**: the whole repository
 **Depends on**: [`Agentic Technique Master.md`](../Agentic%20Technique%20Master.md) — the style guide governing this tree
 
+**Research data:** [Research Data with DVC](02%20-%20Implementation/34%20-%20Research%20Data%20with%20DVC.md)
+describes the benchmark inputs and completed LongMemEval/Chronos snapshots tracked
+by DVC, their exclusions, and how to configure storage and restore them.
+
 This tree follows the folder system in the style guide: each numbered folder is a prerequisite for the folders after it. A change is only "real" when backed by at least one of the three lanes — tests, documentation, code.
 
 **Current design directions:** [Viable Directions Index](01%20-%20Design/04%20-%20Viable%20Directions%20Index.md)

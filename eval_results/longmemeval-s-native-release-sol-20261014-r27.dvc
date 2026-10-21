@@ -1,0 +1,6 @@
+outs:
+- md5: 3b976f0d28b6a4c01f56da9fbcd2721e.dir
+  size: 2157176742
+  nfiles: 4016
+  hash: md5
+  path: longmemeval-s-native-release-sol-20261014-r27

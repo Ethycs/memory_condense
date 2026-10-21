@@ -1,0 +1,6 @@
+outs:
+- md5: 19a75b9a675919b2d9b6bd9938cf0d02.dir
+  size: 218261
+  nfiles: 8
+  hash: md5
+  path: chronos-time-packet-audit-20261016-r1

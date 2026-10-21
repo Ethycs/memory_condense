@@ -13,3 +13,9 @@ src/memory_condense/runtime/data/history-intent-v1.json* -text
 *.sh text eol=lf
 packaging/Dockerfile text eol=lf
 packaging/docker-entrypoint.sh text eol=lf
+
+# DVC metadata is portable text; data bytes and sealed receipts stay outside Git.
+*.dvc text eol=lf
+.dvcignore text eol=lf
+.dvc/config text eol=lf
+.dvc/.gitignore text eol=lf

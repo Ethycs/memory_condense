@@ -1,0 +1,6 @@
+outs:
+- md5: 045f6e1e536267a6c0dee49e8c1e9e48.dir
+  size: 15890163
+  nfiles: 10794
+  hash: md5
+  path: chronos-source-time-accuracy-20261016-r1

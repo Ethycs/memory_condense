@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import memory_condense.eval._diffuse_base_store as store_module
 from memory_condense.persistence.db import CURRENT_SCHEMA_VERSION
 from tests import test_diffuse_longmemeval_base as base_fixtures
 from tests import test_embedding as embedding_tests
@@ -59,9 +60,13 @@ def test_confirmation_base_store_records_one_index_revision(
     assert not any(empty_state_counts.values())
 
 
-def test_confirmation_pinned_embedder_is_forced_offline(monkeypatch) -> None:
+def test_confirmation_pinned_embedder_is_forced_offline(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     """Reuse the core loader contract inside the sealed confirmation gate."""
 
     embedding_tests.test_default_model_load_is_revision_pinned_and_hash_verified(
-        monkeypatch
+        monkeypatch,
+        tmp_path,
     )

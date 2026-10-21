@@ -33,8 +33,13 @@ The initial five snapshots contain **25,867 files / 2,494,098,705 bytes**
 This is an explicit first snapshot, not a claim that the entire research archive
 has been migrated. `.dvcignore` admits these four completed runs and excludes the
 other evaluation directories from traversal. It also excludes downloaded model
-weights, temporary tests, mutable `.store`/database files, and the baseline's
-compiler and transport caches. Small task definitions in `evals/` and project
+weights, temporary tests, mutable stores directly under `data/`, and the baseline's
+compiler and transport caches. The baseline snapshot does contain the completed
+250 sample stores created by r27, including their `memory.db` source turns and
+`native-spine-live-v1.sqlite` summary indexes. Its first 250 answers were adopted
+from r26, whose stores are outside this initial snapshot. This does **not** yet
+preserve the complete originating-store and summary-cache population.
+Small task definitions in `evals/` and project
 model heads already tracked by Git remain in Git.
 
 Existing `.sha256` sidecars remain authoritative for the project's sealed-artifact
@@ -59,7 +64,11 @@ dvc pull
 ```
 
 The raw payloads stay Git-ignored. `eval_results/*.dvc` is the sole exception
-under the evaluation directory so Git can version the pointers.
+under the evaluation directory so Git can version the pointers. The exclusion
+uses `/eval_results/?*`, requiring a child character: on this Windows setup,
+`/eval_results/*` also matched DVC's trailing-slash check of `eval_results/`,
+which silently hid the four evaluation stages from default push/pull discovery.
+`dvc dag --outs` must show all five snapshots.
 
 ## Shared storage and machine setup
 

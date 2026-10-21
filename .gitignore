@@ -30,7 +30,8 @@ Thumbs.db
 # Eval cache and results
 eval_cache/
 # Keep DVC pointers in Git; experiment payloads remain outside Git.
-/eval_results/*
+# Require a child character: DVC's Windows directory check includes a trailing slash.
+/eval_results/?*
 !/eval_results/*.dvc
 
 # Agent/test scratch artifacts

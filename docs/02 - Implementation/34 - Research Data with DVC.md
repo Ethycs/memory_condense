@@ -1,6 +1,6 @@
 # Research data with DVC
 
-**Status:** Local data tracking; shared remote pending configuration
+**Status:** Local data tracked; lakeFS remote configured; first upload awaits authentication
 
 **Date:** 2026-10-21
 
@@ -9,7 +9,7 @@
 DVC stores the data bytes in its content-addressed cache. Git stores the small
 `.dvc` pointers, `.dvc/config`, `.dvcignore`, and this guide. The application and
 release packages do not require DVC. This setup uses the separately installed
-DVC 3.67.1 CLI; it does not add dependencies to the model runtime.
+DVC 3.67.1 CLI with `dvc-s3`; it does not add dependencies to the model runtime.
 
 ## Initial coverage
 
@@ -51,7 +51,7 @@ Run these commands from the repository root:
 dvc status
 dvc remote list
 
-# Once a remote is configured, restore just the benchmark inputs:
+# After the first remote publication, restore just the benchmark inputs:
 dvc pull data.dvc
 
 # Restore all tracked snapshots:
@@ -61,23 +61,85 @@ dvc pull
 The raw payloads stay Git-ignored. `eval_results/*.dvc` is the sole exception
 under the evaluation directory so Git can version the pointers.
 
-## Configure the shared copy
+## Shared storage and machine setup
 
-No remote destination is assumed. The local `.dvc/cache` is not an off-machine
-backup. Configure the intended folder or storage URI before pushing:
+Follow the infrastructure [project-data guide](https://central-dev.zt:9000/#operations/project-data.md).
+The credential-free remote is configured in `.dvc/config`:
 
-```powershell
-# Replace the quoted placeholder with the chosen local/network path or URI.
-dvc remote add --local -d archive 'APPROVED_FOLDER_OR_STORAGE_URI'
-dvc push
+| Setting | Value |
+| --- | --- |
+| DVC remote | `lakefs` (default) |
+| DVC URL | `s3://memory-condense/main/` |
+| Endpoint | `https://central-dev.zt:8000` |
+| Intended lakeFS repository | `memory-condense` |
+| Intended storage namespace | `s3://lakefs-storage/memory-condense` |
+
+The first URL component is a lakeFS repository, not the underlying MinIO
+bucket. Check that the repository exists before the first push; if absent,
+create it once using authenticated `lakectl`:
+
+```sh
+lakectl repo create lakefs://memory-condense s3://lakefs-storage/memory-condense
 ```
 
-`--local` writes machine-specific settings to ignored `.dvc/config.local`.
-For a shared, credential-free remote URI, omit `--local` so teammates receive
-the location through Git. Keep credentials in local configuration or the
-storage provider's credential mechanism. Cloud/SSH destinations may require
-the matching DVC storage extra; the current installation supports local files
-and HTTP(S).
+Install DVC separately from the application environment on each client:
+
+```powershell
+pixi global install 'dvc=3.67.1' --with dvc-s3
+dvc remote modify --local lakefs ssl_verify 'PATH_TO_TRUSTED_CADDY_ROOT_PEM'
+```
+
+Obtain the Caddy root from the infrastructure checkout or export the already
+trusted certificate on the machine. Do not disable certificate verification.
+This Windows checkout uses `.dvc/tmp/caddy-root.crt`, exported from its trusted
+Caddy root, with an absolute path in `.dvc/config.local`.
+
+Retrieve `LAKEFS_MODELS_ACCESS_KEY_ID` and `LAKEFS_MODELS_SECRET_ACCESS_KEY`
+from Infisical project **Infrastructure** (`b1951664-d0f2-4a26-9db3-dc9a0e430369`),
+environment `prod`, path `/lakefs`, following the access instructions in the
+infrastructure guide. Store them as remote settings `access_key_id` and
+`secret_access_key` only in ignored `.dvc/config.local`; restrict that file's
+permissions to the account running DVC. Fetch them from Infisical on each
+machine instead of copying another clone's configuration. The historically
+named `MODELS` key has instance-wide administrative access.
+
+`--local` keeps credentials, certificate paths and machine-specific endpoint
+overrides out of Git. Neither application installation nor release packaging
+requires these research-storage credentials.
+
+## Publish a recoverable version
+
+Commit the `.dvc` pointers in Git first, then publish the cached bytes and
+commit the lakeFS branch. A DVC push only stages objects; it does not create a
+lakeFS snapshot.
+
+```powershell
+dvc push
+if ($LASTEXITCODE -ne 0) { throw 'DVC push failed; do not publish a lakeFS snapshot.' }
+lakectl diff lakefs://memory-condense/main
+if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the staged lakeFS changes.' }
+# Review that the staged objects belong to this publication, then:
+$dataGitCommit = git rev-parse HEAD
+lakectl commit lakefs://memory-condense/main -m 'Research data snapshot' --meta "git_commit=$dataGitCommit"
+if ($LASTEXITCODE -ne 0) { throw 'The upload is not yet committed in lakeFS.' }
+lakectl log lakefs://memory-condense/main --amount 5
+```
+
+Use authenticated `lakectl` as described by the infrastructure guide; it can
+run on central-dev when unavailable on a Windows client. Use the Git commit
+from this project for the metadata, not the infrastructure checkout's HEAD.
+After publishing, check cloud status per target, for example
+`dvc status --cloud data.dvc`, and test a pull into an empty-cache checkout.
+
+The local `.dvc/cache` alone is not an off-machine backup. The configured
+destination is not proof that the data has been uploaded. The first remote
+publication is still pending: on 2026-10-21 lakeFS health returned HTTP 204,
+but local Infisical needed login and SSH authentication was unavailable.
+
+Do not write directly to MinIO or enable lakeFS garbage collection: the
+infrastructure's `artifacts` repository overlaps the other storage namespaces.
+Do not run `dvc gc --cloud` without accounting for retained Git history and
+lakeFS snapshots.
 
 ## Update or admit another completed run
 
@@ -88,12 +150,12 @@ replacing the source files:
 dvc add --no-relink data
 dvc add --no-relink eval_results/chronos-source-time-accuracy-20261016-r1
 dvc status
-dvc push
 ```
 
 Commit the changed `.dvc` pointers with the code or research note that explains
-the new data version. Avoid changing old sealed evidence to satisfy a new
-experiment; create a new run instead.
+the new data version, then follow **Publish a recoverable version** above,
+including the lakeFS commit. Avoid changing old sealed evidence to satisfy a
+new experiment; create a new run instead.
 
 For another completed run, first add both its directory and descendants to
 the allowlist in `.dvcignore`, before the final exclusions:

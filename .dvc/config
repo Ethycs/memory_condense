@@ -1,2 +1,6 @@
 [core]
     analytics = false
+    remote = lakefs
+['remote "lakefs"']
+    url = s3://memory-condense/main/
+    endpointurl = https://central-dev.zt:8000

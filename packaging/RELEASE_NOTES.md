@@ -1,4 +1,6 @@
-Unreleased additions:
+Memory Condense v0.2.3-beta.1 adds a control plane for seeing and steering the
+running proxy, an optional Codex ChatGPT transport, optional Windows
+start-at-login installation, and per-project store resolution.
 
 **Beta, and augment-mode memory starts empty.** Conversation stores are no longer
 keyed on the provider credential, so every existing store under
@@ -30,6 +32,24 @@ Other changes that move where data lives or what a tool is called:
 - Optional Windows `-StartAtLogin` installation with a current-user task using
   the installed `pythonw.exe`; status/start/stop/removal are in `manage-startup.ps1`.
 - Optional MCP extra and reuse of explicitly configured installed BGE assets.
+- A control plane for seeing and steering the running proxy. It publishes one
+  status document at `<data-dir>/control/status.json`, serves it at
+  `GET /_control/status`, and takes `save`, `load`, `reset` and
+  `load-transcript` on sibling local-only routes. Every surface reads that one
+  document rather than computing its own numbers: `memory-condense ctl
+  status|save|load|reset|load-transcript`, the `memory_snapshot_save` /
+  `memory_snapshot_restore` / `memory_stats` MCP tools, an optional Claude Code
+  statusline, and an optional `UserPromptSubmit` hook that notes state changes.
+  Mutating routes snapshot before they destroy; `reset` needs `--yes`.
+- Augment-mode startup is now visible while it happens. A native session loads
+  models before it can answer, which on a cold attention cache has been observed
+  to take over twenty minutes; status previously reported `idle` throughout,
+  because the queue counters it read are an observe-mode structure that stays
+  empty in augment mode. There is now a `starting` state carrying the per-session
+  stage and elapsed time, and status requests no longer queue behind the model
+  load they describe. A cold load has no total and therefore no ETA -- the stage
+  name and elapsed time are what distinguish a slow start from a wedged one.
+  `starting` is additive: a reader that does not know it prints the state name.
 
 See `docs/02 - Implementation/32 - Codex Client and Windows Startup.md` for
 configuration, affected features and limits. Existing provider routes and

@@ -68,7 +68,7 @@ class SessionEntry:
 
 
 class MemoryProxy:
-    """One namespace per credential/provider/conversation; one IO owner per session.
+    """One namespace per provider/conversation; one IO owner per session.
 
     session_factory(namespace, directory) returns the normal streaming ChatSession.
     The caller supplies HTTP transport. Credentials only bind the namespace;

@@ -25,7 +25,7 @@ own provider credential and configured upstream URL.
 
 ### Native memory beta (`--mode augment`)
 
-The proxy is distributed as version 0.2.2 with an installed `memory-condense`
+The proxy is distributed as version 0.2.3 with an installed `memory-condense`
 command and a packaged resident runtime. It no longer imports research tools
 or reads model paths relative to the checkout. See the root
 [installation guide](../../README.md) for the Pixi build, standalone installer,

@@ -62,7 +62,7 @@ See the startup guide for status, removal and upgrade instructions.
 On Linux the bundle is a flat tarball, so extract it into a directory of its own:
 
 ```bash
-mkdir memory-condense && tar -xzf memory-condense-0.2.2-linux64.tar.gz -C memory-condense
+mkdir memory-condense && tar -xzf memory-condense-0.2.3-linux64.tar.gz -C memory-condense
 cd memory-condense && chmod +x install-proxy.sh && ./install-proxy.sh
 ```
 
@@ -77,12 +77,12 @@ To build from the repository instead:
 pixi build --output-dir dist
 ```
 
-The build produces `dist/memory_condense-0.2.2-pyh4616a5c_0.conda`. Install it
+The build produces `dist/memory_condense-0.2.3-pyh4616a5c_0.conda`. Install it
 into a separate application environment:
 
 ```powershell
 .\packaging\install-proxy.ps1 `
-  -PackagePath .\dist\memory_condense-0.2.2-pyh4616a5c_0.conda
+  -PackagePath .\dist\memory_condense-0.2.3-pyh4616a5c_0.conda
 ```
 
 The installer resolves CUDA-enabled PyTorch and the other native dependencies
@@ -92,7 +92,7 @@ fresh machine. To reuse this project's existing assets instead:
 
 ```powershell
 .\packaging\install-proxy.ps1 `
-  -PackagePath .\dist\memory_condense-0.2.2-pyh4616a5c_0.conda `
+  -PackagePath .\dist\memory_condense-0.2.3-pyh4616a5c_0.conda `
   -AssetsDir 'F:\Keytone\Documents\GitHub\memory_condense\.cache'
 ```
 
@@ -100,7 +100,7 @@ The Linux installer takes the same options as long flags:
 
 ```bash
 ./packaging/install-proxy.sh \
-  --package-path ./dist/memory_condense-0.2.2-pyh4616a5c_0.conda \
+  --package-path ./dist/memory_condense-0.2.3-pyh4616a5c_0.conda \
   --assets-dir /path/to/existing/.cache
 ```
 

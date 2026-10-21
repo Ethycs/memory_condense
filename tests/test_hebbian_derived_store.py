@@ -45,6 +45,8 @@ from memory_condense.modeling.embedding import (
 )
 from memory_condense.persistence.db import Database
 
+from tests.sqlite_writer_fence import connect_past_writer_fence
+
 
 SOURCE_RECEIPT_SHA256 = "a" * 64
 IMPLEMENTATION_SHA256 = "b" * 64
@@ -508,7 +510,10 @@ def test_rejects_changed_staged_retrieval_material_before_learning(tmp_path):
     source = _build_store(tmp_path / "source")
     stage = _copy_stage(source, tmp_path / "derived")
     database_path = stage / "memory.db"
-    connection = sqlite3.connect(database_path)
+    # ``chunks`` writes are fenced behind the product writer identity; an
+    # attacker owning the staged file can satisfy that fence, so the tamper
+    # must satisfy it too or it never lands for the audit to reject.
+    connection = connect_past_writer_fence(database_path)
     try:
         connection.execute(
             "UPDATE chunks SET embedding = ? WHERE chunk_id = 'chunk-0'",

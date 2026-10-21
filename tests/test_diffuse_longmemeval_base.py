@@ -74,6 +74,8 @@ from memory_condense.eval.reproducibility import file_sha256
 from memory_condense.eval.schemas import ChunkerConfig, EvalConfig, RetrievalConfig
 from memory_condense.ingest.loader import BenchmarkQuestion, BenchmarkSample
 
+from tests.sqlite_writer_fence import connect_past_writer_fence
+
 
 _DIMENSION = 16
 _MAX_ELEMENTS = 128
@@ -1151,7 +1153,10 @@ def test_logical_store_audit_rejects_rehashed_sqlite_tamper(tmp_path: Path) -> N
         *_rest,
     ):
         database_path = base.store_path / STORE_DIRECTORY_NAME / _DATABASE_NAME
-        with sqlite3.connect(database_path) as connection:
+        # The schema fences writes to ``turns`` behind the product writer
+        # identity; an attacker owning the file can satisfy it, so the tamper
+        # has to as well or it never lands for the audit to catch.
+        with connect_past_writer_fence(database_path) as connection:
             connection.execute("PRAGMA journal_mode=DELETE")
             connection.execute(
                 "UPDATE turns SET text = text || ' tampered' WHERE ordinal = 1"
@@ -1327,7 +1332,8 @@ def test_store_audit_rejects_rehashed_lexical_posting_tamper(
         *_rest,
     ):
         database_path = base.store_path / STORE_DIRECTORY_NAME / _DATABASE_NAME
-        with sqlite3.connect(database_path) as connection:
+        # ``chunk_terms`` is fenced the same way as ``turns``; see above.
+        with connect_past_writer_fence(database_path) as connection:
             connection.execute("PRAGMA journal_mode=DELETE")
             term, chunk_id = connection.execute(
                 "SELECT term, chunk_id FROM chunk_terms "

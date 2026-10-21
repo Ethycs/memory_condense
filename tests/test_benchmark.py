@@ -272,13 +272,17 @@ def test_prompt_budget_caps_and_truncates_context():
 
     uncapped = ["Boston " * 200, "Pepper " * 200]
     # Leave room for the fixed provenance/update instructions while still
-    # forcing the long retrieved chunks through the truncation path.
-    capped = cap_context_to_prompt_budget("Where?", uncapped, 300)
+    # forcing the long retrieved chunks through the truncation path. The cap
+    # tracks the system prompt: it sits a little above the no-context
+    # overhead so exactly one chunk survives, truncated. Raised from 300
+    # when the untrusted-data clause took the overhead from 297 to 309.
+    budget = 320
+    capped = cap_context_to_prompt_budget("Where?", uncapped, budget)
     prompt = build_qa_prompt("Where?", capped)
 
     assert capped
     assert len(capped) == 1
-    assert count_chat_prompt_token_proxy(prompt) <= 300
+    assert count_chat_prompt_token_proxy(prompt) <= budget
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,29 @@
 Unreleased additions:
 
+**Beta, and augment-mode memory starts empty.** Conversation stores are no longer
+keyed on the provider credential, so every existing store under
+`<data-dir>/sessions/` has a new name and the proxy does not find it. The old files
+are untouched on disk; nothing is deleted. There is no automatic migration, and
+there cannot be one: the old name hashed a credential that has since rotated, so it
+cannot be recomputed. The reason for the change is that the old key forked a live
+conversation's memory on every OAuth token refresh, silently.
+
+Other changes that move where data lives or what a tool is called:
+
+- A proxy started without `--data-dir` now resolves `$MEMORY_CONDENSE_DATA_DIR`, then
+  `<project root>/.memory_condense`, then the user data directory. A store left at
+  `./data` by a bare `python -m memory_condense.interfaces.proxy_server` run needs
+  `--data-dir data` or the environment variable. The installed `memory-condense
+  proxy` command is unchanged and still uses an absolute path, so container and
+  volume setups are unaffected.
+- A store left in a *subdirectory* of a project by an earlier version is not found
+  from the project root. Move it to `<project root>/.memory_condense`, or set
+  `$MEMORY_CONDENSE_DATA_DIR`.
+- Two MCP tools are renamed: `memory_save` is now `memory_snapshot_save`, and
+  `memory_load` is now `memory_snapshot_restore`. The old names are gone. The rename
+  separates the destructive store swap from the additive `memory_load_transcript`.
+
+
 - Optional Codex ChatGPT transport through the existing Responses memory engine:
   stable conversation/retry identity, namespaced/custom tools, Responses Lite
   catalogues, retained assistant phases, compacted replay and interrupted prose.

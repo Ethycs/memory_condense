@@ -11,7 +11,7 @@ from starlette.testclient import TestClient
 
 from memory_condense.application.chat_session import ChatSession,ChatEvent
 from memory_condense.control.snapshots import SessionSnapshotStore
-from memory_condense.interfaces.proxy_memory import MemoryProxy
+from memory_condense.interfaces.proxy_memory import MemoryProxy, MemoryProxyError
 from memory_condense.interfaces.proxy_server import ProxyConfig,build_app
 from memory_condense.interfaces import proxy_memory_wire as wire
 from tests.test_chat_streaming import StreamingBackend

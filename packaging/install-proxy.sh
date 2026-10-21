@@ -119,6 +119,11 @@ KMP_DUPLICATE_LIB_OK = "TRUE"
 
 [dependencies]
 memory_condense = { url = "$package_url", sha256 = "$package_sha" }
+# Pillow is pulled in by the conda solve, which now resolves it to 13.x,
+# while fastembed 0.8.1 requires pillow<13. Constrain it on the conda side,
+# where the version is actually chosen; a pypi pin cannot override a
+# conda-pinned package. Revisit when fastembed supports pillow 13.
+pillow = "<13"
 
 [pypi-dependencies]
 fastembed = "==0.8.1"

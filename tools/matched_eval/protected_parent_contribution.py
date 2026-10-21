@@ -967,6 +967,12 @@ def rehydrate_protected_parent_contributions(
     rebuilt_bytes = canonical_json_bytes(reconstructed)
     _require(rebuilt_bytes == compact_bytes, "compact parent projection changed")
 
+    # Imported at call time, as it was before 9cc4a89 inlined
+    # _rehydrate_handle_binding and dropped this import without migrating
+    # the call below. The assay owns the gold-blind locator->source join;
+    # copying it here would fork a second definition of a sealed projection.
+    from tools import run_reduced_second_read_retrieval_assay as reduced_cli
+
     source_map = reduced_cli._local_source_map(local_audit)
     exact_spans = _exact_span_keys(local_audit, original_bindings)
     priorities = _local_priorities(

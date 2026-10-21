@@ -73,7 +73,15 @@ from memory_condense.eval._diffuse_base_derived import (
 from memory_condense.eval._diffuse_base_publication_guard import (
     freeze_callable_guard,
 )
-from memory_condense.eval.benchmark import QA_SYSTEM_PROMPT, build_qa_prompt
+# The packer/recorder (eval/diffuse_longmemeval.py) builds its prompt from
+# _retrieval_qa_prompt, and the system prompt is passed as base_messages to
+# pack_evidence_plan, so it is part of both the token budget and the recorded
+# bytes. Reading benchmark's copy here -- which 684c3dd rewrote while leaving
+# this one behind -- made reconstruction unable to match any recording.
+from memory_condense.eval._retrieval_qa_prompt import (
+    QA_SYSTEM_PROMPT,
+    build_qa_prompt,
+)
 from memory_condense.eval.diffuse_compilation import DiffuseCompilationPolicy
 from memory_condense.eval.diffuse_longmemeval import (
     LongMemEvalDiffuseQueryReceipt,

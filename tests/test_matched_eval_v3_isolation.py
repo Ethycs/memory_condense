@@ -7,7 +7,10 @@ import pytest
 
 from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.domain.discourse import identity_sha256, quote_sha256
-from memory_condense.eval.benchmark import QA_SYSTEM_PROMPT
+# The renderer under test reads tools/matched_eval/qa_prompt_policy; this
+# import tracked benchmark's copy, which only matched by coincidence until
+# 684c3dd rewrote it.
+from tools.matched_eval.qa_prompt_policy import QA_SYSTEM_PROMPT
 from tests.test_fast_completion_runtime import _FakeClient
 from tests.test_matched_eval_population import _publish, _retrieval
 from tools.matched_eval import judging, live

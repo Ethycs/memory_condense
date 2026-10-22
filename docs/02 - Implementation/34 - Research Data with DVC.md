@@ -1,6 +1,6 @@
 # Research data with DVC
 
-**Status:** Local data tracked; lakeFS remote configured; first upload awaits authentication
+**Status:** Initial five snapshots published and restore-verified; complete 500-store archive verified locally
 
 **Date:** 2026-10-21
 
@@ -37,7 +37,8 @@ weights, temporary tests, mutable stores directly under `data/`, and the baselin
 compiler and transport caches. The baseline snapshot does contain the completed
 250 sample stores created by r27, including their `memory.db` source turns and
 `native-spine-live-v1.sqlite` summary indexes. Its first 250 answers were adopted
-from r26, whose stores are outside this initial snapshot. This does **not** yet
+from r26 and, transitively, earlier runs; their originating stores are outside
+this initial snapshot. This does **not** yet
 preserve the complete originating-store and summary-cache population.
 Small task definitions in `evals/` and project
 model heads already tracked by Git remain in Git.
@@ -68,7 +69,43 @@ under the evaluation directory so Git can version the pointers. The exclusion
 uses `/eval_results/?*`, requiring a child character: on this Windows setup,
 `/eval_results/*` also matched DVC's trailing-slash check of `eval_results/`,
 which silently hid the four evaluation stages from default push/pull discovery.
-`dvc dag --outs` must show all five snapshots.
+`dvc dag --outs` must show the five initial snapshots plus `research_data`.
+
+## Original text and generated summaries
+
+The original LongMemEval histories are in `data/longmemeval_s_cleaned.json`.
+Each built memory store keeps exact source turns in `memory.db` (`turns.text`)
+and its atomic/hierarchical/parent summary sections in
+`native-spine-live-v1.sqlite`. Reusable compiler summaries also exist under
+`compiler/cache/atoms` and `compiler/cache/merges`; their entries include source
+text hashes and support evidence. Attention and vector caches are separate.
+
+Following the saved adoption receipts found **all 500 source/summary store
+pairs across 13 originating runs**. The complete frozen store set is in
+`research_data/longmemeval-s-500-stores-20261021/`, tracked by `research_data.dvc`:
+
+- `catalog.json` maps each question through its adoption history to its source
+  store and archive.
+- Thirteen `.tar.zst` archives preserve the original relative paths of all
+  **1,500 database/index files / 4,124,027,776 bytes**. They compress to
+  **1,528,611,413 bytes**, excluding JSON receipts.
+- Each archive has a JSON manifest with every member's original path, size,
+  timestamp and SHA-256, plus the archive's SHA-256. Every member was read back
+  from its archive and matched against its original hash.
+
+The frozen stores include `memory.db`, `native-spine-live-v1.sqlite`, and
+`hnsw_index.bin`. Ephemeral `-shm` and empty `-wal` files are omitted; the
+archiver refuses a nonempty WAL. Original stores remain in place.
+
+After pulling `research_data.dvc`, extract a bundle into an empty restore
+directory using `tar -xf BUNDLE.tar.zst -C RESTORE_DIRECTORY`. Windows tar
+3.8.9 successfully read this format. Member paths recreate the original
+`eval_results/<run>/samples/<question>/store/memory/` layout.
+
+This complete 500-store set still does not cover the entire larger research
+archive. The requested remaining scope is source text, summaries, provenance,
+and reusable retrieval artifacts; temporary runs and debug artifacts are
+outside it. The broader inventory and archive work are tracked separately.
 
 ## Shared storage and machine setup
 
@@ -80,8 +117,8 @@ The credential-free remote is configured in `.dvc/config`:
 | DVC remote | `lakefs` (default) |
 | DVC URL | `s3://memory-condense/main/` |
 | Endpoint | `https://central-dev.zt:8000` |
-| Intended lakeFS repository | `memory-condense` |
-| Intended storage namespace | `s3://lakefs-storage/memory-condense` |
+| lakeFS repository | `memory-condense` |
+| Storage namespace | `s3://lakefs-storage/memory-condense` |
 
 The first URL component is a lakeFS repository, not the underlying MinIO
 bucket. Check that the repository exists before the first push; if absent,
@@ -140,10 +177,14 @@ from this project for the metadata, not the infrastructure checkout's HEAD.
 After publishing, check cloud status per target, for example
 `dvc status --cloud data.dvc`, and test a pull into an empty-cache checkout.
 
-The local `.dvc/cache` alone is not an off-machine backup. The configured
-destination is not proof that the data has been uploaded. The first remote
-publication is still pending: on 2026-10-21 lakeFS health returned HTTP 204,
-but local Infisical needed login and SSH authentication was unavailable.
+The local `.dvc/cache` alone is not an off-machine backup. On 2026-10-21 the
+first five snapshots were published as lakeFS commit
+`32c35586de25c4364af513a2cf3abb47c8a91b529cada5ceacdb1cdbf5dc80a7`, linked
+to Git commit `71f93a585b2e3cebf6b9a8a6733fa05eb0c5d342`. All **25,074 unique
+objects / 2,496,708,246 remote bytes**, including directory manifests, matched
+the expected keys and sizes. The branch had no uncommitted changes afterward.
+Publication used lakeFS's authenticated commit API, equivalent to `lakectl
+commit`, with the same Git metadata; no direct MinIO writes were used.
 
 Do not write directly to MinIO or enable lakeFS garbage collection: the
 infrastructure's `artifacts` repository overlaps the other storage namespaces.
@@ -194,8 +235,7 @@ Validation covers the selected data, not a new model evaluation:
 - Exercise a temporary local remote with the packet-audit snapshot, pull it
   into an empty DVC project, and compare every restored file's SHA-256.
 
-The temporary restore check is not a substitute for pushing to and checking
-the eventual shared remote.
+The temporary restore check below was followed by a real lakeFS restore.
 
 On 2026-10-21 the temporary-remote round trip passed: all **8 files / 218,261
 bytes** in the packet-audit snapshot were restored into an empty-cache project
@@ -203,6 +243,14 @@ with identical SHA-256 values, and its `dvc status --json` returned `{}`.
 The primary repository's `dvc status --json` also returned `{}` for all five
 snapshots. Their directory-manifest hashes and file counts were checked, along
 with the 500 baseline answer/judgment pairs and the intended exclusions.
+
+The lakeFS check restored `data.dvc` and the packet-audit snapshot into a new
+project with an empty cache, using the immutable commit above. All **14 files /
+311,536,010 bytes** had identical SHA-256 hashes to their originals, and
+`dvc status --json` returned `{}`. The restore and byte comparison took 63.98
+seconds. Credentials were retrieved anew from Infisical and passed only in the
+restore process's environment. This checks source inputs and audit evidence;
+it is not a claim that the larger research archive has been migrated.
 
 References: [DVC add](https://dvc.org/doc/command-reference/add),
 [DVC ignore rules](https://dvc.org/doc/user-guide/project-structure/dvcignore-files),

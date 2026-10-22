@@ -33,6 +33,7 @@ eval_cache/
 # Require a child character: DVC's Windows directory check includes a trailing slash.
 /eval_results/?*
 !/eval_results/*.dvc
+/research_data/
 
 # Agent/test scratch artifacts
 /.agent_tmp/

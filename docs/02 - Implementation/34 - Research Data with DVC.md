@@ -1,10 +1,10 @@
 # Research data with DVC
 
-**Status:** Initial five snapshots published and restore-verified; complete 500-store archive verified locally
+**Status:** Selected research archive published and restore-tested; Windows access gaps recorded
 
-**Date:** 2026-10-21
+**Date:** 2026-10-24
 
-**Scope:** Benchmark inputs and an initial set of completed LongMemEval/Chronos evidence
+**Scope:** Source text, summaries, provenance, and reusable retrieval artifacts
 
 DVC stores the data bytes in its content-addressed cache. Git stores the small
 `.dvc` pointers, `.dvc/config`, `.dvcignore`, and this guide. The application and
@@ -105,7 +105,127 @@ directory using `tar -xf BUNDLE.tar.zst -C RESTORE_DIRECTORY`. Windows tar
 This complete 500-store set still does not cover the entire larger research
 archive. The requested remaining scope is source text, summaries, provenance,
 and reusable retrieval artifacts; temporary runs and debug artifacts are
-outside it. The broader inventory and archive work are tracked separately.
+outside it. The broader publication and its remaining access gaps are documented below.
+
+The 2026-10-21 inventory measured **3,242,246 readable files /
+125,221,388,344 logical bytes** across `data/`, `_ingest/`, and 1,006 evaluation
+directories. This is a pre-exclusion inventory, not an uploaded-byte count or
+deduplicated disk usage. It includes installed environments and retired
+worktrees. Access-denied paths are recorded separately; their unknown contents
+are not included in that total. Reusable `.cache/experiments` artifacts are
+included in the broader archive where accessible.
+
+The complete 500-store publication is lakeFS commit
+`82d974caec273e113dd864f9da352c003540e9225fbcce3766a81c103e005dab`, associated
+with Git commit `fc25ea0d3cccc589346ddc13747218b8dc7a1221`. Together with the
+initial snapshots it contains **25,102 unique remote objects /
+4,026,009,800 bytes**, including DVC directory manifests. The branch was
+checked for missing objects, size mismatches, and uncommitted changes.
+
+A fresh empty-cache DVC consumer restored an individual three-question bundle
+from that immutable commit. Its archive and all **nine source/summary/index
+members / 26,067,232 uncompressed bytes** matched their SHA-256 receipts.
+Individual bundles can be pulled without restoring the entire research output:
+
+```powershell
+dvc pull research_data/longmemeval-s-500-stores-20261021/longmemeval-s-native-release-sol-20261010-r10.tar.zst
+dvc pull research_data/longmemeval-s-500-stores-20261021/longmemeval-s-native-release-sol-20261010-r10.tar.zst.json
+```
+
+## Reusable summary handoff
+
+`research_data/summary-handoff-20261024/` shares the broader archive's
+`research_data.dvc` pointer and publication. It contains a roughly **38.35 MB**
+consumer package, so a recipient can inspect and reuse summaries without
+downloading and extracting the entire archive.
+
+- `HANDOFF.json` records restore instructions, source/summary joins, provenance
+  limits, and the complete archive's dependencies and access gaps.
+- `summary-artifacts.jsonl.zst` maps matching artifacts to their original paths,
+  bundles, sizes and SHA-256 receipts. `inventory.json` gives counts by source
+  root. It indexes **253,366 atomic JSON caches and 13,843 merge JSON caches**,
+  excluding checksum sidecars, plus summary databases and candidate provenance.
+  The respective distinct file-content counts are **229,673 and 13,326**;
+  neither count measures independent source conversations or gold labels.
+- `source-families.json` identifies all 158 additional source stores by path and
+  bundle. Its family labels are hints; shared-session and text-overlap checks
+  are still required before assigning training splits.
+- `read_summary_pairs.py` reads current per-section and older snapshot schemas,
+  checks exact source-span hashes and attribution, and preserves child-summary
+  references. `schemas.json`, `verified-examples.json`, and
+  `join-verification.json` document the checks and limitations.
+- `engineering-candidates.jsonl.zst` is a **5.14 MB** convenience shard with
+  **4,542 records from 25 engineering stores**: 3,315 raw-summary candidates,
+  601 hierarchy-merge candidates, and 626 structural-summary candidates.
+  Every exported source span passed its SHA-256 check, and source and summary
+  database files matched the frozen archive. Its coverage receipt is
+  `engineering-shard-verification.json`.
+
+Repeated runs and shared sources remain identified. These are unreviewed
+existing targets, with no new model calls, human labels, or assigned splits.
+Children reconstructed from a hierarchy are not proof of the exact original
+model prompt; use saved generation receipts to recover prompts and teacher
+identity. Copied, inline, concatenated, generated, and rejected outputs must
+remain distinguishable. The recipient reported that earlier NCM models had
+already trained on a subset of the LongMemEval-derived export, so that corpus
+is not an untouched benchmark for those models. New training should exclude
+the 500-store collection and overlapping sessions when preserving that
+evaluation boundary.
+
+```powershell
+dvc pull research_data/summary-handoff-20261024
+# Or retrieve only the small engineering shard and its coverage receipt:
+dvc pull research_data/summary-handoff-20261024/engineering-candidates.jsonl.zst research_data/summary-handoff-20261024/engineering-shard-verification.json
+```
+
+## Broader archive publication
+
+`research_data/reusable-research-20261021/`, tracked by `research_data.dvc`,
+preserves **2,357,622 additional files /
+79,421,060,633 uncompressed bytes** in verified bundles totaling
+**28,571,676,558 compressed bytes**, excluding their manifests.
+These are additional to the existing snapshots and complete 500-store archive;
+their contents are reused through the catalog's explicit dependencies.
+
+The publication is lakeFS commit `ded03c25a12e56d620710d2bff334ba5beed923584783c460084eb5922a8270a`,
+associated with Git commit `1fbb00c3602c2d7fb22baf363030481df23b2a7e`. No original data was
+deleted or changed. Temporary/debug directories, runtime transport traces,
+installed environments and retired worktrees were excluded.
+
+`catalog.json` maps original roots to bundles and records exclusions and
+dependencies. `coverage.json` summarizes the data categories and shared-cache
+links. Each bundle contains `data.tar.zst`, `members.jsonl.zst`, and
+`receipt.json`; the receipt carries archive/manifest hashes and the compressed
+manifest records every member's original path, size, timestamp and SHA-256.
+All included members were read back and verified before publication.
+
+**Coverage limitation:** Windows denied access to
+**804 paths across 80 roots**.
+The exact paths are retained in `access-omissions.json` and per-bundle receipts.
+Accessible files from those roots were preserved. An included-byte integrity
+pass does not imply those missing paths were backed up; their permissions were
+not changed. This publication therefore does not claim the entire local archive
+is recoverable. Reparse links are recorded rather than followed or recreated;
+consult `coverage.json` for the target bundle and any target access gaps.
+
+A new empty-cache consumer pulled a representative bundle from the immutable
+lakeFS commit and verified **4,142 members /
+33,403,462 uncompressed bytes**. It includes original memory,
+summary indexes, atomic/hierarchy summary caches, vectors and attention caches.
+The same empty-cache consumer restored the complete summary handoff and verified
+all **12 manifest-listed files / 38,349,085 bytes** against their SHA-256 receipts.
+
+```powershell
+dvc pull research_data/reusable-research-20261021/catalog.json
+dvc pull research_data/reusable-research-20261021/coverage.json
+dvc pull research_data/reusable-research-20261021/access-omissions.json
+# Pull just one bundle after selecting its path in the catalog:
+dvc pull research_data/reusable-research-20261021/bundles/eval_results__longmemeval-s-native-release-sol-20261010-r7
+```
+
+Extract `data.tar.zst` into a separate empty restore directory using `tar -xf`.
+Its member paths reconstruct the original repository-relative layout. A bundle
+is an archival snapshot; the application continues to use its original stores.
 
 ## Shared storage and machine setup
 

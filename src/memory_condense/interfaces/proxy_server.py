@@ -321,6 +321,10 @@ def memory_health(snapshot) -> tuple[str, list[str]]:
         reasons.append('memory_sessions_failed')
     if snapshot.get('sessions_at_capacity'):
         reasons.append('memory_sessions_at_capacity')
+    # Only a degraded passthrough is a health reason: a forced one is the
+    # operator's choice, and reporting it would make `off` look broken.
+    if snapshot.get('passthrough_degraded_recently'):
+        reasons.append('memory_passthrough_degraded')
     return ('degraded' if reasons else 'ok'), reasons
 
 
@@ -529,10 +533,24 @@ def build_app(
                 except (MemoryProxyError, ValueError, OSError, zlib.error) as exc:
                     return JSONResponse({'error': {'message': str(exc)}}, status_code=400)
 
+        # Set when augment mode serves this request without the memory service:
+        # (degraded, reason, memory_mode). It then takes the forwarding path
+        # below, which is exactly what observe mode does with the bytes.
+        passthrough: tuple[bool, str, str] | None = None
         if memory is not None and provider is not None:
-            from memory_condense.interfaces.proxy_memory import MemoryProxyError, WireResponse
+            from memory_condense.interfaces.proxy_memory import MEMORY_MODES, MemoryProxyError, WireResponse
             if request.method != 'POST':
                 return JSONResponse({'error':{'message':'Chat requests require POST'}},status_code=405)
+            requested_mode = next((v for k, v in headers.items() if k.lower() == 'x-memory-mode'), None)
+            memory_mode = (requested_mode or getattr(memory, 'memory_mode', 'auto')).strip().lower()
+            if memory_mode not in MEMORY_MODES:
+                return JSONResponse({'error':{'type':'memory_request_error',
+                    'message':'x-memory-mode must be one of: '+', '.join(MEMORY_MODES)}},status_code=400)
+            if memory_mode == 'off':
+                # Returns before `entry()`: no session, no model_start_lock, no
+                # journal and no local model. This is what frees the GPU.
+                passthrough = (False, 'memory mode off', memory_mode)
+        if memory is not None and provider is not None and passthrough is None:
             method = request.method
             if conversation_source != SOURCE_HEADER:
                 # Clients such as Claude Code and Codex send no conversation
@@ -576,28 +594,59 @@ def build_app(
                 # Compiler workers are ordinary threads and may outlive this
                 # request. The shared HTTP client stays open through final drain.
                 return asyncio.run_coroutine_threadsafe(send_memory(value,summary),loop).result()
+            reply = None
             try:
                 reply = await run_in_threadpool(memory.exchange,body,provider,headers,
                     send_from_worker, lambda value:send_from_worker(value,True),fmt)
-            except MemoryProxyError as exc:
-                return JSONResponse({'error':{'type':'memory_request_error','message':str(exc)}},status_code=exc.status)
-            except Exception:
-                logger.exception('memory request failed before provider completion')
-                return JSONResponse({'error':{'type':'memory_error','message':'Memory request failed; inspect local service logs'}},status_code=503)
-            # The request was served, so there is something to describe. A
-            # served body identical to the client's is the pre-send guard's
-            # sanctioned passthrough, and `receipt_for_augment` scores that as
-            # not rewritten. A served body of None means nothing went upstream
-            # at all -- an idempotent replay of an already-complete request --
-            # so the served side stays unknown rather than being invented.
-            record_receipt(proxy_receipts.receipt_for_augment(
-                fmt, body, served_body, usage=served_usage
-            ))
-            if reply.headers.get('content-type','').startswith('text/event-stream'):
-                # Inline summaries are validated before any visible bytes leave
-                # the proxy. Native tool streams retain their original framing.
-                return StreamingResponse(iter([reply.body]),status_code=reply.status,headers=reply.headers)
-            return Response(reply.body,status_code=reply.status,headers=reply.headers)
+            except Exception as exc:
+                # `auto` never refuses a request memory cannot serve: the
+                # service marks what failed before anything was captured or
+                # sent, and that request goes through untouched instead.
+                if memory_mode == 'auto' and getattr(exc, 'memory_degradable', False):
+                    reason = (f'memory unavailable: {exc}' if isinstance(exc, MemoryProxyError)
+                              else f'memory unavailable: {type(exc).__name__}')
+                    if not isinstance(exc, MemoryProxyError):
+                        logger.exception('memory request failed before capture; passing through')
+                    passthrough = (True, reason, memory_mode)
+                elif isinstance(exc, MemoryProxyError):
+                    return JSONResponse({'error':{'type':'memory_request_error','message':str(exc)}},status_code=exc.status)
+                else:
+                    logger.exception('memory request failed before provider completion')
+                    return JSONResponse({'error':{'type':'memory_error','message':'Memory request failed; inspect local service logs'}},status_code=503)
+            if passthrough is None:
+                # The request was served, so there is something to describe. A
+                # served body identical to the client's is the pre-send guard's
+                # sanctioned passthrough, and `receipt_for_augment` scores that as
+                # not rewritten. A served body of None means nothing went upstream
+                # at all -- an idempotent replay of an already-complete request --
+                # so the served side stays unknown rather than being invented.
+                record_receipt(proxy_receipts.receipt_for_augment(
+                    fmt, body, served_body, usage=served_usage,
+                    level=getattr(reply, 'level', 'local'), memory_mode=memory_mode,
+                ))
+                if reply.headers.get('content-type','').startswith('text/event-stream'):
+                    # Inline summaries are validated before any visible bytes leave
+                    # the proxy. Native tool streams retain their original framing.
+                    return StreamingResponse(iter([reply.body]),status_code=reply.status,headers=reply.headers)
+                return Response(reply.body,status_code=reply.status,headers=reply.headers)
+
+        if passthrough is not None:
+            # Nothing of the memory protocol goes upstream on a passthrough,
+            # exactly as `send_memory` strips it on a memory-backed request.
+            headers = {k: v for k, v in headers.items()
+                       if not k.lower().startswith('x-memory-') and k.lower() != 'x-conversation-id'}
+            try:
+                memory.record_passthrough(degraded=passthrough[0], reason=passthrough[1])
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("passthrough accounting failed")
+
+        def forwarded_receipt(usage):
+            """Observe mode's receipt, or augment mode's passthrough receipt."""
+            if passthrough is None:
+                return proxy_receipts.receipt_for_observe(fmt, body, usage=usage)
+            degraded, reason, mode = passthrough
+            return proxy_receipts.receipt_for_passthrough(
+                fmt, body, usage=usage, degraded=degraded, reason=reason, memory_mode=mode)
 
         upstream_request = upstream.build_request(
             request.method,
@@ -649,6 +698,11 @@ def build_app(
         streaming = is_streaming_request(body)
 
         async def publish(reply_text: str, streamed: bool) -> None:
+            if memory is not None:
+                # Augment mode has no capture lane. A passthrough turn is
+                # ingested by the next memory-backed turn, whose history
+                # still contains it.
+                return
             if not prompt and not reply_text:
                 return
             # Codex sends title generation and compaction to the same endpoint
@@ -679,9 +733,7 @@ def build_app(
             # Observe mode forwards verbatim, so served equals static and
             # nothing is rewritten; the upstream's own prompt count is right
             # here in the body it just returned, and beats the estimate.
-            record_receipt(proxy_receipts.receipt_for_observe(
-                fmt, body, usage=proxy_receipts.usage_from_response(fmt, payload)
-            ))
+            record_receipt(forwarded_receipt(proxy_receipts.usage_from_response(fmt, payload)))
             try:
                 await publish(response_text(provider, payload, fmt), False)
             except CaptureQueueRejectedError as exc:
@@ -717,9 +769,7 @@ def build_app(
                     logger.exception("stream usage finalization failed")
                 # After the stream, not before it: the receipt describes a
                 # request that was actually served.
-                record_receipt(proxy_receipts.receipt_for_observe(
-                    fmt, body, usage=usage.input_tokens
-                ))
+                record_receipt(forwarded_receipt(usage.input_tokens))
                 try:
                     accumulator.close()
                     await publish(accumulator.text, True)
@@ -1070,6 +1120,28 @@ def build_app(
         logger.info('control: bulk job %s queued for %s', job.id, job.path)
         return JSONResponse({'job': job.queue_doc(job.position_at_submit), 'path': job.path}, status_code=202)
 
+    async def control_handoff(request: Request) -> Response:
+        override = getattr(memory, 'override_handoff', None)
+        if override is None:
+            return _not_implemented('the summary handoff exists only in augment mode')
+        body = await _json_body(request)
+        mode, for_s = body.get('mode'), body.get('for_s')
+        if not isinstance(mode, str):
+            return JSONResponse({'error': {'message': 'mode (auto, handoff or local) is required'}},
+                                status_code=400)
+        try:
+            result = await run_in_threadpool(lambda: override(mode, for_s=for_s))
+        except NotImplementedError as exc:
+            return _not_implemented(str(exc))
+        except PermissionError as exc:
+            return JSONResponse({'error': {'type': 'policy', 'message': str(exc)}}, status_code=409)
+        except ValueError as exc:
+            return JSONResponse({'error': {'message': str(exc)}}, status_code=400)
+        logger.info('control: summary handoff override %s%s', mode,
+                    f' for {for_s}s' if for_s is not None else '')
+        await run_in_threadpool(publisher.publish, 'handoff')
+        return JSONResponse(result)
+
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
         if memory is None:
@@ -1106,6 +1178,7 @@ def build_app(
             Route("/_control/load", control_load, methods=["POST"]),
             Route("/_control/reset", control_reset, methods=["POST"]),
             Route("/_control/load-transcript", control_load_transcript, methods=["POST"]),
+            Route("/_control/handoff", control_handoff, methods=["POST"]),
             Route(
                 "/{path:path}",
                 handle,
@@ -1167,6 +1240,17 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
     parser.add_argument('--memory-empty-response-retries',type=int,choices=(0,1,2),default=2)
     parser.add_argument('--memory-summary-api-fallback',action=argparse.BooleanOptionalAction,default=True,
                         help='Escalate failed local summaries to the conversation provider/model')
+    parser.add_argument('--memory-mode', choices=('require','auto','off'), default='auto',
+                        help='Default for requests without x-memory-mode: require never passes through, '
+                             'auto passes through when memory cannot serve, off always passes through')
+    parser.add_argument('--memory-summary-handoff', choices=('failure','saturation','both'), default='both',
+                        help='When a summary goes to the provider: on a failed local summary, only while '
+                             'local ingest is saturated, or both (default)')
+    parser.add_argument('--memory-handoff-z', type=float, default=3.0,
+                        help='Adjusted steady-state ingest z-score above which local work is handed off')
+    parser.add_argument('--memory-summary-model', metavar='MODEL',
+                        help='Designated model for summary handoffs on the conversation provider '
+                             '(default: the model the conversation uses)')
     parser.add_argument('--assets-dir',help='Local model/runtime assets (otherwise saved setup configuration)')
     parser.add_argument('--codex-chatgpt', action='store_true',
                         help='Use Codex ChatGPT backend routing and stable account/thread identity')
@@ -1273,14 +1357,16 @@ def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI
         factory = NativeProxySessions(args.data_dir,recent_exchanges=args.memory_recent_exchanges,
             recent_token_budget=args.memory_recent_token_budget,assets=assets,
             summary_api_fallback=args.memory_summary_api_fallback, dialogue_policy=retrieval,
-            retrieval_policy=args.memory_retrieval_policy,experiment_policy=experiments)
+            retrieval_policy=args.memory_retrieval_policy,experiment_policy=experiments,
+            summary_handoff=args.memory_summary_handoff,handoff_z=args.memory_handoff_z)
         memory_class = MemoryProxy
         if args.codex_chatgpt:
             from memory_condense.interfaces.proxy_codex import CodexMemoryProxy
             memory_class = CodexMemoryProxy
         memory = memory_class(args.data_dir,factory,inline_memory=args.inline_memory,
             empty_response_retries=args.memory_empty_response_retries,max_sessions=args.memory_max_sessions,
-            recent_token_budget=args.memory_recent_token_budget,summary_api_fallback=args.memory_summary_api_fallback)
+            recent_token_budget=args.memory_recent_token_budget,summary_api_fallback=args.memory_summary_api_fallback,
+            memory_mode=args.memory_mode,summary_model=args.memory_summary_model)
         try:
             app = build_app(config=config,memory=memory,locator=TranscriptLocator())
             uvicorn.run(app,host=args.host,port=args.port,log_level='info')

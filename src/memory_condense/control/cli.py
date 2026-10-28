@@ -1,7 +1,8 @@
 """``memory-condense ctl``: the control plane from the terminal.
 
 ``status`` renders ``status.json`` (no proxy needed); ``save``, ``load``,
-``reset`` and ``load-transcript`` POST to the proxy's local control routes.
+``reset``, ``load-transcript`` and ``handoff`` POST to the proxy's local
+control routes.
 Only ``control.status`` and the routes in
 ``docs/01 - Design/03 - System Controls.md`` are relied on here — this module
 never computes a number of its own.
@@ -140,6 +141,25 @@ def is_stale(doc: Mapping[str, Any]) -> bool:
     return age is not None and age > STALE_AFTER_S
 
 
+def describe_handoff(gate: Any) -> str | None:
+    """One line for the summary handoff: decision, who decided, z and policy."""
+    if not isinstance(gate, Mapping) or not isinstance(gate.get("ingest"), Mapping):
+        return None
+    ingest = gate["ingest"]
+    override = ingest.get("override") if isinstance(ingest.get("override"), Mapping) else {}
+    mode = override.get("mode", "auto")
+    line = "ON" if ingest.get("handoff") else "off"
+    if mode != "auto":
+        left = override.get("expires_in_s")
+        line += f" (override {mode}" + (f", {format_eta(left)} left)" if left is not None else ")")
+    z = ingest.get("z")
+    line += f" · z {_num(z, 2)}/{_num(ingest.get('enter_z'), 1)}" if z is not None else " · z warming up"
+    line += f" · policy {gate.get('policy', '?')}"
+    if ingest.get("reason") and mode == "auto":
+        line += f" · {ingest['reason']}"
+    return line
+
+
 def render_table(doc: Mapping[str, Any]) -> str:
     """The on-demand view: one summary line, then one labelled row per section."""
     rows: list[tuple[str, str]] = []
@@ -206,6 +226,9 @@ def render_table(doc: Mapping[str, Any]) -> str:
         rows.append(("session " + name[:12], f"opening · {format_eta(waited)}"))
     if memory.get("error"):
         rows.append(("memory", f"status unavailable — {memory['error']}"))
+    handoff = describe_handoff(memory.get("gpu_gate"))
+    if handoff:
+        rows.append(("handoff", handoff))
 
     rates = doc.get("rates") or {}
     rows.append((
@@ -343,9 +366,33 @@ def cmd_load_transcript(args: argparse.Namespace) -> int:
     return _call(args, "load-transcript", {"session": args.session})
 
 
+def cmd_handoff(args: argparse.Namespace) -> int:
+    payload: dict[str, Any] = {"mode": args.mode}
+    if args.for_s is not None:
+        if args.mode == "auto":
+            print("handoff: auto takes no --for", file=sys.stderr)
+            return EXIT_REFUSED
+        payload["for_s"] = args.for_s
+    return _call(args, "handoff", payload)
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
+
+
+class HelpfulParser(argparse.ArgumentParser):
+    """An argument parser that answers a usage error with the full help.
+
+    The stock parser prints one usage line, which lists the subcommands but
+    not what they do; a mistyped or missing command should show both.
+    Subparsers inherit the class, so ``ctl`` and its subcommands behave the
+    same way.
+    """
+
+    def error(self, message: str):  # type: ignore[override]
+        self.print_help(sys.stderr)
+        self.exit(EXIT_REFUSED, f"\n{self.prog}: error: {message}\n")
 
 
 def _add_proxy(parser: argparse.ArgumentParser) -> None:
@@ -357,9 +404,9 @@ def _add_proxy(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = HelpfulParser(
         prog="memory-condense ctl",
-        description="Inspect and control the memory proxy: status, snapshots, reset, bulk transcript loads.",
+        description="Inspect and control the memory proxy: status, snapshots, reset, bulk transcript loads, summary handoff.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -389,11 +436,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_proxy(p)
     p.set_defaults(func=cmd_load_transcript)
 
+    p = sub.add_parser(
+        "handoff",
+        help="Override the summary handoff: force it (handoff), suppress it (local), or return to the z-score (auto)",
+    )
+    p.add_argument("mode", choices=("auto", "handoff", "local"))
+    p.add_argument("--for", dest="for_s", type=float, metavar="SECONDS",
+                   help="end the override after SECONDS (default: until the next override or a restart)")
+    _add_proxy(p)
+    p.set_defaults(func=cmd_handoff)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    if not argv:
+        parser.print_help()
+        return EXIT_OK
+    args = parser.parse_args(argv)
     # The summary line contains "▸"; a cp1252 console must not crash on it.
     try:
         sys.stdout.reconfigure(errors="replace")  # type: ignore[attr-defined]

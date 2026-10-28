@@ -24,6 +24,8 @@ from memory_condense.interfaces.proxy_capture import (
 from tests.test_proxy_memory import HEADERS, app_for, inline_content
 
 PATH = '/v1/responses'
+# The refusals below are the memory service's own; `auto` would pass them through.
+REQUIRE = dict(HEADERS, **{'x-memory-mode': 'require'})
 
 
 def message_item(role, text, *, kind='input_text'):
@@ -323,7 +325,7 @@ def test_a_conversation_threaded_upstream_with_no_turns_in_the_body_is_refused(t
 
     app, _, _ = app_for(tmp_path, upstream, inline_memory=False)
     with TestClient(app) as client:
-        reply = client.post(PATH, headers=HEADERS, json=dict(
+        reply = client.post(PATH, headers=REQUIRE, json=dict(
             model='test', previous_response_id='resp_elsewhere', input='Which release shipped?'))
         assert reply.status_code == 409, reply.text
         assert 'send the prior turns in input' in reply.json()['error']['message']
@@ -393,7 +395,7 @@ def test_a_lone_tool_result_against_no_history_is_still_refused(tmp_path):
 
     app, _, _ = app_for(tmp_path, upstream, inline_memory=False)
     with TestClient(app) as client:
-        reply = client.post(PATH, headers=HEADERS, json=dict(
+        reply = client.post(PATH, headers=REQUIRE, json=dict(
             model='test', previous_response_id='resp_elsewhere',
             input=[dict(type='function_call_output', call_id='call_1', output='deployed')]))
         assert reply.status_code == 409, reply.text
@@ -458,7 +460,7 @@ def test_a_divergent_history_still_conflicts_on_the_responses_path(tmp_path):
     with TestClient(app) as client:
         assert client.post(PATH, headers=HEADERS, json=dict(
             model='test', input=[message_item('user', 'First turn.')])).status_code == 200
-        reply = client.post(PATH, headers=dict(HEADERS, **{'x-memory-request-id': 'turn2'}), json=dict(
+        reply = client.post(PATH, headers=dict(REQUIRE, **{'x-memory-request-id': 'turn2'}), json=dict(
             model='test', input=[
                 message_item('user', 'A different first turn.'),
                 message_item('assistant', 'Ack.', kind='output_text'),

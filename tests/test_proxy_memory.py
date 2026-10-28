@@ -231,8 +231,15 @@ def test_namespaces_id_conflicts_and_concurrent_duplicate_requests(tmp_path):
         with ThreadPoolExecutor(max_workers=2) as pool:
             replies=list(pool.map(lambda _:client.post('/v1/chat/completions',headers=HEADERS,json=payload),range(2)))
         assert all(r.status_code==200 for r in replies) and len(calls)==1
-        conflict=client.post('/v1/chat/completions',headers=HEADERS,json=dict(payload,messages=[dict(role='user',content='Changed')]))
+        changed=dict(payload,messages=[dict(role='user',content='Changed')])
+        conflict=client.post('/v1/chat/completions',headers=dict(HEADERS,**{'x-memory-mode':'require'}),json=changed)
         assert conflict.status_code==409 and len(calls)==1
+        # Under the default `auto` the same conflict is memory's problem, not
+        # the client's: the request goes through verbatim and is not captured.
+        degraded=client.post('/v1/chat/completions',headers=HEADERS,json=changed)
+        assert degraded.status_code==200 and len(calls)==2
+        assert json.loads(calls[-1].content)==changed
+        calls.pop()
         # A client without a conversation header (Claude Code, Codex) is
         # attributed by request digest and served in its own namespace, not refused.
         headerless=client.post('/v1/chat/completions',headers={'authorization':'Bearer test-secret'},json=payload)

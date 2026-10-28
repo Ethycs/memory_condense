@@ -76,6 +76,7 @@ jobs:
           tests/test_memory_surfaces.py
           tests/test_proxy_sessions.py tests/test_proxy_attribution.py
           tests/test_proxy_headers.py tests/test_proxy_receipts.py tests/test_proxy_units.py
+          tests/test_local_model_handoff.py tests/test_install_cli.py tests/test_cli_print_env.py
           --basetemp="${{ runner.temp }}/memory-tests" --junitxml=eval_results/ci-tests.xml
       - name: Build wheel and source distribution
         run: python -m build --outdir dist/python

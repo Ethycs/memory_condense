@@ -1,3 +1,40 @@
+Unreleased additions
+
+**Two defaults change.** Both follow the rule that the proxy never refuses a
+request because a model is busy:
+
+- `--memory-mode` defaults to `auto`. A request that memory cannot serve -- past
+  `--memory-max-sessions`, or when the local models fail before the exchange is
+  captured -- is now passed through to the provider unchanged, where it used to
+  be refused with 429 or 503. `--memory-mode require` (or the
+  `x-memory-mode: require` header) restores the refusal; `off` always passes
+  through. A degraded passthrough is a health reason for five minutes.
+- `--memory-summary-handoff` defaults to `both`. When local ingest is abnormally
+  slow, summary jobs go to the provider instead of waiting for the GPU, which
+  **spends the user's provider tokens**. `failure` restores the earlier
+  behaviour (provider summaries only when a local summary fails).
+
+What else is new:
+
+- Every serving receipt records the service level -- `local`, `handoff` or
+  `passthrough` -- and the status document counts each, with forced and
+  degraded passthroughs counted apart.
+- The handoff is decided by an ingest z-score. Each exchange preparation is
+  standardised against its own regime (session start, steady state, or a
+  flush/close drain), so regular start and stop slowness never triggers it.
+  It needs 20 steady samples first, holds for 30 seconds, then probes local
+  ingest again; `--memory-handoff-z` sets the threshold (default 3.0) and the
+  baseline persists in `ingest-baseline.json`. `--memory-summary-model` names a
+  designated secondary model for handed-off summaries.
+- An operator override: `memory-condense ctl handoff handoff|local|auto
+  [--for SECONDS]`, or `POST /_control/handoff`. `ctl status` shows the decision,
+  the z-score and any override. Overrides are not persisted.
+- `memory-condense` and `memory-condense ctl` print the full help when run with
+  no command or an unknown one.
+- `pixi run install-cli` puts the environment's `memory-condense` on PATH
+  through `~/.local/bin` (a symlink on Linux, `.cmd` and `sh` launchers on
+  Windows); `--uninstall` removes it.
+
 Memory Condense v0.2.3-beta.1 adds a control plane for seeing and steering the
 running proxy, an optional Codex ChatGPT transport, optional Windows
 start-at-login installation, and per-project store resolution.

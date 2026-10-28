@@ -52,6 +52,7 @@ for the private gateway. Supply these headers on every memory request:
 | `Authorization` or `x-api-key` | The client's provider credential |
 | `x-memory-conversation-id` | Stable identifier for this conversation |
 | `x-memory-request-id` | Unique identifier for this generation; reuse for an identical retry |
+| `x-memory-mode` | Optional: `require`, `auto` or `off`; overrides `--memory-mode` for this request |
 
 The conversation header is required (`x-conversation-id` is also accepted).
 Request IDs default to the exact request-body digest when omitted. Reusing a
@@ -157,6 +158,70 @@ send its same conversation and credential headers, plus
 Normal shutdown drains all sessions and releases the resident models. The
 default active-session limit is eight; `--memory-max-sessions` changes it.
 Restarting releases active slots without deleting stored conversations.
+
+### Memory modes and service levels
+
+Each request runs under one memory mode: the `x-memory-mode` header, else
+`--memory-mode` (default `auto`).
+
+| Mode | Behavior |
+| --- | --- |
+| `require` | Memory serves the request, or the request fails with the memory error (for example 429 at the session limit). Use it for measurements. |
+| `auto` | When memory cannot serve, the proxy forwards the client's bytes unchanged. |
+| `off` | The proxy always forwards the client's bytes. It opens no session and uses no local model. |
+
+`auto` passes a request through only when the failure happened before the
+exchange was captured. Nothing was then ingested or sent, and the next
+memory-backed turn ingests the skipped exchange from the client's history. A
+request whose earlier send has an unknown outcome is never sent again, in any
+mode.
+
+Each serving receipt records a service level: `local`, `handoff` (the
+conversation spent provider tokens on memory work during the turn) or
+`passthrough`. The status document counts them in `serving.levels`.
+`serving.passthrough_forced` counts mode `off`.
+`serving.passthrough_degraded` counts the times memory could not serve. Only a
+degraded passthrough is a health reason (`memory_passthrough_degraded`, for five
+minutes). `/_memory/health` also reports `memory_mode`, `profile` (`A`, `B` or
+`custom`), the `passthrough` counters and `gpu_gate`: the queues of the GPU
+gate and, under `ingest`, the handoff decision with its z-score and baselines.
+
+The handoff is decided by ingest rate. Each streaming exchange preparation is
+a sample of log seconds per 1k tokens. It includes every wait on the GPU gate.
+Samples belong to one of three regimes: `start` (the first two preparations of a
+session, which pay lazy model loads), `stop` (flush and close drains, which
+queue the backlog behind itself) and `steady`. Each regime has its own baseline,
+so each sample's z-score is relative to what is normal for that regime, and
+regular start and stop slowness scores near zero. The adjusted score combines
+the last three z-scores as the z of their mean, and an in-flight preparation
+that is already overdue raises it before it finishes. Above
+`--memory-handoff-z` (default 3.0) local ingest is handed off for 30 seconds,
+then local ingest is probed again. Nothing hands off until the steady baseline
+has 20 samples; baselines persist in `ingest-baseline.json` under the data
+directory and only learn from samples at or below the threshold.
+
+An operator can override the decision from the control plane:
+
+```bash
+memory-condense ctl handoff handoff --for 600   # force it for ten minutes
+memory-condense ctl handoff local               # keep everything local
+memory-condense ctl handoff auto                # back to the z-score
+```
+
+`POST /_control/handoff {"mode": ..., "for_s": ...}` is the same route. Under
+`local` the z-score is still computed and shown, so `ctl status` tells what
+`auto` would decide; a forced `handoff` needs a policy other than `failure`.
+Overrides are runtime state: a restart is always `auto`.
+
+`--memory-summary-handoff` selects what a summary job does. `both` (the
+default) hands it off while ingest is saturated and still escalates a failed
+local summary. `saturation` hands off only under load; an unsaturated failure
+keeps its local result. `failure` is the behavior before the handoff existed.
+A handed-off job never runs the local model.
+`--memory-summary-model` names a designated model for these calls on the same
+provider and transport. The provider and model are part of each summary
+receipt. See
+[Local model handoff and concurrent linking](../01%20-%20Design/05%20-%20Local%20Model%20Handoff%20and%20Concurrent%20Linking.md).
 
 Each credential/provider/conversation combination gets a separate hashed
 namespace, journal, and index. Rotating credentials selects a new namespace.

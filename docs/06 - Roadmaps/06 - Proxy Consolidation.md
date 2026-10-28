@@ -175,7 +175,12 @@ Gate after every step: `pixi run -e dev pytest -q tests/` green; observe-mode by
   `CP/` and `T/test_context_proxy.py`; strike the "Two proxies" open question from
   `01 - Design/03 - System Controls.md` and link here.
 
-- **M6 — Passthrough is a mode, not just a failure path.** **OPEN.** The governing
+- **M6 — Passthrough is a mode, not just a failure path.** **DELIVERED** with
+  `01 - Design/05 - Local Model Handoff and Concurrent Linking.md`: `--memory-mode` and the
+  `x-memory-mode` header, a `memory_degradable` mark on every exception raised before
+  `capture_exchange()`, `serving.passthrough_forced`/`passthrough_degraded` beside
+  `serving.levels`, and a `memory_passthrough_degraded` health reason. The idle reclaim is
+  not built; `MemoryProxy.release()` closes every session at once. The governing
   property, reasoned backwards from stability: an enhancement layer must not be able to
   refuse the thing it enhances. Today every memory-layer problem becomes the client's
   problem, because `handle` turns `MemoryProxyError` into a client-facing error and anything

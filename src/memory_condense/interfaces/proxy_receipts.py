@@ -37,6 +37,13 @@ class ServingReceipt:
     upstream's own count of the forwarded prompt when the response carried
     one; it is exact and wins over ``served_tokens`` wherever a served figure
     is published.  ``None`` means "unknown", never zero.
+
+    ``level`` is the service level in augment mode (``local``, ``handoff`` or
+    ``passthrough``; design note ``01 - Design/05``) and ``None`` in observe
+    mode, which serves no memory at any level.  ``degraded`` separates a
+    passthrough because memory could not serve from one the operator or
+    client asked for.  ``memory_mode`` is the mode the request ran under, so a
+    measurement can prove it never passed through silently.
     """
 
     format: str | None
@@ -46,6 +53,9 @@ class ServingReceipt:
     static_tokens: int | None
     served_tokens: int | None
     usage_input_tokens: int | None
+    level: str | None = None
+    degraded: bool = False
+    memory_mode: str | None = None
 
     @property
     def effective_served_tokens(self) -> int | None:
@@ -279,6 +289,8 @@ def receipt_for_augment(
     served_bytes: bytes | None,
     usage: int | Mapping[str, Any] | None = None,
     reason: str = "",
+    level: str = "local",
+    memory_mode: str | None = None,
 ) -> ServingReceipt:
     """Augment mode: the memory service may have replaced the prompt.
 
@@ -290,10 +302,16 @@ def receipt_for_augment(
     ``reason`` is free text for whoever knows more than this module does (the
     pre-send guard's verdict, say); left empty it is derived from the three
     cases above, so a receipt always says which one it is.
+
+    ``level`` is what the memory service reported for the turn.  Only the
+    service knows whether an unchanged body is the pre-send guard's
+    passthrough (degraded) or an empty packet (local, nothing to add), so a
+    ``passthrough`` level is taken as degraded and nothing is inferred here.
     """
     static = prompt_tokens(fmt, original_bytes)
     served = prompt_tokens(fmt, served_bytes) if served_bytes is not None else None
     rewritten = served_bytes is not None and not _same_payload(original_bytes, served_bytes)
+    degraded = level == "passthrough"
     if not reason:
         reason = (
             "nothing served"
@@ -308,6 +326,39 @@ def receipt_for_augment(
         static_tokens=static,
         served_tokens=served,
         usage_input_tokens=_usage_count(fmt, usage),
+        level=level,
+        degraded=degraded,
+        memory_mode=memory_mode,
+    )
+
+
+def receipt_for_passthrough(
+    fmt: str | None,
+    body_bytes: bytes,
+    usage: int | Mapping[str, Any] | None = None,
+    *,
+    degraded: bool,
+    reason: str,
+    memory_mode: str | None = None,
+) -> ServingReceipt:
+    """Augment mode served the client's bytes without the memory service.
+
+    ``degraded`` is true when memory could not serve (mode ``auto``) and
+    false when no memory was asked for (mode ``off``).  Like observe mode,
+    nothing was rewritten, so served == static.
+    """
+    estimate = prompt_tokens(fmt, body_bytes)
+    return ServingReceipt(
+        format=fmt,
+        mode="augment",
+        rewritten=False,
+        reason=reason,
+        static_tokens=estimate,
+        served_tokens=estimate,
+        usage_input_tokens=_usage_count(fmt, usage),
+        level="passthrough",
+        degraded=degraded,
+        memory_mode=memory_mode,
     )
 
 
@@ -331,6 +382,7 @@ __all__ = [
     "publish",
     "receipt_for_augment",
     "receipt_for_observe",
+    "receipt_for_passthrough",
     "usage_from_response",
     "usage_input_tokens",
 ]

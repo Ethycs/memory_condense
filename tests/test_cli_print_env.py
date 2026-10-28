@@ -148,10 +148,25 @@ class TestDispatch:
         assert calls == [("setup", {"assets_dir": None, "reuse": "/cache"}),
                          ("doctor", {"assets_dir": None, "verify": True})]
 
-    def test_no_command_is_usage_error(self, capsys):
+    def test_no_command_prints_help(self, capsys):
+        assert cli.main([]) == 0
+        out = capsys.readouterr().out
+        assert out.startswith("usage: memory-condense") and "doctor" in out
+
+    def test_unknown_command_prints_help_and_the_error(self, capsys):
         with pytest.raises(SystemExit) as exc:
-            cli.main([])
+            cli.main(["bogus"])
         assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "positional arguments" in err and "invalid choice: 'bogus'" in err
+
+    def test_ctl_without_a_command_prints_help(self, capsys):
+        from memory_condense.control import cli as ctl
+        assert ctl.main([]) == 0
+        assert "handoff" in capsys.readouterr().out
+        with pytest.raises(SystemExit) as exc:
+            ctl.main(["bogus"])
+        assert exc.value.code == 2 and "positional arguments" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

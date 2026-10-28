@@ -225,6 +225,13 @@ any working directory and saves its configuration and memory under
 `%LOCALAPPDATA%\memory_condense`, or
 `${XDG_DATA_HOME:-~/.local/share}/memory_condense` on Linux, by default.
 
+From a pixi checkout, `pixi run install-cli` puts the environment's
+`memory-condense` on PATH through `~/.local/bin` without exposing its `python`
+or `pip`. On Linux it is a symlink; on Windows it is a `.cmd` launcher plus an
+`sh` one for Git Bash. If `~/.local/bin` is not on PATH the command says how to
+add it, and `pixi run install-cli --uninstall` removes what it installed.
+`memory-condense` with no command, or with an unknown one, prints the full help.
+
 ## Connect a client
 
 Point an OpenAI-compatible client at `http://127.0.0.1:8787/v1`, retain its
@@ -267,7 +274,13 @@ Version 0.2.2 keeps local Qwen attention, CPU BGE embeddings, and valid
 local Llama summaries. Failed local summary jobs escalate to the conversation's
 API/model (Sol in our latest evaluation); accepted repairs are cached. This can
 add paid background requests. `--no-memory-summary-api-fallback` disables
-escalation, and health reports its counts under `summary_routing`. This policy
+escalation, and health reports its counts under `summary_routing`.
+Summary jobs are also handed to the provider while local ingest is abnormally
+slow for its start, steady or stop regime (z-score above
+`--memory-handoff-z`, default 3); `--memory-summary-handoff failure` turns
+that off. `--memory-mode auto` (the default) forwards a request unchanged when memory
+cannot serve it, `require` fails it instead, and `off` always forwards; the
+`x-memory-mode` header selects a mode per request. This policy
 is included in 0.2.2; see the [proxy guide](docs/02%20-%20Implementation/06%20-%20Provider%20Proxy%20and%20Transcript%20Import.md)
 for validation and recovery details.
 

@@ -52,10 +52,27 @@ class LocalFirstSummaries:
 
     No API is substituted for Qwen attention or BGE vectors. Their model identity
     remains part of the memory index. Only generative raw/merge jobs escalate.
+
+    ``handoff`` says which condition sends a job to the API (design note
+    ``01 - Design/05``): ``'failure'`` escalates when the local summary fails,
+    which is the historical behaviour; ``'saturation'`` hands off only while
+    ``saturated()`` is true, and a failed local summary is then kept as the
+    local model made it; ``'both'`` does either. In the proxy ``saturated`` is
+    ``IngestRateMonitor.handoff``: the adjusted steady-state ingest z-score.
+    A saturation handoff never runs the local model at all, so it relieves the
+    gate instead of adding to it.
     """
-    def __init__(self, local, root, api, *, require_provider=False):
+    HANDOFF_POLICIES = ('failure', 'saturation', 'both')
+
+    def __init__(self, local, root, api, *, require_provider=False, handoff='failure',
+                 saturated=None):
+        if handoff not in self.HANDOFF_POLICIES:
+            raise ValueError('Unknown summary handoff policy')
+        if saturated is not None and not callable(saturated):
+            raise TypeError('The saturation signal must be callable')
         self.local, self.root, self.api = local, Path(root), api
         self.require_provider = require_provider
+        self.handoff, self.saturated = handoff, saturated
         self.metrics = Counter()
         self._lock = threading.RLock()
         self._grounder_lock = threading.Lock()
@@ -92,6 +109,10 @@ class LocalFirstSummaries:
             with self._lock:
                 self.metrics['bge_grounding_failed'] += 1
             return None
+
+    def _saturated(self):
+        """Without a signal nothing is ever saturated, so nothing hands off."""
+        return bool(self.saturated is not None and self.saturated())
 
     def tactic_router(self):
         return self.local.tactic_router()
@@ -184,6 +205,7 @@ class LocalFirstSummaries:
         # Validate the job before catching model failures. Bad caller input is
         # not an excuse to send unrelated or malformed data to another model.
         prompt, budget = escalation_job(kind, messages, max_tokens, typed_request)
+        saturated = self.handoff != 'failure' and self._saturated()
         with self._lock:
             api = self.api
             if api is None:
@@ -191,6 +213,17 @@ class LocalFirstSummaries:
                     raise SummaryEscalationError('A chat request must bind the provider/model before pending summaries can resume')
                 return self.local.call(kind, messages, scope=scope, max_tokens=max_tokens,
                     typed_request=typed_request, summary_attempt=summary_attempt)
+            if self.handoff == 'saturation' and not saturated:
+                # Strict: load is the only reason to spend provider tokens, so
+                # an unsaturated job is the local model's, failed or not.
+                self.metrics['local_without_handoff'] += 1
+                local_only = True
+            else:
+                local_only = False
+        if local_only:
+            return self.local.call(kind, messages, scope=scope, max_tokens=max_tokens,
+                                   typed_request=typed_request, summary_attempt=summary_attempt)
+        with self._lock:
             identity = dict(format='local-first-source-extracts-v2', kind=kind,
                 messages=messages, max_tokens=max_tokens,
                 typed_request=asdict(typed_request) if typed_request is not None else None,
@@ -223,6 +256,10 @@ class LocalFirstSummaries:
             residual_labels = []
             rejected_proposals = {}
             failure = getattr(self.local, '_summary_start_failure', None)
+            if failure is None and saturated:
+                # A handoff under load: the local model never sees this job, so
+                # the queue it would have joined gets shorter, not longer.
+                failure = 'gpu_saturated'
             if failure is None:
                 try:
                     local = self.local.call(kind, messages, scope=scope, max_tokens=max_tokens,
@@ -300,7 +337,7 @@ class LocalFirstSummaries:
                 prompt, budget = escalation_job(kind, api_validation_messages, max_tokens, None)
                 residual_labels = [f['label'] for f in missing]
             with self._lock:
-                self.metrics['local_failed'] += 1
+                self.metrics['handoff_saturated' if failure == 'gpu_saturated' else 'local_failed'] += 1
 
             def accept_remote(remote, request_sha256, route):
                 api_source_grounding = False
@@ -362,7 +399,9 @@ class LocalFirstSummaries:
                 remote = api(prompt, max_tokens=budget)
                 save(directory/'response.json', remote)
                 result = accept_remote(remote, request.sha256,
-                                       'api_adjudication' if rejected_proposals else 'api_escalation')
+                                       'api_adjudication' if rejected_proposals else
+                                       'api_handoff_saturated' if failure == 'gpu_saturated' else
+                                       'api_escalation')
             except Exception as exc:
                 save(directory/'error.json', dict(error_type=type(exc).__name__, request_sha256=request.sha256))
                 with self._lock:

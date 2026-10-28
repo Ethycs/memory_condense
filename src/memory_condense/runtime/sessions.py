@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from memory_condense.application.chat_session import ChatSession
 from memory_condense.runtime.artifacts import read, save
+from memory_condense.runtime.ingest_rate import IngestRateMonitor
 from memory_condense.runtime.local import LocalRuntime
 from memory_condense.runtime.resident import ResidentNativeBackend
 from memory_condense.runtime.config import RuntimeAssets
@@ -22,7 +23,8 @@ from memory_condense.application.dialogue_retrieval import DialogueRetrievalPoli
 class NativeProxySessions:
     """Own models once; each conversation owns its journal and native index."""
     def __init__(self, directory, *, recent_exchanges=12, recent_token_budget=8192, assets=None,
-                 summary_api_fallback=True, dialogue_policy=None, retrieval_policy='auto', experiment_policy=None):
+                 summary_api_fallback=True, dialogue_policy=None, retrieval_policy='auto', experiment_policy=None,
+                 summary_handoff='both', handoff_z=3.0):
         if dialogue_policy is not None and type(dialogue_policy) is not DialogueRetrievalPolicy:
             raise TypeError('Expected a validated DialogueRetrievalPolicy')
         self.directory = Path(directory)
@@ -39,6 +41,13 @@ class NativeProxySessions:
         self.dialogue_policy = (dialogue_policy or DialogueRetrievalPolicy()
                                if retrieval_policy != 'cap8' else None)
         self.summary_api_fallback = summary_api_fallback
+        if summary_handoff not in SemanticLocalFirstSummaries.HANDOFF_POLICIES:
+            raise ValueError('Unknown summary handoff policy')
+        self.summary_handoff = summary_handoff
+        # One monitor for the service: every conversation's local work shares
+        # the GPU gate, so their preparations are samples of one rate. The
+        # baseline persists so a restart does not repeat the warm-up.
+        self.ingest = IngestRateMonitor(enter_z=handoff_z, path=self.directory/'ingest-baseline.json')
         self.recent_exchanges, self.recent_token_budget = recent_exchanges, recent_token_budget
         self.assets = assets or RuntimeAssets.resolve()
         self.runtime = LocalRuntime(self.directory/'runtime'/uuid4().hex, assets=self.assets)
@@ -80,7 +89,8 @@ class NativeProxySessions:
             if runtime is None:
                 runtime = SemanticLocalFirstSummaries(self.runtime,
                     self.directory/'sessions'/namespace/'summary-fallback'/policy_root_name(), api,
-                    require_provider=self.summary_api_fallback)
+                    require_provider=self.summary_api_fallback, handoff=self.summary_handoff,
+                    saturated=self.ingest.handoff)
                 self.summary_runtimes[namespace] = runtime
                 return runtime
         if configure:
@@ -110,6 +120,30 @@ class NativeProxySessions:
             for namespace in namespaces:
                 self._lifecycle.pop(namespace, None)
                 self.summary_runtimes.pop(namespace, None)
+
+    def gate_status(self):
+        """The GPU gate's queues and the ingest-rate handoff decision."""
+        return dict(self.runtime.gpu_gate.queued(), policy=self.summary_handoff,
+                    ingest=self.ingest.status())
+
+    def handoff_active(self):
+        return self.summary_handoff != 'failure' and self.ingest.handoff()
+
+    def override_handoff(self, mode, *, for_s=None):
+        """The control plane's override of the ingest-rate decision."""
+        if mode == 'handoff' and self.summary_handoff == 'failure':
+            raise PermissionError('summary handoff policy is failure: load never moves summaries '
+                                  'to the provider; restart with --memory-summary-handoff saturation or both')
+        return dict(self.ingest.override(mode, for_s=for_s), policy=self.summary_handoff)
+
+    def api_calls(self, namespace):
+        """Provider summary calls this conversation has made, for its receipts."""
+        with self.registry_lock:
+            runtime = self.summary_runtimes.get(namespace)
+        if runtime is None:
+            return 0
+        with runtime._lock:
+            return runtime.metrics['api_calls']
 
     def summary_status(self):
         from collections import Counter
@@ -163,7 +197,9 @@ class NativeProxySessions:
         # stage must be set before that worker can report a later one.
         self._observe(namespace, 'admitting')
         return ChatSession(directory/'chat','proxy:'+namespace,backend,streaming=True,
-                           recent_exchanges=self.recent_exchanges,recent_token_budget=self.recent_token_budget)
+                           recent_exchanges=self.recent_exchanges,recent_token_budget=self.recent_token_budget,
+                           ingest_observer=self.ingest)
 
     def close(self):
+        self.ingest.save()
         self.runtime.close()

@@ -1,5 +1,6 @@
 """Durable ChatSession integration for provider-compatible memory requests."""
 from base64 import b64decode, b64encode
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import hashlib
@@ -17,11 +18,29 @@ from memory_condense.domain._tokenizer import count_tokens
 from memory_condense.interfaces import proxy_memory_wire as wire
 
 
+#: Service levels, best first (design note ``01 - Design/05``). A request is
+#: served at the first one available; the receipt records which.
+SERVICE_LEVELS = ('local', 'handoff', 'passthrough')
+
+#: ``require`` never passes through, ``auto`` passes through when memory
+#: cannot serve, ``off`` always passes through (roadmap milestone M6).
+MEMORY_MODES = ('require', 'auto', 'off')
+
+#: How long a degraded passthrough keeps ``/health`` degraded.
+DEGRADED_HEALTH_WINDOW_S = 300.0
+
+
 @dataclass(frozen=True)
 class WireResponse:
     status: int
     headers: dict
     body: bytes
+    #: The service level of the turn: ``local``; ``handoff`` when the ingest
+    #: monitor had handed local work to the provider when the turn began, or
+    #: the conversation spent provider tokens on memory during the turn;
+    #: ``passthrough`` when the pre-send guard served the client's own bytes.
+    #: Never persisted; a restored response is the stored bytes only.
+    level: str = 'local'
 
     def stored(self):
         # Persist only protocol/correlation headers; never cookies or credentials.
@@ -35,9 +54,16 @@ class WireResponse:
 
 
 class MemoryProxyError(Exception):
-    def __init__(self, message, status=400):
+    """A request memory cannot serve.
+
+    ``degradable`` is false only where passing the request through would be
+    wrong in itself, as opposed to merely memory-less: today that is a request
+    whose earlier send has an unknown outcome, which must never be sent again.
+    """
+    def __init__(self, message, status=400, *, degradable=True):
         super().__init__(message)
         self.status = status
+        self.degradable = degradable
 
 
 class UpstreamFailure(Exception):
@@ -75,7 +101,8 @@ class MemoryProxy:
     credential headers are never persisted with requests or responses.
     """
     def __init__(self, directory, session_factory, *, inline_memory=True, empty_response_retries=2,
-                 max_sessions=8, recent_token_budget=8192, summary_api_fallback=True):
+                 max_sessions=8, recent_token_budget=8192, summary_api_fallback=True,
+                 memory_mode='auto', summary_model=None):
         if type(empty_response_retries) is not int or not 0 <= empty_response_retries <= 2:
             raise ValueError('Empty completion retries must be between zero and two')
         if type(max_sessions) is not int or max_sessions < 1:
@@ -84,6 +111,18 @@ class MemoryProxy:
         self.inline_memory, self.empty_response_retries = inline_memory, empty_response_retries
         self.max_sessions, self.recent_token_budget = max_sessions, recent_token_budget
         self.summary_api_fallback = summary_api_fallback
+        if memory_mode not in MEMORY_MODES:
+            raise ValueError('Unknown memory mode')
+        if summary_model is not None and (not isinstance(summary_model, str) or not summary_model.strip()):
+            raise ValueError('A designated summary model must be a model name')
+        # The default for requests that carry no x-memory-mode header.
+        self.memory_mode = memory_mode
+        # Handoff target 2: a model the operator designates for memory work,
+        # on the conversation's own provider and transport. None is target 1,
+        # the model the conversation already uses.
+        self.summary_model = summary_model
+        self._passthrough = Counter()
+        self._last_degraded = None
         self.entries, self.lock, self.closed = {}, threading.RLock(), False
         # `lock` is held across session construction and journal replay, which
         # is exactly the work status must be able to describe. These mirrors are
@@ -185,6 +224,17 @@ class MemoryProxy:
             startup = startup_status()
         except Exception as exc:
             startup = dict(unavailable=f'{type(exc).__name__}: {exc}')
+        gate_status = getattr(self.factory, 'gate_status', None)
+        try:
+            gate = gate_status() if gate_status is not None else None
+        except Exception as exc:
+            gate = dict(unavailable=f'{type(exc).__name__}: {exc}')
+        with self._status_lock:
+            passthrough = dict(forced=self._passthrough['forced'], degraded=self._passthrough['degraded'],
+                               last_degraded=None if self._last_degraded is None else
+                               {k: v for k, v in self._last_degraded.items() if k != 'monotonic'})
+            degraded_recently = (self._last_degraded is not None and
+                                 now-self._last_degraded['monotonic'] < DEGRADED_HEALTH_WINDOW_S)
         pending_events = sum(v['pending_events'] for v in values)
         # `entry` gates admission on `len(self.entries)`, so the capacity signal
         # must count the same thing or it reports room that does not exist. Read
@@ -207,7 +257,58 @@ class MemoryProxy:
                                 (r.get('stage') for r in startup.values() if isinstance(r, dict))),
                     inline_memory=self.inline_memory, empty_response_retries=self.empty_response_retries,
                     summary_api_fallback=self.summary_api_fallback, summary_routing=summary_status(),
-                    retrieval=retrieval_status())
+                    retrieval=retrieval_status(), memory_mode=self.memory_mode,
+                    summary_model=self.summary_model, profile=self.profile(), gpu_gate=gate,
+                    passthrough=passthrough, passthrough_degraded_recently=degraded_recently)
+
+    def profile(self):
+        """Which of the design note's two profiles this configuration is.
+
+        ``A`` is one conversation, all local: mode ``require``, one session and
+        no provider summaries, so every number is repeatable against the pinned
+        weights. ``B`` sends live traffic through (mode ``off``) and leaves the
+        GPU to background work. Anything else is ``custom``; its measurements
+        do not compare with either.
+        """
+        if self.memory_mode == 'require' and self.max_sessions == 1 and not self.summary_api_fallback:
+            return 'A'
+        if self.memory_mode == 'off':
+            return 'B'
+        return 'custom'
+
+    def record_passthrough(self, *, degraded, reason):
+        """Count one passthrough; a degraded one also degrades health a while.
+
+        Forced and degraded mean opposite things -- the operator asked for no
+        memory, or memory broke -- so they are counted apart and only the
+        second is ever a health reason.
+        """
+        with self._status_lock:
+            self._passthrough['degraded' if degraded else 'forced'] += 1
+            if degraded:
+                self._last_degraded = dict(at=now_iso(), reason=reason, monotonic=time.monotonic())
+
+    def override_handoff(self, mode, *, for_s=None):
+        """Force, suppress or release the summary handoff (control plane).
+
+        Raises ``NotImplementedError`` when the factory has no handoff to
+        override, ``PermissionError`` when the handoff policy forbids a forced
+        one and ``ValueError`` for an invalid mode or duration.
+        """
+        override = getattr(self.factory, 'override_handoff', None)
+        if override is None:
+            raise NotImplementedError('this memory service has no summary handoff')
+        return override(mode, for_s=for_s)
+
+    def release(self):
+        """Close every memory session and keep every store (profile B).
+
+        A swap whose mutation does nothing: each session is closed and marked
+        stale and the factory forgets its per-conversation state, which frees
+        host memory and every session index. The resident models stay loaded,
+        and the next memory-backed request reopens its session lazily.
+        """
+        return self.swap(lambda: None)
 
     @contextmanager
     def _io(self, namespace, *, summary_api=None):
@@ -351,8 +452,47 @@ class MemoryProxy:
         pinned = [m for _,m in entry.messages[:start] if 'responses_content' in m]
         return pinned + [m for _,m in entry.messages[start:]]
 
+    def _handoff_active(self):
+        handoff_active = getattr(self.factory, 'handoff_active', None)
+        try:
+            return bool(handoff_active is not None and handoff_active())
+        except Exception:
+            return False
+
+    def _api_calls(self, namespace):
+        api_calls = getattr(self.factory, 'api_calls', None)
+        if api_calls is None or namespace is None:
+            return 0
+        try:
+            return api_calls(namespace)
+        except Exception:
+            return 0
+
     def exchange(self, body, provider, headers, send, summary_send=None, fmt=None):
-        """Run synchronously on a worker; send(payload_bytes) bridges async HTTP."""
+        """Run synchronously on a worker; send(payload_bytes) bridges async HTTP.
+
+        An exception leaves with ``memory_degradable`` set: true when it was
+        raised before the exchange was captured, so nothing was ingested,
+        written to the ledger or sent, and the caller may pass the request
+        through instead. The proxy's history then stays an exact prefix of the
+        client's, so the next memory-backed turn ingests the skipped exchange.
+        """
+        stage = dict(captured=False, namespace=None, api_calls=0, handoff=self._handoff_active())
+        try:
+            reply = self._exchange(body, provider, headers, send, summary_send, fmt, stage)
+        except Exception as exc:
+            try:
+                exc.memory_degradable = not stage['captured'] and getattr(exc, 'degradable', True)
+            except AttributeError:
+                pass
+            raise
+        if stage.get('guarded'):
+            # The pre-send guard sent the client's own bytes: memory broke.
+            return replace(reply, level='passthrough')
+        handed_off = stage['handoff'] or self._api_calls(stage['namespace']) > stage['api_calls']
+        return replace(reply, level='handoff' if handed_off else 'local')
+
+    def _exchange(self, body, provider, headers, send, summary_send, fmt, stage):
         # One provider speaks two wire formats. The credential namespace stays
         # keyed on the provider, so a conversation may switch format mid-stream.
         fmt = fmt or wire.format_for(provider)
@@ -362,6 +502,7 @@ class MemoryProxy:
         except (ValueError, TypeError, KeyError) as exc:
             raise MemoryProxyError(str(exc)) from exc
         namespace = self.namespace(provider, headers)
+        stage['namespace'], stage['api_calls'] = namespace, self._api_calls(namespace)
         body_sha = hashlib.sha256(body).hexdigest()
         request_key = next((v for k,v in headers.items() if k.lower() == 'x-memory-request-id'),body_sha)
         if not isinstance(request_key,str) or not request_key.strip() or len(request_key)>512:
@@ -370,7 +511,8 @@ class MemoryProxy:
         summary_api = None
         if self.summary_api_fallback:
             from memory_condense.interfaces.summary_api import ProviderSummaryAPI
-            summary_api = ProviderSummaryAPI(provider, payload['model'], summary_send or send, fmt=fmt)
+            summary_api = ProviderSummaryAPI(provider, self.summary_model or payload['model'],
+                                             summary_send or send, fmt=fmt)
         with self._io(namespace, summary_api=summary_api) as entry:
             session = entry.session
             with session._connect() as db:
@@ -404,7 +546,8 @@ class MemoryProxy:
                 if prior[1] in ('calling','failed'):
                     if prior[3]:
                         return WireResponse.restore(json.loads(prior[3]))
-                    raise MemoryProxyError('Previous provider outcome is unknown; request was retained and will not be resent',409)
+                    raise MemoryProxyError('Previous provider outcome is unknown; request was retained and will not be resent',409,
+                                           degradable=False)
             threaded = bool(payload.get('previous_response_id') or payload.get('conversation'))
             replayed = any(m['role'] == 'assistant' for m in incoming)
             if not prior and not entry.messages and threaded and not replayed:
@@ -421,6 +564,7 @@ class MemoryProxy:
             new = self._new_messages(entry.messages, incoming, fmt) if not prior else []
             if not prior and not new:
                 raise MemoryProxyError('No new input; reuse the original request ID to replay its response',409)
+            stage['captured'] = True
             with session.capture_exchange():
                 if prior:
                     input_id = prior[2]
@@ -457,6 +601,7 @@ class MemoryProxy:
                 # (passthrough is the sanctioned degraded mode). `served` is
                 # the same on every attempt, so the verdict is decided once.
                 problems = guard_served_body(fmt, served)
+                stage['guarded'] = bool(problems)
                 sent = body if problems else wire.encoded(served)
 
                 def tagged(value):

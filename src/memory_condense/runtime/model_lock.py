@@ -47,6 +47,16 @@ class RecallPriorityLock:
                 self._owner = None
                 self._condition.notify_all()
 
+    def queued(self):
+        """Work waiting for admission, by queue, for status reporting.
+
+        A monitoring read: it takes only the condition's own short lock, never
+        waits for the owner, and may be one admission stale.
+        """
+        with self._condition:
+            return dict(foreground=len(self._foreground), background=len(self._background),
+                        held=self._owner is not None)
+
     def __enter__(self):
         self._acquire()
         return self

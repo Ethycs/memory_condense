@@ -139,8 +139,10 @@ def _cosines(encoder, summary: str, candidates: list[str]) -> np.ndarray:
 class SemanticLocalFirstSummaries(LocalFirstSummaries):
     """Local-first summaries whose cache identity includes semantic validation."""
 
-    def __init__(self, local, root, api, *, require_provider=False):
-        super().__init__(local, root, self._bind_policy(api), require_provider=require_provider)
+    def __init__(self, local, root, api, *, require_provider=False, handoff='failure',
+                 saturated=None):
+        super().__init__(local, root, self._bind_policy(api), require_provider=require_provider,
+                         handoff=handoff, saturated=saturated)
 
     @staticmethod
     def _bind_policy(api):

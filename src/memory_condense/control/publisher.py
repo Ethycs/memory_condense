@@ -112,6 +112,9 @@ class StatusPublisher:
             "static_tokens_last": None,
             "served_tokens_last": None,
             "saved_tokens_total": 0,
+            "levels": {"local": 0, "handoff": 0, "passthrough": 0},
+            "passthrough_forced": 0,
+            "passthrough_degraded": 0,
         }
         self._live_tokens = 0
         self._conversations: set[str] = set()
@@ -139,6 +142,15 @@ class StatusPublisher:
             serving["static_tokens_last"] = receipt.effective_static_tokens
             serving["served_tokens_last"] = receipt.effective_served_tokens
             serving["saved_tokens_total"] += int(receipt.saved_tokens)
+            # One counter per service level; observe mode has no level. A
+            # forced and a degraded passthrough mean opposite things, so they
+            # are never added together.
+            level = getattr(receipt, "level", None)
+            if level in serving["levels"]:
+                serving["levels"][level] += 1
+                if level == "passthrough":
+                    key = "passthrough_degraded" if getattr(receipt, "degraded", False) else "passthrough_forced"
+                    serving[key] += 1
             self._dirty = True
 
     def record_capture(self, tokens: int, conversation_id: str | None = None) -> None:
@@ -216,7 +228,7 @@ class StatusPublisher:
             doc["last_job"] = None
 
         with self._lock:
-            serving = dict(self._serving)
+            serving = dict(self._serving, levels=dict(self._serving["levels"]))
             live_tokens = self._live_tokens
             live_sessions = len(self._conversations) + self._conversations_overflow
             override = self._state_override

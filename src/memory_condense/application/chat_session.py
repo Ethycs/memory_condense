@@ -84,7 +84,8 @@ class ChatSession:
 
     def __init__(self, directory: str | Path, session_id: str, backend: ChatBackend, *, batch_exchanges: int = 0,
                  prepare_exchanges: tuple[int, ...] = (), streaming: bool = False,
-                 recent_exchanges: int | None = None, recent_token_budget: int | None = None):
+                 recent_exchanges: int | None = None, recent_token_budget: int | None = None,
+                 ingest_observer=None):
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError('A session_id is required')
         if type(batch_exchanges) is not int or batch_exchanges < 0:
@@ -109,6 +110,10 @@ class ChatSession:
         self.batch_exchanges = batch_exchanges
         self.streaming, self.recent_exchanges, self.recent_token_budget = streaming, recent_exchanges, recent_token_budget
         self._stream_jobs, self._stream_queued = [], False
+        # Times each streaming preparation for the service's ingest-rate
+        # monitor; `_preparations` lets it tell a session's start from its
+        # steady state.
+        self.ingest_observer, self._preparations = ingest_observer, 0
         self.prepare_exchanges, self._prepared = prepare_exchanges, 0
         self._capture_depth = 0
         self.directory = Path(directory)
@@ -325,7 +330,7 @@ class ChatSession:
                     if end <= after:
                         break
                     events = self._event_range(after, end)
-                    future = self._preparers.submit(self.backend.prepare_exchange, events)
+                    future = self._preparers.submit(self._prepare_exchange, events, force_target is not None)
                     self._stream_jobs.append((end, events, future))
                     future.add_done_callback(lambda _: self._schedule_sync())
                     after = end
@@ -337,7 +342,7 @@ class ChatSession:
                 # Publication failures retain successful preparation results.
                 if first.done() and first.exception() is not None:
                     end, events, _ = self._stream_jobs[0]
-                    first = self._preparers.submit(self.backend.prepare_exchange, events)
+                    first = self._preparers.submit(self._prepare_exchange, events, True)
                     self._stream_jobs[0] = (end, events, first)
                 first.result()
             elif not first.done():
@@ -368,6 +373,30 @@ class ChatSession:
                 break
         if force_target is not None:
             self.backend.finalize_stream(self._prefix_events(self._installed))
+
+    def _prepare_exchange(self, events, forced):
+        """One preparation, timed for the ingest-rate monitor when there is one.
+
+        ``forced`` marks a flush or close drain, which submits the whole
+        backlog at once and is slow by design; the monitor judges it against
+        other drains, never against steady-state ingest.
+        """
+        observer = self.ingest_observer
+        if observer is None:
+            return self.backend.prepare_exchange(events)
+        from memory_condense.domain._tokenizer import count_tokens
+        with self._lock:
+            ordinal, self._preparations = self._preparations, self._preparations + 1
+            forced = forced or self._closed
+        ticket = observer.begin(tokens=sum(count_tokens(e.text) for e in events),
+                                ordinal=ordinal, forced=forced)
+        ok = False
+        try:
+            value = self.backend.prepare_exchange(events)
+            ok = True
+            return value
+        finally:
+            observer.end(ticket, ok=ok)
 
     def _prepare_pending(self):
         if not self.prepare_exchanges:

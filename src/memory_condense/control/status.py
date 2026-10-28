@@ -91,7 +91,9 @@ def empty_status(*, mode: str = "observe", pid: int | None = None) -> dict[str, 
                   "avg_s_per_1k_tokens": None, "window_s": 30},
         "totals": {"tokens_ingested": 0, "records_ingested": 0, "sessions": 0, "store_bytes": 0},
         "serving": {"requests": 0, "rewritten": 0, "static_tokens_last": None,
-                    "served_tokens_last": None, "saved_tokens_total": 0},
+                    "served_tokens_last": None, "saved_tokens_total": 0,
+                    "levels": {"local": 0, "handoff": 0, "passthrough": 0},
+                    "passthrough_forced": 0, "passthrough_degraded": 0},
         "store": {"path": None, "snapshot_dir": None, "last_snapshot": None, "snapshots": []},
     }
 

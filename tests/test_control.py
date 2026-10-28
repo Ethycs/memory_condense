@@ -665,6 +665,8 @@ class TestStatusPublisher:
         assert doc["serving"] == {
             "requests": 2, "rewritten": 2, "static_tokens_last": 1_100_000,
             "served_tokens_last": 48_200, "saved_tokens_total": 950_000 + 1_051_800,
+            "levels": {"local": 0, "handoff": 0, "passthrough": 0},
+            "passthrough_forced": 0, "passthrough_degraded": 0,
         }
         assert doc["totals"]["records_ingested"] == 7
         assert doc["totals"]["tokens_ingested"] == 500

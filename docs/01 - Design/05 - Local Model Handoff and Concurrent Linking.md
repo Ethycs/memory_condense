@@ -1,6 +1,7 @@
 # Local model handoff and concurrent linking
 
-**Status**: Design note
+**Status**: Design note. Packages A and B, the saturation handoff and step B0
+are built. See *Implementation status*.
 **Date**: 2026-10-20
 **Applies to**: `runtime/local.py`, `runtime/model_lock.py`, `runtime/sessions.py`,
 `associations/qwen_memory_linker.py`, `modeling/qwen_prefix.py`,
@@ -326,10 +327,12 @@ flowchart LR
     h1 -.-> h3
 ```
 
-1. **H1. The lock exists, and no code uses it.** `Qwen3PrefixEncoder` makes
-   `self.lock` at `modeling/qwen_prefix.py:76`. No other line in that file uses it.
-   Therefore the encoder has no internal serialization. It depends only on the
-   external gate.
+1. **H1. The encoder has no lock for its hook methods.** *Correction (2026-10-27):*
+   the `self.lock` at `modeling/qwen_prefix.py:76` belongs to
+   `_QwenPrefixGateState`, and not to `Qwen3PrefixEncoder`. The fusion provider
+   uses it through `_qwen_prefix_execution_gate`, and that gate fails closed. The
+   methods that add hooks do not use that gate. Therefore those methods depend
+   only on the external gate.
 2. **H2. `encode_layers` changes shared tokenizer data.** The code sets
    `self.tokenizer.padding_side` to `right`, and then it restores the old value
    (`:788-789`). Two concurrent calls compete for this field. The second call makes
@@ -421,3 +424,116 @@ before you merge one of these steps.
 
 Package A and package B come first. Without the capacity signal and the level in the
 receipt, nobody can measure package C or package D.
+
+## Implementation status
+
+**Date**: 2026-10-27
+
+| Item | State | Where |
+| --- | --- | --- |
+| M6 memory modes | built | `--memory-mode`, the `x-memory-mode` header, `MemoryProxy.exchange` |
+| Package A, capacity signal | built before this note | `max_sessions`, `sessions_at_capacity`, `memory_sessions_at_capacity` |
+| Package B, levels and receipts | built | `ServingReceipt.level`, `serving.levels`, `serving.passthrough_*` |
+| Saturation handoff, target 1 and target 2 | built | `runtime/ingest_rate.py`, `--memory-summary-handoff`, `--memory-handoff-z`, `--memory-summary-model` |
+| Profile A and profile B | built | `profile` in the status, `MemoryProxy.release()` |
+| Package C, step B0 | measured; stopped | `tools/measure_linker_tokenization.py` |
+| Package C, steps B1 and B2 | not started | the measurement does not justify them |
+| Package D | not started | the retrieval policy must agree first |
+
+### The memory modes
+
+The proxy passes a request through in mode `auto` only when the failure occurs
+before the capture of the exchange. `MemoryProxy.exchange` marks each exception
+with `memory_degradable`. One error is never degradable: a request whose earlier
+send has an unknown outcome.
+
+A forced passthrough and a degraded passthrough have different counters. Only a
+degraded passthrough is a health reason. The reason stays for five minutes.
+
+### The service level
+
+The memory service sets the level of each turn. The level is `handoff` when the
+provider summary calls of the conversation increase during the turn. The level is
+`passthrough` when the pre-send guard sends the bytes of the client. An unchanged
+body alone is not a passthrough. It can be an empty packet.
+
+This level is an approximation. Background summary work of the same conversation
+can run during the turn. The level then shows that work too.
+
+### The handoff decision
+
+The measurement of saturation is the ingest rate, and not the queue depth of
+the GPU gate. The queue depth shows that work waits. It does not show that the
+wait is abnormal.
+
+`IngestRateMonitor` (`runtime/ingest_rate.py`) takes one sample for each
+streaming exchange preparation. The sample is the logarithm of the seconds for
+each 1000 tokens. The time includes each wait on the GPU gate.
+
+Ingest has two regular transients. At the start of a session, the first
+preparations load models and fill caches. At a stop, a flush or a close submits
+the full backlog, and the jobs wait for each other. These transients are slow,
+but they are normal.
+
+Therefore each sample has a regime: `start`, `steady` or `stop`. Each regime has
+its own baseline. The monitor calculates the z-score of a sample against the
+baseline of its regime. A slow start that is typical for starts has a z-score
+near zero.
+
+The adjusted z-score is the z-score of the mean of the last three samples. A
+preparation that is not complete also counts. Its elapsed time is a lower limit,
+so a job that waits behind the gate starts a handoff before it ends.
+
+| Rule | Value |
+| --- | --- |
+| Threshold | z above 3.0 (`--memory-handoff-z`) |
+| Duration of one handoff | 30 seconds, then a new local probe |
+| Samples before the first decision | 20 steady samples |
+| Samples that update a baseline | samples with z at or below the threshold |
+| Samples that the monitor ignores | failed jobs, and jobs that overlap a handoff |
+| Operator override | `ctl handoff handoff\|local\|auto [--for SECONDS]` |
+
+The operator can override the decision on the control surface. The mode
+`handoff` starts a handoff and keeps it until the operator releases it. The
+mode `local` stops a handoff and prevents a new one. The monitor continues to
+calculate the z-score, and the status shows it. The mode `auto` gives the
+decision back to the z-score. An override with a duration ends at that time.
+The proxy does not save an override, so a restart starts in `auto`. The policy
+`failure` refuses the mode `handoff`, because that policy never sends a
+summary to the provider because of load.
+
+A threshold of 2.0 is too low. Three correlated samples near 1.35 standard
+deviations gave z = 2.34 in a test. With independent noise, z passes 2.0 for
+2.3 % of decisions. At 3.0, the rate is 0.13 %.
+
+The baseline does not learn from saturated samples. If it did, saturation would
+become the normal rate, and the handoff would stop. The baseline is saved in
+`ingest-baseline.json`, so a restart does not repeat the 20 samples.
+
+The default policy is `both`. A summary job goes to the provider when ingest is
+saturated, and also when a local summary fails. The policy `failure` is the
+behavior before this note. The cost question stays open: a handoff spends
+provider tokens of the user. Set `--memory-summary-handoff failure` to stop it.
+
+### Step B0, the measurement
+
+We measured the serving linker pass on 2026-10-27. The setup was an RTX 2070
+SUPER, Qwen3-8B with six prefix layers in `float16`, and 30 passes over windows of
+eight user summaries.
+
+| Value | Result |
+| --- | --- |
+| Median time of one pass | 117.6 ms |
+| Median tokenizer time in one pass | 4.4 ms |
+| Tokenizer calls in one pass | 1 |
+| Median tokenizer share | 3.8 % |
+| Maximum tokenizer share | 4.4 % |
+
+A tokenizer pool can remove at most 4.4 % of the pass from the GPU gate. The
+rule of step B0 applies. Step B0 is the full task, and steps B1 and B2 do not
+start.
+
+Therefore this work does not change `modeling/qwen_prefix.py` or
+`associations/qwen_memory_linker.py`. The attention cache identity stays valid on
+each host. Hazards H2 and H3 stay in the code. The GPU gate continues to prevent
+them.

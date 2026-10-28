@@ -106,11 +106,12 @@ def main(argv=None):
     if args and args[0] == 'ctl':
         from memory_condense.control.cli import main as ctl
         return ctl(args[1:])
-    parser = argparse.ArgumentParser(prog='memory-condense', description=__doc__)
+    from memory_condense.control.cli import HelpfulParser
+    parser = HelpfulParser(prog='memory-condense', description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('proxy', help='Run the memory-enabled provider proxy (--print-env [--preset claude|codex-chatgpt|codex-api] [--port N] prints client setup)')
     commands.add_parser('route', help='Prioritize memory tactics with the existing CPU BGE model')
-    commands.add_parser('ctl', help='Control plane: status | save | load | reset | load-transcript')
+    commands.add_parser('ctl', help='Control plane: status | save | load | reset | load-transcript | handoff')
     setup_parser = commands.add_parser('setup', help='Download pinned model assets or register an existing cache')
     location = setup_parser.add_mutually_exclusive_group()
     location.add_argument('--assets-dir', help='Download destination (default: per-user application data)')
@@ -118,6 +119,9 @@ def main(argv=None):
     doctor_parser = commands.add_parser('doctor', help='Check local assets, dependencies, and CUDA')
     doctor_parser.add_argument('--assets-dir')
     doctor_parser.add_argument('--verify-models', action='store_true', help='Check every pinned model/runtime file hash')
+    if not args:
+        parser.print_help()
+        return 0
     parsed = parser.parse_args(args)
     try:
         from memory_condense.runtime import setup as provision

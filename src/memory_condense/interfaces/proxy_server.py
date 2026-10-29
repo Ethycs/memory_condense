@@ -623,6 +623,7 @@ def build_app(
                 record_receipt(proxy_receipts.receipt_for_augment(
                     fmt, body, served_body, usage=served_usage,
                     level=getattr(reply, 'level', 'local'), memory_mode=memory_mode,
+                    index_deferred=getattr(reply, 'index_deferred', False),
                 ))
                 if reply.headers.get('content-type','').startswith('text/event-stream'):
                     # Inline summaries are validated before any visible bytes leave

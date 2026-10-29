@@ -581,6 +581,73 @@ def test_the_control_route_needs_a_handoff(tmp_path):
         assert client.post('/_control/handoff', json=dict(mode='auto')).status_code == 501
 
 
+# -- the reduced retrieval path (package D) -----------------------------------
+
+class FlushCounting(Factory):
+    """Counts forced flushes and can hold background indexing.
+
+    Holding it makes "not yet indexed" deterministic: the fake backend would
+    otherwise index the import before recall and race the assertion.
+    """
+    def __init__(self, handoff, *, hold):
+        super().__init__()
+        self.flushes, self.handoff_active = [], (lambda: handoff)
+        self.indexing = threading.Event()
+        if not hold:
+            self.indexing.set()
+
+    def __call__(self, namespace, directory):
+        session = super().__call__(namespace, directory)
+        backend, prepare = self.backends[-1], self.backends[-1].prepare_exchange
+
+        def held(events):
+            assert self.indexing.wait(10)
+            return prepare(events)
+        backend.prepare_exchange = held
+        original = session.flush
+        session.flush = lambda: self.flushes.append(namespace) or original()
+        return session
+
+
+IMPORTED = dict(model='test', messages=[
+    *[m for turn in range(12) for m in (
+        dict(role='user', content=f'Imported question {turn} about release r{turn}.'),
+        dict(role='assistant', content=f'Imported answer {turn}.'))],
+    dict(role='user', content='What did we decide about release r3?')])
+
+
+@pytest.mark.parametrize('handoff, headers, deferred', [
+    (True, {}, True),                                  # saturated: serve now
+    (False, {}, False),                                # not saturated: index first
+    (True, {'x-memory-mode': 'require'}, False),       # profile A never reduces
+])
+def test_a_large_import_waits_for_indexing_only_when_local_can_serve(tmp_path, handoff, headers, deferred):
+    upstream = Recorder()
+    app, memory = app_with(tmp_path, upstream, recent_token_budget=32)
+    memory.factory = FlushCounting(handoff, hold=deferred)
+    with TestClient(app) as client:
+        reply = client.post(PATH, headers=dict(HEADERS, **headers), json=IMPORTED)
+        assert reply.status_code == 200
+        assert bool(memory.factory.flushes) is not deferred
+        counters = serving(client)
+        assert counters['index_deferred'] == int(deferred)
+        assert memory.status()['index_deferred'] == int(deferred)
+        if deferred:
+            # Nothing unindexed is dropped: the whole import goes upstream verbatim.
+            sent = json.loads(upstream.calls[-1].content)['messages']
+            texts = '\n'.join(str(m.get('content')) for m in sent)
+            assert all(f'Imported question {turn} ' in texts for turn in range(12))
+            assert counters['levels']['handoff'] == 1
+        memory.factory.indexing.set()   # let the deferred indexing finish before close
+
+
+def test_receipts_record_a_deferred_index():
+    body = json.dumps(PAYLOAD).encode()
+    receipt = receipt_for_augment('openai', body, body, level='handoff', index_deferred=True)
+    assert receipt.index_deferred and not receipt.degraded
+    assert not receipt_for_augment('openai', body, body).index_deferred
+
+
 def test_ctl_handoff_posts_the_override_and_status_shows_it(monkeypatch):
     from memory_condense.control import cli
     sent = []

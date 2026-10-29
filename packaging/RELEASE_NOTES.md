@@ -26,6 +26,11 @@ What else is new:
   ingest again; `--memory-handoff-z` sets the threshold (default 3.0) and the
   baseline persists in `ingest-baseline.json`. `--memory-summary-model` names a
   designated secondary model for handed-off summaries.
+- During a handoff, a turn that imports a large history is no longer held
+  while it is indexed (which runs on the saturated GPU and can take minutes).
+  It is served from the published index with the unindexed history verbatim,
+  and indexing continues in the background; receipts record
+  `index_deferred`. `require` mode always waits.
 - An operator override: `memory-condense ctl handoff handoff|local|auto
   [--for SECONDS]`, or `POST /_control/handoff`. `ctl status` shows the decision,
   the z-score and any override. Overrides are not persisted.

@@ -41,6 +41,10 @@ class WireResponse:
     #: ``passthrough`` when the pre-send guard served the client's own bytes.
     #: Never persisted; a restored response is the stored bytes only.
     level: str = 'local'
+    #: The turn did not wait to index a large import: it was served from the
+    #: published index plus the unindexed history verbatim (the reduced
+    #: retrieval path, design note 05, package D).
+    index_deferred: bool = False
 
     def stored(self):
         # Persist only protocol/correlation headers; never cookies or credentials.
@@ -123,6 +127,7 @@ class MemoryProxy:
         self.summary_model = summary_model
         self._passthrough = Counter()
         self._last_degraded = None
+        self._index_deferred = 0
         self.entries, self.lock, self.closed = {}, threading.RLock(), False
         # `lock` is held across session construction and journal replay, which
         # is exactly the work status must be able to describe. These mirrors are
@@ -230,6 +235,7 @@ class MemoryProxy:
         except Exception as exc:
             gate = dict(unavailable=f'{type(exc).__name__}: {exc}')
         with self._status_lock:
+            index_deferred = self._index_deferred
             passthrough = dict(forced=self._passthrough['forced'], degraded=self._passthrough['degraded'],
                                last_degraded=None if self._last_degraded is None else
                                {k: v for k, v in self._last_degraded.items() if k != 'monotonic'})
@@ -259,7 +265,8 @@ class MemoryProxy:
                     summary_api_fallback=self.summary_api_fallback, summary_routing=summary_status(),
                     retrieval=retrieval_status(), memory_mode=self.memory_mode,
                     summary_model=self.summary_model, profile=self.profile(), gpu_gate=gate,
-                    passthrough=passthrough, passthrough_degraded_recently=degraded_recently)
+                    passthrough=passthrough, passthrough_degraded_recently=degraded_recently,
+                    index_deferred=index_deferred)
 
     def profile(self):
         """Which of the design note's two profiles this configuration is.
@@ -477,7 +484,8 @@ class MemoryProxy:
         through instead. The proxy's history then stays an exact prefix of the
         client's, so the next memory-backed turn ingests the skipped exchange.
         """
-        stage = dict(captured=False, namespace=None, api_calls=0, handoff=self._handoff_active())
+        stage = dict(captured=False, namespace=None, api_calls=0, handoff=self._handoff_active(),
+                     mode=self._request_mode(headers), index_deferred=False)
         try:
             reply = self._exchange(body, provider, headers, send, summary_send, fmt, stage)
         except Exception as exc:
@@ -486,11 +494,21 @@ class MemoryProxy:
             except AttributeError:
                 pass
             raise
+        if stage['index_deferred']:
+            with self._status_lock:
+                self._index_deferred += 1
         if stage.get('guarded'):
             # The pre-send guard sent the client's own bytes: memory broke.
-            return replace(reply, level='passthrough')
+            return replace(reply, level='passthrough', index_deferred=stage['index_deferred'])
         handed_off = stage['handoff'] or self._api_calls(stage['namespace']) > stage['api_calls']
-        return replace(reply, level='handoff' if handed_off else 'local')
+        return replace(reply, level='handoff' if handed_off else 'local',
+                       index_deferred=stage['index_deferred'])
+
+    def _request_mode(self, headers):
+        """The memory mode this request runs under: its header, else the default."""
+        requested = next((v for k, v in (headers or {}).items() if k.lower() == 'x-memory-mode'), None)
+        mode = (requested or self.memory_mode).strip().lower()
+        return mode if mode in MEMORY_MODES else self.memory_mode
 
     def _exchange(self, body, provider, headers, send, summary_send, fmt, stage):
         # One provider speaks two wire formats. The credential namespace stays
@@ -587,7 +605,15 @@ class MemoryProxy:
                     # Initial imported context must be indexed before any of it
                     # can be discarded. Ordinary turns do not wait for ingestion.
                     if count_tokens('\n'.join(e.text for e in events)) > self.recent_token_budget:
-                        session.flush()
+                        if stage['handoff'] and stage['mode'] != 'require':
+                            # Reduced retrieval path: indexing needs the
+                            # saturated GPU and can take minutes. Nothing is
+                            # discarded meanwhile -- the recent window keeps
+                            # every unindexed event -- so serve now and let
+                            # the background sync index the import.
+                            stage['index_deferred'] = True
+                        else:
+                            session.flush()
                 event = session.event(input_id)
                 query = next((wire.message_text(m) for _,m in reversed(entry.messages)
                               if m['role']=='user' and not wire.tool_result(m)),event.text)

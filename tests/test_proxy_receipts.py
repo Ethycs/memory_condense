@@ -277,7 +277,7 @@ class TestSavedTokens:
             "format": "anthropic", "mode": "augment", "rewritten": True,
             "reason": "elided 2 units", "static_tokens": 50, "served_tokens": 20,
             "usage_input_tokens": None, "level": None, "degraded": False,
-            "memory_mode": None, "saved_tokens": 30,
+            "memory_mode": None, "index_deferred": False, "saved_tokens": 30,
         }
 
 

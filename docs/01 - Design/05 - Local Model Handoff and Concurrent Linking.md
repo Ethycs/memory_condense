@@ -1,7 +1,8 @@
 # Local model handoff and concurrent linking
 
-**Status**: Design note. Packages A and B, the saturation handoff and step B0
-are built. See *Implementation status*.
+**Status**: Built. Packages A, B and D, the saturation handoff, the operator
+override and step B0 are built. Steps B1 and B2 do not start. See
+*Implementation status*.
 **Date**: 2026-10-20
 **Applies to**: `runtime/local.py`, `runtime/model_lock.py`, `runtime/sessions.py`,
 `associations/qwen_memory_linker.py`, `modeling/qwen_prefix.py`,
@@ -37,7 +38,7 @@ specification itself, which this repository does not hold. A later pass can do i
 | **passthrough** | the proxy sends the bytes of the client and changes nothing |
 | **handoff** | the proxy gives work to the provider API, because the local models cannot do it |
 | **a packet** | the memory evidence that the proxy adds to a request |
-| **saturated** | the GPU gate holds queued work in `_foreground` or `_background` |
+| **saturated** | the adjusted ingest z-score is above the threshold, or the operator forces a handoff |
 
 ## Purpose
 
@@ -82,6 +83,15 @@ We measured these values.
   `QwenMemoryLinker`: `application/retrieval_workflow.py:24`,
   `search/section_attention.py:9`, and `search/context_card_retrieval.py:15`.
   Therefore each conversation does its own Qwen inspection under the GPU gate.
+
+  *Correction (2026-10-28):* this is not true for the augment proxy. Recall
+  reads the last published snapshot (`ResidentNativeBackend.recall_published`).
+  It uses the BGE encoder on the CPU, with its own lock, and the prepared
+  index. `native_packet` fails when a route reports a Qwen pass
+  (`application/chat_native.py:38`). The GPU gate is on the ingest path: the
+  summaries and the Qwen compile. Experiment modules are the only exception,
+  and they are off by default. The one serving step that waits for the GPU is
+  the forced flush of a large import. Package D removes that wait.
 - **`max_sessions` refuses, and it does not queue.** `MemoryProxy.entry()` raises
   error 429 (`interfaces/proxy_memory.py:130`). The proxy removes no memory session
   to make space.
@@ -142,10 +152,9 @@ The rule has one condition and two targets.
 **Start a handoff only when the local models are saturated. Send the work to the
 active model, or to a designated secondary model.**
 
-- **The condition is saturation, and nothing else.** Saturation means that the GPU
-  gate has queued work. `RecallPriorityLock` holds a `_foreground` deque and a
-  `_background` deque (`runtime/model_lock.py:20`). The depth of those queues is the
-  measurement. A threshold on that depth is the trigger.
+- **The condition is saturation, and nothing else.** This note first measured
+  saturation with the queue depth of the GPU gate. The built system uses the
+  ingest rate. *The handoff decision* gives the reason.
 - **Target 1 is the active model.** This is the model that the conversation already
   uses. The proxy has it in `payload['model']`, and it has the transport of the
   client.
@@ -194,8 +203,9 @@ Select one of these two options.
 - **Both conditions.** Saturation and failure both start a handoff. This option keeps
   the behavior of today, and it adds the new condition.
 
-This note recommends the strict option. The strict option changes the behavior of
-the summary path, so an operator must agree to it first.
+This note recommended the strict option. The operator selected both conditions,
+and `both` is the default of `--memory-summary-handoff`. The value `saturation`
+gives the strict option. The value `failure` gives the behavior before this note.
 
 ### A stage with no target
 
@@ -206,7 +216,8 @@ The linker does not have this form. The linker reads the QK and OV circuits of t
 model. No model API supplies this data.
 
 Therefore the linker has no handoff target, and this is not a problem to correct.
-Saturated linker work waits in the queue, or the turn uses passthrough under M6.
+Saturated linker work waits in the queue. That queue is on the ingest path, so a
+turn does not wait for it. Package D gives the one exception.
 
 ## The two profiles
 
@@ -397,21 +408,21 @@ before you merge one of these steps.
 
 ## Open questions
 
-- **Who selects the level?** The runtime knows that the gate is busy. The retrieval
-  policy knows if a reduced packet is useful. The control plane knows the mode of the
-  operator. One component must select the level. The policy is the correct component,
-  and a signal from the runtime informs it.
-- **Does the proxy hand off one stage, or one turn?** A handoff of one stage makes a
-  packet from two sources. This is acceptable for a summary. This is not acceptable
-  for a stage that supplies a content-addressed identity.
-- **How does the operator control the cost?** A handoff spends the provider tokens of
-  the user on background work. The user did not ask for that work. The flag
-  `--memory-summary-api-fallback` is on by default. This default is acceptable for a
-  failed summary. It is not acceptable for routine load reduction. Add a budget, or
-  add a counter in the `serving` block of the status document.
-- **Does a group of forward passes change the result?** A group must give the same
-  numbers. Attention over one shared forward pass is the place where this can fail.
-  Write a differential test against the serial path first.
+Three questions have an answer now. One question stays open.
+
+- **Who selects the level?** *Answered.* The retrieval policy does not need the
+  GPU, so it has no reason to select. The ingest monitor gives the signal. The
+  operator can override the signal. The memory mode of the request sets the
+  limit: mode `require` never reduces.
+- **Does the proxy hand off one stage, or one turn?** *Answered.* The summary is
+  the only stage that goes to the provider. A packet with summaries from two
+  sources is acceptable. Package D changes one step of the turn: it does not
+  wait for the index. It sends no stage to the provider.
+- **How does the operator control the cost?** *Partly answered.* The `serving`
+  block counts each level, and `ctl handoff local` stops the handoff. There is no
+  token budget. A budget stays open.
+- **Does a group of forward passes change the result?** *Not needed.* Step B0
+  showed that the groups do not give enough benefit. Nobody builds them.
 
 ## Work packages
 
@@ -438,7 +449,8 @@ receipt, nobody can measure package C or package D.
 | Profile A and profile B | built | `profile` in the status, `MemoryProxy.release()` |
 | Package C, step B0 | measured; stopped | `tools/measure_linker_tokenization.py` |
 | Package C, steps B1 and B2 | not started | the measurement does not justify them |
-| Package D | not started | the retrieval policy must agree first |
+| Package D, reduced retrieval path | built | `MemoryProxy._exchange`, `index_deferred` on the receipt and in `serving` |
+| Operator override | built | `POST /_control/handoff`, `ctl handoff` |
 
 ### The memory modes
 
@@ -514,6 +526,32 @@ The default policy is `both`. A summary job goes to the provider when ingest is
 saturated, and also when a local summary fails. The policy `failure` is the
 behavior before this note. The cost question stays open: a handoff spends
 provider tokens of the user. Set `--memory-summary-handoff failure` to stop it.
+
+### The reduced retrieval path
+
+Package D first planned a retrieval fallback that uses the API. The serving
+path does not use the GPU, so that fallback has nothing to replace. One serving
+step waits for the GPU. A turn that imports a large history flushes the session
+before recall. The flush runs the summaries and the Qwen compile. It can take
+minutes.
+
+During a handoff, the proxy does not wait for that flush. It serves the turn from
+the published index. The recent window keeps each event that the index does not
+hold yet. Therefore the history goes to the provider as the client sent it.
+Nothing is lost, and the request is not larger than the request of the client
+plus the packet.
+
+The background sync indexes the import later. The next turns use the index when
+it is ready.
+
+| Rule | Value |
+| --- | --- |
+| Condition | the handoff is active, and the memory mode is not `require` |
+| Effect | no flush before recall; the history goes upstream as text |
+| Record | `index_deferred` on the receipt, and a counter in `serving` and in the status |
+| Level | `handoff` |
+
+Mode `require` keeps the flush. Profile A therefore stays repeatable.
 
 ### Step B0, the measurement
 

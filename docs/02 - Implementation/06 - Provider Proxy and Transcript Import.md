@@ -213,6 +213,15 @@ memory-condense ctl handoff auto                # back to the z-score
 `auto` would decide; a forced `handoff` needs a policy other than `failure`.
 Overrides are runtime state: a restart is always `auto`.
 
+While a handoff is active, a turn that imports more history than
+`--memory-recent-token-budget` is not held for indexing. Normally that turn
+flushes the session first, which runs the summaries and the Qwen compile on the
+saturated GPU and can take minutes. Instead it is served from the published
+index, and the unindexed history goes upstream verbatim -- the recent window
+never drops an event the index does not hold yet. The background sync indexes
+it afterwards. The receipt records `index_deferred`, the status counts it in
+`serving.index_deferred`, and `x-memory-mode: require` always waits.
+
 `--memory-summary-handoff` selects what a summary job does. `both` (the
 default) hands it off while ingest is saturated and still escalates a failed
 local summary. `saturation` hands off only under load; an unsaturated failure

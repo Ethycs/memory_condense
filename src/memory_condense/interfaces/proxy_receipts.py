@@ -43,7 +43,9 @@ class ServingReceipt:
     mode, which serves no memory at any level.  ``degraded`` separates a
     passthrough because memory could not serve from one the operator or
     client asked for.  ``memory_mode`` is the mode the request ran under, so a
-    measurement can prove it never passed through silently.
+    measurement can prove it never passed through silently.  ``index_deferred``
+    marks a turn served by the reduced retrieval path: a large import was not
+    indexed first, so its history went upstream verbatim.
     """
 
     format: str | None
@@ -56,6 +58,7 @@ class ServingReceipt:
     level: str | None = None
     degraded: bool = False
     memory_mode: str | None = None
+    index_deferred: bool = False
 
     @property
     def effective_served_tokens(self) -> int | None:
@@ -291,6 +294,7 @@ def receipt_for_augment(
     reason: str = "",
     level: str = "local",
     memory_mode: str | None = None,
+    index_deferred: bool = False,
 ) -> ServingReceipt:
     """Augment mode: the memory service may have replaced the prompt.
 
@@ -329,6 +333,7 @@ def receipt_for_augment(
         level=level,
         degraded=degraded,
         memory_mode=memory_mode,
+        index_deferred=index_deferred,
     )
 
 

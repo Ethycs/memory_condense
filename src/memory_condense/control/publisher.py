@@ -115,6 +115,7 @@ class StatusPublisher:
             "levels": {"local": 0, "handoff": 0, "passthrough": 0},
             "passthrough_forced": 0,
             "passthrough_degraded": 0,
+            "index_deferred": 0,
         }
         self._live_tokens = 0
         self._conversations: set[str] = set()
@@ -151,6 +152,7 @@ class StatusPublisher:
                 if level == "passthrough":
                     key = "passthrough_degraded" if getattr(receipt, "degraded", False) else "passthrough_forced"
                     serving[key] += 1
+            serving["index_deferred"] += int(bool(getattr(receipt, "index_deferred", False)))
             self._dirty = True
 
     def record_capture(self, tokens: int, conversation_id: str | None = None) -> None:
